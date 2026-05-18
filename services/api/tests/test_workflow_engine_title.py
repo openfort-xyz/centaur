@@ -111,14 +111,14 @@ async def test_title_drops_segments_for_missing_values(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_title_returns_plain_brand_when_nothing_is_known(monkeypatch):
+async def test_title_uses_default_harness_when_nothing_is_known(monkeypatch):
     get_active = AsyncMock(return_value=None)
     monkeypatch.setattr(workflow_engine, "get_active_assignment", get_active)
     selector: dict[str, Any] = {"persona_id": None, "harness": None}
     title = await workflow_engine._compute_agent_session_title(
         pool=object(), thread_key="slack:T:C:1.0", selector=selector,
     )
-    assert title == "Centaur"
+    assert title == "Centaur · codex"
 
 
 @pytest.mark.asyncio
