@@ -1,0 +1,13 @@
+[project]
+name = "sentry"
+version = "0.1.0"
+description = "Sentry error tracking and issue management"
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["sentry.io", "us.sentry.io", "de.sentry.io"]
+secrets = [
+    {type = "http", name = "SENTRY_AUTH_TOKEN", match_headers = ["Authorization"], hosts = ["sentry.io", "us.sentry.io", "de.sentry.io"]},
+]
