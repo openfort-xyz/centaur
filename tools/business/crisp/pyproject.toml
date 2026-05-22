@@ -1,0 +1,13 @@
+[project]
+name = "crisp"
+version = "0.1.0"
+description = "Crisp Chat customer support"
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["api.crisp.chat"]
+secrets = [
+    {type = "http", name = "CRISP_API_CREDENTIALS", match_headers = ["Authorization", "X-Crisp-Tier"], hosts = ["api.crisp.chat"]},
+]
