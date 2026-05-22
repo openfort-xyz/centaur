@@ -1,0 +1,13 @@
+[project]
+name = "gcp_logs"
+version = "0.1.0"
+description = "GCP Cloud Logging queries"
+requires-python = ">=3.11"
+dependencies = ["httpx", "pyjwt"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["logging.googleapis.com", "oauth2.googleapis.com"]
+secrets = [
+    {type = "http", name = "GOOGLE_SERVICE_ACCOUNT_JSON", match_headers = ["Authorization"], hosts = ["logging.googleapis.com", "oauth2.googleapis.com"]},
+]
