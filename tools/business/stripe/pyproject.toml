@@ -1,0 +1,13 @@
+[project]
+name = "stripe"
+version = "0.1.0"
+description = "Stripe billing and subscription data"
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["api.stripe.com"]
+secrets = [
+    {type = "http", name = "STRIPE_RESTRICTED_KEY", match_headers = ["Authorization"], hosts = ["api.stripe.com"]},
+]
