@@ -366,12 +366,200 @@ def whoami(
         console.print(f"[dim]Phone: {result.get('phone', 'N/A')}[/]")
 
 
+@app.command()
+def send_photo(
+    chat_id: str = typer.Argument(..., help="Chat ID or @username"),
+    photo: str = typer.Argument(..., help="File ID, URL, or local path to photo"),
+    caption: str | None = typer.Option(None, "--caption", "-c"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Send a photo."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.send_photo(chat_id, photo, caption))
+    if json_output: print(json.dumps(result, indent=2)); return
+    console.print(f"[green]✓[/] Photo sent as message {result['message_id']}")
+
+
+@app.command()
+def send_file(
+    chat_id: str = typer.Argument(..., help="Chat ID or @username"),
+    file: str = typer.Argument(..., help="File ID, URL, or local path"),
+    caption: str | None = typer.Option(None, "--caption", "-c"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Send a document/file."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.send_document(chat_id, file, caption))
+    if json_output: print(json.dumps(result, indent=2)); return
+    console.print(f"[green]✓[/] File sent as message {result['message_id']}")
+
+
+@app.command()
+def edit(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    message_id: int = typer.Argument(..., help="Message ID to edit"),
+    text: str = typer.Argument(..., help="New text"),
+    markdown: bool = typer.Option(False, "--markdown", "-m"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Edit a sent message."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.edit_message_text(chat_id, message_id, text,
+        parse_mode="Markdown" if markdown else None))
+    if json_output: print(json.dumps(result, indent=2)); return
+    console.print(f"[green]✓[/] Edited message {result['message_id']}")
+
+
+@app.command()
+def react(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    message_id: int = typer.Argument(..., help="Message ID"),
+    emoji: str | None = typer.Option(None, "--emoji", "-e", help="Comma-separated emoji (empty to remove)"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Set reaction on a message."""
+    from .client import TelegramClient; c = TelegramClient()
+    reaction_list = [e.strip() for e in emoji.split(",")] if emoji else None
+    result = asyncio.run(c.set_message_reaction(chat_id, message_id, reaction_list))
+    if json_output: print(json.dumps({"ok": result}), indent=2); return
+    console.print(f"[green]✓[/] Reaction {'set' if reaction_list else 'removed'}")
+
+
+@app.command()
+def pin(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    message_id: int = typer.Argument(..., help="Message ID to pin"),
+    silent: bool = typer.Option(False, "--silent", "-s"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Pin a message."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.pin_chat_message(chat_id, message_id, disable_notification=silent))
+    if json_output: print(json.dumps({"ok": result}), indent=2); return
+    console.print(f"[green]✓[/] Pinned message {message_id}")
+
+
+@app.command()
+def unpin(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    message_id: int | None = typer.Option(None, "--message-id", "-m"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Unpin a message."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.unpin_chat_message(chat_id, message_id))
+    if json_output: print(json.dumps({"ok": result}), indent=2); return
+    console.print(f"[green]✓[/] Unpinned {'message ' + str(message_id) if message_id else 'most recent'}")
+
+
+@app.command()
+def admins(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """List chat administrators."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.get_chat_administrators(chat_id))
+    if json_output: print(json.dumps(result, indent=2)); return
+    table = Table(title=f"Admins — {chat_id}")
+    table.add_column("Username", style="cyan"); table.add_column("Status", style="yellow"); table.add_column("Title", style="white")
+    for a in result: table.add_row(f"@{a['username']}" if a['username'] else f"id:{a['user_id']}", a["status"], a.get("custom_title") or "")
+    console.print(table)
+
+
+@app.command()
+def poll(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    question: str = typer.Argument(..., help="Poll question"),
+    options: list[str] = typer.Argument(..., help="Poll options (space-separated)"),
+    anonymous: bool = typer.Option(True, "--anonymous/--public"),
+    multiple: bool = typer.Option(False, "--multiple"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Create a poll."""
+    from .client import TelegramClient; c = TelegramClient()
+    result = asyncio.run(c.send_poll(chat_id, question, options, anonymous, multiple))
+    if json_output: print(json.dumps(result, indent=2)); return
+    console.print(f"[green]✓[/] Poll sent as message {result['message_id']}")
+
+
+@app.command()
+def typing(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    action: str = typer.Option("typing", "--action", "-a", help="typing, upload_photo, record_video, etc."),
+):
+    """Send typing indicator (lasts ~5 seconds)."""
+    from .client import TelegramClient; c = TelegramClient()
+    asyncio.run(c.send_chat_action(chat_id, action))
+    console.print(f"[green]✓[/] Sent '{action}' indicator")
+
+
+@app.command()
+def ban(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    user_id: int = typer.Argument(..., help="User ID to ban"),
+):
+    """Ban a user from a chat."""
+    from .client import TelegramClient; c = TelegramClient()
+    asyncio.run(c.ban_chat_member(chat_id, user_id))
+    console.print(f"[green]✓[/] Banned user {user_id}")
+
+
+@app.command()
+def unban(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    user_id: int = typer.Argument(..., help="User ID to unban"),
+):
+    """Unban a user."""
+    from .client import TelegramClient; c = TelegramClient()
+    asyncio.run(c.unban_chat_member(chat_id, user_id))
+    console.print(f"[green]✓[/] Unbanned user {user_id}")
+
+
+@app.command()
+def invite_link(
+    chat_id: str = typer.Argument(..., help="Chat ID"),
+    name: str | None = typer.Option(None, "--name"),
+    member_limit: int | None = typer.Option(None, "--limit"),
+    expire_hours: int | None = typer.Option(None, "--expire-hours"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Create an invite link."""
+    from .client import TelegramClient; c = TelegramClient()
+    import time
+    expire = int(time.time()) + expire_hours * 3600 if expire_hours else None
+    result = asyncio.run(c.create_chat_invite_link(chat_id, name, expire, member_limit))
+    if json_output: print(json.dumps(result, indent=2)); return
+    console.print(f"[green]✓[/] Invite link: {result['invite_link']}")
+
+
+@app.command()
+def commands(
+    set_cmds: bool = typer.Option(False, "--set", help="Set bot commands (use with --cmd pairs)"),
+    cmd: list[str] | None = typer.Option(None, "--cmd", help="command:description pairs"),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """List or set bot commands."""
+    from .client import TelegramClient; c = TelegramClient()
+    if set_cmds and cmd:
+        import re
+        parsed = [dict(zip(["command","description"], re.split(r":", c, 1))) for c in cmd]
+        asyncio.run(c.set_my_commands(parsed))
+        console.print(f"[green]✓[/] Set {len(parsed)} commands")
+        return
+    cmds = asyncio.run(c.get_my_commands())
+    if json_output: print(json.dumps(cmds, indent=2)); return
+    for c in cmds: console.print(f"  /{c['command']} — {c['description']}")
+
+
 @app.callback()
 def main():
     """Telegram CLI for AI agents.
 
     Bot commands (TELEGRAM_BOT_TOKEN):
-        me, send, updates, chat, forward, delete, webhook
+        me, send, send-photo, send-file, updates, chat, edit, react, pin,
+        unpin, admins, poll, typing, ban, unban, invite-link, commands,
+        forward, delete, webhook
 
     User commands (TELEGRAM_API_ID + TELEGRAM_API_HASH + login):
         login, whoami, dialogs, history
