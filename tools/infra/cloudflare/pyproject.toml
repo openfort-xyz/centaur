@@ -1,0 +1,13 @@
+[project]
+name = "cloudflare"
+version = "0.1.0"
+description = "Cloudflare zone analytics, DNS, Workers"
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["api.cloudflare.com"]
+secrets = [
+    {type = "http", name = "CLOUDFLARE_API_TOKEN", match_headers = ["Authorization"], hosts = ["api.cloudflare.com"]},
+]
