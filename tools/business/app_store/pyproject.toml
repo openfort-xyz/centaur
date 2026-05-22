@@ -1,0 +1,13 @@
+[project]
+name = "app_store"
+version = "0.1.0"
+description = "App Store Connect — sales, reviews, builds"
+requires-python = ">=3.11"
+dependencies = ["httpx", "pyjwt"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["api.appstoreconnect.apple.com"]
+secrets = [
+    {type = "http", name = "APP_STORE_CONNECT_PRIVATE_KEY", match_headers = ["Authorization"], hosts = ["api.appstoreconnect.apple.com"]},
+]
