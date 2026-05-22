@@ -1,0 +1,9 @@
+[project]
+name = "browser_task"
+version = "0.1.0"
+description = "Browser automation via Playwright — navigate, screenshot, click, fill"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.centaur]
+module = "client.py"
