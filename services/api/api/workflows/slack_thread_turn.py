@@ -1,4 +1,11 @@
-"""Workflow: single agent turn in a Slack thread."""
+"""Workflow: single agent turn in a chat thread (Slack, Google Chat, etc.).
+
+The workflow is platform-agnostic; per-platform quirks (mention syntax,
+prompt-switch release-id namespace) are dispatched off ``delivery.platform``.
+The workflow name remains ``slack_thread_turn`` for wire-contract compatibility
+with in-flight durable runs and the ``_workflow_request_hash`` shortcut in
+``workflow_engine.py``.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from api.runtime_control import ControlPlaneError
 from api.workflow_engine import Delivery, WorkflowContext
 
 WORKFLOW_NAME = "slack_thread_turn"
+_DEFAULT_PLATFORM = "slack"
 
 _EXECUTION_HARNESSES = frozenset({"amp", "claude-code", "codex", "pi-mono"})
 _PROMPT_FLAG_ALIASES = {
@@ -27,10 +35,20 @@ _BARE_PERSONA_PROMPT = (
     "Briefly introduce yourself using your active persona instructions and ask what "
     "we should work on."
 )
-_PROMPT_SWITCH_CONTEXT_NOTE = (
-    "You are being invoked mid-thread with a new active persona. Use the preceding "
-    "Slack thread history as context, then answer the latest user request in that persona."
-)
+# Per-platform persona-switch context note. The wording mentions the originating
+# product so the LLM frames the recap accurately. Slack predates this map; the
+# default fallback uses the Slack phrasing to preserve historical behavior.
+_PROMPT_SWITCH_CONTEXT_NOTES: dict[str, str] = {
+    "slack": (
+        "You are being invoked mid-thread with a new active persona. Use the preceding "
+        "Slack thread history as context, then answer the latest user request in that persona."
+    ),
+    "google-chat": (
+        "You are being invoked mid-thread with a new active persona. Use the preceding "
+        "Chat thread history as context, then answer the latest user request in that persona."
+    ),
+}
+_PROMPT_SWITCH_CONTEXT_NOTE = _PROMPT_SWITCH_CONTEXT_NOTES["slack"]
 
 _RECOVERY_COMMANDS = frozenset(
     {
@@ -57,8 +75,23 @@ _RECOVERY_COMMANDS = frozenset(
     }
 )
 _RECOVERY_NORMALIZE_RE = re.compile(r"[^a-z0-9\s]+")
-_SLACK_ID_MENTION_RE = re.compile(r"^<@[WU][A-Z0-9]+>\s*[:,;-]?\s*(.*)$", re.IGNORECASE)
+# Per-platform leading-mention pattern. Matches the protocol-shape mention only
+# (Slack's ``<@U123>``, Google Chat's ``<users/123>``) so that display-name prose
+# in conversational text stays intact while structured mentions are stripped
+# before recovery-command classification.
+_PLATFORM_MENTION_RES: dict[str, re.Pattern[str]] = {
+    "slack": re.compile(r"^<@[WU][A-Z0-9]+>\s*[:,;-]?\s*(.*)$", re.IGNORECASE),
+    "google-chat": re.compile(r"^<users/[^>]+>\s*[:,;-]?\s*(.*)$", re.IGNORECASE),
+}
 _RECOVERY_CONTEXT_PREFIX = "Previous unresolved user request from this thread:\n"
+
+# Per-platform namespace for the prompt-switch release id. Slack predates this
+# parameterization and used a bare ``prompt-switch:`` prefix; preserve that to
+# avoid changing the dedup key for in-flight Slack runs.
+_PROMPT_SWITCH_RELEASE_PREFIXES: dict[str, str] = {
+    "slack": "prompt-switch",
+    "google-chat": "prompt-switch-chat",
+}
 
 
 @dataclass(frozen=True)
@@ -241,10 +274,12 @@ def _with_prompt_switch_context_note(
     *,
     switched: bool,
     history_messages: list[dict[str, Any]],
+    platform: str = _DEFAULT_PLATFORM,
 ) -> list[dict[str, Any]]:
     if not switched or not history_messages:
         return parts
-    return [{"type": "text", "text": _PROMPT_SWITCH_CONTEXT_NOTE}, *parts]
+    note = _PROMPT_SWITCH_CONTEXT_NOTES.get(platform, _PROMPT_SWITCH_CONTEXT_NOTE)
+    return [{"type": "text", "text": note}, *parts]
 
 
 async def _release_for_prompt_switch(
@@ -252,10 +287,12 @@ async def _release_for_prompt_switch(
     *,
     thread_key: str,
     message_id: str | None,
+    platform: str = _DEFAULT_PLATFORM,
 ) -> None:
     from api.runtime_control import release_assignment
 
-    release_id = f"prompt-switch:{message_id or ctx.run_id}"
+    prefix = _PROMPT_SWITCH_RELEASE_PREFIXES.get(platform, f"prompt-switch-{platform}")
+    release_id = f"{prefix}:{message_id or ctx.run_id}"
     await release_assignment(
         ctx._pool,
         thread_key=thread_key,
@@ -291,19 +328,23 @@ async def _should_backfill_history(
     return await get_active_assignment(ctx._pool, thread_key) is None
 
 
-def _normalize_recovery_command(text: str) -> str:
+def _normalize_recovery_command(text: str, platform: str = _DEFAULT_PLATFORM) -> str:
     normalized = " ".join(_RECOVERY_NORMALIZE_RE.sub(" ", text.lower()).split())
     if normalized in _RECOVERY_COMMANDS:
         return normalized
 
-    # Slack app_mention event text uses ID mentions such as "<@U123> retry".
-    # Strip only that protocol shape so display-name prose stays conversational.
-    stripped = text.lstrip()
-    match = _SLACK_ID_MENTION_RE.match(stripped)
-    if match:
-        candidate = " ".join(_RECOVERY_NORMALIZE_RE.sub(" ", match.group(1).lower()).split())
-        if candidate in _RECOVERY_COMMANDS:
-            return candidate
+    # Mention-prefixed text (Slack's "<@U123> retry", Chat's "<users/123> retry")
+    # is the common case from raw event payloads. Strip the protocol-shape mention
+    # for the active platform so display-name prose stays conversational.
+    mention_re = _PLATFORM_MENTION_RES.get(platform)
+    if mention_re is not None:
+        match = mention_re.match(text.lstrip())
+        if match:
+            candidate = " ".join(
+                _RECOVERY_NORMALIZE_RE.sub(" ", match.group(1).lower()).split()
+            )
+            if candidate in _RECOVERY_COMMANDS:
+                return candidate
 
     return normalized
 
@@ -329,11 +370,11 @@ def _extract_text_parts(parts: Any) -> str | None:
     return "\n\n".join(snippets)
 
 
-def _is_recovery_turn(parts: list[dict[str, Any]]) -> bool:
+def _is_recovery_turn(parts: list[dict[str, Any]], platform: str = _DEFAULT_PLATFORM) -> bool:
     text = _extract_text_parts(parts)
     if text is None or len(parts) != 1:
         return False
-    return _normalize_recovery_command(text) in _RECOVERY_COMMANDS
+    return _normalize_recovery_command(text, platform) in _RECOVERY_COMMANDS
 
 
 def _lookup_last_unresolved_ask_from_history(
@@ -341,6 +382,7 @@ def _lookup_last_unresolved_ask_from_history(
     *,
     user_id: str | None,
     current_message_id: str | None,
+    platform: str = _DEFAULT_PLATFORM,
 ) -> tuple[str | None, dict[str, Any]]:
     for item in reversed(history_messages):
         if not isinstance(item, dict):
@@ -354,7 +396,7 @@ def _lookup_last_unresolved_ask_from_history(
         text = _extract_text_parts(item.get("parts"))
         if not text:
             continue
-        if _normalize_recovery_command(text) in _RECOVERY_COMMANDS:
+        if _normalize_recovery_command(text, platform) in _RECOVERY_COMMANDS:
             continue
         return text, {
             "hydrated_from_message_id": message_id or None,
@@ -370,6 +412,7 @@ async def _lookup_last_unresolved_ask(
     thread_key: str,
     user_id: str | None,
     before_message_id: str | None,
+    platform: str = _DEFAULT_PLATFORM,
 ) -> tuple[str | None, dict[str, Any]]:
     """Find the latest substantive prior user ask in this thread.
 
@@ -377,7 +420,7 @@ async def _lookup_last_unresolved_ask(
     - the current retry message's created_at (so a delayed/replayed workflow
       cannot pull in a later user's substantive ask), and
     - the same user_id when one is provided (so retries by user A don't
-      hydrate from user B's request in the same Slack thread).
+      hydrate from user B's request in the same thread).
 
     Returns (text, provenance_meta) so the caller can persist where the
     context came from.
@@ -412,7 +455,7 @@ async def _lookup_last_unresolved_ask(
         text = _extract_text_parts(row["parts"])
         if not text:
             continue
-        if _normalize_recovery_command(text) in _RECOVERY_COMMANDS:
+        if _normalize_recovery_command(text, platform) in _RECOVERY_COMMANDS:
             continue
         return text, {
             "hydrated_from_message_id": row["id"],
@@ -433,14 +476,16 @@ async def _hydrate_recovery_turn(
     message_id: str | None,
     metadata: dict[str, Any],
     history_messages: list[dict[str, Any]] | None = None,
+    platform: str = _DEFAULT_PLATFORM,
 ) -> list[dict[str, Any]]:
-    if not _is_recovery_turn(parts):
+    if not _is_recovery_turn(parts, platform):
         return parts
 
     prior_ask, provenance = _lookup_last_unresolved_ask_from_history(
         history_messages or [],
         user_id=user_id,
         current_message_id=message_id,
+        platform=platform,
     )
     if prior_ask is None:
         prior_ask, provenance = await _lookup_last_unresolved_ask(
@@ -448,6 +493,7 @@ async def _hydrate_recovery_turn(
             thread_key=thread_key,
             user_id=user_id,
             before_message_id=message_id,
+            platform=platform,
         )
     if not prior_ask:
         return parts
@@ -469,10 +515,11 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     if not thread_key:
         raise ControlPlaneError(
             "INVALID_WORKFLOW_INPUT",
-            "slack_thread_turn requires thread_key",
+            f"{WORKFLOW_NAME} requires thread_key",
             422,
         )
 
+    platform = (inp.delivery.platform or _DEFAULT_PLATFORM).strip() or _DEFAULT_PLATFORM
     selection = _extract_prompt_selection(
         inp.effective_parts,
         explicit_harness=inp.harness,
@@ -484,6 +531,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             ctx,
             thread_key=thread_key,
             message_id=inp.message_id,
+            platform=platform,
         )
 
     parts = await _hydrate_recovery_turn(
@@ -494,11 +542,13 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         message_id=inp.message_id,
         metadata=inp.metadata,
         history_messages=inp.history_messages,
+        platform=platform,
     )
     parts = _with_prompt_switch_context_note(
         parts,
         switched=selection_changed,
         history_messages=inp.history_messages,
+        platform=platform,
     )
     history_messages = (
         inp.history_messages

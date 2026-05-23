@@ -32,6 +32,7 @@ from api.laminar_tracing import set_span_attributes, start_span
 from api.vm_metrics import record_tool_call
 from api.deps import get_key_info, get_sandbox_claims, verify_api_key
 from api import slackbot_client
+from api import chatbot_client
 from centaur_sdk import ToolContext, reset_tool_context, set_tool_context
 
 log = structlog.get_logger()
@@ -908,7 +909,7 @@ def _timeout_label(timeout_s: float | None) -> str:
     return "no timeout" if timeout_s is None else f"{timeout_s:g}s"
 
 
-async def _capture_live_slack_send(
+async def _capture_live_transport_send(
     *,
     request: Request | None,
     sandbox_claims: dict[str, Any] | None,
@@ -916,6 +917,14 @@ async def _capture_live_slack_send(
     method_name: str,
     args: dict[str, Any],
 ) -> dict[str, Any] | None:
+    """Reroute a direct ``slack.send_message`` into any live transport sessions.
+
+    If the active sandbox is tied to a Slack thread that also has a live
+    Slackbot and/or Chatbot agent-session attached, surface the agent's text
+    inside those rich-rendered sessions instead of posting a separate Slack
+    message. A single SQL query fetches all transport session ids stored
+    against the most recent running execution row for this thread_key.
+    """
     if request is None or not sandbox_claims:
         return None
     if tool_name != "slack" or method_name != "send_message":
@@ -942,30 +951,51 @@ async def _capture_live_slack_send(
     pool = getattr(request.app.state, "db_pool", None)
     if pool is None:
         return None
-    session_id = await pool.fetchval(
-        "SELECT metadata->>'slackbot_agent_session_id' "
+
+    # Single fetch returns whichever live transport sessions are attached to
+    # the most recent running execution for this thread_key. The Slack column
+    # historically used a ``v2_live_delivery`` migration flag; preserve it for
+    # back-compat. The Chat column never used such a flag.
+    row = await pool.fetchrow(
+        "SELECT metadata->>'slackbot_agent_session_id' AS slack_session_id, "
+        "       metadata->>'chatbot_agent_session_id' AS chat_session_id "
         "FROM agent_execution_requests "
         "WHERE thread_key = $1 "
         "AND status = 'running' "
         "AND ("
         "  metadata->>'slackbot_live_delivery' = 'true' "
-        "  OR metadata->>('slackbot' || '_v' || '2_live_delivery') = 'true'"
+        "  OR metadata->>('slackbot' || '_v' || '2_live_delivery') = 'true' "
+        "  OR metadata->>'chatbot_live_delivery' = 'true'"
         ") "
-        "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '' "
         "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 1",
         thread_key,
     )
-    session_id = str(session_id or "").strip()
-    if not session_id:
+    if row is None:
         return None
 
-    await slackbot_client.session_text(session_id, text)
-    log.info(
-        "slack_send_message_captured",
-        thread_key=thread_key,
-        sandbox_container_id=sandbox_claims.get("container_id"),
-        slackbot_agent_session_id=session_id,
-    )
+    slack_session_id = str(row["slack_session_id"] or "").strip()
+    chat_session_id = str(row["chat_session_id"] or "").strip()
+    if not slack_session_id and not chat_session_id:
+        return None
+
+    if slack_session_id:
+        await slackbot_client.session_text(slack_session_id, text)
+        log.info(
+            "slack_send_message_captured",
+            thread_key=thread_key,
+            sandbox_container_id=sandbox_claims.get("container_id"),
+            slackbot_agent_session_id=slack_session_id,
+        )
+
+    if chat_session_id:
+        await chatbot_client.session_text(chat_session_id, text)
+        log.info(
+            "chat_send_message_captured",
+            thread_key=thread_key,
+            sandbox_container_id=sandbox_claims.get("container_id"),
+            chatbot_agent_session_id=chat_session_id,
+        )
+
     return {
         "captured": True,
         "message": "Captured into the active Slackbot live reply; no separate Slack message was posted.",
@@ -1855,7 +1885,7 @@ class ToolManager:
         }
         t0 = time.monotonic()
         log.info("tool_call_started", **call_fields)
-        captured_slack_send = await _capture_live_slack_send(
+        captured_slack_send = await _capture_live_transport_send(
             request=request,
             sandbox_claims=sandbox_claims,
             tool_name=tool_name,
@@ -2024,7 +2054,7 @@ class ToolManager:
         }
         t0 = time.monotonic()
         log.info("tool_call_started", **call_fields)
-        captured_slack_send = await _capture_live_slack_send(
+        captured_slack_send = await _capture_live_transport_send(
             request=request,
             sandbox_claims=sandbox_claims,
             tool_name=tool_name,

@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from api import slackbot_client
+from api import chatbot_client
 from api.runtime_control import (
     ControlPlaneError,
     append_message,
@@ -1168,6 +1169,19 @@ async def do_agent_turn(
                         f"Failed to start the runtime: {exc}",
                     )
                     await slackbot_client.session_done(failure_session_id)
+                chat_failure_session_id = await chatbot_client.open_agent_session(
+                    delivery=effective_delivery,
+                    metadata=effective_metadata,
+                    thread_key=effective_thread_key,
+                    title="Centaur",
+                    header=None,
+                )
+                if chat_failure_session_id:
+                    await chatbot_client.session_text(
+                        chat_failure_session_id,
+                        f"Failed to start the runtime: {exc}",
+                    )
+                    await chatbot_client.session_done(chat_failure_session_id)
             except Exception:
                 log.warning(
                     "workflow_spawn_failure_session_failed",
@@ -1194,6 +1208,17 @@ async def do_agent_turn(
         if slackbot_session_id:
             effective_metadata["slackbot_agent_session_id"] = slackbot_session_id
             effective_metadata["slackbot_live_delivery"] = True
+
+        chatbot_session_id = await chatbot_client.open_agent_session(
+            delivery=effective_delivery,
+            metadata=effective_metadata,
+            thread_key=effective_thread_key,
+            title=session_title,
+            header=session_header,
+        )
+        if chatbot_session_id:
+            effective_metadata["chatbot_agent_session_id"] = chatbot_session_id
+            effective_metadata["chatbot_live_delivery"] = True
 
         if isinstance(effective_history, list):
             backfilled = 0
