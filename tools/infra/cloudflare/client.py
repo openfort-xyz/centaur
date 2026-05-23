@@ -37,7 +37,8 @@ class CloudflareClient:
     def list_zones(self, *, name: str | None = None) -> dict[str, Any]:
         """List all zones."""
         params = {}
-        if name: params["name"] = name
+        if name:
+            params["name"] = name
         r = self._http.get("/zones", params=params)
         r.raise_for_status()
         return r.json()
@@ -62,11 +63,11 @@ class CloudflareClient:
         API: ``GET /zones/{zone_id}/analytics/dashboard``
         """
         params: dict[str, Any] = {}
-        if since: params["since"] = since
-        if until: params["until"] = until
-        r = self._http.get(
-            f"/zones/{zone_id}/analytics/dashboard", params=params
-        )
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        r = self._http.get(f"/zones/{zone_id}/analytics/dashboard", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -78,20 +79,21 @@ class CloudflareClient:
         API: ``GET /zones/{zone_id}/analytics/colos``
         """
         params: dict[str, Any] = {}
-        if since: params["since"] = since
-        if until: params["until"] = until
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
         r = self._http.get(f"/zones/{zone_id}/analytics/colos", params=params)
         r.raise_for_status()
         return r.json()
 
     # ── DNS ───────────────────────────────────────────────────────────────
 
-    def list_dns_records(
-        self, zone_id: str, *, type: str | None = None
-    ) -> dict[str, Any]:
+    def list_dns_records(self, zone_id: str, *, type: str | None = None) -> dict[str, Any]:
         """List DNS records for a zone."""
         params: dict[str, Any] = {}
-        if type: params["type"] = type
+        if type:
+            params["type"] = type
         r = self._http.get(f"/zones/{zone_id}/dns_records", params=params)
         r.raise_for_status()
         return r.json()
@@ -103,10 +105,7 @@ class CloudflareClient:
 
         API: ``POST /graphql``
         """
-        r = self._http.post(
-            "https://api.cloudflare.com/client/v4/graphql",
-            json={"query": query},
-        )
+        r = self._http.post("/graphql", json={"query": query})
         r.raise_for_status()
         return r.json()
 
