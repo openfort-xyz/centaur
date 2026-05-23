@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from typing import Any
 
 import httpx
@@ -16,23 +15,25 @@ class CrispClient:
     Uses plugin tier authentication with identifier:key pairs.
     API reference: https://docs.crisp.chat/api/v1/
 
-    Auth: Set ``CRISP_API_CREDENTIALS`` as ``identifier:key`` (e.g.
-    ``plugin-abc123:def456...``). The client sends this as HTTP Basic auth
-    with ``X-Crisp-Tier: plugin`` header.
+    Auth: Set ``CRISP_API_CREDENTIALS`` to the base64-encoded ``identifier:key``
+    pair (i.e. the HTTP Basic token value, ``base64("identifier:key")``). The
+    client sends it verbatim as ``Authorization: Basic <token>`` with an
+    ``X-Crisp-Tier: plugin`` header. The value is sent unencoded so the
+    iron-proxy placeholder survives intact and the firewall can swap in the
+    real credential in the sandbox.
     """
 
     def __init__(self, credentials: str | None = None):
         self.credentials = credentials or secret("CRISP_API_CREDENTIALS", "")
         if not self.credentials:
             raise RuntimeError(
-                "CRISP_API_CREDENTIALS not set. Set it as identifier:key "
+                "CRISP_API_CREDENTIALS not set. Set it to base64(identifier:key) "
                 "in your .env file or inject it via the Centaur secrets system."
             )
-        self._auth = base64.b64encode(self.credentials.encode()).decode()
         self._http = httpx.Client(
             base_url=_CRISP_API_BASE,
             headers={
-                "Authorization": f"Basic {self._auth}",
+                "Authorization": f"Basic {self.credentials}",
                 "X-Crisp-Tier": "plugin",
                 "Content-Type": "application/json",
             },
@@ -82,7 +83,7 @@ class CrispClient:
             filter_unassigned: Only unassigned conversations.
             filter_date_start: ISO 8601 start date.
             filter_date_end: ISO 8601 end date.
-            per_page: Results per page (20–50).
+            per_page: Results per page (20-50).
         """
         params: dict[str, str] = {"per_page": str(max(20, min(per_page, 50)))}
         if search_query:
@@ -102,9 +103,7 @@ class CrispClient:
         if filter_date_end:
             params["filter_date_end"] = filter_date_end
 
-        r = self._http.get(
-            f"/website/{website_id}/conversations/{page}", params=params
-        )
+        r = self._http.get(f"/website/{website_id}/conversations/{page}", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -133,9 +132,7 @@ class CrispClient:
         r.raise_for_status()
         return r.json()
 
-    def get_conversation_messages(
-        self, website_id: str, session_id: str
-    ) -> dict[str, Any]:
+    def get_conversation_messages(self, website_id: str, session_id: str) -> dict[str, Any]:
         """Get all messages in a conversation.
 
         API: ``GET /v1/website/{website_id}/conversation/{session_id}/messages``
@@ -143,9 +140,7 @@ class CrispClient:
         Returns list of messages with ``type``, ``from`` (user/operator),
         ``content``, ``timestamp``, ``origin``, ``user`` info.
         """
-        r = self._http.get(
-            f"/website/{website_id}/conversation/{session_id}/messages"
-        )
+        r = self._http.get(f"/website/{website_id}/conversation/{session_id}/messages")
         r.raise_for_status()
         return r.json()
 
@@ -177,9 +172,7 @@ class CrispClient:
         r.raise_for_status()
         return r.json()
 
-    def send_internal_note(
-        self, website_id: str, session_id: str, content: str
-    ) -> dict[str, Any]:
+    def send_internal_note(self, website_id: str, session_id: str, content: str) -> dict[str, Any]:
         """Add an internal note (not visible to the customer).
 
         Wraps ``send_message`` with ``message_type="note"``.
@@ -211,16 +204,12 @@ class CrispClient:
         """Reopen a resolved conversation."""
         return self.change_conversation_state(website_id, session_id, "unresolved")
 
-    def get_conversation_metas(
-        self, website_id: str, session_id: str
-    ) -> dict[str, Any]:
+    def get_conversation_metas(self, website_id: str, session_id: str) -> dict[str, Any]:
         """Get metadata for a conversation (nickname, email, phone, address, data).
 
         API: ``GET /v1/website/{website_id}/conversation/{session_id}/meta``
         """
-        r = self._http.get(
-            f"/website/{website_id}/conversation/{session_id}/meta"
-        )
+        r = self._http.get(f"/website/{website_id}/conversation/{session_id}/meta")
         r.raise_for_status()
         return r.json()
 
@@ -258,22 +247,16 @@ class CrispClient:
         r.raise_for_status()
         return r.json()
 
-    def get_conversation_routing(
-        self, website_id: str, session_id: str
-    ) -> dict[str, Any]:
+    def get_conversation_routing(self, website_id: str, session_id: str) -> dict[str, Any]:
         """Get routing assignment for a conversation.
 
         API: ``GET /v1/website/{website_id}/conversation/{session_id}/routing``
         """
-        r = self._http.get(
-            f"/website/{website_id}/conversation/{session_id}/routing"
-        )
+        r = self._http.get(f"/website/{website_id}/conversation/{session_id}/routing")
         r.raise_for_status()
         return r.json()
 
-    def assign_conversation(
-        self, website_id: str, session_id: str, user_id: str
-    ) -> dict[str, Any]:
+    def assign_conversation(self, website_id: str, session_id: str, user_id: str) -> dict[str, Any]:
         """Assign a conversation to an operator.
 
         API: ``PATCH /v1/website/{website_id}/conversation/{session_id}/routing``
@@ -285,9 +268,7 @@ class CrispClient:
         r.raise_for_status()
         return r.json()
 
-    def mark_messages_read(
-        self, website_id: str, session_id: str
-    ) -> dict[str, Any]:
+    def mark_messages_read(self, website_id: str, session_id: str) -> dict[str, Any]:
         """Mark all messages in a conversation as read.
 
         API: ``PATCH /v1/website/{website_id}/conversation/{session_id}/read``
@@ -301,16 +282,12 @@ class CrispClient:
 
     # ── People (Customer Profiles) ───────────────────────────────────────
 
-    def get_people_profile(
-        self, website_id: str, people_id: str
-    ) -> dict[str, Any]:
+    def get_people_profile(self, website_id: str, people_id: str) -> dict[str, Any]:
         """Get a people profile by ID.
 
         API: ``GET /v1/website/{website_id}/people/profile/{people_id}``
         """
-        r = self._http.get(
-            f"/website/{website_id}/people/profile/{people_id}"
-        )
+        r = self._http.get(f"/website/{website_id}/people/profile/{people_id}")
         r.raise_for_status()
         return r.json()
 
@@ -328,35 +305,25 @@ class CrispClient:
         params: dict[str, str] = {}
         if search_query:
             params["search_query"] = search_query
-        r = self._http.get(
-            f"/website/{website_id}/people/profiles/{page}", params=params
-        )
+        r = self._http.get(f"/website/{website_id}/people/profiles/{page}", params=params)
         r.raise_for_status()
         return r.json()
 
-    def get_people_conversations(
-        self, website_id: str, people_id: str
-    ) -> dict[str, Any]:
+    def get_people_conversations(self, website_id: str, people_id: str) -> dict[str, Any]:
         """List conversations for a people profile.
 
         API: ``GET /v1/website/{website_id}/people/conversations/{people_id}``
         """
-        r = self._http.get(
-            f"/website/{website_id}/people/conversations/{people_id}"
-        )
+        r = self._http.get(f"/website/{website_id}/people/conversations/{people_id}")
         r.raise_for_status()
         return r.json()
 
-    def get_people_data(
-        self, website_id: str, people_id: str
-    ) -> dict[str, Any]:
+    def get_people_data(self, website_id: str, people_id: str) -> dict[str, Any]:
         """Get data attached to a people profile.
 
         API: ``GET /v1/website/{website_id}/people/data/{people_id}``
         """
-        r = self._http.get(
-            f"/website/{website_id}/people/data/{people_id}"
-        )
+        r = self._http.get(f"/website/{website_id}/people/data/{people_id}")
         r.raise_for_status()
         return r.json()
 
@@ -395,9 +362,7 @@ class CrispClient:
 
         API: ``GET /v1/website/{website_id}/conversations/suggest/segments/{page}``
         """
-        r = self._http.get(
-            f"/website/{website_id}/conversations/suggest/segments/{page}"
-        )
+        r = self._http.get(f"/website/{website_id}/conversations/suggest/segments/{page}")
         r.raise_for_status()
         return r.json()
 
@@ -431,9 +396,7 @@ class CrispClient:
         if metrics:
             body["metrics"] = metrics
 
-        r = self._http.post(
-            f"/website/{website_id}/analytics/generate", json=body
-        )
+        r = self._http.post(f"/website/{website_id}/analytics/generate", json=body)
         r.raise_for_status()
         return r.json()
 

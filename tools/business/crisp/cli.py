@@ -1,16 +1,24 @@
 """Crisp Chat CLI for customer support."""
 
+import json
+from datetime import UTC, datetime
+
+import typer
 from dotenv import load_dotenv
+from rich.console import Console
+
+from centaur_sdk import Table
 
 load_dotenv()
 
-import json
-import typer
-from rich.console import Console
-from centaur_sdk import Table
-
 app = typer.Typer(name="crisp", help="Crisp Chat customer support CLI")
 console = Console()
+
+
+def _ts_fmt(ts: int | float | None) -> str:
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(ts / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M")
 
 
 @app.command()
@@ -230,10 +238,3 @@ def assign_conversation(
         return
 
     console.print(f"[green]Conversation {session_id} assigned to {user_id}.[/green]")
-
-
-def _ts_fmt(ts: int | float | None) -> str:
-    if not ts:
-        return ""
-    from datetime import datetime, timezone
-    return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
