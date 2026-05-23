@@ -140,6 +140,17 @@ slackbot:
   extraEnv: {}
   resources: {}
 
+chatbot:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: centaur-chatbot
+    tag: latest
+    pullPolicy: Always
+  runtimeErrorAlertSpace: ""
+  extraEnv: {}
+  resources: {}
+
 postgres:
   enabled: true
   image:

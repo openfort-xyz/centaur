@@ -750,6 +750,46 @@ async def get_or_spawn(
     return session
 
 
+# Per-platform output-formatting hints appended to the system prompt. ``lines``
+# is the static rules block; ``user_mention_line`` is an optional, ``user_id``-
+# templated tail line that points the agent at the right mention syntax when
+# wrapping a long task. Adding a new platform = adding a new entry here.
+_PLATFORM_FORMATTING_RULES: dict[str, dict[str, Any]] = {
+    "slack": {
+        "lines": [
+            "## Slack Formatting Rules",
+            "",
+            "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
+            "- Do NOT use Slack-native `<URL|text>` link syntax",
+            "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
+            "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
+            "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
+            "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
+            "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
+        ],
+        "user_mention_line": (
+            "- After completing a long task, tag the requester with their real Slack mention: <@{user_id}>"
+        ),
+    },
+    "google-chat": {
+        "lines": [
+            "## Google Chat Formatting Rules",
+            "",
+            "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
+            "- Do NOT use Slack-native `<URL|text>` link syntax",
+            "- Content is rendered as Google Chat Cards v2 with text paragraphs",
+            "- Prefer concise, well-structured markdown; long replies may be split across cards",
+            "- Code blocks render as monospaced text in cards",
+            "- Markdown tables and lists are supported",
+            "- NEVER put links/URLs inside code blocks — they won't be clickable",
+        ],
+        "user_mention_line": (
+            "- After completing a long task, notify the requester with their Chat user mention: {user_id}"
+        ),
+    },
+}
+
+
 def _build_session_context(
     thread_key: str,
     *,
@@ -773,25 +813,13 @@ def _build_session_context(
     if platform:
         lines.append(f"- **Platform**: {platform}")
 
-    if platform and platform.lower() == "slack":
-        lines.extend(
-            [
-                "",
-                "## Slack Formatting Rules",
-                "",
-                "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
-                "- Do NOT use Slack-native `<URL|text>` link syntax",
-                "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
-                "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
-                "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
-                "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
-                "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
-            ]
-        )
-        if user_id:
-            lines.append(
-                f"- After completing a long task, tag the requester with their real Slack mention: <@{user_id}>"
-            )
+    if platform:
+        rules = _PLATFORM_FORMATTING_RULES.get(platform.lower())
+        if rules:
+            lines.append("")
+            lines.extend(rules["lines"])
+            if user_id and rules.get("user_mention_line"):
+                lines.append(rules["user_mention_line"].format(user_id=user_id))
 
     lines.extend(["", "---", ""])
     return "\n".join(lines)

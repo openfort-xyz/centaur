@@ -1,0 +1,13 @@
+[project]
+name = "google-chat"
+version = "0.1.0"
+description = "Google Chat messaging"
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[tool.centaur]
+module = "client.py"
+hosts = ["chatbot"]
+secrets = [
+    {type = "http", name = "CHATBOT_API_KEY", match_headers = ["Authorization"], hosts = ["chatbot"]},
+]

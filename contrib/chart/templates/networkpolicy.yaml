@@ -161,6 +161,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbot") | nindent 14 }}
 {{- end }}
+{{- if .Values.chatbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "chatbot") | nindent 14 }}
+{{- end }}
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "iron-proxy") | nindent 14 }}
@@ -200,6 +205,15 @@ spec:
       ports:
         - protocol: TCP
           port: 3001
+{{- end }}
+{{- if .Values.chatbot.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "chatbot") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
 {{- end }}
     - to:
         - podSelector:
@@ -291,6 +305,51 @@ spec:
           port: {{ .Values.laminar.appServer.service.grpcPort }}
 {{- end }}
     # Slack bootstrap and message delivery need direct HTTPS egress.
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.chatbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "chatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "chatbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "chatbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8000
+{{- if .Values.postgres.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+    # Chatbot needs direct HTTPS egress for Google APIs.
     - ports:
         - protocol: TCP
           port: 443

@@ -15,7 +15,7 @@ build:
       just _build-all-sequential
     else
       pids=()
-      for recipe in _build-api _build-iron-proxy _build-slackbot _build-agent; do
+      for recipe in _build-api _build-iron-proxy _build-slackbot _build-chatbot _build-agent; do
         just "$recipe" &
         pids+=("$!")
       done
@@ -30,6 +30,7 @@ _build-all-sequential:
     just _build-api
     just _build-iron-proxy
     just _build-slackbot
+    just _build-chatbot
     just _build-agent
 
 build-one service:
@@ -39,6 +40,7 @@ build-one service:
       api) just _build-api ;;
       iron-proxy) just _build-iron-proxy ;;
       slackbot) just _build-slackbot ;;
+      chatbot) just _build-chatbot ;;
       agent|sandbox) just _build-agent ;;
       *) echo "unknown service: {{service}}" >&2; exit 2 ;;
     esac
@@ -51,6 +53,9 @@ _build-iron-proxy:
 
 _build-slackbot:
     docker build -t centaur-slackbot:latest -f services/slackbot/Dockerfile .
+
+_build-chatbot:
+    docker build -t centaur-chatbot:latest -f services/chatbot/Dockerfile .
 
 _build-agent:
     docker build --target sandbox -t centaur-agent:latest -f services/sandbox/Dockerfile .

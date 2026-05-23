@@ -12,6 +12,11 @@ Creates the required local-dev Kubernetes infra Secrets consumed by the Helm cha
 Requires OP_SERVICE_ACCOUNT_TOKEN, OP_VAULT, SLACK_BOT_TOKEN,
 SLACK_SIGNING_SECRET, and SLACKBOT_API_KEY in the shell environment.
 
+Optional Google Chat (chatbot) bootstrap (consumed when chatbot.enabled=true
+in the Helm values):
+  GOOGLE_SERVICE_ACCOUNT_JSON  raw JSON for the Google Chat service account
+  CHATBOT_API_KEY              shared secret used by the API <-> chatbot loop
+
 Optional 1Password Connect bootstrap (when ironProxy.manager.secretSource is
 set to onepassword-connect in the Helm values):
   OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
@@ -98,6 +103,12 @@ if secret_exists centaur-infra-env; then
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
   fi
+  if [[ -n "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]]; then
+    patch_data+=("\"GOOGLE_SERVICE_ACCOUNT_JSON\":\"$(printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" | base64 | tr -d '\n')\"")
+  fi
+  if [[ -n "${CHATBOT_API_KEY:-}" ]]; then
+    patch_data+=("\"CHATBOT_API_KEY\":\"$(printf '%s' "$CHATBOT_API_KEY" | base64 | tr -d '\n')\"")
+  fi
   if [[ "${#patch_data[@]}" -gt 0 ]]; then
     patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
@@ -127,6 +138,12 @@ else
   fi
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
+  fi
+  if [[ -n "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]]; then
+    secret_args+=(--from-literal=GOOGLE_SERVICE_ACCOUNT_JSON="$GOOGLE_SERVICE_ACCOUNT_JSON")
+  fi
+  if [[ -n "${CHATBOT_API_KEY:-}" ]]; then
+    secret_args+=(--from-literal=CHATBOT_API_KEY="$CHATBOT_API_KEY")
   fi
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"

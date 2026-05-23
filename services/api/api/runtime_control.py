@@ -24,6 +24,7 @@ from api.agent import (
     stop_session,
 )
 from api import slackbot_client
+from api import chatbot_client
 from api.observability import (
     ExecutionObservationAccumulator,
     extract_usage_metrics,
@@ -84,8 +85,8 @@ EXECUTION_RESERVED_USER_SLOTS = max(
     int(os.getenv("EXECUTION_RESERVED_USER_SLOTS", "16")),
     0,
 )
-_MAX_SLACKBOT_TEXT_CHARS = 12_000
-_MAX_SLACKBOT_STEP_CHARS = 12_000
+_MAX_TRANSPORT_TEXT_CHARS = 12_000
+_MAX_TRANSPORT_STEP_CHARS = 12_000
 _MAX_WORKFLOW_EXECUTION_SLOTS = max(
     EXECUTION_WORKER_CONCURRENCY - EXECUTION_RESERVED_USER_SLOTS,
     1,
@@ -933,7 +934,7 @@ def build_execution_state_payload(
     return payload
 
 
-def _clip_slackbot(value: Any, max_chars: int = _MAX_SLACKBOT_STEP_CHARS) -> str:
+def _clip_transport_text(value: Any, max_chars: int = _MAX_TRANSPORT_STEP_CHARS) -> str:
     text = (
         value
         if isinstance(value, str)
@@ -1002,14 +1003,20 @@ def _slackbot_streamed_answer_chars(value: Any) -> int:
     return 0
 
 
-async def _send_slackbot_canonical_event(
-    session_id: str, event: dict[str, Any]
+async def _send_transport_canonical_event(
+    client: Any, session_id: str, event: dict[str, Any]
 ) -> bool:
+    """Forward one canonical execution event to an ingress transport client.
+
+    ``client`` is the module-level transport client (``slackbot_client`` or
+    ``chatbot_client``) that exposes ``session_text`` and ``session_step``.
+    Returns ``True`` if at least one text block was forwarded.
+    """
     sent_text = False
     for text in _canonical_text_blocks(event):
-        await slackbot_client.session_text(
+        await client.session_text(
             session_id,
-            _clip_slackbot(text, _MAX_SLACKBOT_TEXT_CHARS),
+            _clip_transport_text(text, _MAX_TRANSPORT_TEXT_CHARS),
         )
         sent_text = True
 
@@ -1027,12 +1034,12 @@ async def _send_slackbot_canonical_event(
             tool_input = (
                 block.get("input") if isinstance(block.get("input"), dict) else {}
             )
-            await slackbot_client.session_step(
+            await client.session_step(
                 session_id,
                 step_id=tool_id,
                 title=tool_name,
                 status="in_progress",
-                details=_clip_slackbot(tool_input),
+                details=_clip_transport_text(tool_input),
             )
     elif event_type == "tool":
         content = event.get("content") if isinstance(event.get("content"), list) else []
@@ -1041,29 +1048,29 @@ async def _send_slackbot_canonical_event(
                 continue
             tool_id = str(block.get("tool_use_id") or uuid.uuid4())
             is_error = bool(block.get("is_error"))
-            await slackbot_client.session_step(
+            await client.session_step(
                 session_id,
                 step_id=tool_id,
                 title="Tool result",
                 status="error" if is_error else "complete",
-                output=_clip_slackbot(block.get("content")),
+                output=_clip_transport_text(block.get("content")),
             )
     elif event_type == "command_execution":
         command = str(event.get("command") or "Command")
-        await slackbot_client.session_step(
+        await client.session_step(
             session_id,
             step_id=f"command-{hashlib.sha256(command.encode()).hexdigest()[:12]}",
             title=command[:256],
             status="complete" if event.get("status") == "completed" else "in_progress",
-            output=_clip_slackbot(event.get("aggregated_output") or ""),
+            output=_clip_transport_text(event.get("aggregated_output") or ""),
         )
     elif event_type == "error":
-        await slackbot_client.session_step(
+        await client.session_step(
             session_id,
             step_id=f"error-{uuid.uuid4().hex[:12]}",
             title="Execution error",
             status="error",
-            output=_clip_slackbot(event.get("error") or event),
+            output=_clip_transport_text(event.get("error") or event),
         )
     return sent_text
 
@@ -2529,6 +2536,12 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     slackbot_live_failure_streak = 0
     slackbot_live_failure_limit = 5
 
+    chatbot_session_id = str(execution_metadata.get("chatbot_agent_session_id") or "")
+    chatbot_forward_live = True
+    chatbot_done = False
+    chatbot_live_failure_streak = 0
+    chatbot_live_failure_limit = 5
+
     async def _finalize_execution(
         *,
         status: str,
@@ -2588,6 +2601,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         if user_id:
             record_execution_by_user(user_id, harness, status)
         nonlocal slackbot_session_id, slackbot_text_sent, slackbot_done
+        nonlocal chatbot_session_id, chatbot_done
         finalize_session_id = slackbot_session_id or str(
             execution_metadata.get("slackbot_agent_session_id") or ""
         )
@@ -2622,6 +2636,27 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                     "finalize_failed",
                 )
                 slackbot_session_id = ""
+        chatbot_finalize_id = chatbot_session_id or str(
+            execution_metadata.get("chatbot_agent_session_id") or ""
+        )
+        if chatbot_finalize_id and not chatbot_done and chatbot_forward_live:
+            try:
+                await chatbot_client.session_done(chatbot_finalize_id)
+                chatbot_done = True
+                log.info(
+                    "chatbot_live_delivery_finalized",
+                    execution_id=execution_id,
+                    thread_key=thread_key,
+                    chatbot_agent_session_id=chatbot_finalize_id,
+                )
+            except Exception:
+                log.warning(
+                    "chatbot_live_delivery_finalize_failed",
+                    execution_id=execution_id,
+                    thread_key=thread_key,
+                    exc_info=True,
+                )
+                chatbot_session_id = ""
         await _mark_execution_terminal(
             pool,
             execution_id=execution_id,
@@ -2818,6 +2853,36 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                             > previous_streamed_answer_chars
                         ):
                             slackbot_text_sent = True
+            if chatbot_session_id and chatbot_forward_live:
+                chat_events = canonical_events or [payload]
+                for chat_event in chat_events:
+                    if not isinstance(chat_event, dict):
+                        continue
+                    try:
+                        sent = await _send_transport_canonical_event(
+                            chatbot_client, chatbot_session_id, chat_event,
+                        )
+                        if sent:
+                            chatbot_live_failure_streak = 0
+                    except Exception:
+                        chatbot_live_failure_streak += 1
+                        log.warning(
+                            "chatbot_live_delivery_failed",
+                            execution_id=execution_id,
+                            thread_key=thread_key,
+                            event_type=chat_event.get("type"),
+                            consecutive_failures=chatbot_live_failure_streak,
+                            failure_limit=chatbot_live_failure_limit,
+                        )
+                        if chatbot_live_failure_streak >= chatbot_live_failure_limit:
+                            log.error(
+                                "chatbot_live_delivery_disabled",
+                                execution_id=execution_id,
+                                thread_key=thread_key,
+                                consecutive_failures=chatbot_live_failure_streak,
+                            )
+                            chatbot_forward_live = False
+                        break
             observations.raw_event_count += 1
             # ``amp_raw_event`` is a HISTORICAL label preserved for API and
             # dashboard back-compat. Despite the name, this row stores the

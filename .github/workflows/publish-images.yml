@@ -41,6 +41,10 @@ jobs:
             image: centaur-slackbot
             dockerfile: services/slackbot/Dockerfile
             target: ""
+          - service: chatbot
+            image: centaur-chatbot
+            dockerfile: services/chatbot/Dockerfile
+            target: ""
           - service: agent
             image: centaur-agent
             dockerfile: services/sandbox/Dockerfile
@@ -70,7 +74,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/paradigmxyz/${{ matrix.image }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           flavor: |
             latest=false
           tags: |

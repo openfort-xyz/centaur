@@ -379,6 +379,75 @@ def test_recovery_command_paraphrases_are_recognized():
         )
 
 
+def test_recovery_command_paraphrases_are_recognized_on_google_chat():
+    """Google Chat mention syntax (``<users/...>``) must be stripped before
+    recovery-command classification, mirroring the Slack ``<@U...>`` path.
+    """
+    from api.workflows.slack_thread_turn import _is_recovery_turn
+
+    recovery_on_chat = [
+        "retry",
+        "continue",
+        "try again",
+        "<users/123456> retry",
+        "<users/abcdef> please continue",
+        "<users/abcdef>: try again",
+    ]
+    for text in recovery_on_chat:
+        assert _is_recovery_turn(
+            [{"type": "text", "text": text}], platform="google-chat"
+        ), f"Expected recovery hydration for utterance: {text!r}"
+
+    not_recovery_on_chat = [
+        "retry the failing test",
+        "<users/abc> continue editing the document",
+        "<users/abc> thanks again",
+        # Slack-shaped mention should NOT match when platform=chat
+        "<@U0AH5TRP0H0> retry",
+    ]
+    for text in not_recovery_on_chat:
+        assert not _is_recovery_turn(
+            [{"type": "text", "text": text}], platform="google-chat"
+        ), f"Did not expect recovery hydration for utterance: {text!r}"
+
+
+def test_prompt_switch_release_id_uses_per_platform_prefix():
+    """Slack must keep the legacy ``prompt-switch:`` prefix for in-flight
+    runs; non-Slack platforms get a per-platform namespace so dedup keys do
+    not collide across platforms sharing a thread_key prefix.
+    """
+    from api.workflows.slack_thread_turn import _PROMPT_SWITCH_RELEASE_PREFIXES
+
+    assert _PROMPT_SWITCH_RELEASE_PREFIXES["slack"] == "prompt-switch"
+    assert _PROMPT_SWITCH_RELEASE_PREFIXES["google-chat"] == "prompt-switch-chat"
+
+
+def test_prompt_switch_context_note_per_platform():
+    """The persona-switch context note should mention the originating product
+    so the LLM frames the recap accurately.
+    """
+    from api.workflows.slack_thread_turn import _with_prompt_switch_context_note
+
+    parts = [{"type": "text", "text": "pick this up"}]
+    history = [{"message_id": "h:prior", "parts": [{"type": "text", "text": "prior"}]}]
+
+    slack_result = _with_prompt_switch_context_note(
+        parts, switched=True, history_messages=history, platform="slack"
+    )
+    assert "Slack thread history" in slack_result[0]["text"]
+
+    chat_result = _with_prompt_switch_context_note(
+        parts, switched=True, history_messages=history, platform="google-chat"
+    )
+    assert "Chat thread history" in chat_result[0]["text"]
+
+    # Unknown platforms fall back to the Slack phrasing for back-compat.
+    unknown_result = _with_prompt_switch_context_note(
+        parts, switched=True, history_messages=history, platform="discord"
+    )
+    assert "Slack thread history" in unknown_result[0]["text"]
+
+
 @pytest.mark.parametrize(
     ("text", "harness", "persona", "cleaned"),
     [

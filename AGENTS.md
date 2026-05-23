@@ -72,11 +72,12 @@ See the [architecture diagram in the README](README.md#architecture).
 ### End-to-End Request Flow
 
 1. User mentions bot in Slack → webhook → slackbot → api
-2. API spawns/reuses a Kubernetes sandbox pod (`centaur-agent:latest`) for that thread
-3. Executes harness (amp/claude-code/codex) through the sandbox backend
-4. Harness calls tools via `curl` back to API at `http://api:8000` (REST, NOT MCP)
-5. LLM API calls route through firewall proxy which injects real credentials
-6. Results stream as JSON events → posted to Slack
+2. User mentions bot in Google Chat → webhook → chatbot → api
+3. API spawns/reuses a Kubernetes sandbox pod (`centaur-agent:latest`) for that thread
+4. Executes harness (amp/claude-code/codex) through the sandbox backend
+5. Harness calls tools via `curl` back to API at `http://api:8000` (REST, NOT MCP)
+6. LLM API calls route through firewall proxy which injects real credentials
+7. Results stream as JSON events → posted to Slack or Google Chat
 
 ### Service Interface Contracts
 
@@ -233,7 +234,8 @@ centaur/
 │   ├── secrets/          # Pluggable secrets manager (standalone service)
 │   ├── firewall/         # mitmproxy addon — credential injection proxy
 │   ├── sandbox/          # Agent container image (Ubuntu 24.04 + uv + gh + node + bun + amp)
-│   ├── slackbot/         # Next.js + Slack Bolt event listener (pnpm)
+│   ├── slackbot/         # TypeScript + Hono Slack event listener (pnpm/Bun)
+│   ├── chatbot/          # TypeScript + Hono Google Chat event listener (pnpm/Bun)
 │   ├── grafana/          # Grafana dashboards + provisioning
 │   ├── fluentbit/        # Fluent Bit log shipping config
 │   └── alloy/            # Grafana Alloy config
@@ -418,7 +420,7 @@ Runs go through: `queued → running → sleeping/waiting → running → … �
 | Workflow | Description |
 |----------|-------------|
 | `agent_turn` | Single durable agent turn: spawn → message → execute → wait for terminal result. |
-| `slack_thread_turn` | Same as `agent_turn` but requires a Slack `thread_key`. Used by the slackbot. |
+| `slack_thread_turn` | Same as `agent_turn` but requires a chat `thread_key`. Used by both the slackbot and the chatbot (Google Chat). Per-platform behavior (mention regex, persona-switch context note, prompt-switch release-id) is dispatched off `delivery.platform`; the workflow name is intentionally `slack_thread_turn` rather than a generic `comms_thread_turn` so durable in-flight runs and the `_workflow_request_hash` shortcut keep resolving. |
 | `agent_loop` | Recurring agent loop: runs an agent turn every N seconds until the agent signals `{"done": true}`, max iterations, or deadline. |
 
 ### Durable state
@@ -492,6 +494,7 @@ Sandbox Pods never see real API keys. The firewall (`services/firewall/addon.py`
 - **API auth**: All callers authenticate with DB-backed API keys (`aiv2_*` prefix, stored in `api_keys` table). Local in-cluster service calls use the configured bypass paths where applicable.
 - **Sandbox auth**: Sandbox Pods get auto-issued HMAC-signed tokens (`sbx1.*` prefix) minted by the API. These are short-lived (2h TTL) and scoped to `agent` + `tools:*`.
 - **Slack**: HMAC-SHA256 signature verification on all webhooks
+- **Google Chat**: Service account app authentication + domain allowlisting on webhooks
 - **Public edge**: The Helm chart exposes public routes only when configured through Ingress, HTTPRoute, or service settings.
 - **Sandbox isolation**: Pods get stub keys only; real keys injected by firewall proxy in-flight
 - **Filesystem**: Host repos mounted read-only by default; only working repo is read-write
@@ -511,6 +514,7 @@ All API authentication uses **DB-backed keys** stored in the `api_keys` Postgres
 ### How services get their keys
 
 - **Slackbot**: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and `SLACKBOT_API_KEY` are injected from the local infra Secret.
+- **Chatbot**: `GOOGLE_SERVICE_ACCOUNT_JSON`, `CHATBOT_API_KEY` are injected from the local infra Secret.
 - **Sandbox containers**: Auto-issued `sbx1.*` token injected as `CENTAUR_API_KEY` at container creation
 - **Local testing**: Use localhost bypass (no key needed from inside the API deployment), or create a key via admin API
 

@@ -199,9 +199,9 @@ spec:
             - name: SSL_CERT_FILE
               value: /firewall-certs/ca-cert.pem
             - name: NO_PROXY
-              value: {{ printf "localhost,127.0.0.1,%s,%s,%s,%s%s,centaur-egress.svc.cluster.local,.centaur-egress.svc.cluster.local" (include "centaur.componentName" (dict "root" . "component" "postgres")) (include "centaur.componentName" (dict "root" . "component" "api")) (include "centaur.componentName" (dict "root" . "component" "slackbot")) (include "centaur.firewallNoProxyHosts" .) (include "centaur.laminarNoProxyHosts" .) | quote }}
+              value: {{ printf "localhost,127.0.0.1,%s,%s,%s,%s,%s%s,centaur-egress.svc.cluster.local,.centaur-egress.svc.cluster.local" (include "centaur.componentName" (dict "root" . "component" "postgres")) (include "centaur.componentName" (dict "root" . "component" "api")) (include "centaur.componentName" (dict "root" . "component" "slackbot")) (include "centaur.componentName" (dict "root" . "component" "chatbot")) (include "centaur.firewallNoProxyHosts" .) (include "centaur.laminarNoProxyHosts" .) | quote }}
             - name: no_proxy
-              value: {{ printf "localhost,127.0.0.1,%s,%s,%s,%s%s,centaur-egress.svc.cluster.local,.centaur-egress.svc.cluster.local" (include "centaur.componentName" (dict "root" . "component" "postgres")) (include "centaur.componentName" (dict "root" . "component" "api")) (include "centaur.componentName" (dict "root" . "component" "slackbot")) (include "centaur.firewallNoProxyHosts" .) (include "centaur.laminarNoProxyHosts" .) | quote }}
+              value: {{ printf "localhost,127.0.0.1,%s,%s,%s,%s,%s%s,centaur-egress.svc.cluster.local,.centaur-egress.svc.cluster.local" (include "centaur.componentName" (dict "root" . "component" "postgres")) (include "centaur.componentName" (dict "root" . "component" "api")) (include "centaur.componentName" (dict "root" . "component" "slackbot")) (include "centaur.componentName" (dict "root" . "component" "chatbot")) (include "centaur.firewallNoProxyHosts" .) (include "centaur.laminarNoProxyHosts" .) | quote }}
             - name: CENTAUR_LOG_LEVEL
               value: info
             - name: TOOL_DIRS
@@ -363,6 +363,12 @@ spec:
 {{- if .Values.slackbot.enabled }}
             - name: SLACKBOT_URL
               value: {{ printf "http://%s:3001" (include "centaur.componentName" (dict "root" . "component" "slackbot")) | quote }}
+{{- end }}
+{{- if .Values.chatbot.enabled }}
+            - name: CHATBOT_URL
+              value: {{ printf "http://%s:3002" (include "centaur.componentName" (dict "root" . "component" "chatbot")) | quote }}
+            - name: CHATBOT_ENABLED
+              value: "true"
 {{- end }}
 {{- range $name, $value := .Values.api.extraEnv }}
             - name: {{ $name }}
@@ -540,6 +546,88 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.slackbot.resources | nindent 12 }}
+      volumes:
+        - name: firewall-ca
+          secret:
+            secretName: {{ include "centaur.trustedCaSecretName" . }}
+{{- end }}
+{{- if .Values.chatbot.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "chatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "chatbot") | nindent 4 }}
+spec:
+  replicas: {{ .Values.chatbot.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "chatbot") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/secret-env: {{ toJson (dict "secretManager" .Values.secretManager "firewallCa" .Values.firewall.ca) | sha256sum }}
+        checksum/firewall-ca: {{ toJson .Values.firewall.ca | sha256sum }}
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "chatbot") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: chatbot
+          image: {{ printf "%s:%s" .Values.chatbot.image.repository .Values.chatbot.image.tag | quote }}
+          imagePullPolicy: {{ .Values.chatbot.image.pullPolicy }}
+          env:
+            - name: GOOGLE_SERVICE_ACCOUNT_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLE_SERVICE_ACCOUNT_JSON" .Values.secretManager.envPrefix }}
+            - name: CHATBOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCHATBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: LMNR_PROJECT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sLMNR_PROJECT_API_KEY" .Values.secretManager.envPrefix }}
+                  optional: true
+            - name: CENTAUR_API_URL
+              value: {{ printf "http://%s:8000" (include "centaur.componentName" (dict "root" . "component" "api")) | quote }}
+            - name: HTTPS_PROXY
+              value: {{ include "centaur.firewallProxyUrl" . | quote }}
+            - name: NODE_EXTRA_CA_CERTS
+              value: /firewall-certs/ca-cert.pem
+            - name: NO_PROXY
+              value: {{ printf "localhost,127.0.0.1,%s,%s,%s%s,centaur-egress.svc.cluster.local,.centaur-egress.svc.cluster.local" (include "centaur.componentName" (dict "root" . "component" "postgres")) (include "centaur.componentName" (dict "root" . "component" "api")) (include "centaur.firewallNoProxyHosts" .) (include "centaur.laminarNoProxyHosts" .) | quote }}
+            - name: no_proxy
+              value: {{ printf "localhost,127.0.0.1,%s,%s,%s%s,centaur-egress.svc.cluster.local,.centaur-egress.svc.cluster.local" (include "centaur.componentName" (dict "root" . "component" "postgres")) (include "centaur.componentName" (dict "root" . "component" "api")) (include "centaur.firewallNoProxyHosts" .) (include "centaur.laminarNoProxyHosts" .) | quote }}
+          ports:
+            - containerPort: 3002
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+          volumeMounts:
+            - name: firewall-ca
+              mountPath: /firewall-certs
+              readOnly: true
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.chatbot.resources | nindent 12 }}
       volumes:
         - name: firewall-ca
           secret:
