@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@centaur/harness-events": "workspace:*",
-    "axios": "^1.13.6",
+    "axios": "^1.15.2",
     "eventsource-parser": "^3.0.6"
   },
   "devDependencies": {
