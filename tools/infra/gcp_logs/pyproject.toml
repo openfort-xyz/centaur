@@ -3,11 +3,27 @@ name = "gcp_logs"
 version = "0.1.0"
 description = "GCP Cloud Logging queries"
 requires-python = ">=3.11"
-dependencies = ["httpx", "pyjwt"]
+dependencies = [
+    "httpx>=0.27.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+gcp-logs = "gcp_logs.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
-hosts = ["logging.googleapis.com", "oauth2.googleapis.com"]
+hosts = ["logging.googleapis.com"]
+# Authentication is minted by iron-proxy's gcp_auth transform: it loads the
+# GOOGLE_SERVICE_ACCOUNT_JSON keyfile, mints an OAuth2 access token for the
+# logging.read scope, and injects it as Authorization: Bearer on outbound
+# requests to logging.googleapis.com. The tool never sees the credential.
 secrets = [
-    {type = "http", name = "GOOGLE_SERVICE_ACCOUNT_JSON", match_headers = ["Authorization"], hosts = ["logging.googleapis.com", "oauth2.googleapis.com"]},
+    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["logging.googleapis.com"], scopes = ["https://www.googleapis.com/auth/logging.read"]},
 ]

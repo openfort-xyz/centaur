@@ -1,12 +1,12 @@
 """GCP Cloud Logging CLI."""
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import json
+
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
-from centaur_sdk import Table
+
+load_dotenv()
 
 app = typer.Typer(name="gcp-logs", help="GCP Cloud Logging query CLI")
 console = Console()
@@ -21,10 +21,13 @@ def query(
 ):
     """Query logs for a GCP project."""
     from .client import _client
+
     c = _client()
     result = c.query_logs(project_id, filter, page_size=page_size)
     entries = result.get("entries", [])
-    if json_output: print(json.dumps(result, indent=2)); return
+    if json_output:
+        print(json.dumps(result, indent=2))
+        return
     console.print(f"[bold]{len(entries)} log entries[/bold]")
     for entry in entries[:20]:
         ts = entry.get("timestamp", "")[:19]
@@ -44,10 +47,19 @@ def gke_logs(
 ):
     """Get GKE container logs."""
     from .client import _client
+
     c = _client()
-    result = c.get_gke_logs(project_id, cluster_name=cluster, namespace=namespace, container_name=container, severity=severity)
+    result = c.get_gke_logs(
+        project_id,
+        cluster_name=cluster,
+        namespace=namespace,
+        container_name=container,
+        severity=severity,
+    )
     entries = result.get("entries", [])
-    if json_output: print(json.dumps(entries, indent=2)); return
+    if json_output:
+        print(json.dumps(entries, indent=2))
+        return
     console.print(f"[bold]{len(entries)} GKE log entries[/bold]")
     for entry in entries[:20]:
         ts = entry.get("timestamp", "")[:19]
@@ -67,10 +79,13 @@ def cloud_run_logs(
 ):
     """Get Cloud Run revision logs."""
     from .client import _client
+
     c = _client()
     result = c.get_cloud_run_logs(project_id, service_name=service, severity=severity)
     entries = result.get("entries", [])
-    if json_output: print(json.dumps(entries, indent=2)); return
+    if json_output:
+        print(json.dumps(entries, indent=2))
+        return
     for entry in entries[:20]:
         ts = entry.get("timestamp", "")[:19]
         msg = (entry.get("textPayload", "") or "")[:120]

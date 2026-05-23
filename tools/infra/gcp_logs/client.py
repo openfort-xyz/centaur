@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import json
-import time
 from typing import Any
 
 import httpx
-
-from centaur_sdk import secret
 
 _LOGGING_API_BASE = "https://logging.googleapis.com/v2"
 
@@ -15,61 +11,31 @@ class GCPLogsClient:
     """GCP Cloud Logging API v2 client for querying infrastructure logs.
 
     API: https://cloud.google.com/logging/docs/reference/v2/rest
-    Auth: Service account JWT signed with ``GOOGLE_SERVICE_ACCOUNT_JSON``.
-          The client signs a JWT and exchanges it for an OAuth2 access token.
+
+    Auth: handled by iron-proxy's ``gcp_auth`` transform. The proxy loads the
+    ``GOOGLE_SERVICE_ACCOUNT_JSON`` service-account keyfile, mints a short-lived
+    OAuth2 access token for the ``logging.read`` scope, and injects it as the
+    ``Authorization: Bearer`` header on outbound requests to
+    ``logging.googleapis.com``. The tool itself sends no credentials, so the
+    private key never reaches the sandbox.
 
     Scope: https://www.googleapis.com/auth/logging.read
     """
 
-    def __init__(self, service_account_json: str | None = None):
-        self.sa_json = service_account_json or secret("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-        if not self.sa_json:
+    def __init__(self) -> None:
+        self._http = httpx.Client(base_url=_LOGGING_API_BASE, timeout=30.0)
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        try:
+            r = self._http.request(method, path, **kwargs)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
             raise RuntimeError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON not set. Set it in your .env file."
-            )
-        self._access_token: str | None = None
-        self._token_expiry = 0
-
-    def _http(self) -> httpx.Client:
-        token = self._get_access_token()
-        return httpx.Client(
-            base_url=_LOGGING_API_BASE,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30.0,
-        )
-
-    def _get_access_token(self) -> str:
-        if self._access_token and time.time() < self._token_expiry - 60:
-            return self._access_token
-
-        import jwt as pyjwt
-        sa = json.loads(self.sa_json)
-        now = int(time.time())
-        assertion = pyjwt.encode(
-            {
-                "iss": sa["client_email"],
-                "sub": sa["client_email"],
-                "scope": "https://www.googleapis.com/auth/logging.read",
-                "aud": "https://oauth2.googleapis.com/token",
-                "iat": now,
-                "exp": now + 3600,
-            },
-            sa["private_key"],
-            algorithm="RS256",
-        )
-
-        r = httpx.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": assertion,
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        self._access_token = data["access_token"]
-        self._token_expiry = time.time() + data.get("expires_in", 3600) - 120
-        return self._access_token
+                f"GCP Logging API error: {e.response.status_code} - {e.response.text}"
+            ) from e
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Request failed: {e}") from e
 
     # ── Log Entries ───────────────────────────────────────────────────────
 
@@ -101,10 +67,7 @@ class GCPLogsClient:
         if resource_names:
             body["resourceNames"] = resource_names
 
-        with self._http() as http:
-            r = http.post("/entries:list", json=body)
-        r.raise_for_status()
-        return r.json()
+        return self._request("POST", "/entries:list", json=body)
 
     def query_logs(
         self,
@@ -140,7 +103,7 @@ class GCPLogsClient:
         """
         parts = [
             'resource.type="k8s_container"',
-            f'severity>={severity}',
+            f"severity>={severity}",
         ]
         if cluster_name:
             parts.append(f'resource.labels.cluster_name="{cluster_name}"')
@@ -166,7 +129,7 @@ class GCPLogsClient:
         """Get Cloud Run revision logs."""
         parts = [
             'resource.type="cloud_run_revision"',
-            f'severity>={severity}',
+            f"severity>={severity}",
         ]
         if service_name:
             parts.append(f'resource.labels.service_name="{service_name}"')
