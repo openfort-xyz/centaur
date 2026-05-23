@@ -3,7 +3,19 @@ name = "sentry"
 version = "0.1.0"
 description = "Sentry error tracking and issue management"
 requires-python = ">=3.11"
-dependencies = ["httpx"]
+dependencies = [
+    "httpx>=0.27.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+sentry = "sentry.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"

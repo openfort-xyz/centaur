@@ -1,13 +1,15 @@
 """Sentry CLI for error monitoring and issue triage."""
 
+import json
+from typing import Annotated
+
+import typer
 from dotenv import load_dotenv
+from rich.console import Console
+
+from centaur_sdk import Table
 
 load_dotenv()
-
-import json
-import typer
-from rich.console import Console
-from centaur_sdk import Table, render_text_table
 
 app = typer.Typer(name="sentry", help="Sentry error tracking and issue management CLI")
 console = Console()
@@ -58,12 +60,17 @@ def _print_issue_table(issues: list[dict], title: str = "Issues") -> None:
 
 # ── Issues ────────────────────────────────────────────────────────────────
 
+
 @app.command()
 def list_issues(
     organization_slug: str = typer.Argument(..., help="Organization slug"),
     project_slug: str | None = typer.Option(None, "--project", "-p", help="Filter by project slug"),
-    query: str | None = typer.Option(None, "--query", "-q", help='Search query (e.g. "is:unresolved")'),
-    stats_period: str | None = typer.Option(None, "--stats-period", help="Stats window: 24h, 14d, or empty string"),
+    query: str | None = typer.Option(
+        None, "--query", "-q", help='Search query (e.g. "is:unresolved")'
+    ),
+    stats_period: str | None = typer.Option(
+        None, "--stats-period", help="Stats window: 24h, 14d, or empty string"
+    ),
     sort: str | None = typer.Option(None, "--sort", help='Sort order: "date", "new", "freq"'),
     limit: int = typer.Option(100, "--limit", "-n", help="Max results (1-100)"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
@@ -132,7 +139,9 @@ def get_issue(
 def update_issue(
     organization_slug: str = typer.Argument(..., help="Organization slug"),
     issue_id: str = typer.Argument(..., help="Issue ID"),
-    status: str | None = typer.Option(None, "--status", help='New status: "resolved", "unresolved", "ignored"'),
+    status: str | None = typer.Option(
+        None, "--status", help='New status: "resolved", "unresolved", "ignored"'
+    ),
     assigned_to: str | None = typer.Option(None, "--assign", help='User ID or "me" to self-assign'),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
@@ -204,7 +213,7 @@ def get_issue_tags(
     table.add_column("Top Values", style="white")
     for tag in tags:
         top = ", ".join(
-            f"{tv.get('value','')}({tv.get('count',0)})"
+            f"{tv.get('value', '')}({tv.get('count', 0)})"
             for tv in (tag.get("topValues", []) or [])[:5]
         )
         table.add_row(str(tag.get("key", "")), str(tag.get("totalValues", "")), top[:80])
@@ -212,6 +221,7 @@ def get_issue_tags(
 
 
 # ── Releases ─────────────────────────────────────────────────────────────
+
 
 @app.command()
 def list_releases(
@@ -267,17 +277,22 @@ def get_release(
     console.print(f"  Date Created: {release.get('dateCreated')}")
     console.print(f"  Date Released: {release.get('dateReleased')}")
     console.print(f"  Ref: {release.get('ref', '')}")
-    console.print(f"  Commits: {release.get('commitCount', 0)}  Deploys: {release.get('deployCount', 0)}")
+    console.print(
+        f"  Commits: {release.get('commitCount', 0)}  Deploys: {release.get('deployCount', 0)}"
+    )
     console.print(f"  New Groups: {release.get('newGroups', 0)}")
 
 
 # ── Discover ─────────────────────────────────────────────────────────────
 
+
 @app.command()
 def discover(
     organization_slug: str = typer.Argument(..., help="Organization slug"),
     query: str = typer.Argument(..., help="Discover search query"),
-    fields: list[str] | None = typer.Option(None, "--field", "-f", help="Fields to return"),
+    fields: Annotated[
+        list[str] | None, typer.Option("--field", "-f", help="Fields to return")
+    ] = None,
     sort: str | None = typer.Option(None, "--sort", help='Sort expression (e.g. "-timestamp")'),
     limit: int = typer.Option(100, "--limit", "-n", help="Max results"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
@@ -302,7 +317,6 @@ def discover(
     if not data:
         console.print("[yellow]No results.[/yellow]")
         return
-    meta = result.get("meta", {})
     headers = list(data[0].keys()) if data else []
     table = Table(title="Discover Results")
     for header in headers[:8]:
@@ -313,6 +327,7 @@ def discover(
 
 
 # ── Projects ─────────────────────────────────────────────────────────────
+
 
 @app.command()
 def list_projects(

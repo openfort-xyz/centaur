@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 
 from centaur_sdk import secret
-
 
 _SENTRY_API_BASE = "https://sentry.io/api/0"
 
@@ -31,7 +31,10 @@ class SentryClient:
                 "SENTRY_AUTH_TOKEN not set. Set it in your .env file "
                 "or inject it via the Centaur secrets system."
             )
-        base_url = secret("SENTRY_API_BASE", _SENTRY_API_BASE).strip().rstrip("/")
+        # SENTRY_API_BASE is non-secret config (region selection), not a
+        # credential, so it is read from the environment rather than the secret
+        # manager. The auth token still comes from secret() above.
+        base_url = os.getenv("SENTRY_API_BASE", _SENTRY_API_BASE).strip().rstrip("/")  # noqa: TID251
         self._http = httpx.Client(
             base_url=base_url,
             headers={
@@ -78,7 +81,7 @@ class SentryClient:
                    Defaults to ``"is:unresolved"`` when not provided.
             stats_period: Stats time window - ``"24h"``, ``"14d"``, or ``""`` for none.
             sort: Sort order (e.g. ``"date"``, ``"new"``, ``"freq"``).
-            limit: Max results per page (1–100).
+            limit: Max results per page (1-100).
             cursor: Pagination cursor from previous response headers.
 
         Returns a dict with ``body`` (list of issue dicts) and
@@ -97,9 +100,7 @@ class SentryClient:
             params["cursor"] = cursor
 
         qs = urlencode(params, doseq=True)
-        r = self._http.get(
-            f"/organizations/{organization_slug}/issues/?{qs}"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/issues/?{qs}")
         r.raise_for_status()
         body = r.json()
         return {"body": body, "pagination": self._pagination(r)}
@@ -112,9 +113,7 @@ class SentryClient:
         Includes activity log, tags, stats (24h + 30d), first/last seen,
         assigned user, project info, metadata, and stack trace info.
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/issues/{issue_id}/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/issues/{issue_id}/")
         r.raise_for_status()
         return r.json()
 
@@ -161,9 +160,7 @@ class SentryClient:
 
         API: ``DELETE /api/0/organizations/{org}/issues/{issue_id}/``
         """
-        r = self._http.delete(
-            f"/organizations/{organization_slug}/issues/{issue_id}/"
-        )
+        r = self._http.delete(f"/organizations/{organization_slug}/issues/{issue_id}/")
         r.raise_for_status()
 
     # ── Issue Events ──────────────────────────────────────────────────────
@@ -180,9 +177,7 @@ class SentryClient:
         Returns a list of event objects with ``eventID``, ``dateCreated``,
         ``message``, ``title``, tags, and user info.
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/issues/{issue_id}/events/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/issues/{issue_id}/events/")
         r.raise_for_status()
         return r.json()
 
@@ -204,9 +199,7 @@ class SentryClient:
 
     # ── Issue Tags ────────────────────────────────────────────────────────
 
-    def get_issue_tags(
-        self, organization_slug: str, issue_id: str
-    ) -> list[dict[str, Any]]:
+    def get_issue_tags(self, organization_slug: str, issue_id: str) -> list[dict[str, Any]]:
         """List all tag keys and their top values for an issue.
 
         API: ``GET /api/0/organizations/{org}/issues/{issue_id}/tags/``
@@ -214,9 +207,7 @@ class SentryClient:
         Returns tags with ``key``, ``totalValues``, and ``topValues[]``
         containing ``value``, ``count``, ``lastSeen``, ``firstSeen``.
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/issues/{issue_id}/tags/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/issues/{issue_id}/tags/")
         r.raise_for_status()
         return r.json()
 
@@ -227,9 +218,7 @@ class SentryClient:
 
         API: ``GET /api/0/organizations/{org}/issues/{issue_id}/tags/{key}/``
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/issues/{issue_id}/tags/{tag_key}/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/issues/{issue_id}/tags/{tag_key}/")
         r.raise_for_status()
         return r.json()
 
@@ -247,17 +236,13 @@ class SentryClient:
         Hash objects include ``id``, ``latestEvent`` (timestamp), and counts
         (``eventCount``, ``userCount``, ``stats``).
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/issues/{issue_id}/hashes/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/issues/{issue_id}/hashes/")
         r.raise_for_status()
         return r.json()
 
     # ── Events ────────────────────────────────────────────────────────────
 
-    def get_event(
-        self, organization_slug: str, project_slug: str, event_id: str
-    ) -> dict[str, Any]:
+    def get_event(self, organization_slug: str, project_slug: str, event_id: str) -> dict[str, Any]:
         """Retrieve a single event by ID from a project.
 
         API: ``GET /api/0/projects/{org}/{project}/events/{event_id}/``
@@ -265,9 +250,7 @@ class SentryClient:
         Returns full event data: tags, user, contexts, breadcrumbs, entries
         (stacktrace, request, exception), and metadata.
         """
-        r = self._http.get(
-            f"/projects/{organization_slug}/{project_slug}/events/{event_id}/"
-        )
+        r = self._http.get(f"/projects/{organization_slug}/{project_slug}/events/{event_id}/")
         r.raise_for_status()
         return r.json()
 
@@ -319,16 +302,12 @@ class SentryClient:
             params["cursor"] = cursor
 
         qs = urlencode(params) if params else ""
-        r = self._http.get(
-            f"/organizations/{organization_slug}/releases/{'?' + qs if qs else ''}"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/releases/{'?' + qs if qs else ''}")
         r.raise_for_status()
         body = r.json()
         return {"body": body, "pagination": self._pagination(r)}
 
-    def get_release(
-        self, organization_slug: str, version: str
-    ) -> dict[str, Any]:
+    def get_release(self, organization_slug: str, version: str) -> dict[str, Any]:
         """Get details for a specific release by version.
 
         API: ``GET /api/0/organizations/{org}/releases/{version}/``
@@ -337,35 +316,25 @@ class SentryClient:
         ``commitCount``, ``deployCount``, ``newGroups``, project list, and
         file/commit info.
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/releases/{version}/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/releases/{version}/")
         r.raise_for_status()
         return r.json()
 
-    def list_release_deploys(
-        self, organization_slug: str, version: str
-    ) -> list[dict[str, Any]]:
+    def list_release_deploys(self, organization_slug: str, version: str) -> list[dict[str, Any]]:
         """List deploys for a release.
 
         API: ``GET /api/0/organizations/{org}/releases/{version}/deploys/``
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/releases/{version}/deploys/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/releases/{version}/deploys/")
         r.raise_for_status()
         return r.json()
 
-    def list_release_commits(
-        self, organization_slug: str, version: str
-    ) -> list[dict[str, Any]]:
+    def list_release_commits(self, organization_slug: str, version: str) -> list[dict[str, Any]]:
         """List commits associated with a release.
 
         API: ``GET /api/0/organizations/{org}/releases/{version}/commits/``
         """
-        r = self._http.get(
-            f"/organizations/{organization_slug}/releases/{version}/commits/"
-        )
+        r = self._http.get(f"/organizations/{organization_slug}/releases/{version}/commits/")
         r.raise_for_status()
         return r.json()
 
