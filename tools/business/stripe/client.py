@@ -25,10 +25,16 @@ class StripeClient:
                 "STRIPE_RESTRICTED_KEY not set. Set it in your .env file "
                 "or inject it via the Centaur secrets system."
             )
+        # Send the key as a raw Bearer token (Stripe accepts this) rather than
+        # httpx.BasicAuth: BasicAuth base64-encodes the value, which would hide
+        # the iron-proxy placeholder so the firewall could never swap in the
+        # real credential. A raw header keeps the placeholder verbatim.
         self._http = httpx.Client(
             base_url=_STRIPE_API_BASE,
-            auth=httpx.BasicAuth(self.api_key, ""),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
             timeout=30.0,
         )
 
@@ -45,7 +51,8 @@ class StripeClient:
         API: ``GET /v1/customers``
         """
         params: dict[str, Any] = {"limit": min(limit, 100)}
-        if email: params["email"] = email
+        if email:
+            params["email"] = email
         r = self._http.get("/customers", params=params)
         r.raise_for_status()
         return r.json()
@@ -73,8 +80,10 @@ class StripeClient:
         API: ``GET /v1/subscriptions``
         """
         params: dict[str, Any] = {"limit": min(limit, 100)}
-        if customer_id: params["customer"] = customer_id
-        if status: params["status"] = status
+        if customer_id:
+            params["customer"] = customer_id
+        if status:
+            params["status"] = status
         r = self._http.get("/subscriptions", params=params)
         r.raise_for_status()
         return r.json()
@@ -102,8 +111,10 @@ class StripeClient:
         API: ``GET /v1/invoices``
         """
         params: dict[str, Any] = {"limit": min(limit, 100)}
-        if customer_id: params["customer"] = customer_id
-        if status: params["status"] = status
+        if customer_id:
+            params["customer"] = customer_id
+        if status:
+            params["status"] = status
         r = self._http.get("/invoices", params=params)
         r.raise_for_status()
         return r.json()
@@ -130,7 +141,8 @@ class StripeClient:
         API: ``GET /v1/charges``
         """
         params: dict[str, Any] = {"limit": min(limit, 100)}
-        if customer_id: params["customer"] = customer_id
+        if customer_id:
+            params["customer"] = customer_id
         r = self._http.get("/charges", params=params)
         r.raise_for_status()
         return r.json()
@@ -179,7 +191,8 @@ class StripeClient:
         API: ``GET /v1/payment_intents``
         """
         params: dict[str, Any] = {"limit": min(limit, 100)}
-        if customer_id: params["customer"] = customer_id
+        if customer_id:
+            params["customer"] = customer_id
         r = self._http.get("/payment_intents", params=params)
         r.raise_for_status()
         return r.json()
