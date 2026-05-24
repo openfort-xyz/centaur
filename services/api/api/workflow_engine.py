@@ -68,12 +68,23 @@ class Delivery:
     """Where to deliver execution results.  Construct via class methods."""
 
     platform: str = "dev"
+    # Slack fields
     channel: str | None = None
     thread_ts: str | None = None
     recipient_user_id: str | None = None
     recipient_team_id: str | None = None
     channel_id: str | None = None
     team_id: str | None = None
+    # Google Chat fields
+    space_name: str | None = None
+    space_type: str | None = None
+    message_name: str | None = None
+    thread_name: str | None = None
+    user_name: str | None = None
+    # Pre-created chatbot ack message name (set by chatbot's webhook handler
+    # before handoff; round-tripped here so the final-delivery outbox poller
+    # can PATCH this same message with the canonical answer).
+    chatbot_session_message_name: str | None = None
 
     @classmethod
     def slack(
@@ -108,6 +119,18 @@ class Delivery:
             d["recipient_user_id"] = self.recipient_user_id
         if recipient_team_id:
             d["recipient_team_id"] = recipient_team_id
+        if self.space_name:
+            d["space_name"] = self.space_name
+        if self.space_type:
+            d["space_type"] = self.space_type
+        if self.message_name:
+            d["message_name"] = self.message_name
+        if self.thread_name:
+            d["thread_name"] = self.thread_name
+        if self.user_name:
+            d["user_name"] = self.user_name
+        if self.chatbot_session_message_name:
+            d["chatbot_session_message_name"] = self.chatbot_session_message_name
         return d
 
     @classmethod
@@ -120,6 +143,12 @@ class Delivery:
             thread_ts=d.get("thread_ts"),
             recipient_user_id=d.get("recipient_user_id") or d.get("user_id"),
             recipient_team_id=d.get("recipient_team_id") or d.get("team_id"),
+            space_name=d.get("space_name") or d.get("spaceName"),
+            space_type=d.get("space_type") or d.get("spaceType"),
+            message_name=d.get("message_name") or d.get("messageName"),
+            thread_name=d.get("thread_name") or d.get("threadName"),
+            user_name=d.get("user_name") or d.get("userName"),
+            chatbot_session_message_name=d.get("chatbot_session_message_name"),
         )
 
 
@@ -1209,16 +1238,32 @@ async def do_agent_turn(
             effective_metadata["slackbot_agent_session_id"] = slackbot_session_id
             effective_metadata["slackbot_live_delivery"] = True
 
-        chatbot_session_id = await chatbot_client.open_agent_session(
-            delivery=effective_delivery,
-            metadata=effective_metadata,
-            thread_key=effective_thread_key,
-            title=session_title,
-            header=session_header,
-        )
-        if chatbot_session_id:
-            effective_metadata["chatbot_agent_session_id"] = chatbot_session_id
+        # The chatbot creates the "_Centaur is thinking…_" ack message inline
+        # in its webhook handler (before this workflow even starts) to beat
+        # Google Chat's ~5s "<bot> not responding" placeholder. The ack's
+        # message name arrives in delivery.chatbot_session_message_name; if
+        # present, we just record it and skip the redundant open round-trip.
+        # The legacy open path still fires for callers (e.g. /agent/execute)
+        # that don't pre-create.
+        pre_created_ack = str(
+            effective_delivery.get("chatbot_session_message_name") or ""
+        ).strip()
+        if pre_created_ack:
+            effective_metadata["chatbot_session_message_name"] = pre_created_ack
             effective_metadata["chatbot_live_delivery"] = True
+        else:
+            chatbot_session = await chatbot_client.open_agent_session(
+                delivery=effective_delivery,
+                metadata=effective_metadata,
+                thread_key=effective_thread_key,
+            )
+            if chatbot_session:
+                effective_metadata["chatbot_agent_session_id"] = chatbot_session["session_id"]
+                effective_metadata["chatbot_live_delivery"] = True
+                ack_message_name = chatbot_session.get("message_name") or ""
+                if ack_message_name:
+                    effective_metadata["chatbot_session_message_name"] = ack_message_name
+                    effective_delivery["chatbot_session_message_name"] = ack_message_name
 
         if isinstance(effective_history, list):
             backfilled = 0

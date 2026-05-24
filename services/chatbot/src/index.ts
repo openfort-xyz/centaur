@@ -71,16 +71,23 @@ const apiKeyMiddleware: MiddlewareHandler<{ Variables: Variables }> = async (c, 
 }
 
 const chatEventsHandler = async (c: Context<{ Variables: Variables }>) => {
+  // Google Chat is strict about the sync HTTP response shape. To silently
+  // acknowledge an event (and respond later via the Chat REST API), the bot
+  // MUST return `{}` with Content-Type: application/json. Anything else —
+  // empty body, text/plain, a non-Message JSON shape like `{"ok": true}`,
+  // or HTTP 204 — surfaces as a "<bot> not responding" placeholder card at
+  // the top of the DM (even when the bot is healthy and follows up async).
+  // Refs: https://developers.google.com/workspace/chat/receive-respond-interactions
   const body = await c.req.raw.text()
   const envelope = parseChatBody(body)
-  if (!envelope) return c.json({ ok: false, error: 'invalid_chat_payload' }, 400)
+  if (!envelope) return c.json({}, 400)
 
   const verification = verifyChatRequest({
     config,
     envelope
   })
   if (!verification.ok) {
-    return c.json({ ok: false, error: verification.reason }, verification.status)
+    return c.json({}, verification.status)
   }
 
   const key = chatDedupKey({
@@ -90,11 +97,11 @@ const chatEventsHandler = async (c: Context<{ Variables: Variables }>) => {
   })
   if (!deduper.checkAndRemember(key)) {
     logWarn('chat_duplicate_event_skipped', { dedupe_key: key })
-    return c.json({ ok: true, duplicate: true })
+    return c.json({})
   }
 
   runInBackground(c, processChatEvent(envelope))
-  return c.json({ ok: true })
+  return c.json({})
 }
 
 app.post(config.CHAT_EVENTS_PATH, chatEventsHandler)
@@ -162,16 +169,18 @@ app.get('/api/chat/messages', apiKeyMiddleware, async c => {
 app.post('/api/chat/agent-sessions', apiKeyMiddleware, async c => {
   const body = await c.req.json<{
     space_name: string
-    header?: string
-    title?: string
+    thread_name?: string
   }>()
   try {
     const result = await new AgentSessionRenderer(client).open({
       spaceName: body.space_name,
-      header: body.header,
-      title: body.title
+      threadName: body.thread_name
     })
-    return c.json({ ok: true, session_id: result.sessionId })
+    return c.json({
+      ok: true,
+      session_id: result.sessionId,
+      message_name: result.messageName
+    })
   } catch (error) {
     return chatApiErrorResponse(c, error)
   }
@@ -241,7 +250,6 @@ function botResourceName(): string | undefined {
 
 async function processChatEvent(envelope: GoogleChatEnvelope): Promise<void> {
   const botUser = botResourceName()
-
   const normalized = await normalizeChatEnvelope(envelope, botUser)
   if (!normalized) return
 
@@ -258,7 +266,27 @@ async function processChatEvent(envelope: GoogleChatEnvelope): Promise<void> {
 
   if (!normalized.is_mention) return
 
-  const result = await handoff.emit(normalized)
+  // Post the "_Centaur is thinking…_" ack message IMMEDIATELY, before handoff.
+  // Google Chat shows a built-in "<bot> not responding" placeholder when no
+  // bot message appears within ~5s of the user's prompt. Waiting for the API
+  // to spawn a sandbox and call back to /api/chat/agent-sessions takes 5-10s,
+  // so we'd always lose this race. Posting inline keeps the user informed
+  // and seeds the message_name that the outbox poller later PATCHes with the
+  // final answer.
+  let ackMessageName = ''
+  try {
+    const ack = await client.createMessage(
+      normalized.space_name,
+      { text: '_Centaur is thinking…_' },
+      { threadName: normalized.chat.thread_name }
+    )
+    ackMessageName = ack.name ?? ''
+  } catch (error) {
+    logError('chat_ack_create_failed', error)
+    // Continue with handoff; outbox poller will fall back to createMessage.
+  }
+
+  const result = await handoff.emit(normalized, { ackMessageName })
   if (!result.ok) {
     if (result.status === 409) {
       logWarn('centaur_chat_handoff_conflict', result.body)
@@ -301,9 +329,58 @@ function getExecutionContext(c: Context): WaitUntilContext | null {
 }
 
 function parseChatBody(rawBody: string): GoogleChatEnvelope | null {
+  let parsed: Record<string, unknown>
   try {
-    return JSON.parse(rawBody) as GoogleChatEnvelope
+    parsed = JSON.parse(rawBody) as Record<string, unknown>
   } catch {
     return null
   }
+
+  // Google Workspace Add-ons (v2) envelope unwrap into v1 shape consumed by
+  // normalize.ts. Apps created via the new Chat API "Configuration" UI default
+  // to v2 — events arrive nested under `chat`, with the v1 fields split into
+  // typed payload buckets.
+  const chat = (parsed as { chat?: Record<string, unknown> }).chat
+  if (chat && typeof chat === 'object') {
+    const eventTime = chat.eventTime as string | undefined
+    const user = chat.user as Record<string, unknown> | undefined
+    const messagePayload = chat.messagePayload as
+      | { space?: unknown; message?: unknown }
+      | undefined
+    if (messagePayload) {
+      return {
+        type: 'MESSAGE',
+        eventTime,
+        user,
+        space: messagePayload.space,
+        message: messagePayload.message
+      } as unknown as GoogleChatEnvelope
+    }
+    const addedToSpacePayload = chat.addedToSpacePayload as
+      { space?: unknown } | undefined
+    if (addedToSpacePayload) {
+      return {
+        type: 'ADDED_TO_SPACE',
+        eventTime,
+        user,
+        space: addedToSpacePayload.space
+      } as unknown as GoogleChatEnvelope
+    }
+    const removedFromSpacePayload = chat.removedFromSpacePayload as
+      { space?: unknown } | undefined
+    if (removedFromSpacePayload) {
+      return {
+        type: 'REMOVED_FROM_SPACE',
+        eventTime,
+        user,
+        space: removedFromSpacePayload.space
+      } as unknown as GoogleChatEnvelope
+    }
+    // appCommandPayload / buttonClickedPayload / submitFormPayload are
+    // deliberately dropped here, matching the v1 normalize.ts policy.
+    return null
+  }
+
+  // v1 (legacy Chat API) envelope — pass through unchanged.
+  return parsed as unknown as GoogleChatEnvelope
 }

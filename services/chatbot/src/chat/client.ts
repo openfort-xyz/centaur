@@ -102,17 +102,49 @@ export class ChatEdgeClient {
   /**
    * Create a message in a Google Chat space.
    * Path: POST /v1/spaces/{space}/messages
+   *
+   * Accepts either a bare space id ("lw57hyAAAAE") or a fully-qualified resource
+   * name ("spaces/lw57hyAAAAE") — Google Chat's MESSAGE event sends the latter,
+   * so we normalize to avoid double-prefixing the URL.
+   *
+   * When threadName is provided, the new message is threaded under the given
+   * thread (resource name like "spaces/<id>/threads/<id>"). In 1:1 DMs Google
+   * Chat ignores the field; in named spaces it makes the bot reply land under
+   * the user's message instead of in the space root.
    */
-  async createMessage(spaceName: string, message: Partial<GoogleChatMessage>): Promise<GoogleChatMessage> {
-    return this.request('POST', `spaces/${spaceName}/messages`, message)
+  async createMessage(
+    spaceName: string,
+    message: Partial<GoogleChatMessage>,
+    opts: { threadName?: string } = {}
+  ): Promise<GoogleChatMessage> {
+    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    const body: Partial<GoogleChatMessage> & { thread?: { name: string } } = { ...message }
+    if (opts.threadName) {
+      body.thread = { name: opts.threadName }
+    }
+    const path = opts.threadName
+      ? `spaces/${id}/messages?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
+      : `spaces/${id}/messages`
+    return this.request('POST', path, body)
   }
 
   /**
    * Update a message.
-   * Path: PATCH /v1/{message.name}
+   * Path: PATCH /v1/{message.name}?updateMask=<fields>
+   *
+   * Google Chat requires updateMask as a query parameter listing the fields to
+   * patch. We default to "text,cardsV2" because those are the only writable
+   * fields we change. Pass a custom mask via opts.updateMask if patching a
+   * different field.
    */
-  async updateMessage(messageName: string, update: Partial<GoogleChatMessage>): Promise<GoogleChatMessage> {
-    return this.request('PATCH', messageName, update)
+  async updateMessage(
+    messageName: string,
+    update: Partial<GoogleChatMessage>,
+    opts: { updateMask?: string } = {}
+  ): Promise<GoogleChatMessage> {
+    const mask = opts.updateMask ?? 'text,cardsV2'
+    const path = `${messageName}?updateMask=${encodeURIComponent(mask)}`
+    return this.request('PATCH', path, update)
   }
 
   /**

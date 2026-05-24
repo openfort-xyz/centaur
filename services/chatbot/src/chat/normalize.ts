@@ -107,9 +107,13 @@ function buildAddedToSpaceEvent(
 function normalizeSpaceType(type: string | undefined): ChatSpaceType | null {
   if (!type) return null
   const normalized = type.toUpperCase()
+  // v1 (legacy Chat API) enum values
   if (normalized === 'DIRECT_MESSAGE') return 'DIRECT_MESSAGE'
   if (normalized === 'GROUP_CHAT') return 'GROUP_CHAT'
   if (normalized === 'SPACE') return 'SPACE'
+  // v2 (Workspace Add-ons) enum values
+  if (normalized === 'DM') return 'DIRECT_MESSAGE'
+  if (normalized === 'ROOM') return 'SPACE'
   return null
 }
 
