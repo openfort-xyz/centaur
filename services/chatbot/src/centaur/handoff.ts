@@ -12,7 +12,10 @@ export class CentaurHandoff {
     this.config = config
   }
 
-  async emit(event: NormalizedChatEvent): Promise<CentaurHandoffResult> {
+  async emit(
+    event: NormalizedChatEvent,
+    opts: { ackMessageName?: string } = {}
+  ): Promise<CentaurHandoffResult> {
     const url = new URL('/workflows/runs', this.config.CENTAUR_API_URL)
     const apiKey = centaurApiKey(this.config)
     const response = await fetch(url, {
@@ -48,7 +51,12 @@ export class CentaurHandoff {
             message_name: event.chat.message_name,
             thread_name: event.chat.thread_name,
             user_id: event.user_id,
-            user_name: event.user_name
+            user_name: event.user_name,
+            // Pre-created ack message — round-tripped into the outbox row's
+            // delivery dict so the final-delivery poller PATCHes this name
+            // instead of creating a new bubble. Empty string means the
+            // inline ack failed and the poller should createMessage instead.
+            ...(opts.ackMessageName ? { chatbot_session_message_name: opts.ackMessageName } : {})
           }
         }
       })

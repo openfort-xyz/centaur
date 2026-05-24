@@ -932,7 +932,13 @@ async def _capture_live_transport_send(
 
     thread_key = str(sandbox_claims.get("thread_key") or "")
     parts = thread_key.split(":")
-    if len(parts) < 4 or parts[0] != "slack":
+    # Allow chat-rooted threads to also reach the capture path. The SQL query
+    # below already supports chat sessions; the namespace check was the only
+    # thing blocking them. For chat threads, the slack-shaped channel/thread_ts
+    # comparisons that follow will simply mismatch (chat threads have no slack
+    # channel), and we'll return None — same net effect as before. The change
+    # only matters once chat-side tool capture is added in a follow-up.
+    if len(parts) < 4 or parts[0] not in {"slack", "chat", "google-chat"}:
         return None
     active_channel = parts[2]
     active_thread_ts = parts[3]

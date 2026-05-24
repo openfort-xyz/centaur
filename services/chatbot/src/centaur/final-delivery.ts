@@ -5,12 +5,20 @@ import { markdownToChatMessage } from '../chat/render'
 import { withLaminarSpan } from './tracing'
 
 const CONSUMER_ID = `chatbot-${process.pid}`
-// Slack-side dedup uses metadata round-trip via conversations.replies; Google
-// Chat has no equivalent per-message metadata API, so retries here are
-// at-least-once and may re-post a final card if the API ACK is lost between
-// `deliver` and `delivered`. Acceptable: the outbox already deduplicates by
-// execution_id at the API tier, and Card v2 messages are idempotent enough
-// in practice. Revisit if duplicates show up in prod.
+// The live ack path posts a placeholder message and round-trips its
+// resource name through API metadata into the outbox row. Here we PATCH that
+// same message with the canonical final answer, so the user sees a single
+// bubble that mutates from "_Centaur is thinking…_" → final answer.
+//
+// If the patch fails (message deleted, edit-window expired, name missing
+// because live open() failed) we fall back to createMessage, threading under
+// the user's original message when we know its thread.
+//
+// Outbox claims are at-least-once: if the /delivered ACK is lost between
+// `deliver` and the API write, the next tick re-claims and re-patches. PATCHing
+// the same message with the same content is idempotent in practice, so this
+// is safe — the duplicate-bubble bug is gone by construction now that live and
+// outbox write the same slot.
 
 const NON_RETRYABLE_CHAT_ERRORS = new Set([
   'space_not_found',
@@ -69,16 +77,42 @@ export async function pollFinalDeliveriesOnce(
 async function deliver(client: ChatEdgeClient, delivery: any): Promise<void> {
   const meta = delivery.delivery ?? {}
   const payload = delivery.final_payload ?? {}
-  const spaceName = meta.space_name ?? meta.spaceName ?? ''
+  const spaceName: string = meta.space_name ?? meta.spaceName ?? ''
   if (!spaceName) throw new Error('missing_chat_delivery_target')
 
-  const text = extractText(payload)
-  const result = markdownToChatMessage(text)
+  const ackMessageName: string =
+    payload.chatbot_session_message_name ?? meta.chatbot_session_message_name ?? ''
+  const threadName: string | undefined = meta.thread_name ?? meta.threadName
 
-  await client.createMessage(spaceName, {
-    text: result.fallbackText,
-    cardsV2: result.cardsV2
-  })
+  const text = extractText(payload)
+  const rendered = markdownToChatMessage(text)
+  // For simple text answers (no markdown structure), Google Chat renders both
+  // the `text` fallback AND the cardsV2 textParagraph — looks like the bot
+  // replied twice. Reserve cardsV2 for content with structure (headers, lists,
+  // code blocks, tables); send plain text otherwise. When PATCHing the ack
+  // we always include cardsV2 in the body (with [] in the plain case) so the
+  // updateMask clears any prior cards the ack may have carried.
+  const looksRich = /^\s*#{1,6}\s|\n#{1,6}\s|```|^\s*[-*+]\s|\n\s*[-*+]\s|^\s*\d+\.\s|\n\s*\d+\.\s|\|.*\|/.test(text)
+  const body = looksRich
+    ? { text: rendered.fallbackText, cardsV2: rendered.cardsV2 }
+    : { text: rendered.fallbackText, cardsV2: [] }
+
+  if (ackMessageName) {
+    try {
+      await client.updateMessage(ackMessageName, body)
+      return
+    } catch (error) {
+      // Edit-window expired, message deleted, or other unrecoverable PATCH
+      // failure — fall through to createMessage so the user still gets the
+      // answer. The ack remains visible as an orphan, accepted trade-off.
+      logError('final_delivery_patch_failed_falling_back_to_create', error)
+    }
+  }
+
+  // createMessage doesn't tolerate empty cardsV2 the same way PATCH does;
+  // drop the field when there's no card content.
+  const createBody = looksRich ? body : { text: rendered.fallbackText }
+  await client.createMessage(spaceName, createBody, { threadName })
 }
 
 function extractText(payload: any): string {

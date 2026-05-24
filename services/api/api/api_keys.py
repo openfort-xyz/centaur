@@ -45,6 +45,11 @@ _SERVICE_API_KEYS: tuple[ServiceAPIKeySpec, ...] = (
         scopes=("agent",),
     ),
     ServiceAPIKeySpec(
+        env_var="CHATBOT_API_KEY",
+        name="service:chatbot",
+        scopes=("agent",),
+    ),
+    ServiceAPIKeySpec(
         env_var="LOCAL_DEV_API_KEY",
         name="service:local-dev",
         scopes=("admin", "agent", "threads", "tools:*"),

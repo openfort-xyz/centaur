@@ -107,24 +107,32 @@ async def open_agent_session(
     delivery: dict[str, Any],
     metadata: dict[str, Any],
     thread_key: str,
-    title: str = "Centaur execution",
-    header: str | None = None,
-) -> str | None:
+) -> dict[str, str] | None:
+    """Open a chatbot ack session, returning {session_id, message_name}.
+
+    The chatbot posts a single "_Centaur is thinking…_" placeholder message
+    and returns its resource name. The caller is expected to store the name
+    in execution metadata so the final-delivery outbox row can carry it; the
+    chatbot's outbox poller then PATCHes that same message with the canonical
+    final answer, giving the user a single-bubble UX.
+    """
     if not enabled() or not is_chat_delivery(delivery):
         return None
     target_space = space_name(delivery)
     if not target_space:
         return None
-    body: dict[str, Any] = {
-        "space_name": target_space,
-        "title": title,
-    }
-    header_text = (header or "").strip()
-    if header_text:
-        body["header"] = header_text
+    body: dict[str, Any] = {"space_name": target_space}
+    thread_name = str(delivery.get("thread_name") or "").strip()
+    if thread_name:
+        body["thread_name"] = thread_name
     result = await post("/api/chat/agent-sessions", body)
-    session_id = str((result or {}).get("session_id") or "").strip()
-    return session_id or None
+    if not result:
+        return None
+    session_id = str(result.get("session_id") or "").strip()
+    message_name = str(result.get("message_name") or "").strip()
+    if not session_id:
+        return None
+    return {"session_id": session_id, "message_name": message_name}
 
 
 async def session_text(session_id: str | None, markdown: str) -> None:
