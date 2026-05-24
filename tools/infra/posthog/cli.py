@@ -25,6 +25,38 @@ def print_markdown_table(headers: list[str], rows: list[list[str]]) -> None:
         print("| " + " | ".join(str(cell) for cell in row) + " |")
 
 
+@app.command("list-projects")
+def list_projects(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """List PostHog projects the personal API key can access."""
+    client = get_client()
+
+    try:
+        projects = client.list_projects()
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    if json_output:
+        print(json.dumps(projects, indent=2))
+        return
+
+    if not projects:
+        console.print("[yellow]No projects[/]")
+        return
+
+    table = Table(title="PostHog projects")
+    table.add_column("ID", style="yellow", justify="right")
+    table.add_column("Name", style="cyan")
+    table.add_column("Organization", style="dim")
+
+    for p in projects:
+        table.add_row(str(p["id"]), str(p.get("name") or ""), str(p.get("organization") or ""))
+
+    console.print(table)
+
+
 @app.command()
 def query(
     project_id: str = typer.Argument(..., help="PostHog project id (numeric)"),

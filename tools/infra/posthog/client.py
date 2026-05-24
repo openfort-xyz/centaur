@@ -84,6 +84,20 @@ class PostHogClient:
         except httpx.RequestError as e:
             raise RuntimeError(f"Request failed: {e}")
 
+    def list_projects(self) -> list[dict]:
+        """List PostHog projects the personal API key can access.
+
+        Returns a flat list of ``{"id": <int>, "name": <str>, "organization": <str>}``
+        so agents can resolve a human-readable project name to the numeric id
+        required by the other query methods.
+        """
+        data = self._request("GET", "/api/projects/")
+        results = data.get("results", []) if isinstance(data, dict) else []
+        return [
+            {"id": p["id"], "name": p.get("name"), "organization": p.get("organization")}
+            for p in results
+        ]
+
     def query(self, project_id: str | int, sql: str, name: str | None = None) -> dict:
         """Execute a HogQL query against a specific project.
 
