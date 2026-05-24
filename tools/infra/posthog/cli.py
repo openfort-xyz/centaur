@@ -25,8 +25,41 @@ def print_markdown_table(headers: list[str], rows: list[list[str]]) -> None:
         print("| " + " | ".join(str(cell) for cell in row) + " |")
 
 
+@app.command("list-projects")
+def list_projects(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """List PostHog projects the personal API key can access."""
+    client = get_client()
+
+    try:
+        projects = client.list_projects()
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    if json_output:
+        print(json.dumps(projects, indent=2))
+        return
+
+    if not projects:
+        console.print("[yellow]No projects[/]")
+        return
+
+    table = Table(title="PostHog projects")
+    table.add_column("ID", style="yellow", justify="right")
+    table.add_column("Name", style="cyan")
+    table.add_column("Organization", style="dim")
+
+    for p in projects:
+        table.add_row(str(p["id"]), str(p.get("name") or ""), str(p.get("organization") or ""))
+
+    console.print(table)
+
+
 @app.command()
 def query(
+    project_id: str = typer.Argument(..., help="PostHog project id (numeric)"),
     sql: str = typer.Argument(..., help="HogQL SQL query"),
     name: str = typer.Option(None, "--name", "-n", help="Query name for logging"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
@@ -36,7 +69,7 @@ def query(
     client = get_client()
 
     try:
-        result = client.query(sql, name=name)
+        result = client.query(project_id, sql, name=name)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
@@ -68,6 +101,7 @@ def query(
 
 @app.command()
 def breakdown(
+    project_id: str = typer.Argument(..., help="PostHog project id (numeric)"),
     property: str = typer.Argument("$browser", help="Property to breakdown by"),
     event: str = typer.Option(None, "--event", "-e", help="Filter by event name"),
     days: int = typer.Option(7, "--days", "-d", help="Number of days to look back"),
@@ -79,7 +113,7 @@ def breakdown(
     client = get_client()
 
     try:
-        result = client.breakdown(event=event, property=property, days=days, limit=limit)
+        result = client.breakdown(project_id, event=event, property=property, days=days, limit=limit)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
@@ -118,6 +152,7 @@ def breakdown(
 
 @app.command()
 def pageviews(
+    project_id: str = typer.Argument(..., help="PostHog project id (numeric)"),
     url: str = typer.Option(None, "--url", "-u", help="Filter URLs containing this pattern"),
     days: int = typer.Option(7, "--days", "-d", help="Number of days to look back"),
     limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
@@ -128,7 +163,7 @@ def pageviews(
     client = get_client()
 
     try:
-        result = client.pageviews(url_pattern=url, days=days, limit=limit)
+        result = client.pageviews(project_id, url_pattern=url, days=days, limit=limit)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
@@ -162,6 +197,7 @@ def pageviews(
 
 @app.command("user-agents")
 def user_agents(
+    project_id: str = typer.Argument(..., help="PostHog project id (numeric)"),
     url: str = typer.Option(None, "--url", "-u", help="Filter URLs containing this pattern"),
     event: str = typer.Option("$pageview", "--event", "-e", help="Event type"),
     days: int = typer.Option(7, "--days", "-d", help="Number of days to look back"),
@@ -173,7 +209,7 @@ def user_agents(
     client = get_client()
 
     try:
-        result = client.user_agents(url_pattern=url, event=event, days=days, limit=limit)
+        result = client.user_agents(project_id, url_pattern=url, event=event, days=days, limit=limit)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
@@ -219,6 +255,7 @@ def user_agents(
 
 @app.command()
 def events(
+    project_id: str = typer.Argument(..., help="PostHog project id (numeric)"),
     event: str = typer.Option(None, "--event", "-e", help="Filter by event name"),
     after: str = typer.Option(None, "--after", "-a", help="Events after (YYYY-MM-DD)"),
     before: str = typer.Option(None, "--before", "-b", help="Events before (YYYY-MM-DD)"),
@@ -229,7 +266,7 @@ def events(
     client = get_client()
 
     try:
-        result = client.events(event=event, after=after, before=before, limit=limit)
+        result = client.events(project_id, event=event, after=after, before=before, limit=limit)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)

@@ -12,13 +12,14 @@ class PostHogClient:
     """Client for PostHog API.
 
     Uses HogQL queries for flexible analytics. Requires a personal API key
-    with Query Read permissions.
+    with Query Read permissions. The PostHog project is passed per call —
+    a single account often has multiple projects and the agent picks the
+    right one at query time.
     """
 
     def __init__(
         self,
         api_key: str | None = None,
-        project_id: str | None = None,
         host: str | None = None,
         timeout: float = 60.0,
     ):
@@ -26,12 +27,10 @@ class PostHogClient:
 
         Args:
             api_key: Personal API key (or set POSTHOG_API_KEY)
-            project_id: Project ID (or set POSTHOG_PROJECT_ID)
-            host: API host (default: us.posthog.com)
+            host: API host (default: eu.posthog.com; override with POSTHOG_HOST)
             timeout: Request timeout in seconds
         """
         self._api_key = api_key
-        self._project_id = project_id
         self._host = host
         self.timeout = timeout
         self._client: httpx.Client | None = None
@@ -53,21 +52,11 @@ class PostHogClient:
         raise RuntimeError("POSTHOG_API_KEY not set.")
 
     @property
-    def project_id(self) -> str:
-        """Get project ID from instance or env var."""
-        if self._project_id:
-            return self._project_id
-        pid = secret("POSTHOG_PROJECT_ID", "")
-        if pid:
-            return pid
-        raise RuntimeError("POSTHOG_PROJECT_ID not set.")
-
-    @property
     def host(self) -> str:
         """Get API host."""
         if self._host:
             return self._host
-        return os.getenv("POSTHOG_HOST", "us.posthog.com")  # noqa: TID251
+        return os.getenv("POSTHOG_HOST", "eu.posthog.com")  # noqa: TID251
 
     @property
     def base_url(self) -> str:
@@ -80,20 +69,7 @@ class PostHogClient:
         json_data: dict | None = None,
         params: dict | None = None,
     ) -> dict | list:
-        """Make an authenticated API request.
-
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            endpoint: API endpoint path
-            json_data: JSON body for POST requests
-            params: Query parameters
-
-        Returns:
-            JSON response data
-
-        Raises:
-            RuntimeError: If the request fails
-        """
+        """Make an authenticated API request."""
         url = f"{self.base_url}{endpoint}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
@@ -108,17 +84,29 @@ class PostHogClient:
         except httpx.RequestError as e:
             raise RuntimeError(f"Request failed: {e}")
 
-    def query(self, sql: str, name: str | None = None) -> dict:
-        """Execute a HogQL query.
+    def list_projects(self) -> list[dict]:
+        """List PostHog projects the personal API key can access.
+
+        Returns a flat list of ``{"id": <int>, "name": <str>, "organization": <str>}``
+        so agents can resolve a human-readable project name to the numeric id
+        required by the other query methods.
+        """
+        data = self._request("GET", "/api/projects/")
+        results = data.get("results", []) if isinstance(data, dict) else []
+        return [
+            {"id": p["id"], "name": p.get("name"), "organization": p.get("organization")}
+            for p in results
+        ]
+
+    def query(self, project_id: str | int, sql: str, name: str | None = None) -> dict:
+        """Execute a HogQL query against a specific project.
 
         Args:
+            project_id: PostHog project id (numeric). Required.
             sql: HogQL SQL query
             name: Optional query name for logging
-
-        Returns:
-            Query results with columns and results
         """
-        payload = {
+        payload: dict = {
             "query": {
                 "kind": "HogQLQuery",
                 "query": sql,
@@ -127,28 +115,18 @@ class PostHogClient:
         if name:
             payload["name"] = name
 
-        return self._request("POST", f"/api/projects/{self.project_id}/query/", json_data=payload)
+        return self._request("POST", f"/api/projects/{project_id}/query/", json_data=payload)
 
     def events(
         self,
+        project_id: str | int,
         event: str | None = None,
         properties: dict | None = None,
         limit: int = 100,
         after: str | None = None,
         before: str | None = None,
-    ) -> list[dict]:
-        """Query events using HogQL.
-
-        Args:
-            event: Filter by event name
-            properties: Filter by properties
-            limit: Max results
-            after: Events after this datetime
-            before: Events before this datetime
-
-        Returns:
-            List of events
-        """
+    ) -> dict:
+        """Query events using HogQL."""
         conditions = []
         if event:
             conditions.append(f"event = '{event}'")
@@ -165,26 +143,17 @@ class PostHogClient:
             ORDER BY timestamp DESC
             LIMIT {limit}
         """
-        return self.query(sql, name="events_query")
+        return self.query(project_id, sql, name="events_query")
 
     def breakdown(
         self,
+        project_id: str | int,
         event: str | None = None,
         property: str = "$browser",
         days: int = 7,
         limit: int = 20,
     ) -> dict:
-        """Get event breakdown by a property.
-
-        Args:
-            event: Event name to filter (None for all events)
-            property: Property to breakdown by (e.g., '$browser', '$os')
-            days: Number of days to look back
-            limit: Max results
-
-        Returns:
-            Query results with breakdown
-        """
+        """Get event breakdown by a property."""
         event_filter = f"AND event = '{event}'" if event else ""
         sql = f"""
             SELECT
@@ -198,24 +167,16 @@ class PostHogClient:
             ORDER BY count DESC
             LIMIT {limit}
         """
-        return self.query(sql, name=f"breakdown_{property}")
+        return self.query(project_id, sql, name=f"breakdown_{property}")
 
     def pageviews(
         self,
+        project_id: str | int,
         url_pattern: str | None = None,
         days: int = 7,
         limit: int = 20,
     ) -> dict:
-        """Get pageview analytics.
-
-        Args:
-            url_pattern: Filter URLs containing this pattern
-            days: Number of days to look back
-            limit: Max results
-
-        Returns:
-            Pageview data by URL
-        """
+        """Get pageview analytics."""
         url_filter = f"AND properties.$current_url LIKE '%{url_pattern}%'" if url_pattern else ""
         sql = f"""
             SELECT
@@ -230,26 +191,17 @@ class PostHogClient:
             ORDER BY views DESC
             LIMIT {limit}
         """
-        return self.query(sql, name="pageviews")
+        return self.query(project_id, sql, name="pageviews")
 
     def user_agents(
         self,
+        project_id: str | int,
         url_pattern: str | None = None,
         event: str = "$pageview",
         days: int = 7,
         limit: int = 20,
     ) -> dict:
-        """Get user-agent breakdown.
-
-        Args:
-            url_pattern: Filter URLs containing this pattern
-            event: Event type to filter
-            days: Number of days to look back
-            limit: Max results
-
-        Returns:
-            User-agent breakdown with counts and percentages
-        """
+        """Get user-agent breakdown."""
         url_filter = f"AND properties.$current_url LIKE '%{url_pattern}%'" if url_pattern else ""
         sql = f"""
             SELECT
@@ -265,7 +217,7 @@ class PostHogClient:
             ORDER BY count DESC
             LIMIT {limit}
         """
-        return self.query(sql, name="user_agents")
+        return self.query(project_id, sql, name="user_agents")
 
     def close(self):
         """Close the HTTP client."""
@@ -283,5 +235,4 @@ class PostHogClient:
 
 def _client() -> PostHogClient:
     api_key = secret("POSTHOG_API_KEY", "")
-    project_id = secret("POSTHOG_PROJECT_ID", "")
-    return PostHogClient(api_key=api_key, project_id=project_id)
+    return PostHogClient(api_key=api_key)
