@@ -15,7 +15,7 @@ def _install_fake_tool_manager(monkeypatch: pytest.MonkeyPatch) -> None:
             name=name,
             description="Investment persona",
             engine="amp",
-            default_repo="paradigmxyz/centaur",
+            default_repo="openfort-xyz/centaur",
             prompt_file="PROMPT.md",
             has_custom_executor=False,
         )
@@ -44,7 +44,7 @@ async def test_runtime_reports_active_persona_and_overlay(
     _install_fake_tool_manager(monkeypatch)
     monkeypatch.setattr(agent, "get_active_assignment", fake_get_active_assignment)
     monkeypatch.setenv("CENTAUR_OVERLAY_DIR", str(tmp_path))
-    monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE", "ghcr.io/paradigmxyz/centaur-paradigm:sha-test")
+    monkeypatch.setenv("CENTAUR_OVERLAY_IMAGE", "ghcr.io/openfort-xyz/centaur-openfort:sha-test")
 
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(db_pool=object())),
@@ -60,7 +60,7 @@ async def test_runtime_reports_active_persona_and_overlay(
         "loaded": True,
         "mount_api": str(tmp_path),
         "mount_sandbox": "/home/agent/overlay/org",
-        "image": "ghcr.io/paradigmxyz/centaur-paradigm:sha-test",
+        "image": "ghcr.io/openfort-xyz/centaur-openfort:sha-test",
     }
     assert result["available_personas"] == ["eng", "invest"]
 

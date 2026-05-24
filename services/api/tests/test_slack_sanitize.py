@@ -13,7 +13,7 @@ def test_empty_input_returns_empty_string():
 
 
 def test_passes_through_clean_prose_unchanged():
-    text = "Spock — Paradigm's investment agent. What are we looking at?"
+    text = "Spock — Openfort's investment agent. What are we looking at?"
     assert sanitize_for_slack(text) == text
 
 

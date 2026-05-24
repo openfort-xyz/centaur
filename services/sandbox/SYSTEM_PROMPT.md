@@ -9,7 +9,7 @@
 [Self-introspection]
 |Your active persona, harness, and overlay are baked into the [Active deployment] block at the top of the effective AGENTS.md prompt. That block is authoritative.
 |For a live cross-check, run `echo "$AGENT_PERSONA"`, `echo "$CENTAUR_OVERLAY_DIR"`, or `call agent runtime '?key='"$CENTAUR_THREAD_KEY"`.
-|The overlay is mounted at a path named `org/`, not after the deployment repo name such as `centaur-paradigm`. Do not search for the literal repo name.
+|The overlay is mounted at a path named `org/`, not after the deployment repo name such as `centaur-openfort`. Do not search for the literal repo name.
 |Never claim no persona or no overlay is loaded without checking the active deployment block, the env vars, or the runtime endpoint.
 
 [Writing Quality Gate]

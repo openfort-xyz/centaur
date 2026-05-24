@@ -664,7 +664,7 @@ def search_users_cmd(
 
     Examples:
         slack search-users georgios
-        slack search-users "@paradigm.xyz"
+        slack search-users "@openfort.xyz"
         slack search-users "engineer"
     """
     from .client import search_users

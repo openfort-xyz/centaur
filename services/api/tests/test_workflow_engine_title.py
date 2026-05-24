@@ -137,8 +137,8 @@ async def test_title_handles_non_dict_active_assignment(monkeypatch):
 # ── Per-message header (rendered italic above every assistant message) ─────
 
 @pytest.mark.asyncio
-async def test_header_uses_base_when_no_persona_paradigm_claude(monkeypatch):
-    """Paradigm + no persona + claude-code → ``base · claude-opus-4-7``."""
+async def test_header_uses_base_when_no_persona_default_claude(monkeypatch):
+    """Default org + no persona + claude-code → ``base · claude-opus-4-7``."""
     get_active = AsyncMock(return_value={"persona_id": None, "harness": "claude-code", "engine": "claude-code"})
     monkeypatch.setattr(workflow_engine, "get_active_assignment", get_active)
     monkeypatch.delenv("CLAUDE_MODEL", raising=False)
@@ -151,8 +151,8 @@ async def test_header_uses_base_when_no_persona_paradigm_claude(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_header_uses_persona_segment_paradigm_legal_codex(monkeypatch):
-    """Paradigm + legal persona + codex → ``legal · codex-gpt-5``."""
+async def test_header_uses_persona_segment_default_legal_codex(monkeypatch):
+    """Default org + legal persona + codex → ``legal · codex-gpt-5``."""
     get_active = AsyncMock(return_value={"persona_id": "legal", "harness": "legal", "engine": "codex"})
     monkeypatch.setattr(workflow_engine, "get_active_assignment", get_active)
     monkeypatch.setenv("CODEX_MODEL", "gpt-5")

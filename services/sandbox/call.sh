@@ -32,7 +32,7 @@ request() {
   local data="${3:-}"
   # Watchdog ceiling for the curl -> API hop, NOT a quality budget. Tool
   # plugins can legitimately run for many minutes (deep research crawls,
-  # recursive people pulls, internal-priors aggregation, paradigm-pulse, etc.)
+  # recursive people pulls, internal-priors aggregation, daily digests, etc.)
   # and Anthropic / OpenAI deep_research calls under the hood routinely take
   # 5-15 minutes. The previous 30s default made the helper report "failed"
   # while the upstream tool was still working, which trained agents to retry
