@@ -1,0 +1,25 @@
+[project]
+name = "stripe"
+version = "0.1.0"
+description = "Stripe billing and subscription data"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+stripe = "stripe.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.centaur]
+module = "client.py"
+hosts = ["api.stripe.com"]
+secrets = [
+    {type = "http", name = "STRIPE_RESTRICTED_KEY", match_headers = ["Authorization"], hosts = ["api.stripe.com"]},
+]
