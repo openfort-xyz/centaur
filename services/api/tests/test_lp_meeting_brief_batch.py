@@ -29,7 +29,7 @@ def _event(
         "id": event_id or summary.lower().replace(" ", "-"),
         "summary": summary,
         "description": description,
-        "attendees": attendees or ["allocator@example.com", "owner@paradigm.xyz"],
+        "attendees": attendees or ["allocator@example.com", "owner@openfort.xyz"],
         "has_visibility": has_visibility,
         "start": "2026-05-06T16:00:00+00:00",
     }
@@ -55,7 +55,7 @@ def test_lp_meeting_filter_accepts_positive_examples_and_paraphrases() -> None:
     ]
 
     for summary in [*positives, *paraphrases]:
-        assert _looks_like_lp_meeting(_event(summary), "pam@paradigm.xyz"), summary
+        assert _looks_like_lp_meeting(_event(summary), "pam@openfort.xyz"), summary
 
 
 def test_lp_meeting_filter_rejects_negative_examples() -> None:
@@ -65,7 +65,7 @@ def test_lp_meeting_filter_rejects_negative_examples() -> None:
         "Team all hands",
     ]
     for summary in negatives:
-        assert not _looks_like_lp_meeting(_event(summary), "pam@paradigm.xyz"), summary
+        assert not _looks_like_lp_meeting(_event(summary), "pam@openfort.xyz"), summary
 
 
 def test_lp_meeting_filter_rejects_private_or_internal_only_events() -> None:
@@ -75,7 +75,7 @@ def test_lp_meeting_filter_rejects_private_or_internal_only_events() -> None:
     assert not _looks_like_lp_meeting(
         _event(
             "Allocator meeting",
-            attendees=["owner@paradigm.xyz", "colleague@paradigm.xyz"],
+            attendees=["owner@openfort.xyz", "colleague@openfort.xyz"],
         ),
         IR_CALENDAR_ID,
     )

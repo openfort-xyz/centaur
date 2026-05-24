@@ -250,7 +250,7 @@ def calendar_events(
         gsuite calendar events -n 10 -d 7
         gsuite calendar events --query "meeting"
         gsuite calendar events --start 2025-01-01 --end 2025-12-31
-        gsuite calendar events -c dan@paradigm.xyz -s 2025-01-01 -e 2025-06-30
+        gsuite calendar events -c dan@openfort.xyz -s 2025-01-01 -e 2025-06-30
     """
     from datetime import datetime, timedelta, timezone
 
@@ -1207,8 +1207,8 @@ def docs_create_cmd(
     removes the service account's editor role permissions after 7 days.
 
     Examples:
-        gsuite docs create "Meeting Notes" --channel eng-ai --owner alice@paradigm.xyz
-        gsuite docs create "Doc Title" --channel ai-agent --owner bob@paradigm.xyz --content "Hello"
+        gsuite docs create "Meeting Notes" --channel eng-ai --owner alice@openfort.xyz
+        gsuite docs create "Doc Title" --channel ai-agent --owner bob@openfort.xyz --content "Hello"
     """
     from .client import docs_create, drive_setup_channel_permissions
 
@@ -1328,7 +1328,7 @@ def sheets_create_cmd(
     removes the service account's editor role permissions after 7 days.
 
     Examples:
-        gsuite sheets create "My Spreadsheet" --channel eng-ai --owner alice@paradigm.xyz
+        gsuite sheets create "My Spreadsheet" --channel eng-ai --owner alice@openfort.xyz
     """
     from .client import sheets_create, drive_setup_channel_permissions
 
@@ -1376,7 +1376,7 @@ def slides_create_cmd(
     removes the service account's editor role permissions after 7 days.
 
     Examples:
-        gsuite slides create "My Presentation" --channel eng-ai --owner alice@paradigm.xyz
+        gsuite slides create "My Presentation" --channel eng-ai --owner alice@openfort.xyz
     """
     from .client import slides_create, drive_setup_channel_permissions
 
@@ -1428,7 +1428,7 @@ def _setup_analytics_property():
 
         if not resolved_id:
             console.print(f"[red]Could not find GA4 property for: {_analytics_site}[/]")
-            console.print("[dim]Known sites: paradigm.xyz, predictions.paradigm.xyz[/]")
+            console.print("[dim]Known sites: openfort.xyz, docs.openfort.xyz[/]")
             console.print("[dim]Tip: Use 'gsuite analytics sites' to list known sites[/]")
             raise typer.Exit(1)
 
@@ -1440,7 +1440,7 @@ def _setup_analytics_property():
 
 @analytics_app.callback()
 def analytics_main(
-    site: str = typer.Option(None, "--site", "-s", help="Site name (e.g., 'paradigm.xyz')"),
+    site: str = typer.Option(None, "--site", "-s", help="Site name (e.g., 'openfort.xyz')"),
     property_id: str = typer.Option(None, "--property", "-p", help="GA4 property ID"),
 ):
     """Google Analytics - query GA4 data.
@@ -1448,7 +1448,7 @@ def analytics_main(
     Use --site for known sites or --property for custom property IDs.
 
     Examples:
-        gsuite analytics -s paradigm.xyz summary
+        gsuite analytics -s openfort.xyz summary
         gsuite analytics -s predictions pages --start 7daysAgo
     """
     global _analytics_site, _analytics_property
@@ -1481,7 +1481,7 @@ def analytics_sites():
 
     console.print(table)
     console.print("\n[dim]Use --site or -s to select a site, e.g.:[/]")
-    console.print("[dim]  gsuite analytics -s paradigm.xyz summary[/]")
+    console.print("[dim]  gsuite analytics -s openfort.xyz summary[/]")
 
 
 @analytics_app.command("summary")
@@ -1493,8 +1493,8 @@ def analytics_summary(
     """Get summary metrics for the property.
 
     Examples:
-        gsuite analytics -s paradigm.xyz summary
-        gsuite analytics -s paradigm.xyz summary --start 7daysAgo
+        gsuite analytics -s openfort.xyz summary
+        gsuite analytics -s openfort.xyz summary --start 7daysAgo
     """
     import json
     from .client import analytics_get_summary
@@ -1548,8 +1548,8 @@ def analytics_sources(
     """Get traffic by source/medium.
 
     Examples:
-        gsuite analytics -s paradigm.xyz sources
-        gsuite analytics -s paradigm.xyz sources --start 7daysAgo -n 10
+        gsuite analytics -s openfort.xyz sources
+        gsuite analytics -s openfort.xyz sources --start 7daysAgo -n 10
     """
     import json
     from .client import analytics_get_traffic_by_source
@@ -1861,8 +1861,8 @@ def analytics_query(
     """Run a custom query with any dimensions and metrics.
 
     Examples:
-        gsuite analytics -s paradigm.xyz query "country,deviceCategory" "sessions,activeUsers"
-        gsuite analytics -s paradigm.xyz query "pagePath" "screenPageViews" -n 50
+        gsuite analytics -s openfort.xyz query "country,deviceCategory" "sessions,activeUsers"
+        gsuite analytics -s openfort.xyz query "pagePath" "screenPageViews" -n 50
 
     Common dimensions: country, city, deviceCategory, browser, operatingSystem,
         pagePath, pageTitle, sessionSourceMedium, sessionDefaultChannelGroup

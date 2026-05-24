@@ -28,7 +28,7 @@ from .client import (
 )
 
 # Feedback database location
-FEEDBACK_DB_PATH = Path.home() / ".cache" / "paradigm-slack" / "feedback.db"
+FEEDBACK_DB_PATH = Path.home() / ".cache" / "centaur-slack" / "feedback.db"
 SANDBOX_API_KEY_PATH = Path("/home/agent/.api_key")
 
 # Heuristic signals for feedback detection
@@ -335,7 +335,6 @@ def extract_amp_thread_id(messages: list[dict]) -> str | None:
 def extract_cli_mentions(text: str) -> list[str]:
     """Extract CLI names mentioned in text."""
     known_clis = [
-        "paradigmdb",
         "figma",
         "anchorage",
         "coinbase",
@@ -840,10 +839,11 @@ def build_improvement_prompt(items: list[FeedbackItem], channels: list[str]) -> 
             }
         )
 
+    centaur_repo = os.getenv("CENTAUR_REPO", "openfort-xyz/centaur")
     prompt = [
-        "You are working on paradigmxyz/centaur.",
+        f"You are working on {centaur_repo}.",
         "Investigate and fix the highest-leverage issues surfaced by Slack feedback.",
-        "Use git-branch paradigmxyz/centaur before editing because the host mount is read-only.",
+        f"Use git-branch {centaur_repo} before editing because the host mount is read-only.",
         "Read the linked Slack permalinks and Amp threads when they are relevant, then make code changes in the repo.",
         "Prefer the smallest fixes that materially improve agent behavior.",
         "When done, open a PR with a concise summary of the fixes.",

@@ -421,7 +421,7 @@ async def test_create_requires_repo_cache_volume_for_repo(
             "slack:C123:123.456",
             "amp",
             "amp",
-            repo="paradigmxyz/centaur",
+            repo="openfort-xyz/centaur",
         )
 
 
@@ -480,7 +480,7 @@ async def test_create_builds_pod_and_prompt_secret(
         "amp",
         "amp",
         persona="eng",
-        repo="paradigmxyz/centaur",
+        repo="openfort-xyz/centaur",
         resume_thread_id="T-123",
         trace_id="00000000-0000-0000-0000-000000000123",
     )
@@ -515,7 +515,7 @@ async def test_create_builds_pod_and_prompt_secret(
     assert env["AMP_API_KEY"] == "AMP_API_KEY"
     assert env["CENTAUR_OVERLAY_DIR"] == "/home/agent/overlay/org"
     assert env["AGENT_PERSONA"] == "eng"
-    assert env["AGENT_REPO"] == "paradigmxyz/centaur"
+    assert env["AGENT_REPO"] == "openfort-xyz/centaur"
     assert (
         pod_body["metadata"]["annotations"]["centaur.ai/thread-key"]
         == "slack:C123:123.456"
@@ -968,7 +968,7 @@ async def test_create_mounts_repo_cache_host_path(
         "slack:C123:123.456",
         "amp",
         "amp",
-        repo="paradigmxyz/centaur",
+        repo="openfort-xyz/centaur",
     )
 
     pod_body = fake_core.created_pods[1][1]

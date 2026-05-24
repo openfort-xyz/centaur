@@ -33,7 +33,7 @@ describe('Slack event HTTP dedupe', () => {
             issueCreate: {
               issue: {
                 identifier: 'DSGN-123',
-                url: 'https://linear.app/paradigmxyz/issue/DSGN-123'
+                url: 'https://linear.app/openfort/issue/DSGN-123'
               }
             }
           }
@@ -61,7 +61,7 @@ describe('Slack event HTTP dedupe', () => {
       expect(response.status).toBe(200)
       expect(await response.json()).toEqual({
         response_type: 'ephemeral',
-        text: 'Created DSGN-123: https://linear.app/paradigmxyz/issue/DSGN-123'
+        text: 'Created DSGN-123: https://linear.app/openfort/issue/DSGN-123'
       })
       expect(fetchMock).toHaveBeenCalledTimes(1)
     } finally {
