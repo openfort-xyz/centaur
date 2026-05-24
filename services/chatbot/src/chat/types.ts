@@ -100,6 +100,28 @@ export type GoogleChatEnvelope = {
   configCompleteRedirectUrl?: string
 }
 
+// Inbound message shape returned by spaces.messages.list / spaces.messages.get.
+// Richer than the outbound `GoogleChatMessage` (which only types fields we send).
+// Field reference: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages#Message
+export type ChatListMessage = {
+  name?: string
+  text?: string
+  argumentText?: string
+  formattedText?: string
+  fallbackText?: string
+  createTime?: string
+  lastUpdateTime?: string
+  threadReply?: boolean
+  thread?: { name?: string }
+  sender?: {
+    name?: string
+    displayName?: string
+    type?: 'HUMAN' | 'BOT'
+    domainId?: string
+  }
+  annotations?: Array<{ type?: string }>
+}
+
 export type GoogleChatMessage = {
   name?: string
   text?: string
