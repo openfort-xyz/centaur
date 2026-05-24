@@ -421,7 +421,7 @@ def react(
     from .client import TelegramClient; c = TelegramClient()
     reaction_list = [e.strip() for e in emoji.split(",")] if emoji else None
     result = asyncio.run(c.set_message_reaction(chat_id, message_id, reaction_list))
-    if json_output: print(json.dumps({"ok": result}), indent=2); return
+    if json_output: print(json.dumps({"ok": result}, indent=2)); return
     console.print(f"[green]✓[/] Reaction {'set' if reaction_list else 'removed'}")
 
 
@@ -435,7 +435,7 @@ def pin(
     """Pin a message."""
     from .client import TelegramClient; c = TelegramClient()
     result = asyncio.run(c.pin_chat_message(chat_id, message_id, disable_notification=silent))
-    if json_output: print(json.dumps({"ok": result}), indent=2); return
+    if json_output: print(json.dumps({"ok": result}, indent=2)); return
     console.print(f"[green]✓[/] Pinned message {message_id}")
 
 
@@ -448,7 +448,7 @@ def unpin(
     """Unpin a message."""
     from .client import TelegramClient; c = TelegramClient()
     result = asyncio.run(c.unpin_chat_message(chat_id, message_id))
-    if json_output: print(json.dumps({"ok": result}), indent=2); return
+    if json_output: print(json.dumps({"ok": result}, indent=2)); return
     console.print(f"[green]✓[/] Unpinned {'message ' + str(message_id) if message_id else 'most recent'}")
 
 
@@ -543,13 +543,13 @@ def commands(
     from .client import TelegramClient; c = TelegramClient()
     if set_cmds and cmd:
         import re
-        parsed = [dict(zip(["command","description"], re.split(r":", c, 1))) for c in cmd]
+        parsed = [dict(zip(["command","description"], re.split(r":", entry, 1))) for entry in cmd]
         asyncio.run(c.set_my_commands(parsed))
         console.print(f"[green]✓[/] Set {len(parsed)} commands")
         return
     cmds = asyncio.run(c.get_my_commands())
     if json_output: print(json.dumps(cmds, indent=2)); return
-    for c in cmds: console.print(f"  /{c['command']} — {c['description']}")
+    for entry in cmds: console.print(f"  /{entry['command']} — {entry['description']}")
 
 
 @app.callback()
