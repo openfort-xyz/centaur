@@ -21,9 +21,12 @@ build-backend = "hatchling.build"
 module = "client.py"
 hosts = ["logging.googleapis.com"]
 # Authentication is minted by iron-proxy's gcp_auth transform: it loads the
-# GOOGLE_SERVICE_ACCOUNT_JSON keyfile, mints an OAuth2 access token for the
+# GCP_LOGS_SERVICE_ACCOUNT_JSON keyfile, mints an OAuth2 access token for the
 # logging.read scope, and injects it as Authorization: Bearer on outbound
 # requests to logging.googleapis.com. The tool never sees the credential.
+#
+# This is a dedicated logs-only service account, distinct from
+# GOOGLE_SERVICE_ACCOUNT_JSON (which the chatbot uses for Google Chat).
 secrets = [
-    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["logging.googleapis.com"], scopes = ["https://www.googleapis.com/auth/logging.read"]},
+    {type = "gcp_auth", name = "GCP_LOGS_SERVICE_ACCOUNT_JSON", hosts = ["logging.googleapis.com"], scopes = ["https://www.googleapis.com/auth/logging.read"]},
 ]
