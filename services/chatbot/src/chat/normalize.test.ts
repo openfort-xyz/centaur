@@ -1,6 +1,11 @@
 import { test, expect, describe } from 'bun:test'
-import { normalizeChatEnvelope, normalizeChatText } from './normalize'
-import type { GoogleChatEnvelope } from './types'
+import {
+  collectThreadHistory,
+  normalizeChatEnvelope,
+  normalizeChatText,
+  type ChatHistoryFetcher
+} from './normalize'
+import type { ChatListMessage, GoogleChatEnvelope } from './types'
 
 const BOT_USER = 'users/bot-account'
 
@@ -89,6 +94,264 @@ describe('normalizeChatEnvelope', () => {
       BOT_USER
     )
     expect(own).toBeNull()
+  })
+})
+
+describe('collectThreadHistory', () => {
+  type CapturedCall = { spaceName: string; filter?: string; orderBy?: string; pageToken?: string }
+  function fetcher(
+    pages: Array<{ messages: ChatListMessage[]; nextPageToken?: string }>,
+    captured?: CapturedCall[]
+  ): ChatHistoryFetcher {
+    let i = 0
+    return {
+      async listMessages(spaceName, opts) {
+        captured?.push({
+          spaceName,
+          filter: opts.filter,
+          orderBy: opts.orderBy,
+          pageToken: opts.pageToken
+        })
+        const page = pages[i] ?? { messages: [] }
+        i++
+        return page
+      }
+    }
+  }
+
+  const baseOpts = {
+    spaceName: 'spaces/AAAA',
+    threadName: 'spaces/AAAA/threads/T1',
+    currentMessageName: 'spaces/AAAA/messages/T1.M3',
+    botUserName: BOT_USER
+  }
+
+  test('fetches prior thread messages, infers roles, drops the current one and chronologizes', async () => {
+    const captured: CapturedCall[] = []
+    const history: ChatListMessage[] = [
+      // Newest first — Google returns desc by createTime as we asked.
+      {
+        name: 'spaces/AAAA/messages/T1.M3',
+        text: 'what about it?',
+        sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' },
+        createTime: '2026-01-01T00:00:03Z'
+      },
+      {
+        name: 'spaces/AAAA/messages/T1.M2',
+        argumentText: 'sure, what do you want to know?',
+        sender: { name: 'users/bot-numeric-id', displayName: 'Bot', type: 'BOT' },
+        createTime: '2026-01-01T00:00:02Z'
+      },
+      {
+        name: 'spaces/AAAA/messages/T1.M1',
+        text: 'hey can we chat about openfort',
+        sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' },
+        createTime: '2026-01-01T00:00:01Z'
+      }
+    ]
+    const out = await collectThreadHistory(
+      fetcher([{ messages: history }], captured),
+      baseOpts
+    )
+
+    expect(out).toHaveLength(2)
+    const [first, second] = out
+    expect(first).toMatchObject({ role: 'user', message_id: 'spaces/AAAA/messages/T1.M1' })
+    expect(first?.parts[0]).toMatchObject({ type: 'text', text: 'hey can we chat about openfort' })
+    expect(second).toMatchObject({ role: 'assistant', message_id: 'spaces/AAAA/messages/T1.M2' })
+    expect(second?.parts[0]).toMatchObject({ type: 'text', text: 'sure, what do you want to know?' })
+
+    expect(captured).toHaveLength(1)
+    expect(captured[0]?.spaceName).toBe('spaces/AAAA')
+    expect(captured[0]?.filter).toBe('thread.name = "spaces/AAAA/threads/T1"')
+    expect(captured[0]?.orderBy).toBe('createTime desc')
+  })
+
+  test('returns [] without an API call when the message *is* the thread root', async () => {
+    const captured: CapturedCall[] = []
+    const out = await collectThreadHistory(fetcher([], captured), {
+      ...baseOpts,
+      // Real Google shape: thread.name uses /threads/<T>, message.name uses /messages/<T>
+      threadName: 'spaces/AAAA/threads/r23TZL4dpqk',
+      currentMessageName: 'spaces/AAAA/messages/r23TZL4dpqk'
+    })
+    expect(out).toEqual([])
+    expect(captured).toHaveLength(0)
+  })
+
+  test('treats /messages/<T>.<reply> as inside thread <T>, not the root', async () => {
+    const captured: CapturedCall[] = []
+    await collectThreadHistory(fetcher([{ messages: [] }], captured), {
+      ...baseOpts,
+      threadName: 'spaces/AAAA/threads/r23TZL4dpqk',
+      currentMessageName: 'spaces/AAAA/messages/r23TZL4dpqk.Rcgc9eeTD7Q'
+    })
+    expect(captured).toHaveLength(1)
+  })
+
+  test('rejects malformed threadName without calling the API (injection defense)', async () => {
+    const captured: CapturedCall[] = []
+    const hostile = 'spaces/AAAA/threads/T1" OR thread.name = "spaces/OTHER/threads/Z'
+    const out = await collectThreadHistory(fetcher([], captured), {
+      ...baseOpts,
+      threadName: hostile
+    })
+    expect(out).toEqual([])
+    expect(captured).toHaveLength(0)
+  })
+
+  test('paginates and caps at THREAD_HISTORY_LIMIT (50), keeping the newest', async () => {
+    // Build 60 desc-ordered messages across two pages of 100 (one with token, one without).
+    const desc: ChatListMessage[] = Array.from({ length: 60 }, (_, i) => {
+      const idx = 60 - i // 60, 59, ..., 1
+      return {
+        name: `spaces/AAAA/messages/T1.M${String(idx).padStart(3, '0')}`,
+        text: `msg ${idx}`,
+        sender: { name: 'users/U1', type: 'HUMAN' as const },
+        createTime: `2026-01-01T00:${String(idx).padStart(2, '0')}:00Z`
+      }
+    })
+    const captured: CapturedCall[] = []
+    const out = await collectThreadHistory(
+      fetcher(
+        [
+          { messages: desc.slice(0, 30), nextPageToken: 'pg2' },
+          { messages: desc.slice(30, 60) }
+        ],
+        captured
+      ),
+      { ...baseOpts, currentMessageName: 'spaces/AAAA/messages/never-matches' }
+    )
+    expect(out).toHaveLength(50)
+    // Chronologically ordered: the OLDEST in the returned slice should be msg 11
+    // (i.e. the 50 newest of 60 are msgs 11..60, ascending).
+    expect(out[0]?.message_id).toBe('spaces/AAAA/messages/T1.M011')
+    expect(out[out.length - 1]?.message_id).toBe('spaces/AAAA/messages/T1.M060')
+    // We should have stopped paginating once we hit the cap — second page started
+    // mid-iteration but the loop breaks at 50.
+    expect(captured.length).toBeLessThanOrEqual(2)
+  })
+
+  test('infers role=assistant via botUserName fallback when sender.type is missing', async () => {
+    const out = await collectThreadHistory(
+      fetcher([
+        {
+          messages: [
+            {
+              name: 'spaces/AAAA/messages/T1.M1',
+              text: 'older bot turn',
+              sender: { name: BOT_USER } // no type field
+            }
+          ]
+        }
+      ]),
+      baseOpts
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.role).toBe('assistant')
+  })
+
+  test('drops the bot’s own "_Centaur is thinking…_" ack messages from history', async () => {
+    const out = await collectThreadHistory(
+      fetcher([
+        {
+          messages: [
+            {
+              name: 'spaces/AAAA/messages/T1.M2',
+              text: '_Centaur is thinking…_',
+              sender: { name: 'users/bot', type: 'BOT' }
+            },
+            {
+              name: 'spaces/AAAA/messages/T1.M1',
+              text: 'real user content',
+              sender: { name: 'users/U1', type: 'HUMAN' }
+            }
+          ]
+        }
+      ]),
+      baseOpts
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.message_id).toBe('spaces/AAAA/messages/T1.M1')
+  })
+
+  test('drops content-less messages (card-only or empty)', async () => {
+    const out = await collectThreadHistory(
+      fetcher([
+        {
+          messages: [
+            { name: 'spaces/AAAA/messages/T1.M2', text: '', sender: { name: 'users/U1' } },
+            {
+              name: 'spaces/AAAA/messages/T1.M1',
+              text: 'hello',
+              sender: { name: 'users/U1' }
+            }
+          ]
+        }
+      ]),
+      baseOpts
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.message_id).toBe('spaces/AAAA/messages/T1.M1')
+  })
+
+  test('returns [] on Chat API 503', async () => {
+    const breaking: ChatHistoryFetcher = {
+      async listMessages() {
+        throw new Error('Chat API GET spaces/X/messages failed: 503 backend unavailable')
+      }
+    }
+    const out = await collectThreadHistory(breaking, baseOpts)
+    expect(out).toEqual([])
+  })
+
+  test('returns [] on Chat API 403 (scope misconfig) — logged as scope_denied', async () => {
+    const breaking: ChatHistoryFetcher = {
+      async listMessages() {
+        throw new Error('Chat API GET spaces/X/messages failed: 403 PERMISSION_DENIED')
+      }
+    }
+    const out = await collectThreadHistory(breaking, baseOpts)
+    expect(out).toEqual([])
+  })
+
+  test('strips bot mention from user-authored history, not the user’s own resource name', async () => {
+    const out = await collectThreadHistory(
+      fetcher([
+        {
+          messages: [
+            {
+              name: 'spaces/AAAA/messages/T1.M1',
+              text: 'hey <users/bot-account> can you help',
+              sender: { name: 'users/U1', type: 'HUMAN' }
+            }
+          ]
+        }
+      ]),
+      baseOpts
+    )
+    // Mention is stripped; surrounding double-space is left as-is (cosmetic only).
+    expect(out[0]?.parts[0]).toMatchObject({ type: 'text', text: 'hey  can you help' })
+  })
+})
+
+describe('normalizeChatEnvelope (no client → no history)', () => {
+  test('does not attach history_messages by itself; index.ts merges them in', async () => {
+    const env: GoogleChatEnvelope = {
+      type: 'MESSAGE',
+      eventTime: '2026-01-01T00:00:00Z',
+      space: { name: 'spaces/AAAA', type: 'SPACE' },
+      thread: { name: 'spaces/AAAA/threads/T1' },
+      message: {
+        name: 'spaces/AAAA/messages/T1.M2',
+        text: '<users/bot-account> hi',
+        thread: { name: 'spaces/AAAA/threads/T1' },
+        sender: { name: 'users/U1', displayName: 'Alice' }
+      }
+    }
+    const normalized = await normalizeChatEnvelope(env, BOT_USER)
+    expect(normalized).not.toBeNull()
+    expect(normalized!.history_messages).toBeUndefined()
   })
 })
 

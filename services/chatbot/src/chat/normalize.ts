@@ -1,6 +1,25 @@
-import type { NormalizedChatEvent, NormalizedPart, GoogleChatEnvelope, ChatSpaceType } from './types'
+import type {
+  ChatListMessage,
+  ChatSpaceType,
+  GoogleChatEnvelope,
+  NormalizedChatEvent,
+  NormalizedPart
+} from './types'
 
 type ChatHistoryMessage = NonNullable<NormalizedChatEvent['history_messages']>[number]
+
+// Minimal interface we need from ChatEdgeClient — keeps normalize.ts unit-testable
+// without instantiating the real client (which needs a service-account JSON).
+export interface ChatHistoryFetcher {
+  listMessages(
+    spaceName: string,
+    opts: { pageSize?: number; pageToken?: string; filter?: string; orderBy?: string }
+  ): Promise<{ messages?: ChatListMessage[]; nextPageToken?: string }>
+}
+
+// Cap on how many thread messages we ship to the agent. A typical 4-5 turn
+// thread fits well under this; mega-threads would blow up the LLM context.
+const THREAD_HISTORY_LIMIT = 50
 
 export async function normalizeChatEnvelope(
   envelope: GoogleChatEnvelope,
@@ -59,15 +78,6 @@ export async function normalizeChatEnvelope(
   const threadName = threadField?.name
   const threadKey = buildThreadKey(spaceName, threadName ?? message.name)
 
-  const historyMessages = isMention
-    ? await collectThreadHistorySafely({
-        spaceName,
-        threadName,
-        currentMessageName: message.name,
-        botUserName
-      })
-    : []
-
   return {
     thread_key: threadKey,
     message_id: message.name,
@@ -77,13 +87,123 @@ export async function normalizeChatEnvelope(
     user_name: displayName,
     is_mention: isMention,
     parts,
-    ...(historyMessages.length ? { history_messages: historyMessages } : {}),
     chat: {
       event_time: eventTime,
       message_name: message.name,
       thread_name: threadName
     }
   }
+}
+
+// thread.name = "spaces/<S>/threads/<T>" — strict shape, anything else is
+// either a Google API surface change or a forged envelope. Build the filter
+// only after passing this guard to keep the filter expression safe.
+const THREAD_NAME_PATTERN = /^spaces\/[A-Za-z0-9_-]+\/threads\/[A-Za-z0-9_.-]+$/
+
+/**
+ * Fetch prior messages in the thread the bot was @mentioned in.
+ * Caller should post the user-visible ack BEFORE awaiting this (a slow Chat
+ * backend on the listMessages call could otherwise blow the ~5s "bot not
+ * responding" budget Google enforces).
+ *
+ * Returns [] when:
+ *  - The thread is a fresh root (no prior context to fetch).
+ *  - The threadName fails validation (defense in depth against injection).
+ *  - The API errors out (degrades silently so a Chat outage cannot drop the event).
+ *
+ * Throws? No — all failures are converted to [] with a structured log line.
+ */
+export async function collectThreadHistory(
+  client: ChatHistoryFetcher,
+  opts: {
+    spaceName: string
+    threadName: string | undefined
+    currentMessageName: string
+    botUserName?: string
+  }
+): Promise<ChatHistoryMessage[]> {
+  // No thread, or this message *is* the thread root → nothing earlier exists.
+  if (!opts.threadName) return []
+  if (isThreadRoot(opts.threadName, opts.currentMessageName)) return []
+
+  // Reject anything that doesn't match the canonical resource-name shape.
+  // Prevents quote/backslash/newline injection into the filter expression
+  // and guards against unexpected envelope mutations.
+  if (!THREAD_NAME_PATTERN.test(opts.threadName)) {
+    console.warn('chat_thread_history_invalid_thread_name', {
+      space: opts.spaceName,
+      thread: opts.threadName
+    })
+    return []
+  }
+
+  const filter = `thread.name = "${opts.threadName}"`
+
+  const collected: ChatListMessage[] = []
+  let pageToken: string | undefined
+  try {
+    do {
+      const page = await client.listMessages(opts.spaceName, {
+        pageSize: 100,
+        pageToken,
+        filter,
+        // Newest first so the cap drops the OLDEST messages — recency carries
+        // the most context for a reply. Long threads will lose their head turn;
+        // acceptable for an assistant in conversational use.
+        orderBy: 'createTime desc'
+      })
+      for (const message of page.messages ?? []) {
+        if (!message.name || message.name === opts.currentMessageName) continue
+        if (isAckOrEmpty(message)) continue
+        collected.push(message)
+        if (collected.length >= THREAD_HISTORY_LIMIT) break
+      }
+      if (collected.length >= THREAD_HISTORY_LIMIT) break
+      pageToken = page.nextPageToken
+    } while (pageToken)
+  } catch (error) {
+    // Distinguish scope/auth errors so a missed admin grant surfaces in logs
+    // rather than silently degrading every event for days.
+    const message = error instanceof Error ? error.message : String(error)
+    const isAuth = /\b(401|403)\b/.test(message)
+    console.warn(
+      isAuth ? 'chat_thread_history_scope_denied' : 'chat_thread_history_collect_failed',
+      {
+        space: opts.spaceName,
+        thread: opts.threadName,
+        error: message
+      }
+    )
+    return []
+  }
+
+  // desc → asc: agent prompt wants chronological order.
+  collected.reverse()
+
+  return collected.map(message => toHistoryMessage(message, opts.botUserName))
+}
+
+function isThreadRoot(threadName: string, currentMessageName: string): boolean {
+  // Resource names live in different collections:
+  //   thread.name  = spaces/<S>/threads/<T>
+  //   message.name = spaces/<S>/messages/<T>           ← thread root (no suffix)
+  //   message.name = spaces/<S>/messages/<T>.<reply>   ← reply in thread
+  // A thread-root message has message-id EXACTLY equal to the thread id; any
+  // ".<reply>" suffix means it's a reply, not the root.
+  const threadId = threadName.split('/threads/')[1]
+  const messageId = currentMessageName.split('/messages/')[1]
+  if (!threadId || !messageId) return false
+  return threadId === messageId
+}
+
+function isAckOrEmpty(message: ChatListMessage): boolean {
+  const text = (message.argumentText ?? message.text ?? '').trim()
+  if (!text) return true
+  // The inline ack we post at the start of every mention is the same literal
+  // string — it would otherwise show up as an "assistant said this" turn on
+  // every follow-up mention in the same thread.
+  if (text === '_Centaur is thinking…_') return true
+  return false
 }
 
 function buildAddedToSpaceEvent(
@@ -147,32 +267,40 @@ function normalizeThreadSegment(segment: string): string {
   return segment.replace(/\//g, ':').replace(/\s+/g, '_')
 }
 
-async function collectThreadHistorySafely(opts: {
-  spaceName: string
-  threadName?: string
-  currentMessageName: string
-  botUserName?: string
-}): Promise<ChatHistoryMessage[]> {
-  try {
-    return await collectThreadHistory(opts)
-  } catch (error) {
-    console.warn('chat_thread_history_collect_failed', {
-      space: opts.spaceName,
-      thread: opts.threadName,
-      error: error instanceof Error ? error.message : String(error)
-    })
-    return []
-  }
-}
+function toHistoryMessage(
+  message: ChatListMessage,
+  botUserName: string | undefined
+): ChatHistoryMessage {
+  const senderName = message.sender?.name
+  // Two-pronged role detection: prefer the explicit sender.type from the API,
+  // fall back to comparing against the bot's resource name. sender.type='BOT'
+  // is the reliable signal — botUserName matching is brittle because the bot's
+  // sender.name is a numeric "users/12345...", not "users/<email>".
+  const role: 'user' | 'assistant' =
+    message.sender?.type === 'BOT' || (botUserName && senderName === botUserName)
+      ? 'assistant'
+      : 'user'
 
-async function collectThreadHistory(opts: {
-  spaceName: string
-  threadName?: string
-  currentMessageName: string
-  botUserName?: string
-}): Promise<ChatHistoryMessage[]> {
-  if (!opts.threadName || opts.threadName === opts.currentMessageName) return []
-  return []
+  // Prefer argumentText (mention pre-stripped by Google) for cleaner agent
+  // prompts; fall back to text. Pass the bare bot id (sans "users/" prefix) so
+  // user messages mentioning the bot don't carry the raw <users/...> tag.
+  const rawText = (message.argumentText ?? message.text ?? '').trim()
+  const botMentionId = botUserName?.replace(/^users\//, '')
+  const cleaned = normalizeChatText(rawText, botMentionId)
+
+  const parts: NormalizedPart[] = cleaned ? [{ type: 'text', text: cleaned }] : []
+
+  const metadata: Record<string, unknown> = {}
+  if (message.createTime) metadata.create_time = message.createTime
+  if (message.sender?.displayName) metadata.sender_display_name = message.sender.displayName
+
+  return {
+    message_id: message.name ?? '',
+    role,
+    parts,
+    ...(senderName ? { user_id: senderName } : {}),
+    ...(Object.keys(metadata).length ? { metadata } : {})
+  }
 }
 
 function escapeRegex(str: string): string {

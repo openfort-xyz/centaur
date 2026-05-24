@@ -15,7 +15,7 @@ import {
 } from './chat/agent-session'
 import { ChatEdgeClient } from './chat/client'
 import { EventDeduper, chatDedupKey } from './chat/dedup'
-import { normalizeChatEnvelope } from './chat/normalize'
+import { collectThreadHistory, normalizeChatEnvelope } from './chat/normalize'
 import { verifyChatRequest } from './chat/verify'
 import { isAddedToSpace } from './chat/auth'
 import type { NormalizedChatEvent, GoogleChatEnvelope, GoogleChatMessage } from './chat/types'
@@ -273,18 +273,32 @@ async function processChatEvent(envelope: GoogleChatEnvelope): Promise<void> {
   // so we'd always lose this race. Posting inline keeps the user informed
   // and seeds the message_name that the outbox poller later PATCHes with the
   // final answer.
-  let ackMessageName = ''
-  try {
-    const ack = await client.createMessage(
+  //
+  // The thread-history fetch runs in parallel with the ack — neither depends
+  // on the other and they share the same network budget. Awaiting them
+  // separately lets us log a failure on either side without sacrificing the
+  // other.
+  const ackPromise = client
+    .createMessage(
       normalized.space_name,
       { text: '_Centaur is thinking…_' },
       { threadName: normalized.chat.thread_name }
     )
-    ackMessageName = ack.name ?? ''
-  } catch (error) {
-    logError('chat_ack_create_failed', error)
-    // Continue with handoff; outbox poller will fall back to createMessage.
-  }
+    .then(ack => ack.name ?? '')
+    .catch(error => {
+      logError('chat_ack_create_failed', error)
+      return ''
+    })
+
+  const historyPromise = collectThreadHistory(client, {
+    spaceName: normalized.space_name,
+    threadName: normalized.chat.thread_name,
+    currentMessageName: normalized.message_id,
+    botUserName: botUser
+  })
+
+  const [ackMessageName, historyMessages] = await Promise.all([ackPromise, historyPromise])
+  if (historyMessages.length) normalized.history_messages = historyMessages
 
   const result = await handoff.emit(normalized, { ackMessageName })
   if (!result.ok) {

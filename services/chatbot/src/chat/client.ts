@@ -1,5 +1,5 @@
 import type { AppConfig } from '../config'
-import type { GoogleChatMessage } from './types'
+import type { ChatListMessage, GoogleChatMessage } from './types'
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
@@ -38,7 +38,13 @@ export class ChatEdgeClient {
       return this.accessToken
     }
 
-    const scope = 'https://www.googleapis.com/auth/chat.bot'
+    // chat.bot: act as the app for sends/edits/deletes. Self-granted, no admin step.
+    // chat.app.messages.readonly: read sibling messages in threads the app is mentioned in.
+    // Requires one-time Workspace admin install of the private Marketplace listing.
+    const scope = [
+      'https://www.googleapis.com/auth/chat.bot',
+      'https://www.googleapis.com/auth/chat.app.messages.readonly'
+    ].join(' ')
     const now = Math.floor(Date.now() / 1000)
     const expiry = now + 3600
 
@@ -166,16 +172,29 @@ export class ChatEdgeClient {
   /**
    * List messages in a space.
    * Path: GET /v1/spaces/{space}/messages
+   *
+   * Pass `filter='thread.name="spaces/<id>/threads/<id>"'` to scope the listing
+   * to a single thread — this is how thread-history context is fetched after a
+   * bot @mention. Requires `chat.app.messages.readonly` (admin-approved) or a
+   * user-auth scope; the self-granted `chat.bot` scope is rejected with 403.
    */
   async listMessages(
     spaceName: string,
-    opts: { pageSize?: number; pageToken?: string } = {}
-  ): Promise<{ messages?: GoogleChatMessage[]; nextPageToken?: string }> {
+    opts: {
+      pageSize?: number
+      pageToken?: string
+      filter?: string
+      orderBy?: string
+    } = {}
+  ): Promise<{ messages?: ChatListMessage[]; nextPageToken?: string }> {
+    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
     const params = new URLSearchParams()
     if (opts.pageSize) params.set('pageSize', String(opts.pageSize))
     if (opts.pageToken) params.set('pageToken', opts.pageToken)
+    if (opts.filter) params.set('filter', opts.filter)
+    if (opts.orderBy) params.set('orderBy', opts.orderBy)
     const query = params.toString()
-    return this.request('GET', `spaces/${spaceName}/messages${query ? `?${query}` : ''}`)
+    return this.request('GET', `spaces/${id}/messages${query ? `?${query}` : ''}`)
   }
 
   /**
