@@ -106,6 +106,34 @@ if [ -f "$HARNESS_CONFIG_DIR/claude/settings.json" ]; then
     cp "$HARNESS_CONFIG_DIR/claude/settings.json" "$HOME_DIR/.claude/settings.json"
 fi
 
+# CLAUDE_CODE_AUTH_MODE selects how Claude Code authenticates with the upstream
+# (mirrors CODEX_AUTH_MODE):
+#   - api_key (default): Claude Code uses ANTHROPIC_API_KEY against
+#     api.anthropic.com. The harness stub key is left in the env; iron-proxy's
+#     ANTHROPIC_API_KEY HttpSecret rewrites the X-Api-Key header on the wire.
+#   - access_token: Claude Code runs as a Claude.ai Pro or Max subscription
+#     user. We install a dummy ~/.claude/.credentials.json so the CLI emits
+#     OAuth-shaped requests, unset the API-key stub so it does not fall back
+#     to X-Api-Key, and let iron-token-broker mint a real Bearer at request
+#     time via the anthropic-claude brokered_token secret.
+CLAUDE_CODE_AUTH_MODE="${CLAUDE_CODE_AUTH_MODE:-api_key}"
+case "$CLAUDE_CODE_AUTH_MODE" in
+    api_key)
+        :
+        ;;
+    access_token)
+        unset ANTHROPIC_API_KEY
+        if [ -f /etc/centaur/claude-credentials.default.json ]; then
+            cp /etc/centaur/claude-credentials.default.json "$HOME_DIR/.claude/.credentials.json"
+            chmod 600 "$HOME_DIR/.claude/.credentials.json"
+        fi
+        ;;
+    *)
+        echo "unknown CLAUDE_CODE_AUTH_MODE: $CLAUDE_CODE_AUTH_MODE (expected api_key or access_token)" >&2
+        exit 1
+        ;;
+esac
+
 # ── Pi-mono settings ─────────────────────────────────────────────────────────
 mkdir -p "$HOME_DIR/.pi/agent/extensions"
 cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
@@ -208,6 +236,19 @@ if [ "$CODEX_AUTH_MODE" != "access_token" ]; then
     if [ -n "$CODEX_KEY" ]; then
         echo "$CODEX_KEY" | codex login --with-api-key 2>/dev/null || true
     fi
+fi
+
+# Wait for the tool-server sidecar before signalling readiness, so the harness
+# doesn't issue its first tool call before the server is listening.
+if [ -n "${CENTAUR_TOOLS_URL:-}" ]; then
+    _tools_deadline=$(( $(date +%s) + ${CENTAUR_TOOLS_WAIT_SECONDS:-10} ))
+    until curl -fsS --noproxy '*' --max-time 2 "${CENTAUR_TOOLS_URL}/healthz" >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$_tools_deadline" ]; then
+            echo "tool-server /healthz not ready after ${CENTAUR_TOOLS_WAIT_SECONDS:-10}s; continuing" >&2
+            break
+        fi
+        sleep 0.5
+    done
 fi
 
 # Signal readiness
