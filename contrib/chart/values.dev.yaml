@@ -31,9 +31,23 @@ ironProxy:
   manager:
     secretSource: onepassword
 
+chatbot:
+  image:
+    pullPolicy: IfNotPresent
+
 tokenBroker:
-  enabled: true
+  enabled: false
 
 sandbox:
   image:
     pullPolicy: IfNotPresent
+
+laminar:
+  enabled: true
+  appServer:
+    service:
+      httpPort: 8000
+      grpcPort: 8001
+
+networkPolicy:
+  enabled: false
