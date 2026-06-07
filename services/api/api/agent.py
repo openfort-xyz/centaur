@@ -551,6 +551,9 @@ async def _get_latest_thread_user_id(thread_key: str) -> str | None:
     where execution is when prompt context is assembled. Prefer the newest row
     across those sources so the session context does not depend on one caller
     preserving one specific delivery field.
+
+    Slack history backfill rows preserve thread context and may include the
+    thread root author. They are not the requester for the active prompt.
     """
     pool = _get_pool()
     row = await pool.fetchrow(
@@ -558,6 +561,7 @@ async def _get_latest_thread_user_id(thread_key: str) -> str | None:
         "  SELECT COALESCE(user_id, metadata->>'user_id') AS user_id, created_at, 1 AS source_rank "
         "  FROM chat_messages "
         "  WHERE thread_key = $1 AND role = 'user' "
+        "    AND COALESCE(metadata->>'history_backfill', 'false') <> 'true' "
         "  UNION ALL "
         "  SELECT COALESCE(metadata->>'user_id', delivery->>'recipient_user_id', delivery->>'user_id') "
         "    AS user_id, created_at, 2 AS source_rank "
@@ -722,6 +726,12 @@ async def _insert_system_message(
         platform=effective_platform,
         user_id=effective_user_id,
     )
+    context_metadata = {
+        "session_context": True,
+        "platform": effective_platform or "generic",
+    }
+    if effective_user_id:
+        context_metadata["prompt_requester_user_id"] = effective_user_id
     context = _build_session_context(
         thread_key,
         platform=effective_platform,
@@ -741,13 +751,22 @@ async def _insert_system_message(
     )
     await pool.execute(
         "INSERT INTO chat_messages (id, thread_key, role, parts, metadata) "
-        "VALUES ($1, $2, 'system', $3::jsonb, '{}'::jsonb) "
-        "ON CONFLICT (id) DO UPDATE SET parts = EXCLUDED.parts "
+        "VALUES ($1, $2, 'system', $3::jsonb, $5::jsonb) "
+        "ON CONFLICT (id) DO UPDATE SET "
+        "  parts = EXCLUDED.parts, "
+        "  metadata = EXCLUDED.metadata, "
+        "  created_at = CASE "
+        "    WHEN chat_messages.metadata->>'prompt_requester_user_id' "
+        "      IS DISTINCT FROM EXCLUDED.metadata->>'prompt_requester_user_id' "
+        "    THEN NOW() "
+        "    ELSE chat_messages.created_at "
+        "  END "
         "WHERE $4::boolean",
         msg_id,
         thread_key,
         json.dumps([{"type": "text", "text": context}]),
         bool(effective_user_id),
+        json.dumps(context_metadata),
     )
 
 
@@ -1049,6 +1068,7 @@ def _build_session_context(
                     "",
                     "- If you create a GitHub PR for this Slack request, "
                     f"the PR body MUST contain this standalone line: `Prompted by: {github_handle}`",
+                    "- The credited prompter is the requester in this section, not the Slack thread OP/root author.",
                     "- This is a GitHub PR body requirement, not a Slack response mention rule.",
                     "- Assign the PR to the requester when possible: "
                     f"`{github_login}`",
@@ -1070,13 +1090,23 @@ def _build_session_context(
                 ]
             )
 
-    if platform:
-        rules = _PLATFORM_FORMATTING_RULES.get(platform.lower())
-        if rules:
-            lines.append("")
-            lines.extend(rules["lines"])
-            if user_id and rules.get("user_mention_line"):
-                lines.append(rules["user_mention_line"].format(user_id=user_id))
+    if platform and platform.lower() == "slack":
+        lines.extend(
+            [
+                "",
+                "## Slack Formatting Rules",
+                "",
+                "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
+                "- Do NOT use Slack-native `<URL|text>` link syntax",
+                "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
+                "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
+                "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
+                "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
+                "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
+                "- For links to Slack threads or messages, always use the canonical `https://slack.com/archives/{CHANNEL_ID}/p{TS_WITHOUT_DOT}` form. Slack redirects this to the correct workspace. Do not invent or hardcode a `<workspace>.slack.com` subdomain.",
+                "- Do not @-mention or tag the requester when replying; reply naturally in the thread.",
+            ]
+        )
 
     lines.extend(["", "---", ""])
     return "\n".join(lines)
@@ -1406,6 +1436,9 @@ async def inject_stdin(
     *,
     platform: str | None = None,
     user_id: str | None = None,
+    trace_id: str | None = None,
+    traceparent: str | None = None,
+    trace_metadata: dict | None = None,
 ) -> dict:
     """Flush pending messages + write to stdin. Does not touch stdout.
 
@@ -1435,17 +1468,29 @@ async def inject_stdin(
         msgs = _flushed_to_messages(flushed)
         content_blocks = messages_to_content_blocks(msgs) + inline_blocks
         turn_input = build_user_input(
-            content_blocks, thread_key=session.thread_key, trace_id=session.trace_id
+            content_blocks,
+            thread_key=session.thread_key,
+            trace_id=trace_id or session.trace_id,
+            traceparent=traceparent,
+            trace_metadata=trace_metadata,
         )
     elif flushed:
         msgs = _flushed_to_messages(flushed)
         content_blocks = messages_to_content_blocks(msgs)
         turn_input = build_user_input(
-            content_blocks, thread_key=session.thread_key, trace_id=session.trace_id
+            content_blocks,
+            thread_key=session.thread_key,
+            trace_id=trace_id or session.trace_id,
+            traceparent=traceparent,
+            trace_metadata=trace_metadata,
         )
     elif inline_blocks:
         turn_input = build_user_input(
-            inline_blocks, thread_key=session.thread_key, trace_id=session.trace_id
+            inline_blocks,
+            thread_key=session.thread_key,
+            trace_id=trace_id or session.trace_id,
+            traceparent=traceparent,
+            trace_metadata=trace_metadata,
         )
     else:
         return {"ok": True, "injected": False}

@@ -141,6 +141,22 @@ registered refresh_token OAuthTokenSecrets by the API server at startup.
 {{- printf "http://%s:%v" (include "centaur.tokenBrokerHost" .) .Values.tokenBroker.service.httpPort -}}
 {{- end -}}
 
+{{- /*
+iron-control — Rails control plane for authenticated API access and encrypted
+secret storage. Flag-gated (ironControl.enabled), in-cluster ClusterIP Service.
+*/ -}}
+{{- define "centaur.ironControlName" -}}
+{{- include "centaur.componentName" (dict "root" . "component" "iron-control") -}}
+{{- end -}}
+
+{{- define "centaur.ironControlHost" -}}
+{{- include "centaur.ironControlName" . -}}
+{{- end -}}
+
+{{- define "centaur.ironControlUrl" -}}
+{{- printf "http://%s:%v" (include "centaur.ironControlHost" .) .Values.ironControl.service.httpPort -}}
+{{- end -}}
+
 {{- define "centaur.laminarNoProxyHosts" -}}
 {{- if .Values.laminar.enabled -}}
 {{- printf ",%s,%s,%s,%s,%s,%s" (include "centaur.componentName" (dict "root" . "component" "laminar-app-server")) (include "centaur.componentName" (dict "root" . "component" "laminar-frontend")) (include "centaur.componentName" (dict "root" . "component" "laminar-postgres")) (include "centaur.componentName" (dict "root" . "component" "laminar-clickhouse")) (include "centaur.componentName" (dict "root" . "component" "laminar-query-engine")) (include "centaur.componentName" (dict "root" . "component" "laminar-quickwit")) -}}
