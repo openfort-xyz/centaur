@@ -26,7 +26,7 @@
     "@slack/types": "^2.19.0",
     "@slack/web-api": "^7.15.2",
     "@std/ulid": "npm:@jsr/std__ulid",
-    "hono": "^4.12.18",
+    "hono": "^4.12.25",
     "zod": "^4.4.3"
   },
   "devDependencies": {
