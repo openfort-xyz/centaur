@@ -1,7 +1,6 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables, taskPlanCard } from './render'
+import { markdownToChatMessage, fenceMarkdownTables } from './render'
 import { chatReplyLimits } from '../constants'
-import type { RendererTask } from '@centaur/rendering'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
 
@@ -74,36 +73,6 @@ describe('markdownToChatMessage', () => {
       )
       expect(widgets).toBeLessThanOrEqual(chatReplyLimits.card.maxWidgetsPerCard + 1)
     }
-  })
-})
-
-describe('taskPlanCard', () => {
-  const tasks: RendererTask[] = [
-    { id: 'a', title: 'Read files', status: 'complete' },
-    { id: 'b', title: 'Edit module', status: 'in_progress' },
-    { id: 'c', title: 'Run tests', status: 'pending' }
-  ]
-
-  test('renders one row per task with a status glyph', () => {
-    const { card } = taskPlanCard(tasks)
-    const rows = (card.sections?.[0]?.widgets ?? []).map((w) => w.decoratedText?.text)
-    expect(rows).toHaveLength(3)
-    expect(rows[0]).toContain('✅')
-    expect(rows[0]).toContain('Read files')
-    expect(rows[1]).toContain('⏳')
-    expect(rows[2]).toContain('◻️')
-  })
-
-  test('caps the number of rendered tasks', () => {
-    const many: RendererTask[] = Array.from({ length: 100 }, (_, i) => ({
-      id: String(i),
-      title: `task ${i}`,
-      status: 'pending' as const
-    }))
-    const { card } = taskPlanCard(many)
-    expect(card.sections?.[0]?.widgets?.length).toBeLessThanOrEqual(
-      chatReplyLimits.stream.maxPlanTasks
-    )
   })
 })
 

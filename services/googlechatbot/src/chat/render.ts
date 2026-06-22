@@ -1,4 +1,3 @@
-import type { RendererTask, RendererTaskStatus } from '@centaur/rendering'
 import type { GoogleChatCard, GoogleChatCardSection, GoogleChatCardWidget } from './types'
 import { chatReplyLimits } from '../constants'
 
@@ -191,47 +190,6 @@ export function splitMarkdownText(input: string, maxChars: number): string[] {
   }
   if (remaining) chunks.push(remaining)
   return chunks
-}
-
-const PLAN_STATUS_ICON: Record<RendererTaskStatus, string> = {
-  complete: '✅',
-  in_progress: '⏳',
-  error: '⚠️',
-  pending: '◻️'
-}
-
-/**
- * Render the live task plan as a card: one decoratedText row per task so each
- * shows on its own line with a status glyph. Used to PATCH the "thinking" bubble
- * while the agent runs, giving Google Chat the task-timeline UX Slack has.
- */
-export function taskPlanCard(
-  tasks: RendererTask[],
-  opts: { header?: string } = {}
-): { cardId: string; card: GoogleChatCard } {
-  const widgets: GoogleChatCardWidget[] = tasks
-    .slice(0, chatReplyLimits.stream.maxPlanTasks)
-    .map((task) => ({
-      decoratedText: {
-        text: `${PLAN_STATUS_ICON[task.status] ?? '◻️'} ${oneLine(task.title).slice(
-          0,
-          chatReplyLimits.stream.taskTitleChars
-        )}`,
-        wrapText: true
-      }
-    }))
-
-  return {
-    cardId: 'plan',
-    card: {
-      ...(opts.header ? { header: { title: opts.header.slice(0, MAX_HEADER_CHARS) } } : {}),
-      sections: [{ widgets: widgets.length ? widgets : [{ textParagraph: { text: '…' } }] }]
-    }
-  }
-}
-
-function oneLine(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
 }
 
 /** Collapse Markdown into a short, single-line notification summary for `text`. */

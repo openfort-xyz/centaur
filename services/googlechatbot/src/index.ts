@@ -9,7 +9,6 @@ import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
 import { extractMessageOverrides } from './overrides'
 import {
-  FEEDBACK_FUNCTION,
   INITIAL_STATUS,
   consumeRenderStream,
   createRenderState,
@@ -59,15 +58,6 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     // HTTP 204 — surfaces as a "<bot> not responding" placeholder card.
     // https://developers.google.com/workspace/chat/receive-respond-interactions
     const body = await c.req.raw.text()
-
-    // A 👍/👎 click on a past answer arrives as CARD_CLICKED. Record it and ack;
-    // it never starts an agent run.
-    const feedback = parseFeedbackClick(body)
-    if (feedback) {
-      incr('googlechatbot_feedback_total', { rating: feedback })
-      return c.json({})
-    }
-
     const envelope = parseChatBody(body)
     if (!envelope) return c.json({}, 400)
 
@@ -293,18 +283,6 @@ function getExecutionContext(c: Context): WaitUntilContext | null {
   } catch {
     return null
   }
-}
-
-/**
- * Detect a feedback button click and extract its rating. Works across the v1
- * (`action.actionMethodName` + parameters) and v2 (`commonEventObject`) payload
- * shapes by keying off our own function name and scanning for the rating value,
- * so a Chat payload-format change can't silently drop feedback.
- */
-export function parseFeedbackClick(rawBody: string): 'up' | 'down' | 'unknown' | null {
-  if (!rawBody.includes(FEEDBACK_FUNCTION)) return null
-  const match = /"(?:rating|value)"\s*:\s*"?(up|down)"?/i.exec(rawBody)
-  return match ? (match[1]!.toLowerCase() as 'up' | 'down') : 'unknown'
 }
 
 export function parseChatBody(rawBody: string): GoogleChatEnvelope | null {
