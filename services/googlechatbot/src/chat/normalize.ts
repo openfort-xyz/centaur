@@ -57,8 +57,14 @@ export async function normalizeChatEnvelope(
   // Skip bot's own messages (sender.name is a resource name like "users/123")
   if (botUserName && senderName === botUserName) return null
 
-  const text = normalizeChatText(message.text ?? '', senderName)
-  const formattedText = message.formattedText ?? ''
+  // A slash command (`/centaur …`) is addressed to the app: Google strips the
+  // command token and puts the rest in argumentText, which is the cleanest
+  // prompt. Treat it like a mention so it always starts a run.
+  const isSlashCommand = (message.annotations ?? []).some(a => a.type === 'SLASH_COMMAND')
+  const text = isSlashCommand
+    ? normalizeChatText(message.argumentText ?? message.text ?? '', senderName)
+    : normalizeChatText(message.text ?? '', senderName)
+  const formattedText = isSlashCommand ? '' : message.formattedText ?? ''
 
   const parts: NormalizedPart[] = []
   const textPart = [formattedText, text].filter(Boolean).join('\n').trim()
@@ -69,6 +75,7 @@ export async function normalizeChatEnvelope(
   // Determine if the bot was @mentioned.
   // In Google Chat, mentions use <users/{botUserId}> syntax in message text.
   const isMention =
+    isSlashCommand ||
     Boolean(botUserName && (message.text ?? '').includes(botUserName)) ||
     Boolean(botUserName && (message.text ?? '').includes('@')) ||
     envelope.space?.singleUserBotDm === true
@@ -181,6 +188,16 @@ export async function collectThreadHistory(
   collected.reverse()
 
   return collected.map(message => toHistoryMessage(message, opts.botUserName))
+}
+
+/**
+ * True when the event is a reply inside an existing thread (not a fresh root).
+ * Used to gate follow-up runs that continue a thread without a re-@mention.
+ */
+export function isThreadReply(event: NormalizedChatEvent): boolean {
+  const threadName = event.chat.thread_name
+  if (!threadName) return false
+  return !isThreadRoot(threadName, event.message_id)
 }
 
 function isThreadRoot(threadName: string, currentMessageName: string): boolean {

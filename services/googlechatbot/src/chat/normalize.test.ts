@@ -1,6 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import {
   collectThreadHistory,
+  isThreadReply,
   normalizeChatEnvelope,
   normalizeChatText,
   type ChatHistoryFetcher
@@ -35,6 +36,52 @@ describe('normalizeChatEnvelope', () => {
     expect(normalized!.space_type).toBe('SPACE')
     expect(normalized!.parts).toHaveLength(1)
     expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
+  })
+
+  test('treats a slash command as a mention and uses argumentText as the prompt', async () => {
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: '/centaur ship the feature',
+          argumentText: 'ship the feature',
+          sender: { name: 'users/U1', displayName: 'Alice' },
+          annotations: [{ type: 'SLASH_COMMAND', slashCommand: { commandName: '/centaur' } }]
+        }
+      }),
+      BOT_USER
+    )
+    expect(normalized!.is_mention).toBe(true)
+    expect(normalized!.parts[0]).toMatchObject({ type: 'text', text: 'ship the feature' })
+  })
+
+  test('isThreadReply distinguishes a reply from a thread root', async () => {
+    const root = await normalizeChatEnvelope(
+      messageEnvelope({
+        thread: { name: 'spaces/AAAA/threads/M1' },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'hi',
+          thread: { name: 'spaces/AAAA/threads/M1' },
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    const reply = await normalizeChatEnvelope(
+      messageEnvelope({
+        thread: { name: 'spaces/AAAA/threads/M1' },
+        message: {
+          name: 'spaces/AAAA/messages/M1.R2',
+          text: 'follow up',
+          thread: { name: 'spaces/AAAA/threads/M1' },
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(isThreadReply(root!)).toBe(false)
+    expect(isThreadReply(reply!)).toBe(true)
   })
 
   test('does not include the dropped vaporware fields', async () => {

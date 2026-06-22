@@ -33,7 +33,20 @@ const EnvSchema = z.object({
 
   // Optional per-run guards forwarded to api-rs.
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
-  SESSION_MAX_DURATION_MS: z.coerce.number().int().positive().optional()
+  SESSION_MAX_DURATION_MS: z.coerce.number().int().positive().optional(),
+
+  // Optional deep-link template for the final answer's "View session" button.
+  // `{thread}` and `{execution}` are substituted, e.g.
+  // "https://centaur.example/sessions/{thread}". Button is omitted if unset.
+  GOOGLECHATBOT_SESSION_URL_TEMPLATE: z.string().optional(),
+
+  // Opt-in: continue a thread on a plain reply (no re-@mention), like Slack's
+  // subscribed-thread mode. OFF by default — only enable when the app is
+  // configured to receive all messages in the space, or it will not see replies.
+  GOOGLECHATBOT_FOLLOW_UP_THREADS: z
+    .string()
+    .default('false')
+    .transform(value => value === 'true' || value === '1')
 })
 
 export type AppConfig = z.infer<typeof EnvSchema>

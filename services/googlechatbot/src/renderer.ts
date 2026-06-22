@@ -1,12 +1,13 @@
 import {
   CodexAppServerRendererEventMapper,
-  type RendererEvent
+  type RendererEvent,
+  type RendererTask
 } from '@centaur/rendering'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { ChatEdgeClient } from './chat/client'
-import { markdownToChatMessage } from './chat/render'
+import { markdownToChatMessage, taskPlanCard } from './chat/render'
 import { logError, logWarn } from './logging'
-import type { GoogleChatMessage } from './chat/types'
+import type { GoogleChatCard, GoogleChatCardWidget, GoogleChatMessage } from './chat/types'
 
 export const INITIAL_STATUS = '_Centaur is thinking…_'
 const STATUS_FLUSH_INTERVAL_MS = 1_000
@@ -24,6 +25,8 @@ export type RenderTarget = {
   ackMessageName: string
   /** Thread to fall back into if the ack PATCH fails and we must post fresh. */
   threadName?: string
+  /** Optional deep link rendered as a "View session" button on the final answer. */
+  sessionUrl?: string
 }
 
 /**
@@ -33,39 +36,79 @@ export type RenderTarget = {
  * the same bubble. There is no streaming answer text — Google Chat lacks a
  * streaming primitive and rate-limits edits — so the canonical answer is only
  * written once, at the end.
+ *
+ * Single-shot helper; callers that need resume-on-drop use createRenderState +
+ * consumeRenderStream + finalizeRender directly (see driveSession).
  */
 export async function renderSessionToChat(
   client: ChatEdgeClient,
   stream: AsyncIterable<RustSessionStreamEvent>,
   target: RenderTarget
 ): Promise<void> {
-  const mapper = new CodexAppServerRendererEventMapper()
-  const state: RenderState = {
+  const state = createRenderState()
+  await consumeRenderStream(client, stream, target, state)
+  await finalizeRender(client, target, state)
+}
+
+export type RenderState = {
+  answer: string
+  error: string | undefined
+  /** Short label for the current activity, shown in the `text` line. */
+  statusLine: string
+  /** Live task plan, keyed by task id in arrival order. */
+  tasks: Map<string, RendererTask>
+  lastSignature: string
+  lastFlushAt: number
+  /** True once a definitive end (completed/failed/cancelled) was seen. */
+  terminal: boolean
+  /** Persisted across resume passes so the answer keeps accumulating. */
+  mapper: CodexAppServerRendererEventMapper
+}
+
+export function createRenderState(): RenderState {
+  return {
     answer: '',
     error: undefined,
-    lastStatus: INITIAL_STATUS,
-    lastStatusFlushAt: 0
+    statusLine: 'thinking',
+    tasks: new Map(),
+    lastSignature: INITIAL_STATUS,
+    lastFlushAt: 0,
+    terminal: false,
+    mapper: new CodexAppServerRendererEventMapper()
   }
+}
 
+/**
+ * Process one SSE pass into the render state, pulsing the live bubble. Does NOT
+ * flush or deliver — a stream that drops mid-run leaves state.terminal false so
+ * the caller can re-open from the last event id and continue.
+ */
+export async function consumeRenderStream(
+  client: ChatEdgeClient,
+  stream: AsyncIterable<RustSessionStreamEvent>,
+  target: RenderTarget,
+  state: RenderState
+): Promise<void> {
   try {
     for await (const event of stream) {
       captureStreamError(event, state)
-      await applyRendererEvents(client, target, state, mapper.process(event))
+      await applyRendererEvents(client, target, state, state.mapper.process(event))
     }
-    await applyRendererEvents(client, target, state, mapper.flush())
   } catch (error) {
+    // A transport drop is recoverable: leave terminal false so we resume.
     state.error = state.error ?? errorText(error)
     logError('googlechatbot_render_stream_failed', error)
   }
-
-  await deliverFinal(client, target, state)
 }
 
-type RenderState = {
-  answer: string
-  error: string | undefined
-  lastStatus: string
-  lastStatusFlushAt: number
+/** Flush any buffered renderer state and write the canonical final answer once. */
+export async function finalizeRender(
+  client: ChatEdgeClient,
+  target: RenderTarget,
+  state: RenderState
+): Promise<void> {
+  await applyRendererEvents(client, target, state, state.mapper.flush())
+  await deliverFinal(client, target, state)
 }
 
 async function applyRendererEvents(
@@ -83,16 +126,24 @@ async function applyRendererEvents(
         state.answer = event.markdown
         break
       case 'renderer.status':
-        await pulseStatus(client, target, state, event.status)
+        if (event.status.trim()) state.statusLine = event.status.trim()
+        await pulse(client, target, state)
+        break
+      case 'renderer.plan.update':
+        if (event.title.trim()) state.statusLine = event.title.trim()
+        await pulse(client, target, state)
         break
       case 'renderer.task.update':
-        await pulseStatus(client, target, state, event.task.title)
+        state.tasks.set(event.task.id, event.task)
+        if (event.task.title.trim()) state.statusLine = event.task.title.trim()
+        await pulse(client, target, state)
         break
       case 'renderer.done':
         if (typeof event.answerMarkdown === 'string' && event.answerMarkdown.trim()) {
           state.answer = event.answerMarkdown
         }
         if (event.error) state.error = state.error ?? event.error
+        state.terminal = true
         break
       default:
         break
@@ -101,29 +152,37 @@ async function applyRendererEvents(
 }
 
 /**
- * Edit the "thinking" bubble with a short `_Centaur · <task>…_` pulse, deduped
- * and rate-limited to 1 Hz so we don't spam Google Chat's edit endpoint.
+ * Edit the "thinking" bubble with the live task-plan card plus a short
+ * `_Centaur · <activity>…_` line, deduped and rate-limited to 1 Hz so we stay
+ * under Google Chat's 1-write/second-per-space cap.
  */
-async function pulseStatus(
+async function pulse(
   client: ChatEdgeClient,
   target: RenderTarget,
-  state: RenderState,
-  rawTitle: string
+  state: RenderState
 ): Promise<void> {
   if (!target.ackMessageName) return
-  const title = rawTitle.trim().slice(0, 80)
-  if (!title) return
-  const status = `_Centaur · ${title}…_`
-  if (status === state.lastStatus) return
+  const signature = `${state.statusLine}|${planSignature(state.tasks)}`
+  if (signature === state.lastSignature) return
   const now = Date.now()
-  if (now - state.lastStatusFlushAt < STATUS_FLUSH_INTERVAL_MS) return
-  state.lastStatusFlushAt = now
-  state.lastStatus = status
+  if (now - state.lastFlushAt < STATUS_FLUSH_INTERVAL_MS) return
+  state.lastFlushAt = now
+  state.lastSignature = signature
+
+  const text = `_Centaur · ${state.statusLine.slice(0, 80)}…_`
+  const body: Partial<GoogleChatMessage> = state.tasks.size
+    ? { text, cardsV2: [taskPlanCard([...state.tasks.values()])] }
+    : { text }
+
   try {
-    await client.updateMessage(target.ackMessageName, { text: status })
+    await client.updateMessage(target.ackMessageName, body)
   } catch (error) {
     logWarn('googlechatbot_status_pulse_failed', error)
   }
+}
+
+function planSignature(tasks: Map<string, RendererTask>): string {
+  return [...tasks.values()].map((task) => `${task.id}:${task.status}`).join(',')
 }
 
 async function deliverFinal(
@@ -134,9 +193,13 @@ async function deliverFinal(
   const text = finalText(state)
   const rendered = markdownToChatMessage(text)
   const looksRich = LOOKS_RICH_RE.test(text)
+  const button = actionButtonsWidget(target.sessionUrl)
+  // Rich: a short summary in `text` (notification) + the card body — never the
+  // full answer in both, or Google Chat shows it twice. Plain: the whole answer
+  // in `text`, no card (plus a button-only card when a session URL is set).
   const body: Partial<GoogleChatMessage> = looksRich
-    ? { text: rendered.fallbackText, cardsV2: rendered.cardsV2 }
-    : { text: rendered.fallbackText, cardsV2: [] }
+    ? { text: rendered.fallbackText, cardsV2: withButton(rendered.cardsV2, button) }
+    : { text: rendered.text, cardsV2: button ? [buttonCard(button)] : [] }
 
   if (target.ackMessageName) {
     try {
@@ -148,13 +211,50 @@ async function deliverFinal(
   }
 
   try {
-    const createBody: Partial<GoogleChatMessage> = looksRich
-      ? body
-      : { text: rendered.fallbackText }
-    await client.createMessage(target.spaceName, createBody, { threadName: target.threadName })
+    await client.createMessage(target.spaceName, body, { threadName: target.threadName })
   } catch (error) {
     logError('googlechatbot_final_create_failed', error)
   }
+}
+
+/** Feedback name routed back to the CARD_CLICKED handler in index.ts. */
+export const FEEDBACK_FUNCTION = 'centaur_feedback'
+
+/**
+ * The action row on the final answer: 👍/👎 feedback plus an optional
+ * "View session" deep link. The feedback buttons fire a CARD_CLICKED event the
+ * service handles; the link is a plain openLink (no callback needed).
+ */
+function actionButtonsWidget(sessionUrl?: string): GoogleChatCardWidget {
+  const buttons = [
+    {
+      text: '👍',
+      onClick: { action: { function: FEEDBACK_FUNCTION, parameters: [{ key: 'rating', value: 'up' }] } }
+    },
+    {
+      text: '👎',
+      onClick: { action: { function: FEEDBACK_FUNCTION, parameters: [{ key: 'rating', value: 'down' }] } }
+    },
+    ...(sessionUrl ? [{ text: 'View session', onClick: { openLink: { url: sessionUrl } } }] : [])
+  ]
+  return { buttonList: { buttons } }
+}
+
+/** Append the button to the last card's sections, or make a card if there are none. */
+function withButton(
+  cards: Array<{ cardId: string; card: GoogleChatCard }> | undefined,
+  button: GoogleChatCardWidget | undefined
+): Array<{ cardId: string; card: GoogleChatCard }> {
+  if (!button) return cards ?? []
+  if (!cards || cards.length === 0) return [buttonCard(button)]
+  const last = cards[cards.length - 1]!
+  const sections = [...(last.card.sections ?? []), { widgets: [button] }]
+  const updated = { cardId: last.cardId, card: { ...last.card, sections } }
+  return [...cards.slice(0, -1), updated]
+}
+
+function buttonCard(button: GoogleChatCardWidget): { cardId: string; card: GoogleChatCard } {
+  return { cardId: 'actions', card: { sections: [{ widgets: [button] }] } }
 }
 
 function finalText(state: RenderState): string {
@@ -178,6 +278,11 @@ function captureStreamError(event: RustSessionStreamEvent, state: RenderState): 
     if (data && typeof data === 'object' && 'error' in data) {
       const error = (data as { error?: unknown }).error
       if (typeof error === 'string') state.error = state.error ?? error
+    }
+    // A real failure/cancellation is final — don't resume. A bare stream_error
+    // is treated as transport noise and left resumable.
+    if (kind === 'session.execution_failed' || kind === 'session.execution_cancelled') {
+      state.terminal = true
     }
   }
 }
