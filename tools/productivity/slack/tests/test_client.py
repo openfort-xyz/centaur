@@ -25,6 +25,8 @@ class _FakeWebClient:
         self.history_pages: list[dict] = []
         self.reply_calls: list[dict] = []
         self.reply_pages: list[dict] = []
+        self.open_calls: list[dict] = []
+        self.open_response: dict = {"channel": {"id": "D123"}}
         self.users_calls: list[dict] = []
         self.users_pages: list[dict] = []
         self.list_calls: list[dict] = []
@@ -56,6 +58,10 @@ class _FakeWebClient:
     def conversations_replies(self, **kwargs):
         self.reply_calls.append(kwargs)
         return self.reply_pages.pop(0)
+
+    def conversations_open(self, **kwargs):
+        self.open_calls.append(kwargs)
+        return self.open_response
 
     def users_list(self, **kwargs):
         self.users_calls.append(kwargs)
@@ -125,7 +131,7 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     client._ratelimit_deadlines = {}
     client._resolve_channel = lambda channel: "C123"  # type: ignore[method-assign]
     client._format_requester_attribution = lambda: ""  # type: ignore[method-assign]
-    client.list_bot_channels = lambda **_: [{"id": "C123", "name": "test-channel"}]  # type: ignore[method-assign]
+    client.list_bot_channels = lambda **_: [{"id": "C123", "name": "paradigm-pulse"}]  # type: ignore[method-assign]
     return client, fake_web_client
 
 
@@ -142,7 +148,7 @@ def test_send_message_forwards_unfurl_flags() -> None:
     client, fake_web_client = _make_client()
 
     client.send_message(
-        "test-channel",
+        "paradigm-pulse",
         "hello",
         unfurl_links=False,
         unfurl_media=False,
@@ -156,11 +162,44 @@ def test_send_message_forwards_unfurl_flags() -> None:
 def test_send_message_omits_unfurl_flags_by_default() -> None:
     client, fake_web_client = _make_client()
 
-    client.send_message("test-channel", "hello")
+    client.send_message("paradigm-pulse", "hello")
 
     assert fake_web_client.last_kwargs is not None
     assert "unfurl_links" not in fake_web_client.last_kwargs
     assert "unfurl_media" not in fake_web_client.last_kwargs
+
+
+def test_send_message_normalizes_escaped_line_breaks() -> None:
+    client, fake_web_client = _make_client()
+
+    client.send_message("paradigm-pulse", "*Title*\\n- one\\r\\n- two", no_attribution=True)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["text"] == "*Title*\n- one\n- two"
+
+
+def test_send_message_opens_dm_for_user_id_destination() -> None:
+    client, fake_web_client = _make_client()
+
+    result = client.send_message("<@U123ABC>", "hello", no_attribution=True)
+
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["text"] == "hello"
+    assert result["channel"] == "D123"
+    assert result["permalink"] == "https://slack.com/archives/D123/p123456"
+
+
+def test_send_dm_opens_dm_and_posts_message() -> None:
+    client, fake_web_client = _make_client()
+
+    client.send_dm("U234ABC", "hello", no_attribution=True, unfurl_links=False)
+
+    assert fake_web_client.open_calls == [{"users": "U234ABC"}]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["unfurl_links"] is False
 
 
 def test_retry_on_ratelimit_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -245,7 +284,7 @@ def test_get_channel_history_page_paginates_with_date_window() -> None:
     ]
 
     result = client.get_channel_history_page(
-        "test-channel",
+        "paradigm-pulse",
         limit=3,
         oldest="2026-01-01",
         latest="2026-01-02",
@@ -272,7 +311,7 @@ def test_get_channel_history_page_surfaces_structured_auth_failure() -> None:
     fake_web_client.conversations_history = fail_history  # type: ignore[method-assign]
 
     with pytest.raises(SlackAuthError) as excinfo:
-        client.get_channel_history_page("test-channel")
+        client.get_channel_history_page("paradigm-pulse")
 
     payload = json.loads(str(excinfo.value))
     assert payload == {
@@ -280,7 +319,7 @@ def test_get_channel_history_page_surfaces_structured_auth_failure() -> None:
         "error": "slack_auth_failed",
         "error_code": "invalid_auth",
         "message": "Slack authentication failed for conversations.history via bot_token",
-        "requested_channel": "test-channel",
+        "requested_channel": "paradigm-pulse",
         "resolved_channel": "C123",
         "slack_method": "conversations.history",
         "status_code": 401,
@@ -334,7 +373,7 @@ def test_get_channel_history_page_preserves_non_auth_error_shape() -> None:
     fake_web_client.conversations_history = fail_history  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="Slack API error: channel_not_found"):
-        client.get_channel_history_page("test-channel")
+        client.get_channel_history_page("paradigm-pulse")
 
 
 def test_search_messages_with_channel_ids_scans_history_without_listing() -> None:
@@ -466,7 +505,7 @@ def test_get_thread_replies_page_uses_bounded_default() -> None:
         }
     ]
 
-    result = client.get_thread_replies_page("test-channel", "100.000000")
+    result = client.get_thread_replies_page("paradigm-pulse", "100.000000")
 
     assert fake_web_client.reply_calls[0]["limit"] == 50
     assert result["effective_limit"] == 50
@@ -496,7 +535,7 @@ def test_dump_channel_with_threads_limits_thread_expansion() -> None:
     ]
 
     result = client.dump_channel_with_threads(
-        "test-channel",
+        "paradigm-pulse",
         max_threads=1,
         replies_limit=500,
     )
@@ -523,7 +562,7 @@ def test_upload_file_surfaces_structured_auth_failure() -> None:
 
     with pytest.raises(SlackAuthError) as excinfo:
         client.upload_file(
-            "test-channel",
+            "paradigm-pulse",
             content_base64="dGVzdA==",
             filename="chart.png",
         )
@@ -534,7 +573,7 @@ def test_upload_file_surfaces_structured_auth_failure() -> None:
         "error": "slack_auth_failed",
         "error_code": "not_authed",
         "message": "Slack authentication failed for files.upload_v2 via file_upload",
-        "requested_channel": "test-channel",
+        "requested_channel": "paradigm-pulse",
         "resolved_channel": "C123",
         "slack_method": "files.upload_v2",
         "status_code": 401,
@@ -546,7 +585,7 @@ def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
 
     result = client.upload_file(
         None,
-        channel_id="test-channel",
+        channel_id="paradigm-pulse",
         content_base64="YSxiCjEsMgo=",
         filename="data.csv",
     )
@@ -581,6 +620,54 @@ def test_upload_file_infers_slack_thread_from_tool_context() -> None:
     assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["thread_ts"] == "1777910337.403889"
     assert fake_web_client.last_kwargs["initial_comment"] == "Uploaded `chart.png`."
+
+
+def test_upload_file_defaults_to_api_slack_thread_context(monkeypatch) -> None:
+    import slack.client as slack_client_module
+
+    client, fake_web_client = _make_client()
+    monkeypatch.setattr(
+        slack_client_module,
+        "current_slack_thread",
+        lambda: {"channel_id": "C-api", "thread_ts": "200.000000"},
+    )
+    client._resolve_channel = lambda channel: channel  # type: ignore[method-assign]
+
+    client.upload_file(content_base64="dGVzdA==", filename="chart.png")
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C-api"
+    assert fake_web_client.last_kwargs["thread_ts"] == "200.000000"
+
+
+def test_upload_file_explicit_destination_overrides_api_context(monkeypatch) -> None:
+    import slack.client as slack_client_module
+
+    resolved_channels: list[str] = []
+    client, fake_web_client = _make_client()
+    monkeypatch.setattr(
+        slack_client_module,
+        "current_slack_thread",
+        lambda: {"channel_id": "C-api", "thread_ts": "200.000000"},
+    )
+
+    def resolve_channel(channel: str) -> str:
+        resolved_channels.append(channel)
+        return channel
+
+    client._resolve_channel = resolve_channel  # type: ignore[method-assign]
+
+    client.upload_file(
+        channel_id="C-explicit",
+        thread_ts="201.000000",
+        content_base64="dGVzdA==",
+        filename="chart.png",
+    )
+
+    assert resolved_channels == ["C-explicit"]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "C-explicit"
+    assert fake_web_client.last_kwargs["thread_ts"] == "201.000000"
 
 
 def test_upload_file_infers_destination_from_team_scoped_thread_key() -> None:
@@ -698,30 +785,14 @@ def test_upload_file_rejects_local_path_argument() -> None:
     client, _ = _make_client()
 
     with pytest.raises(TypeError):
-        client.upload_file("test-channel", file_path="/tmp/missing-chart.png")
+        client.upload_file("paradigm-pulse", file_path="/tmp/missing-chart.png")
 
 
 def test_upload_file_requires_a_content_source() -> None:
     client, _ = _make_client()
 
-    with pytest.raises(ValueError, match="content_base64, attachment_id, or attachment_url"):
-        client.upload_file("test-channel")
-
-
-def test_attachment_url_must_use_centaur_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-
-    with pytest.raises(ValueError, match="configured Centaur API"):
-        client._download_attachment_bytes(attachment_url="https://evil.example/file")
-
-
-def test_attachment_url_requires_attachment_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-
-    with pytest.raises(ValueError, match="attachment download path"):
-        client._download_attachment_bytes(attachment_url="/not-attachments/file")
+    with pytest.raises(ValueError, match="content_base64 is required"):
+        client.upload_file("paradigm-pulse")
 
 
 def test_upload_file_can_infer_destination_without_channel_arg() -> None:
@@ -762,109 +833,40 @@ class _FakeHTTPResponse:
         return msg
 
 
-def test_download_file_rejects_non_files_host() -> None:
+def test_fetch_slack_file_rejects_non_files_host() -> None:
     client, _ = _make_client()
     client.token = "SLACK_BOT_TOKEN"
 
     with pytest.raises(ValueError, match=r"files\.slack\.com"):
-        client.download_file("https://slack.com/api/api.test?x=SLACK_BOT_TOKEN")
+        client._fetch_slack_file("https://slack.com/api/api.test?x=SLACK_BOT_TOKEN")
 
     with pytest.raises(ValueError, match=r"files\.slack\.com"):
-        client.download_file("http://files.slack.com/files-pri/T1-F1/report.pdf")
+        client._fetch_slack_file("http://files.slack.com/files-pri/T1-F1/report.pdf")
 
 
-def test_download_file_stores_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_slack_file_returns_file_metadata_and_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import urllib.request
 
     client, _ = _make_client()
     client.token = "SLACK_BOT_TOKEN"
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-    posted: dict = {}
 
     def fake_urlopen(req, *args, **kwargs):
         if "files.slack.com" in req.full_url:
             assert req.get_header("Authorization") == "Bearer SLACK_BOT_TOKEN"
             return _FakeHTTPResponse(b"%PDF-1.4 report", "application/pdf")
-        if req.full_url.endswith("/agent/attachments/upload"):
-            posted["body"] = json.loads(req.data)
-            return _FakeHTTPResponse(
-                json.dumps({"id": "att-abc123", "name": "report.pdf"}).encode(),
-                "application/json",
-            )
         raise AssertionError(f"unexpected url {req.full_url}")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    token = set_tool_context(ToolContext(name="slack", thread_key="slack:C1:1.2"))
-    try:
-        result = client.download_file("https://files.slack.com/files-pri/T1-F1/report.pdf")
-    finally:
-        reset_tool_context(token)
-
-    assert result == {
-        "attachment_id": "att-abc123",
-        "filename": "report.pdf",
-        "mime_type": "application/pdf",
-        "size_bytes": 15,
-    }
-    assert posted["body"]["thread_key"] == "slack:C1:1.2"
-    assert posted["body"]["name"] == "report.pdf"
-    assert posted["body"]["mime_type"] == "application/pdf"
-    assert base64.b64decode(posted["body"]["data"]) == b"%PDF-1.4 report"
-
-
-def test_download_file_requires_thread_context(monkeypatch: pytest.MonkeyPatch) -> None:
-    import urllib.request
-
-    client, _ = _make_client()
-    client.token = "SLACK_BOT_TOKEN"
-    monkeypatch.setattr(
-        urllib.request,
-        "urlopen",
-        lambda req, *a, **k: _FakeHTTPResponse(b"data", "application/octet-stream"),
+    filename, mime_type, body = client._fetch_slack_file(
+        "https://files.slack.com/files-pri/T1-F1/report.pdf"
     )
 
-    with pytest.raises(RuntimeError, match="thread"):
-        client.download_file("https://files.slack.com/files-pri/T1-F1/report.pdf")
-
-
-def test_download_attachment_bytes_scopes_request_to_thread(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An attachment fetch carries the tool's thread_key so the API can reject
-    a cross-thread read."""
-    import urllib.request
-
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-    captured: dict = {}
-
-    def fake_urlopen(req, *args, **kwargs):
-        captured["url"] = req.full_url
-        return _FakeHTTPResponse(b"file-bytes", "application/octet-stream")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    token = set_tool_context(ToolContext(name="slack", thread_key="slack:C1:1.2"))
-    try:
-        body = client._download_attachment_bytes(attachment_id="att-xyz")
-    finally:
-        reset_tool_context(token)
-
-    assert body == b"file-bytes"
-    assert captured["url"] == (
-        "http://api:8000/agent/attachments/att-xyz/download?thread_key=slack%3AC1%3A1.2"
-    )
-
-
-def test_download_attachment_bytes_requires_thread_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client, _ = _make_client()
-    monkeypatch.setenv("CENTAUR_API_URL", "http://api:8000")
-
-    with pytest.raises(RuntimeError, match="thread"):
-        client._download_attachment_bytes(attachment_id="att-xyz")
+    assert filename == "report.pdf"
+    assert mime_type == "application/pdf"
+    assert body == b"%PDF-1.4 report"
 
 
 def test_native_search_uses_dedicated_search_client() -> None:
@@ -879,7 +881,7 @@ def test_native_search_uses_dedicated_search_client() -> None:
                     "text": "deploy <@U2>",
                     "ts": "200.000000",
                     "permalink": "https://slack.com/archives/C123/p200000000",
-                    "channel": {"id": "C123", "name": "test-channel"},
+                    "channel": {"id": "C123", "name": "paradigm-pulse"},
                     "thread_ts": "200.000000",
                     "reply_count": 2,
                 }
@@ -893,7 +895,7 @@ def test_native_search_uses_dedicated_search_client() -> None:
 
     assert result == [
         {
-            "channel": "test-channel",
+            "channel": "paradigm-pulse",
             "channel_id": "C123",
             "user": "alice",
             "user_id": "U1",
@@ -914,7 +916,7 @@ def test_sync_channel_history_uses_watermark_lookback() -> None:
     def fake_get_channel_history_page(**kwargs):
         captured.update(kwargs)
         return {
-            "channel": "test-channel",
+            "channel": "paradigm-pulse",
             "channel_id": "C123",
             "messages": [{"timestamp": "3000100.000000"}],
             "count": 1,
@@ -931,7 +933,7 @@ def test_sync_channel_history_uses_watermark_lookback() -> None:
     client.get_channel_history_page = fake_get_channel_history_page  # type: ignore[method-assign]
 
     result = client.sync_channel_history(
-        "test-channel",
+        "paradigm-pulse",
         state={"watermark": "3000000.000000"},
         lookback_days=30,
         limit=100,
