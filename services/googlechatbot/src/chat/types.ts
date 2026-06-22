@@ -154,7 +154,10 @@ export type GoogleChatCardSection = {
 }
 
 export type GoogleChatCardWidget = {
-  textParagraph?: { text: string }
+  // textSyntax MARKDOWN makes Google Chat render Markdown (bold, italic, links,
+  // inline code, code fences, lists) instead of the default HTML. Available for
+  // Chat apps; see cards reference Message.TextSyntax.
+  textParagraph?: { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
   decoratedText?: {
     icon?: { knownIcon?: string }
     text: string

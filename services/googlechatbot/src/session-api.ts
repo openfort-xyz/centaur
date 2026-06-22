@@ -139,11 +139,12 @@ export function turnMessagesFromEvent(event: NormalizedChatEvent): {
 export async function createSession(
   config: AppConfig,
   threadKey: string,
-  conversationName?: string
+  conversationName?: string,
+  harnessType?: string
 ): Promise<void> {
   const name = conversationName?.trim()
   const body: CreateSessionRequest = {
-    harness_type: 'codex',
+    harness_type: harnessType ?? 'codex',
     metadata: {
       source: 'googlechatbot',
       platform: 'googlechat',
@@ -182,16 +183,22 @@ export async function appendSessionMessages(
   await ensureApiOk(response, 'append session messages')
 }
 
+export type TurnOverrides = {
+  model?: string
+  provider?: string
+  reasoning?: string
+}
+
 export async function executeSession(
   config: AppConfig,
   threadKey: string,
   message: GoogleChatTurnMessage,
-  opts: { idleTimeoutMs?: number; maxDurationMs?: number } = {}
+  opts: { idleTimeoutMs?: number; maxDurationMs?: number; overrides?: TurnOverrides } = {}
 ): Promise<ExecuteSessionResponse> {
   const body: ExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(threadKey, message, { action: 'execute' }),
-    input_lines: [toCodexInputLine(threadKey, message)],
+    input_lines: [toCodexInputLine(threadKey, message, opts.overrides)],
     ...(opts.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: opts.idleTimeoutMs }),
     ...(opts.maxDurationMs === undefined ? {} : { max_duration_ms: opts.maxDurationMs })
   }
@@ -282,11 +289,19 @@ function sessionMetadata(
   }
 }
 
-function toCodexInputLine(threadKey: string, message: GoogleChatTurnMessage): string {
+function toCodexInputLine(
+  threadKey: string,
+  message: GoogleChatTurnMessage,
+  overrides?: TurnOverrides
+): string {
   return JSON.stringify({
     type: 'user',
     thread_key: threadKey,
     trace_metadata: sessionMetadata(threadKey, message, { action: 'execute' }),
+    // Per-turn knobs ride the blocks-protocol top-level fields (codex harness).
+    ...(overrides?.model ? { model: overrides.model } : {}),
+    ...(overrides?.provider ? { provider: overrides.provider } : {}),
+    ...(overrides?.reasoning ? { reasoning: overrides.reasoning } : {}),
     message: {
       role: 'user',
       content: codexInputContent(message)
