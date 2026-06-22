@@ -1,0 +1,47 @@
+import { z } from 'zod'
+
+const EnvSchema = z.object({
+  NODE_ENV: z.string().default('development'),
+  PORT: z.coerce.number().int().positive().default(3002),
+
+  // Google service account key (raw JSON, not a file path). Used for the
+  // outbound Chat REST client (JWT OAuth2) and to derive the bot's own user
+  // resource name so we skip its own messages.
+  GOOGLE_SERVICE_ACCOUNT_JSON: z.string().optional(),
+
+  // api-rs (the Rust Centaur API) the bot drives sessions against.
+  CENTAUR_API_URL: z.string().url().default('http://127.0.0.1:8080'),
+  CENTAUR_API_KEY: z.string().optional(),
+  // Preferred bearer token for api-rs; falls back to CENTAUR_API_KEY.
+  GOOGLECHATBOT_API_KEY: z.string().optional(),
+
+  CHAT_EVENTS_PATH: z.string().default('/api/chat/events'),
+  CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
+  CHAT_EVENT_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(60 * 5),
+
+  // Comma/space-separated email-domain allowlist for inbound events. The bot is
+  // OPEN to all domains until set; set it (e.g. "openfort.xyz") to fail closed.
+  GOOGLECHATBOT_ALLOWED_DOMAIN: z
+    .string()
+    .default('')
+    .transform(value =>
+      value
+        .split(/[\s,]+/)
+        .map(part => part.trim())
+        .filter(Boolean)
+    ),
+
+  // Optional per-run guards forwarded to api-rs.
+  SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
+  SESSION_MAX_DURATION_MS: z.coerce.number().int().positive().optional()
+})
+
+export type AppConfig = z.infer<typeof EnvSchema>
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  return EnvSchema.parse(env)
+}
+
+export function centaurApiKey(config: AppConfig): string | undefined {
+  return config.GOOGLECHATBOT_API_KEY || config.CENTAUR_API_KEY || undefined
+}

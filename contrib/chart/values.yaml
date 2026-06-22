@@ -365,6 +365,30 @@ discordbot:
   extraEnv: {}
   resources: {}
 
+# Google Chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over the
+# session API. Off by default; needs a Google Chat app + service account JSON. Stateless (in-memory
+# dedup), so no Postgres. Webhooks arrive over HTTP, so enable the dedicated ingress below.
+googlechatbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-googlechatbot
+    tag: latest
+    pullPolicy: Always
+  # Path Google Chat POSTs events to. Must match the Chat app config and the ingress route.
+  eventsPath: /api/chat/events
+  # Comma/space-separated email-domain allowlist for inbound events. Empty = open to all domains.
+  allowedDomain: ""
+  # Public ingress for the webhook. Separate from the slackbotv2 ingress (which owns "/").
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    annotations: {}
+    tls: []
+  extraEnv: {}
+  resources: {}
+
 postgres:
   enabled: true
   image:

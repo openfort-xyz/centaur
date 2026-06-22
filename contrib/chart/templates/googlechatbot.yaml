@@ -1,0 +1,129 @@
+{{- if .Values.googlechatbot.enabled }}
+{{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+spec:
+  replicas: {{ .Values.googlechatbot.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: googlechatbot
+          image: {{ printf "%s:%s" .Values.googlechatbot.image.repository .Values.googlechatbot.image.tag | quote }}
+          imagePullPolicy: {{ .Values.googlechatbot.image.pullPolicy }}
+          env:
+            - name: PORT
+              value: "3002"
+            - name: CENTAUR_API_URL
+              value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            # Service account key for the Chat REST client (JWT OAuth2) and bot identity.
+            - name: GOOGLE_SERVICE_ACCOUNT_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLE_SERVICE_ACCOUNT_JSON" .Values.secretManager.envPrefix }}
+            # api-rs bearer token. Optional: api-rs is internal, so a deployment
+            # without this key still starts and calls api-rs unauthenticated.
+            - name: GOOGLECHATBOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLECHATBOT_API_KEY" .Values.secretManager.envPrefix }}
+                  optional: true
+            - name: CHAT_EVENTS_PATH
+              value: {{ .Values.googlechatbot.eventsPath | quote }}
+{{- if .Values.googlechatbot.allowedDomain }}
+            - name: GOOGLECHATBOT_ALLOWED_DOMAIN
+              value: {{ .Values.googlechatbot.allowedDomain | quote }}
+{{- end }}
+{{- range $name, $value := .Values.googlechatbot.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "centaur.secretEnvName" . }}
+          ports:
+            - containerPort: 3002
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            timeoutSeconds: 5
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.googlechatbot.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+  ports:
+    - name: http
+      port: 3002
+      targetPort: 3002
+{{- if .Values.googlechatbot.ingress.enabled }}
+---
+# Dedicated public ingress for the Google Chat webhook. Separate from the
+# slackbotv2 ingress (which owns "/") so Google Chat can POST to its own host.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+  {{- with .Values.googlechatbot.ingress.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.googlechatbot.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - {{- if .Values.googlechatbot.ingress.host }}
+      host: {{ .Values.googlechatbot.ingress.host | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: {{ .Values.googlechatbot.eventsPath | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+                port:
+                  number: 3002
+  {{- with .Values.googlechatbot.ingress.tls }}
+  tls:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
