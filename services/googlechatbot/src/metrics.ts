@@ -13,8 +13,7 @@ type CounterSpec = {
 const COUNTERS: CounterSpec[] = [
   { name: 'googlechatbot_events_total', help: 'Inbound Chat events by outcome.' },
   { name: 'googlechatbot_runs_total', help: 'Agent runs by outcome.' },
-  { name: 'googlechatbot_render_resumes_total', help: 'Resumed SSE render passes after a stream drop.' },
-  { name: 'googlechatbot_feedback_total', help: 'Answer feedback button clicks by rating.' }
+  { name: 'googlechatbot_render_resumes_total', help: 'Resumed SSE render passes after a stream drop.' }
 ]
 
 const values = new Map<string, number>()

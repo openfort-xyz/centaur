@@ -1,11 +1,10 @@
 import {
   CodexAppServerRendererEventMapper,
-  type RendererEvent,
-  type RendererTask
+  type RendererEvent
 } from '@centaur/rendering'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { ChatEdgeClient } from './chat/client'
-import { markdownToChatMessage, taskPlanCard } from './chat/render'
+import { markdownToChatMessage } from './chat/render'
 import { logError, logWarn } from './logging'
 import type { GoogleChatCard, GoogleChatCardWidget, GoogleChatMessage } from './chat/types'
 
@@ -55,8 +54,6 @@ export type RenderState = {
   error: string | undefined
   /** Short label for the current activity, shown in the `text` line. */
   statusLine: string
-  /** Live task plan, keyed by task id in arrival order. */
-  tasks: Map<string, RendererTask>
   lastSignature: string
   lastFlushAt: number
   /** True once a definitive end (completed/failed/cancelled) was seen. */
@@ -70,7 +67,6 @@ export function createRenderState(): RenderState {
     answer: '',
     error: undefined,
     statusLine: 'thinking',
-    tasks: new Map(),
     lastSignature: INITIAL_STATUS,
     lastFlushAt: 0,
     terminal: false,
@@ -134,7 +130,6 @@ async function applyRendererEvents(
         await pulse(client, target, state)
         break
       case 'renderer.task.update':
-        state.tasks.set(event.task.id, event.task)
         if (event.task.title.trim()) state.statusLine = event.task.title.trim()
         await pulse(client, target, state)
         break
@@ -152,9 +147,10 @@ async function applyRendererEvents(
 }
 
 /**
- * Edit the "thinking" bubble with the live task-plan card plus a short
- * `_Centaur · <activity>…_` line, deduped and rate-limited to 1 Hz so we stay
- * under Google Chat's 1-write/second-per-space cap.
+ * Edit the "thinking" bubble with a single compact `_Centaur · <activity>…_`
+ * line. The agent's reasoning and tool calls arrive as task updates; we DON'T
+ * render them — they're noise that eats space — and only surface the current
+ * activity. Deduped and rate-limited to 1 Hz for the 1-write/second-per-space cap.
  */
 async function pulse(
   client: ChatEdgeClient,
@@ -162,27 +158,18 @@ async function pulse(
   state: RenderState
 ): Promise<void> {
   if (!target.ackMessageName) return
-  const signature = `${state.statusLine}|${planSignature(state.tasks)}`
-  if (signature === state.lastSignature) return
+  const text = `_Centaur · ${state.statusLine.slice(0, 80)}…_`
+  if (text === state.lastSignature) return
   const now = Date.now()
   if (now - state.lastFlushAt < STATUS_FLUSH_INTERVAL_MS) return
   state.lastFlushAt = now
-  state.lastSignature = signature
-
-  const text = `_Centaur · ${state.statusLine.slice(0, 80)}…_`
-  const body: Partial<GoogleChatMessage> = state.tasks.size
-    ? { text, cardsV2: [taskPlanCard([...state.tasks.values()])] }
-    : { text }
+  state.lastSignature = text
 
   try {
-    await client.updateMessage(target.ackMessageName, body)
+    await client.updateMessage(target.ackMessageName, { text })
   } catch (error) {
     logWarn('googlechatbot_status_pulse_failed', error)
   }
-}
-
-function planSignature(tasks: Map<string, RendererTask>): string {
-  return [...tasks.values()].map((task) => `${task.id}:${task.status}`).join(',')
 }
 
 async function deliverFinal(
@@ -193,7 +180,7 @@ async function deliverFinal(
   const text = finalText(state)
   const rendered = markdownToChatMessage(text)
   const looksRich = LOOKS_RICH_RE.test(text)
-  const button = actionButtonsWidget(target.sessionUrl)
+  const button = sessionButtonWidget(target.sessionUrl)
   // Rich: a short summary in `text` (notification) + the card body — never the
   // full answer in both, or Google Chat shows it twice. Plain: the whole answer
   // in `text`, no card (plus a button-only card when a session URL is set).
@@ -217,27 +204,13 @@ async function deliverFinal(
   }
 }
 
-/** Feedback name routed back to the CARD_CLICKED handler in index.ts. */
-export const FEEDBACK_FUNCTION = 'centaur_feedback'
-
 /**
- * The action row on the final answer: 👍/👎 feedback plus an optional
- * "View session" deep link. The feedback buttons fire a CARD_CLICKED event the
- * service handles; the link is a plain openLink (no callback needed).
+ * Optional "View session" deep link on the final answer. A plain openLink — no
+ * callback, so it can't error like an action button. Omitted when no URL is set.
  */
-function actionButtonsWidget(sessionUrl?: string): GoogleChatCardWidget {
-  const buttons = [
-    {
-      text: '👍',
-      onClick: { action: { function: FEEDBACK_FUNCTION, parameters: [{ key: 'rating', value: 'up' }] } }
-    },
-    {
-      text: '👎',
-      onClick: { action: { function: FEEDBACK_FUNCTION, parameters: [{ key: 'rating', value: 'down' }] } }
-    },
-    ...(sessionUrl ? [{ text: 'View session', onClick: { openLink: { url: sessionUrl } } }] : [])
-  ]
-  return { buttonList: { buttons } }
+function sessionButtonWidget(sessionUrl?: string): GoogleChatCardWidget | undefined {
+  if (!sessionUrl) return undefined
+  return { buttonList: { buttons: [{ text: 'View session', onClick: { openLink: { url: sessionUrl } } }] } }
 }
 
 /** Append the button to the last card's sections, or make a card if there are none. */
