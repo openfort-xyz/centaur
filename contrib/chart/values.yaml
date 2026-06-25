@@ -177,16 +177,18 @@ overlay:
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
 overlays:
-  # Org-specific tools and workflows live in our private overlay repo
-  # (openfort-xyz/centaur-overlay) instead of being vendored into this fork.
-  # repo-cache needs read credentials for the private repo to sync it.
+  # Ordered tool/workflow sources. The first entry is the base: this fork's own
+  # tools (the upstream tool set plus google_chat). The second is our org overlay
+  # with org-specific tools/workflows (crisp, stripe, cloudflare, gcp_logs,
+  # openfort_pulse_daily). Listing the base explicitly is required: when
+  # `sources` is non-empty the legacy toolServer.repo base is NOT auto-included.
+  # The overlay repo is private, so repo-cache needs read credentials for it
+  # (see repoCache.githubToken).
   sources:
+    - repo: openfort-xyz/centaur
+      ref: main
     - repo: openfort-xyz/centaur-overlay
       ref: main
-  # - repo: your-org/workflows-only
-  #   ref: main
-  #   toolsSubdir: ""
-  #   skillsSubdir: ""
 
 sandbox:
   controller: pod
