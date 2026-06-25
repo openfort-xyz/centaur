@@ -71,7 +71,7 @@ def test_run_improvement_cycle_dispatches_only_actionable_items(tmp_path, monkey
 
     class FakeAgentClient:
         def start_improvement_run(self, prompt: str, **kwargs):
-            assert "git-branch openfort-xyz/centaur" in prompt
+            assert "git-branch paradigmxyz/centaur" in prompt
             return {
                 "thread_key": "feedback-improvement:test",
                 "assignment_generation": 7,
