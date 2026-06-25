@@ -82,7 +82,7 @@ class SlackClient:
     """
 
     # Cache settings
-    _CACHE_DIR = Path.home() / ".cache" / "centaur-slack"
+    _CACHE_DIR = Path.home() / ".cache" / "paradigm-slack"
     _CHANNEL_CACHE_FILE = _CACHE_DIR / "channels.json"
     _USER_CACHE_FILE = _CACHE_DIR / "users.json"
     _CHANNEL_CACHE_TTL = 300  # 5 minutes

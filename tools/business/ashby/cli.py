@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -16,13 +15,6 @@ from rich.console import Console
 
 app = typer.Typer(name="ashby", help="Ashby ATS CLI for AI agents")
 console = Console()
-
-# Email domain used to identify current/former employees in Ashby candidates.
-# Override per-deployment via the EMPLOYEE_EMAIL_DOMAIN env var. Bare domain
-# (no leading "@") so we can match both "x@<domain>" and use it in SQL LIKE
-# expressions.
-EMPLOYEE_EMAIL_DOMAIN = os.getenv("EMPLOYEE_EMAIL_DOMAIN", "openfort.xyz").lstrip("@")
-_EMPLOYEE_EMAIL_SUFFIX = f"@{EMPLOYEE_EMAIL_DOMAIN}"
 
 
 def get_pmadmin_employees() -> tuple[set[str], set[str]]:
@@ -43,7 +35,7 @@ def get_pmadmin_employees() -> tuple[set[str], set[str]]:
                 "500",
                 'SELECT u.email, p."fullName" FROM "User" u '
                 'JOIN "Person" p ON u."personId" = p.id '
-                f"WHERE u.email LIKE '%{_EMPLOYEE_EMAIL_SUFFIX}';",
+                "WHERE u.email LIKE '%@paradigm.xyz';",
             ],
             capture_output=True,
             text=True,
@@ -51,12 +43,12 @@ def get_pmadmin_employees() -> tuple[set[str], set[str]]:
         )
         if result.returncode == 0:
             for line in result.stdout.strip().split("\n"):
-                if _EMPLOYEE_EMAIL_SUFFIX in line and "│" in line:
+                if "@paradigm.xyz" in line and "│" in line:
                     parts = [p.strip() for p in line.split("│")]
                     if len(parts) >= 3:
                         email = parts[1].strip().lower()
                         name = parts[2].strip()
-                        if email and email.endswith(_EMPLOYEE_EMAIL_SUFFIX):
+                        if email and email.endswith("@paradigm.xyz"):
                             employee_emails.add(email)
                         if name:
                             employee_names.add(normalize_name(name))
@@ -1027,7 +1019,7 @@ def extract_scores_from_feedback(feedback: dict) -> list[dict]:
     """Extract numerical scores from feedback submitted values.
 
     Returns list of {field_path, score, max_score} dicts.
-    Handles various Ashby feedback formats:
+    Handles various Paradigm feedback formats:
     - ValueSelect with "1", "2", "3", "4" values (overall_recommendation)
     - Score type fields with {"score": N} format
     - Text labels like "Strong Yes", "Yes", "No", "Strong No"
@@ -1292,7 +1284,7 @@ def check_access(
     Checks performed (any match denies access):
     - Primary email matches an employee email
     - Any secondary email matches an employee email
-    - Candidate has an employee-domain email (EMPLOYEE_EMAIL_DOMAIN, default openfort.xyz)
+    - Candidate has @paradigm.xyz email address
     - Exact name match with a current or past employee
     - Last name + first initial match (e.g., "William Berman" matches "Will Berman")
 
@@ -1345,12 +1337,12 @@ def check_access(
     for email_obj in candidate.get("emailAddresses", []):
         candidate_emails.add(email_obj.get("value", "").lower())
 
-    # Check if any candidate email is on the employee domain — definitive employee indicator
-    employee_domain_emails = [e for e in candidate_emails if e.endswith(_EMPLOYEE_EMAIL_SUFFIX)]
-    if employee_domain_emails:
+    # Check if any candidate email is @paradigm.xyz - definitive employee indicator
+    paradigm_emails = [e for e in candidate_emails if e.endswith("@paradigm.xyz")]
+    if paradigm_emails:
         result["candidate_is_employee"] = True
         result["reason"] = (
-            f"Candidate has {_EMPLOYEE_EMAIL_SUFFIX} email ({employee_domain_emails[0]}) - "
+            f"Candidate has @paradigm.xyz email ({paradigm_emails[0]}) - "
             "their candidate data cannot be shared"
         )
         if json_output:

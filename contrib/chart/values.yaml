@@ -173,11 +173,12 @@ overlay:
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
 overlays:
-  sources: []
-  # - repo: paradigmxyz/centaur
-  #   ref: ""
-  # - repo: your-org/centaur-overlay
-  #   ref: main
+  # Org-specific tools and workflows live in our private overlay repo
+  # (openfort-xyz/centaur-overlay) instead of being vendored into this fork.
+  # repo-cache needs read credentials for the private repo to sync it.
+  sources:
+    - repo: openfort-xyz/centaur-overlay
+      ref: main
   # - repo: your-org/workflows-only
   #   ref: main
   #   toolsSubdir: ""

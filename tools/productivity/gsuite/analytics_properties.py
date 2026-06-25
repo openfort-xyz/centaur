@@ -1,35 +1,20 @@
 """GA4 property ID mappings for known sites."""
 
-import json
-import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from google.oauth2.credentials import Credentials
 
-
-def _load_static_mappings() -> dict[str, str]:
-    """Load deployment-specific GA4 mappings from GA4_PROPERTY_MAPPINGS_JSON.
-
-    The env var should hold a JSON object mapping site aliases to property
-    IDs, e.g. ``{"openfort.xyz": "123", "openfort": "123"}``. Falls back to
-    an empty dict so the only path becomes dynamic discovery via the Admin
-    API (see ``_discover_property_for_domain``).
-    """
-    raw = os.getenv("GA4_PROPERTY_MAPPINGS_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return {str(k).lower(): str(v) for k, v in parsed.items() if v}
-
-
-# Mapping of site names/aliases to GA4 property IDs. Populated per-deployment
-# via the GA4_PROPERTY_MAPPINGS_JSON env var; otherwise empty and discovery
-# is fully dynamic via the GA4 Admin API.
-PROPERTY_MAPPINGS: dict[str, str] = _load_static_mappings()
+# Mapping of site names/aliases to GA4 property IDs
+PROPERTY_MAPPINGS: dict[str, str] = {
+    # paradigm.xyz
+    "paradigm.xyz": "266994435",
+    "paradigm": "266994435",
+    "main": "266994435",
+    # predictions.paradigm.xyz
+    "predictions.paradigm.xyz": "520074175",
+    "predictions": "520074175",
+}
 
 # Cache for dynamically discovered properties
 _dynamic_cache: dict[str, str] = {}
@@ -41,7 +26,7 @@ def get_property_id_for_site(site: str, credentials: "Credentials | None" = None
     First checks static mappings, then tries to discover dynamically via Admin API.
 
     Args:
-        site: Site name or alias (e.g., 'openfort.xyz', 'docs')
+        site: Site name or alias (e.g., 'paradigm.xyz', 'predictions')
         credentials: Optional Google credentials for dynamic lookup
 
     Returns:
