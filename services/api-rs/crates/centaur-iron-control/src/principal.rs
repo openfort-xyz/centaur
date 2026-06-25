@@ -2,6 +2,7 @@
 //!
 //! A principal is the identity that holds roles and owns proxies. For Centaur
 //! the principal is the conversation: a Discord **channel** (every thread in it
+//! shares one principal), a Google Chat **space** (every thread/message in it
 //! shares one principal), a Linear **issue** (every agent session on it shares
 //! one principal), a Microsoft Teams **channel/conversation** (or **user** for
 //! a personal/user-scoped run when the acting user is known), or — for Slack —
@@ -144,6 +145,22 @@ pub fn derive_principal(
         };
     }
 
+    // Google Chat sessions key on the space so every thread and message in a
+    // space shares one principal (mirrors the Slack channel model). The
+    // googlechatbot thread key is ``chat:spaces:<space>:…`` (a DM space is 1:1,
+    // so space-keying is per-conversation there too).
+    if let Some(space) = parse_gchat_space(thread_key) {
+        let mut labels = BTreeMap::new();
+        labels.insert("gchat_space_id".to_owned(), space.to_owned());
+        return PrincipalRef {
+            foreign_id: format!("gchat-space-{}", slugify(space)),
+            name: display_name
+                .map(|name| format!("Google Chat Space #{name}"))
+                .unwrap_or_else(|| format!("Google Chat Space {space}")),
+            labels,
+        };
+    }
+
     let (team_id, conversation_id) = parse_slack_segments(thread_key);
     let mut labels = BTreeMap::new();
     if let Some(team) = team_id {
@@ -257,6 +274,23 @@ fn parse_teams_adapter_segments(thread_key: &str) -> Option<(String, String, Opt
         })
         .unwrap_or((conversation_id, None));
     Some((conversation_id, service_url, thread_id))
+}
+
+/// The Google Chat space id of a ``chat:spaces:<space>:…`` thread key, or
+/// ``None`` when the key is not a Google Chat thread. The googlechatbot encodes
+/// session threads as ``chat:<space_resource>:<message_resource>`` where each
+/// Google Chat resource name has ``/`` rewritten to ``:`` (e.g.
+/// ``chat:spaces:AAAA:spaces:AAAA:threads:T``), so the space id is the segment
+/// right after the leading ``chat:spaces:``. Keying on it groups every thread
+/// and message in a space onto one principal. The Slack-compatible ``chat:C…``
+/// adapter format is left untouched — only ``chat:spaces:`` matches here.
+fn parse_gchat_space(thread_key: &str) -> Option<&str> {
+    thread_key
+        .strip_prefix("chat:spaces:")?
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|space| !space.is_empty())
 }
 
 /// Slack direct-message conversation ids start with ``D``.
@@ -498,5 +532,50 @@ mod tests {
             input.labels.get("slack_channel_id").map(String::as_str),
             Some("C1")
         );
+    }
+
+    #[test]
+    fn gchat_sessions_key_on_the_space() {
+        // Every thread and message in a space resolves to one principal.
+        let thread = derive_principal("chat:spaces:AAAA:spaces:AAAA:threads:T1", None, None);
+        let other_thread = derive_principal("chat:spaces:AAAA:spaces:AAAA:threads:T2", None, None);
+        let message = derive_principal("chat:spaces:AAAA:spaces:AAAA:messages:M9", None, None);
+        assert_eq!(thread.foreign_id, "gchat-space-aaaa");
+        assert_eq!(thread.foreign_id, other_thread.foreign_id);
+        assert_eq!(thread.foreign_id, message.foreign_id);
+        assert_eq!(thread.name, "Google Chat Space AAAA");
+        assert_eq!(
+            thread.labels.get("gchat_space_id").map(String::as_str),
+            Some("AAAA")
+        );
+    }
+
+    #[test]
+    fn gchat_space_id_is_normalized_in_the_key() {
+        let principal = derive_principal(
+            "chat:spaces:lw57hyAAAAE:spaces:lw57hyAAAAE:threads:UgtiPHEVtMk",
+            None,
+            None,
+        );
+        assert_eq!(principal.foreign_id, "gchat-space-lw57hyaaaae");
+    }
+
+    #[test]
+    fn gchat_conversation_name_overrides_the_display_name_but_not_the_key() {
+        let principal = derive_principal(
+            "chat:spaces:AAAA:spaces:AAAA:threads:T1",
+            None,
+            Some("incidents"),
+        );
+        // Key stays derived from the space id so a rename never splits it.
+        assert_eq!(principal.foreign_id, "gchat-space-aaaa");
+        assert_eq!(principal.name, "Google Chat Space #incidents");
+    }
+
+    #[test]
+    fn slack_chat_prefix_is_not_mistaken_for_gchat() {
+        // `chat:C…` is the Slack-compatible adapter format, not Google Chat.
+        let principal = derive_principal("chat:C123:1780000000.000000", None, None);
+        assert_eq!(principal.foreign_id, "slack-channel-c123");
     }
 }
