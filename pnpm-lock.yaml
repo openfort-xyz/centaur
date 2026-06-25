@@ -28,7 +28,7 @@ importers:
         specifier: workspace:*
         version: link:../harness-events
       axios:
-        specifier: ^1.15.2
+        specifier: ^1.13.6
         version: 1.18.0
       eventsource-parser:
         specifier: ^3.0.6

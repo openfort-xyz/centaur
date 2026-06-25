@@ -190,13 +190,3 @@ IRON_CONTROL_API_KEY (their names are hardcoded in the Rust binaries); the URL
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- printf "http://%s:%v" (include "centaur.consoleHost" .) $console.service.httpPort -}}
 {{- end -}}
-
-{{- define "centaur.laminarNoProxyHosts" -}}
-{{- if .Values.laminar.enabled -}}
-{{- printf ",%s,%s,%s,%s,%s,%s" (include "centaur.componentName" (dict "root" . "component" "laminar-app-server")) (include "centaur.componentName" (dict "root" . "component" "laminar-frontend")) (include "centaur.componentName" (dict "root" . "component" "laminar-postgres")) (include "centaur.componentName" (dict "root" . "component" "laminar-clickhouse")) (include "centaur.componentName" (dict "root" . "component" "laminar-query-engine")) (include "centaur.componentName" (dict "root" . "component" "laminar-quickwit")) -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "centaur.laminarBaseUrl" -}}
-{{- printf "http://%s" (include "centaur.componentName" (dict "root" . "component" "laminar-app-server")) -}}
-{{- end -}}
