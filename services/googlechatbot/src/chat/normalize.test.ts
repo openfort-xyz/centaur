@@ -298,14 +298,14 @@ describe('collectThreadHistory', () => {
     expect(out[0]?.role).toBe('assistant')
   })
 
-  test('drops the bot’s own "_Centaur is thinking…_" ack messages from history', async () => {
+  test('drops the bot’s own "_Condor is thinking…_" ack messages from history', async () => {
     const out = await collectThreadHistory(
       fetcher([
         {
           messages: [
             {
               name: 'spaces/AAAA/messages/T1.M2',
-              text: '_Centaur is thinking…_',
+              text: '_Condor is thinking…_',
               sender: { name: 'users/bot', type: 'BOT' }
             },
             {

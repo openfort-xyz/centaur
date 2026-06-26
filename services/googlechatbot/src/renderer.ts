@@ -8,7 +8,7 @@ import { markdownToChatMessage } from './chat/render'
 import { logError, logWarn } from './logging'
 import type { GoogleChatCard, GoogleChatCardWidget, GoogleChatMessage } from './chat/types'
 
-export const INITIAL_STATUS = '_Centaur is thinking…_'
+export const INITIAL_STATUS = '_Condor is thinking…_'
 const STATUS_FLUSH_INTERVAL_MS = 1_000
 const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 
@@ -147,7 +147,7 @@ async function applyRendererEvents(
 }
 
 /**
- * Edit the "thinking" bubble with a single compact `_Centaur · <activity>…_`
+ * Edit the "thinking" bubble with a single compact `_Condor · <activity>…_`
  * line. The agent's reasoning and tool calls arrive as task updates; we DON'T
  * render them — they're noise that eats space — and only surface the current
  * activity. Deduped and rate-limited to 1 Hz for the 1-write/second-per-space cap.
@@ -158,7 +158,7 @@ async function pulse(
   state: RenderState
 ): Promise<void> {
   if (!target.ackMessageName) return
-  const text = `_Centaur · ${state.statusLine.slice(0, 80)}…_`
+  const text = `_Condor · ${state.statusLine.slice(0, 80)}…_`
   if (text === state.lastSignature) return
   const now = Date.now()
   if (now - state.lastFlushAt < STATUS_FLUSH_INTERVAL_MS) return
