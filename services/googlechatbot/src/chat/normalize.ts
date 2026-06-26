@@ -219,7 +219,7 @@ function isAckOrEmpty(message: ChatListMessage): boolean {
   // The inline ack we post at the start of every mention is the same literal
   // string — it would otherwise show up as an "assistant said this" turn on
   // every follow-up mention in the same thread.
-  if (text === '_Centaur is thinking…_') return true
+  if (text === '_Condor is thinking…_') return true
   return false
 }
 

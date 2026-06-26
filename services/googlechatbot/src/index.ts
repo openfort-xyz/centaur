@@ -126,7 +126,7 @@ async function processChatEvent(
   const followUp = config.GOOGLECHATBOT_FOLLOW_UP_THREADS && isThreadReply(normalized)
   if (!normalized.is_mention && !followUp) return
 
-  // Post the "_Centaur is thinking…_" ack IMMEDIATELY, before touching api-rs.
+  // Post the "_Condor is thinking…_" ack IMMEDIATELY, before touching api-rs.
   // Google Chat shows a "<bot> not responding" placeholder if no bot message
   // appears within ~5s, and spinning up a sandbox takes longer than that. The
   // ack seeds the message we later PATCH with the answer. The thread-history

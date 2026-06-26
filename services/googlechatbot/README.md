@@ -20,7 +20,7 @@ User @mentions the bot in Google Chat
   dedup → returns {} immediately (silent ACK)
         │  (async, after responding)
         ▼
-  post "_Centaur is thinking…_" ack message  ── seeds the bubble we PATCH later
+  post "_Condor is thinking…_" ack message  ── seeds the bubble we PATCH later
   collectThreadHistory (parallel)
         ▼
   createSession → appendSessionMessages → executeSession   (POST /api/session/*)
@@ -31,7 +31,7 @@ User @mentions the bot in Google Chat
 ```
 
 Single-message UX: Google Chat lacks a streaming primitive and rate-limits
-edits, so the bubble shows short `_Centaur · <task>…_` pulses while the run is in
+edits, so the bubble shows short `_Condor · <task>…_` pulses while the run is in
 flight, then is PATCHed once with the final answer.
 
 ## Runtime
