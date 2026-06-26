@@ -13,6 +13,7 @@
 {{- $apiWorkflowDirList := list -}}
 {{- $sandboxWorkflowDirList := list -}}
 {{- $skillDirs := list -}}
+{{- $overlayPromptDir := "" -}}
 {{- range $source := $overlaySources -}}
 {{- $repo := get $source "repo" | default "" -}}
 {{- if $repo -}}
@@ -27,6 +28,9 @@
 {{- end -}}
 {{- with (get $source "skillsSubdir") -}}
 {{- $skillDirs = append $skillDirs (printf "/home/agent/github/%s/%s" $repo .) -}}
+{{- end -}}
+{{- if and (not $overlayPromptDir) (get $source "promptPath") -}}
+{{- $overlayPromptDir = printf "/home/agent/github/%s" $repo -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -177,6 +181,9 @@ spec:
 {{- if .Values.overlay.systemPrompt }}
             - name: CENTAUR_OVERLAY_DIR
               value: {{ .Values.overlay.mountPath | quote }}
+{{- else if $overlayPromptDir }}
+            - name: CENTAUR_OVERLAY_DIR
+              value: {{ $overlayPromptDir | quote }}
 {{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}
@@ -271,6 +278,11 @@ spec:
 {{- $sandboxEnvList := list }}
 {{- if and .Values.repoCache.enabled (gt (len $skillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SKILL_DIRS" "value" (join ":" $skillDirs)) }}
+{{- end }}
+{{- if .Values.overlay.systemPrompt }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_OVERLAY_DIR" "value" .Values.overlay.mountPath) }}
+{{- else if $overlayPromptDir }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_OVERLAY_DIR" "value" $overlayPromptDir) }}
 {{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}
