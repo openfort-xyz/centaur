@@ -176,6 +176,8 @@ overlay:
 # only need `repo`; set `ref` to a branch, tag, or commit when you do not want
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
+# Set promptPath to services/sandbox/SYSTEM_PROMPT.md when a source should
+# provide the sandbox prompt overlay loaded through CENTAUR_OVERLAY_DIR.
 overlays:
   # Ordered tool/workflow sources. The first entry is the base: this fork's own
   # tools (the upstream tool set plus google_chat). The second is our org overlay
@@ -189,6 +191,7 @@ overlays:
       ref: main
     - repo: openfort-xyz/centaur-overlay
       ref: main
+      promptPath: services/sandbox/SYSTEM_PROMPT.md
 
 sandbox:
   controller: pod
