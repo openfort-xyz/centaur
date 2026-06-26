@@ -5,6 +5,19 @@ description = "Google Chat messaging"
 requires-python = ">=3.11"
 dependencies = ["httpx"]
 
+[project.scripts]
+google-chat = "centaur_tool_google_chat.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build.targets.wheel.sources]
+"." = "centaur_tool_google_chat"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.centaur]
 module = "client.py"
 hosts = ["chatbot"]

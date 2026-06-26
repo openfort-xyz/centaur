@@ -6,7 +6,12 @@ use std::{
 
 use sqlx::{Connection, Executor, PgConnection, Row};
 
+const SLACK_SYNC_SQL: &str = include_str!("../migrations/0011_slack_sync_tables.sql");
 const SLACK_DM_SYNC_SQL: &str = include_str!("../migrations/0027_slack_dm_sync_tables.sql");
+const SLACK_DM_CONTEXT_DOCUMENTS_SQL: &str =
+    include_str!("../migrations/0028_slack_dm_context_documents.sql");
+const SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL: &str =
+    include_str!("../migrations/0029_slack_dm_conversation_context_documents.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_dm_sync_conversations",
@@ -16,6 +21,8 @@ const RLS_TABLES: &[&str] = &[
     "slack_dm_sync_checkpoints",
     "slack_dm_sync_runs",
     "slack_dm_sync_backfill_jobs",
+    "slack_dm_context_documents",
+    "slack_dm_conversation_context_documents",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,6 +32,8 @@ struct VisibleDmRows {
     messages: Vec<String>,
     attachments: Vec<String>,
     checkpoints: Vec<String>,
+    context_docs: Vec<String>,
+    conversation_context_docs: Vec<String>,
     runs: i64,
     backfill_jobs: i64,
 }
@@ -45,12 +54,16 @@ async fn slack_dm_rls_requires_current_membership_and_user_setting() -> Result<(
 async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(), Box<dyn Error>> {
     set_search_path(conn, schema).await?;
     create_roles(conn).await?;
+    execute_migration(conn, SLACK_SYNC_SQL).await?;
     execute_migration(conn, SLACK_DM_SYNC_SQL).await?;
+    execute_slack_dm_context_documents_migration(conn).await?;
+    execute_slack_dm_conversation_context_documents_migration(conn).await?;
     grant_schema_usage(conn, schema).await?;
 
     assert_rls_enabled(conn).await?;
     assert_expected_policies(conn).await?;
     insert_fixture_rows(conn).await?;
+    assert_projected_documents(conn).await?;
 
     let user_a = visible_rows(
         conn,
@@ -71,6 +84,14 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
             ],
             attachments: vec!["T_HOME:D_A:1000.000001:F_A".to_owned()],
             checkpoints: vec!["bcr_a:T_HOME:D_A".to_owned()],
+            context_docs: vec![
+                "slack_dm:T_HOME:D_A:1000.000001".to_owned(),
+                "slack_dm:T_HOME:G_MPIM:1000.000003".to_owned(),
+            ],
+            conversation_context_docs: vec![
+                "slack_dm_conversation:T_HOME:D_A".to_owned(),
+                "slack_dm_conversation:T_HOME:G_MPIM".to_owned(),
+            ],
             runs: 0,
             backfill_jobs: 0,
         }
@@ -95,6 +116,14 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
             ],
             attachments: vec![],
             checkpoints: vec![],
+            context_docs: vec![
+                "slack_dm:T_HOME:D_B:1000.000002".to_owned(),
+                "slack_dm:T_HOME:G_MPIM:1000.000003".to_owned(),
+            ],
+            conversation_context_docs: vec![
+                "slack_dm_conversation:T_HOME:D_B".to_owned(),
+                "slack_dm_conversation:T_HOME:G_MPIM".to_owned(),
+            ],
             runs: 0,
             backfill_jobs: 0,
         }
@@ -134,6 +163,8 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
             messages: vec!["T_OTHER:D_A:1000.000004".to_owned()],
             attachments: vec![],
             checkpoints: vec![],
+            context_docs: vec!["slack_dm:T_OTHER:D_A:1000.000004".to_owned()],
+            conversation_context_docs: vec!["slack_dm_conversation:T_OTHER:D_A".to_owned()],
             runs: 0,
             backfill_jobs: 0,
         }
@@ -226,6 +257,102 @@ async fn execute_migration(conn: &mut PgConnection, sql: &str) -> Result<(), sql
     Ok(())
 }
 
+async fn execute_slack_dm_context_documents_migration(
+    conn: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    if pg_search_available(conn).await? {
+        return execute_migration(conn, SLACK_DM_CONTEXT_DOCUMENTS_SQL).await;
+    }
+
+    let sql = slack_dm_context_documents_without_bm25();
+    execute_migration(conn, &sql).await
+}
+
+async fn execute_slack_dm_conversation_context_documents_migration(
+    conn: &mut PgConnection,
+) -> Result<(), sqlx::Error> {
+    if pg_search_available(conn).await? {
+        return execute_migration(conn, SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL).await;
+    }
+
+    let sql = slack_dm_conversation_context_documents_without_bm25();
+    execute_migration(conn, &sql).await
+}
+
+async fn pg_search_available(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "select exists (select 1 from pg_available_extensions where name = 'pg_search')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+}
+
+fn slack_dm_context_documents_without_bm25() -> String {
+    let sql = SLACK_DM_CONTEXT_DOCUMENTS_SQL.replace(
+        "create extension if not exists pg_search;",
+        "-- search extension unavailable in this test database",
+    );
+    let (before_bm25, rest) = sql
+        .split_once("drop index if exists idx_slack_dm_context_documents_bm25;")
+        .expect("Slack DM context migration should contain BM25 index block");
+    let (_, after_bm25) = rest
+        .split_once("create or replace function centaur_refresh_slack_dm_context_document(")
+        .expect("Slack DM context migration should define projection refresh function");
+
+    format!(
+        "{before_bm25}create or replace function centaur_refresh_slack_dm_context_document({after_bm25}"
+    )
+}
+
+fn slack_dm_conversation_context_documents_without_bm25() -> String {
+    let sql = SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL.replace(
+        "create extension if not exists pg_search;",
+        "-- search extension unavailable in this test database",
+    );
+    let (before_bm25, rest) = sql
+        .split_once("drop index if exists idx_slack_dm_conversation_context_documents_bm25;")
+        .expect("Slack DM conversation context migration should contain BM25 index block");
+    let (_, after_bm25) = rest
+        .split_once(
+            "create or replace function centaur_refresh_slack_dm_conversation_context_document(",
+        )
+        .expect("Slack DM conversation context migration should define refresh function");
+
+    format!(
+        "{before_bm25}create or replace function \
+         centaur_refresh_slack_dm_conversation_context_document({after_bm25}"
+    )
+}
+
+#[test]
+fn slack_dm_context_documents_test_migration_omits_bm25_when_extension_is_unavailable() {
+    let sql = slack_dm_context_documents_without_bm25();
+    let conversation_sql = slack_dm_conversation_context_documents_without_bm25();
+
+    assert!(!sql.contains("create extension if not exists pg_search"));
+    assert!(!sql.contains("using bm25"));
+    assert!(!sql.contains("key_field = 'document_id'"));
+    assert!(sql.contains("create table if not exists slack_dm_context_documents"));
+    assert!(sql.contains("create or replace function centaur_refresh_slack_dm_context_document("));
+    assert!(sql.contains("create policy centaur_slack_dm_context_documents_reader_select"));
+
+    assert!(!conversation_sql.contains("create extension if not exists pg_search"));
+    assert!(!conversation_sql.contains("using bm25"));
+    assert!(!conversation_sql.contains("key_field = 'document_id'"));
+    assert!(
+        conversation_sql
+            .contains("create table if not exists slack_dm_conversation_context_documents")
+    );
+    assert!(conversation_sql.contains(
+        "create or replace function centaur_refresh_slack_dm_conversation_context_document("
+    ));
+    assert!(
+        conversation_sql.contains(
+            "create policy centaur_slack_dm_conversation_context_documents_reader_select"
+        )
+    );
+}
+
 async fn assert_rls_enabled(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     for table in RLS_TABLES {
         let enabled: bool = sqlx::query_scalar(
@@ -285,6 +412,14 @@ async fn assert_expected_policies(conn: &mut PgConnection) -> Result<(), sqlx::E
             "centaur_slack_dm_backfill_jobs_reader_select",
         ),
         (
+            "slack_dm_context_documents",
+            "centaur_slack_dm_context_documents_reader_select",
+        ),
+        (
+            "slack_dm_conversation_context_documents",
+            "centaur_slack_dm_conversation_context_documents_reader_select",
+        ),
+        (
             "slack_dm_sync_conversations",
             "centaur_readonly_slack_dm_sync_conversations_select",
         ),
@@ -311,6 +446,14 @@ async fn assert_expected_policies(conn: &mut PgConnection) -> Result<(), sqlx::E
         (
             "slack_dm_sync_backfill_jobs",
             "centaur_readonly_slack_dm_sync_backfill_jobs_select",
+        ),
+        (
+            "slack_dm_context_documents",
+            "centaur_readonly_slack_dm_context_documents_select",
+        ),
+        (
+            "slack_dm_conversation_context_documents",
+            "centaur_readonly_slack_dm_conversation_context_documents_select",
         ),
     ] {
         assert!(
@@ -346,6 +489,14 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
             ('T_HOME', 'G_MPIM', 'U_C', false),
             ('T_OTHER', 'D_A', 'U_A', true);
 
+        insert into slack_sync_users
+            (user_id, user_name, real_name, display_name, team_id)
+        values
+            ('U_A', 'alice', 'Alice Example', 'Alice', 'T_HOME'),
+            ('U_B', 'bob', 'Bob Example', 'Bobby', 'T_HOME'),
+            ('U_C', 'charlie', 'Charlie Example', 'Charlie', 'T_HOME'),
+            ('U_OTHER', 'tom', 'Tom Example', 'Tom', 'T_HOME');
+
         insert into slack_dm_sync_runs (run_id, status, broker_credential_id)
         values ('run_a', 'completed', 'bcr_a');
 
@@ -358,9 +509,9 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
             ('T_OTHER', 'D_A', '1000.000004', 'other workspace dm', 'run_a');
 
         insert into slack_dm_sync_message_attachments
-            (home_team_id, conversation_id, message_ts, slack_file_id, name, source_run_id)
+            (home_team_id, conversation_id, message_ts, slack_file_id, name, title, source_run_id)
         values
-            ('T_HOME', 'D_A', '1000.000001', 'F_A', 'a.pdf', 'run_a');
+            ('T_HOME', 'D_A', '1000.000001', 'F_A', 'a.pdf', 'Alpha attachment', 'run_a');
 
         insert into slack_dm_sync_checkpoints
             (broker_credential_id, home_team_id, conversation_id, watermark_ts)
@@ -375,6 +526,57 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
+
+async fn assert_projected_documents(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        select body, metadata
+        from slack_dm_context_documents
+        where document_id = 'slack_dm:T_HOME:D_A:1000.000001'
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let body: String = row.get("body");
+    let metadata: serde_json::Value = row.get("metadata");
+
+    assert!(
+        body.contains("user a dm"),
+        "projected body should contain message text"
+    );
+    assert!(
+        body.contains("Alpha attachment"),
+        "projected body should contain attachment search text"
+    );
+    assert_eq!(metadata["attachment_count"], 1);
+    assert_eq!(metadata["conversation_type"], "im");
+
+    let conversation_row = sqlx::query(
+        r#"
+        select title, body, participant_labels
+        from slack_dm_conversation_context_documents
+        where document_id = 'slack_dm_conversation:T_HOME:D_A'
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let title: String = conversation_row.get("title");
+    let body: String = conversation_row.get("body");
+    let participant_labels: Vec<String> = conversation_row.get("participant_labels");
+    assert!(
+        title.contains("Alice") && title.contains("Tom"),
+        "projected conversation title should contain participant labels"
+    );
+    assert!(
+        body.contains("U_A") && body.contains("Tom"),
+        "projected conversation body should contain ids and searchable names"
+    );
+    assert_eq!(
+        participant_labels,
+        vec!["Alice".to_owned(), "Tom".to_owned()]
+    );
     Ok(())
 }
 
@@ -428,6 +630,16 @@ async fn visible_rows(
             "select coalesce(array_agg(broker_credential_id || ':' || home_team_id || ':' || conversation_id order by broker_credential_id, home_team_id, conversation_id), '{}') from slack_dm_sync_checkpoints",
         )
         .await?,
+        context_docs: text_array(
+            &mut tx,
+            "select coalesce(array_agg(document_id order by document_id), '{}') from slack_dm_context_documents",
+        )
+        .await?,
+        conversation_context_docs: text_array(
+            &mut tx,
+            "select coalesce(array_agg(document_id order by document_id), '{}') from slack_dm_conversation_context_documents",
+        )
+        .await?,
         runs: count(&mut tx, "slack_dm_sync_runs").await?,
         backfill_jobs: count(&mut tx, "slack_dm_sync_backfill_jobs").await?,
     };
@@ -460,6 +672,8 @@ fn empty_visible_dm_rows() -> VisibleDmRows {
         messages: vec![],
         attachments: vec![],
         checkpoints: vec![],
+        context_docs: vec![],
+        conversation_context_docs: vec![],
         runs: 0,
         backfill_jobs: 0,
     }
