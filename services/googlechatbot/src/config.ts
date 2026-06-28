@@ -9,6 +9,10 @@ const EnvSchema = z.object({
   // resource name so we skip its own messages.
   GOOGLE_SERVICE_ACCOUNT_JSON: z.string().optional(),
 
+  // Harness for new threads when no --claude/--amp/--codex flag is given
+  // (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
+  GOOGLECHATBOT_DEFAULT_HARNESS: z.string().default('codex'),
+
   // api-rs (the Rust Centaur API) the bot drives sessions against.
   CENTAUR_API_URL: z.string().url().default('http://127.0.0.1:8080'),
   CENTAUR_API_KEY: z.string().optional(),

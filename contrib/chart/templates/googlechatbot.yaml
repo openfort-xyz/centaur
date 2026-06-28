@@ -32,6 +32,10 @@ spec:
               value: "3002"
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            # Default harness for new threads (per-session --claude/--codex flags
+            # still override). Mirrors the other bots: driven by sandbox.harnessEngine.
+            - name: GOOGLECHATBOT_DEFAULT_HARNESS
+              value: {{ .Values.sandbox.harnessEngine | quote }}
             # Service account key for the Chat REST client (JWT OAuth2) and bot identity.
             - name: GOOGLE_SERVICE_ACCOUNT_JSON
               valueFrom:

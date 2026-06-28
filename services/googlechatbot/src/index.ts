@@ -173,7 +173,12 @@ async function driveSession(
   execute.text = overrides.cleanedText
   incr('googlechatbot_runs_total', { outcome: 'started' })
   try {
-    await createSession(config, threadKey, conversationName(event), overrides.harnessType)
+    await createSession(
+      config,
+      threadKey,
+      conversationName(event),
+      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+    )
     await appendSessionMessages(config, threadKey, history)
     const execution = await executeSession(config, threadKey, execute, {
       idleTimeoutMs: config.SESSION_IDLE_TIMEOUT_MS,
