@@ -69,6 +69,35 @@ describe('markdownToChatMessage', () => {
     expect(out.text).not.toMatch(/\n[^`\n]*\|\s*\n/) // no unfenced pipe row leaks
   })
 
+  test('wide / link-heavy tables become a responsive record list, not dash soup', () => {
+    const md = [
+      '| Live site | What it is | Repo |',
+      '| --- | --- | --- |',
+      '| [demo.openfort.io](https://demo.openfort.io/) | **"Openfort Examples"** — 7 interactive use-case demos: stablecoin transfer, agentic CFO, x402 paywall, DCA into Morpho | `openfort-xyz/demo-directory` |'
+    ].join('\n')
+    const out = markdownToChatMessage(md)
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    // No fence and no giant dash separator — it would wrap unreadably on a card.
+    expect(joined).not.toContain('```')
+    expect(joined).not.toMatch(/-{20}/)
+    // Row title + labelled bullets, with the link preserved (clickable, not raw).
+    expect(joined).toContain('**[demo.openfort.io](https://demo.openfort.io/)**')
+    expect(joined).toContain('- What it is: **"Openfort Examples"**')
+    expect(joined).toContain('- Repo: `openfort-xyz/demo-directory`')
+  })
+
+  test('compact plain tables still render as an aligned monospace fence', () => {
+    const md = '| name | age |\n| --- | --- |\n| bob | 30 |'
+    const out = markdownToChatMessage(md)
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('```')
+    expect(joined).toContain('name | age')
+  })
+
   test('table-first answers do not dump pipe soup into the notification summary', () => {
     const md = '| name | age |\n| --- | --- |\n| bob | 30 |\n\nSummary prose here.'
     const out = markdownToChatMessage(md)
