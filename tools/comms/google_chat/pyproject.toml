@@ -20,7 +20,16 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
-hosts = ["chatbot"]
+hosts = ["chatbot", "chat.googleapis.com"]
+# CHATBOT_API_KEY: the tool's send/list/update/delete go through the chatbot service.
+#
+# gcp_auth on GOOGLE_SERVICE_ACCOUNT_JSON registers the iron-proxy grant the
+# Google Chat ETL (workflows/google_chat) relies on: the proxy mints an OAuth
+# token for the Chat scopes from the Chat-app service account and injects
+# Authorization: Bearer on outbound requests to chat.googleapis.com, so the
+# workflow host never holds the key. chat.app.messages.readonly is what enables
+# history reads and needs the one-time Workspace-admin Marketplace install.
 secrets = [
     {type = "http", name = "CHATBOT_API_KEY", match_headers = ["Authorization"], hosts = ["chatbot"]},
+    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/chat.app.messages.readonly"]},
 ]

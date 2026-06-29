@@ -21,6 +21,8 @@ EXACT_QUERY_TITLE_BOOST = 8
 EXACT_QUERY_BODY_BOOST = 2
 THREAD_SCORE_MULTIPLIER = 1.25
 CHANNEL_DAY_SCORE_MULTIPLIER = 0.75
+# Google Chat threads are conversational like Slack threads; weight them up.
+CHAT_THREAD_SCORE_MULTIPLIER = 1.25
 DEFAULT_PREVIEW_CHARS = 280
 MAX_RELATED_CHILDREN = 25
 SLACK_DM_SOURCE = "slack_dm"
@@ -363,6 +365,7 @@ class CompanyContextClient:
                     * CASE source_type
                         WHEN 'slack_thread' THEN {THREAD_SCORE_MULTIPLIER}
                         WHEN 'slack_channel_day' THEN {CHANNEL_DAY_SCORE_MULTIPLIER}
+                        WHEN 'google_chat_thread' THEN {CHAT_THREAD_SCORE_MULTIPLIER}
                         ELSE 1.0
                     END DESC,
                     source_updated_at DESC NULLS LAST
