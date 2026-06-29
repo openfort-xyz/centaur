@@ -18,11 +18,12 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   cardsV2?: Array<{ cardId: string; card: GoogleChatCard }>
 } {
   const trimmed = markdown.trim() || ' '
-  // Google Chat renders no table widget and no Markdown/HTML tables on any
-  // surface, so re-emit Markdown tables as a column-aligned monospace code block
-  // (which DOES render — both in the plain `text` field and in card MARKDOWN).
-  // Apply it to BOTH the card body and the plain-text path so a table never
-  // leaks raw `| a | b |` pipes regardless of which delivery path is taken.
+  // Google Chat renders no table on any surface, so re-emit Markdown tables as
+  // either a column-aligned monospace fence (compact, plain tables) or a
+  // responsive record list (wide/link-heavy tables). Applied to BOTH the card
+  // body and the plain-text path so a table never leaks raw `| a | b |` pipes
+  // or dash soup regardless of which delivery path is taken. (Name kept for the
+  // public test import; it now does more than fence.)
   const fenced = fenceMarkdownTables(trimmed)
 
   const cards = splitMarkdownToCards(fenced)
@@ -127,12 +128,20 @@ function buildTextWidgets(text: string): GoogleChatCardWidget[] {
   }))
 }
 
+/** A monospace fence wider than this wraps (never scrolls) on a Chat card. */
+const MAX_FENCED_TABLE_WIDTH = 64
+
 /**
- * Convert GitHub-flavoured Markdown tables into a column-aligned monospace code
- * block. Google Chat has no table widget and renders no Markdown/HTML table on
- * any surface, so the only faithful option is a fixed-width block: parse the
- * table, pad every cell to its column width, and fence it. Raw GFM rows (often
- * unpadded, e.g. `| Name | Age |`) would otherwise render as ragged pipe text.
+ * Convert GitHub-flavoured Markdown tables into something Google Chat can render
+ * legibly. Chat has no table widget and renders no Markdown/HTML table on any
+ * surface, and its monospace code blocks WRAP rather than scroll — so a wide
+ * aligned table collapses into dash soup (as seen with prose/link-heavy tables).
+ *
+ * Strategy per table:
+ *  - compact + plain  → column-aligned monospace fence (a real little table);
+ *  - wide OR contains links/inline markdown → a responsive record list
+ *    (`**row title**` + `- Column: value` bullets) that wraps naturally and
+ *    keeps links clickable (a fence would show `[text](url)` raw).
  */
 export function fenceMarkdownTables(markdown: string): string {
   const lines = markdown.split('\n')
@@ -168,20 +177,32 @@ export function fenceMarkdownTables(markdown: string): string {
       i += 1
     }
     i -= 1 // step back; outer loop re-increments
-    out.push('```', ...alignMarkdownTable(block), '```')
+    out.push(...renderMarkdownTable(block))
   }
 
   return out.join('\n')
 }
 
-/**
- * Render a raw GFM table block (header, separator, data rows) as a list of
- * fixed-width, space-padded lines so columns line up in a monospace fence.
- * The separator row is rebuilt with dashes sized to each column; GFM alignment
- * colons are dropped (they have no effect in a monospace block).
- */
-function alignMarkdownTable(block: string[]): string[] {
+/** Pick the legible rendering for one GFM table block. */
+function renderMarkdownTable(block: string[]): string[] {
   const rows = block.map(splitTableRow)
+  const aligned = alignMarkdownTable(rows)
+  const widest = Math.max(0, ...aligned.map(line => line.length))
+  // Links/images can't render inside a fence, and prose cells overflow the card
+  // width; either way, a record list reads far better than a wrapped grid.
+  const hasInlineMarkdown = block.some(line => /\]\(|!\[/.test(line))
+  if (widest <= MAX_FENCED_TABLE_WIDTH && !hasInlineMarkdown) {
+    return ['```', ...aligned, '```']
+  }
+  return tableRowsToList(rows)
+}
+
+/**
+ * Column-align a parsed table (header, separator, data rows) into fixed-width
+ * monospace lines. The separator is rebuilt with dashes sized to each column;
+ * GFM alignment colons are dropped (no effect in a monospace block).
+ */
+function alignMarkdownTable(rows: string[][]): string[] {
   const columnCount = Math.max(0, ...rows.map(row => row.length))
   const widths = Array.from({ length: columnCount }, (_, c) =>
     Math.max(3, ...rows.map((row, idx) => (idx === 1 ? 0 : (row[c]?.length ?? 0))))
@@ -196,6 +217,31 @@ function alignMarkdownTable(block: string[]): string[] {
       .join(' | ')
       .replace(/\s+$/, '')
   })
+}
+
+/**
+ * Render a table as a responsive record list: each data row becomes a bold
+ * first-cell title followed by `- Header: value` bullets for the rest. This
+ * wraps cleanly on narrow Chat cards and preserves clickable links/markdown.
+ */
+function tableRowsToList(rows: string[][]): string[] {
+  const header = rows[0] ?? []
+  const out: string[] = []
+
+  for (const row of rows.slice(2)) {
+    if (!row.some(cell => cell.trim())) continue
+    const title = row[0]?.trim()
+    if (title) out.push(`**${title}**`)
+    for (let c = 1; c < Math.max(header.length, row.length); c += 1) {
+      const value = row[c]?.trim()
+      if (!value) continue
+      const label = header[c]?.trim()
+      out.push(label ? `- ${label}: ${value}` : `- ${value}`)
+    }
+    out.push('')
+  }
+  while (out.length && out[out.length - 1] === '') out.pop()
+  return out
 }
 
 /** Split one table row into trimmed cells, dropping the leading/trailing pipes. */
