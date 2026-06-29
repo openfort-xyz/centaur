@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables } from './render'
+import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup } from './render'
 import { chatReplyLimits } from '../constants'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
@@ -112,6 +112,23 @@ describe('markdownToChatMessage', () => {
     const long = 'x'.repeat(10_000)
     const out = markdownToChatMessage(long)
     expect(out.text.length).toBe(10_000)
+  })
+
+  test('plain text path translates GFM the text field cannot render into Chat markup', () => {
+    const md = '**Barcelona ~29°C, sunny** — Sources: [Met Office](https://w.example/sp3) · [AccuWeather](https://a.example/bcn)'
+    const out = markdownToChatMessage(md)
+    // No leaked GFM: bold double-asterisks and `[label](url)` are gone.
+    expect(out.text).not.toContain('**')
+    expect(out.text).not.toContain('](http')
+    // Rendered as Chat-flavoured bold + `<url|label>` links.
+    expect(out.text).toContain('*Barcelona ~29°C, sunny*')
+    expect(out.text).toContain('<https://w.example/sp3|Met Office>')
+    expect(out.text).toContain('<https://a.example/bcn|AccuWeather>')
+  })
+
+  test('toChatTextMarkup leaves image embeds and plain prose untouched', () => {
+    expect(toChatTextMarkup('plain prose, no markup')).toBe('plain prose, no markup')
+    expect(toChatTextMarkup('![alt](https://img.example/x.png)')).toBe('![alt](https://img.example/x.png)')
   })
 
   test('splits into multiple cards before exceeding the per-card widget limit', () => {
