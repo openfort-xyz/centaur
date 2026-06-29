@@ -453,39 +453,58 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     include_types = _include_space_types()
     explicit_space_ids = {sid.strip() for sid in inp.space_ids if sid.strip()}
 
+    # Record the run before any Chat call so an enumeration failure (auth,
+    # blocked egress) lands in the ledger instead of disappearing silently.
+    await _record_run_start(
+        ctx._pool,
+        run_id=run_id,
+        workflow_run_id=ctx.run_id,
+        scopes_requested=[],
+        metadata={**inp.metadata, "page_size": page_size, "max_pages": max_pages},
+    )
+
     client = _client()
 
     # Enumerate the spaces the app can see (filtered to allowed types), unless
     # the caller pinned an explicit set.
     spaces: list[dict[str, Any]] = []
     page_token: str | None = None
-    while True:
-        page = client.list_spaces(page_size=DEFAULT_PAGE_SIZE, page_token=page_token)
-        for space in page.get("spaces", []):
-            if not isinstance(space, dict):
-                continue
-            space_id = _resource_id(str(space.get("name") or ""))
-            if not space_id:
-                continue
-            if explicit_space_ids and space_id not in explicit_space_ids:
-                continue
-            space_type = str(space.get("type") or space.get("spaceType") or "").upper()
-            if not explicit_space_ids and include_types and space_type not in include_types:
-                continue
-            spaces.append(space)
-        page_token = page.get("nextPageToken")
-        if not page_token:
-            break
-
-    await _record_run_start(
-        ctx._pool,
-        run_id=run_id,
-        workflow_run_id=ctx.run_id,
-        scopes_requested=[
-            _scope_ref(_resource_id(str(s.get("name") or ""))) for s in spaces
-        ],
-        metadata={**inp.metadata, "page_size": page_size, "max_pages": max_pages},
-    )
+    try:
+        while True:
+            page = client.list_spaces(page_size=DEFAULT_PAGE_SIZE, page_token=page_token)
+            for space in page.get("spaces", []):
+                if not isinstance(space, dict):
+                    continue
+                space_id = _resource_id(str(space.get("name") or ""))
+                if not space_id:
+                    continue
+                if explicit_space_ids and space_id not in explicit_space_ids:
+                    continue
+                space_type = str(space.get("type") or space.get("spaceType") or "").upper()
+                if (
+                    not explicit_space_ids
+                    and include_types
+                    and space_type not in include_types
+                ):
+                    continue
+                spaces.append(space)
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as exc:
+        error = str(exc)
+        record_etl_items_failed("google_chat", "message", "spaces", "api_error")
+        await _record_run_finish(
+            ctx._pool,
+            run_id=run_id,
+            status="failed",
+            scopes_synced=[],
+            scopes_failed=[],
+            counts={"spaces_seen": 0, "spaces_synced": 0, "messages_seen": 0, "messages_upserted": 0},
+            error_text=f"list_spaces failed: {error}",
+        )
+        ctx.log("google_chat_sync_list_spaces_failed", error=error)
+        return {"status": "failed", "run_id": run_id, "error": error}
 
     counts = {
         "spaces_seen": len(spaces),

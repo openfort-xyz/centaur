@@ -4,12 +4,16 @@ import os
 from urllib.parse import urlsplit
 
 
-def build_http():
+def build_http(timeout: float | None = None):
     """Build a google-api-python-client HTTP transport routed through iron-proxy.
 
     Google REST clients use httplib2, so we wire proxy and CA settings
     explicitly. The imports stay lazy so workflow modules can load in test
     environments that have not installed tool-only Google dependencies.
+
+    Pass ``timeout`` (seconds) to bound socket connect/read — without it an
+    unreachable or blocked upstream (e.g. a missing egress rule) hangs the
+    workflow indefinitely, with no run-ledger entry to show why.
     """
     import httplib2
     import socks
@@ -26,4 +30,4 @@ def build_http():
     ca_certs = os.environ.get("SSL_CERT_FILE") or os.environ.get(
         "REQUESTS_CA_BUNDLE"
     )
-    return httplib2.Http(proxy_info=proxy_info, ca_certs=ca_certs)
+    return httplib2.Http(proxy_info=proxy_info, ca_certs=ca_certs, timeout=timeout)
