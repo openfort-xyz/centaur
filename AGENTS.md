@@ -470,7 +470,7 @@ Runs go through: `queued → running → sleeping/waiting → running → … �
 | `echo` | Minimal smoke workflow. |
 | `slack_sync`, `slack_backfill` | Slack ETL sync and backfill jobs. |
 | `company_context_documents` | Projection from synced sources into retrieval documents. |
-| `google_drive_sync`, `google_calendar_sync`, `linear_sync` | Optional connector sync workflows. |
+| `google_drive_sync`, `google_calendar_sync`, `google_chat_sync`, `linear_sync` | Optional connector sync workflows. |
 | `github_issue_triage` | Example webhook-triggered triage flow. |
 
 ### Durable state

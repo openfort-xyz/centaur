@@ -25,6 +25,9 @@ WORKFLOW_NAME = "company_context_documents"
 DEFAULT_SYNC_INTERVAL_SECONDS = 4 * 60 * 60
 DEFAULT_WATERMARK_OVERLAP_SECONDS = 60
 MIN_THREAD_MESSAGES = 5
+# Google Chat threads are often short; project every thread with at least one
+# message so single-message rooms are not dropped from the corpus.
+MIN_CHAT_THREAD_MESSAGES = 1
 FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
 SLACK_CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)(?:\|([^>]+))?>")
@@ -32,12 +35,14 @@ COMPANY_CONTEXT_SOURCE_TYPES = {
     "slack": ("slack_channel_day", "slack_thread", "slack_attachment"),
     "google_drive": ("google_doc",),
     "google_calendar": ("calendar_event",),
+    "google_chat": ("google_chat_thread",),
     "linear": ("linear_issue",),
 }
 COMPANY_CONTEXT_DOCUMENT_ACTIONS = ("inserted", "updated", "deleted", "noop")
 ETL_CHECKPOINT_TABLES = {
     "google_drive": "google_drive_sync_checkpoints",
     "google_calendar": "google_calendar_sync_checkpoints",
+    "google_chat": "google_chat_sync_checkpoints",
     "linear": "linear_sync_checkpoints",
 }
 
@@ -79,6 +84,7 @@ SCHEDULE = {
             _env_flag_enabled("SLACK_ETL_ENABLED")
             or _env_flag_enabled("GOOGLE_DRIVE_ETL_ENABLED")
             or _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
+            or _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
             or _env_flag_enabled("LINEAR_ETL_ENABLED")
         )
         and _env_flag_enabled("COMPANY_CONTEXT_DOCUMENTS_ENABLED", default=True)
@@ -165,6 +171,7 @@ def _source_enabled() -> bool:
         _env_flag_enabled("SLACK_ETL_ENABLED")
         or _env_flag_enabled("GOOGLE_DRIVE_ETL_ENABLED")
         or _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
+        or _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
         or _env_flag_enabled("LINEAR_ETL_ENABLED")
     )
 
@@ -1208,6 +1215,144 @@ def _calendar_event_document_id(row: Any) -> str:
     return f"google_calendar:event:{calendar_id}:{event_id}"
 
 
+async def _load_changed_chat_threads(pool, since: dt.datetime | None) -> dict[str, Any]:
+    """Find Google Chat threads affected by changed message rows."""
+    if since is None:
+        where_sql = "WHERE last_error = '' AND thread_id <> ''"
+        args: list[Any] = []
+    else:
+        where_sql = "WHERE last_error = '' AND thread_id <> '' AND updated_at > $1"
+        args = [since]
+
+    thread_rows = await pool.fetch(
+        "SELECT DISTINCT space_id, thread_id "
+        f"FROM google_chat_sync_messages {where_sql} "
+        "ORDER BY space_id, thread_id",
+        *args,
+    )
+    stats = await pool.fetchrow(
+        "SELECT COUNT(*) AS changed_messages, MAX(updated_at) AS max_updated_at "
+        f"FROM google_chat_sync_messages {where_sql}",
+        *args,
+    )
+    max_updated_at = stats["max_updated_at"] if stats else None
+    if isinstance(max_updated_at, dt.datetime):
+        max_updated_at = max_updated_at.astimezone(dt.timezone.utc)
+    return {
+        "threads": [
+            (str(row["space_id"]), str(row["thread_id"])) for row in thread_rows
+        ],
+        "changed_messages": int(stats["changed_messages"] or 0) if stats else 0,
+        "max_updated_at": max_updated_at,
+    }
+
+
+async def _load_chat_thread_messages(pool, space_id: str, thread_id: str) -> list[Any]:
+    """Load all messages for one Google Chat thread aggregate."""
+    return list(
+        await pool.fetch(
+            "SELECT m.space_id, s.display_name AS space_display_name, s.space_type, "
+            "m.message_id, m.message_name, m.thread_id, m.sender_id, m.sender_name, "
+            "m.sender_type, m.text_content, m.source_create_time, m.updated_at "
+            "FROM google_chat_sync_messages m "
+            "LEFT JOIN google_chat_sync_spaces s ON s.space_id = m.space_id "
+            "WHERE m.space_id = $1 AND m.thread_id = $2 AND m.last_error = '' "
+            "ORDER BY m.source_create_time NULLS LAST, m.message_id",
+            space_id,
+            thread_id,
+        )
+    )
+
+
+def _chat_speaker(row: Any) -> str:
+    """Return the best display name for a Google Chat sender row."""
+    name = str(row["sender_name"] or "").strip()
+    if name:
+        return name
+    return str(row["sender_id"] or "").strip() or "Unknown"
+
+
+def _google_chat_thread_document(
+    *,
+    space_id: str,
+    thread_id: str,
+    messages: list[Any],
+) -> dict[str, Any] | None:
+    """Render one Google Chat thread into a context document."""
+    if len(messages) < MIN_CHAT_THREAD_MESSAGES:
+        return None
+
+    first = messages[0]
+    space_name = str(first["space_display_name"] or space_id)
+    first_text = str(first["text_content"] or "").strip()
+    title = (
+        _sanitize_heading(first_text)
+        if first_text
+        else f"Chat thread in {space_name}"
+    )
+    participants = sorted(
+        {_chat_speaker(row) for row in messages if str(row["sender_id"] or "")}
+    )
+    last_updated = max(
+        row["updated_at"].astimezone(dt.timezone.utc) for row in messages
+    )
+    occurred_at = first["source_create_time"]
+
+    lines = [
+        f"# {title}",
+        "",
+        "- Source: Google Chat",
+        f"- Space: {space_name}",
+        f"- Started: {_format_time(occurred_at)}",
+        f"- Participants: {', '.join(participants)}",
+        f"- Messages: {len(messages)}",
+        "",
+        "---",
+        "",
+    ]
+    for row in messages:
+        speaker = _chat_speaker(row)
+        text = str(row["text_content"] or "").strip()
+        lines.extend(
+            [
+                f"### {speaker} - {_format_time(row['source_create_time'])}",
+                "",
+                text,
+                "",
+            ]
+        )
+
+    body = "\n".join(lines).strip()
+    source_document_id = f"{space_id}:{thread_id}"
+    metadata = {
+        "space_id": space_id,
+        "space_name": space_name,
+        "space_type": str(first["space_type"] or ""),
+        "thread_id": thread_id,
+        "message_count": len(messages),
+        "participants": participants,
+        "aggregation": "thread",
+    }
+    return {
+        "document_id": f"google_chat:thread:{space_id}:{thread_id}",
+        "source": "google_chat",
+        "source_type": "google_chat_thread",
+        "source_document_id": source_document_id,
+        "source_chunk_id": "",
+        "parent_document_id": None,
+        "title": title,
+        "body": body,
+        "url": "",
+        "author_id": str(first["sender_id"] or ""),
+        "author_name": _chat_speaker(first),
+        "access_scope": "company",
+        "occurred_at": occurred_at,
+        "source_updated_at": last_updated,
+        "content_hash": _content_hash(title, body, "", metadata),
+        "metadata": metadata,
+    }
+
+
 async def _upsert_document(pool, document: dict[str, Any]) -> str:
     """Upsert a projected document and return inserted/updated/noop."""
     existing_hash = await pool.fetchval(
@@ -1300,6 +1445,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     slack_enabled = _env_flag_enabled("SLACK_ETL_ENABLED")
     google_drive_enabled = _env_flag_enabled("GOOGLE_DRIVE_ETL_ENABLED")
     google_calendar_enabled = _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
+    google_chat_enabled = _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
     linear_enabled = _env_flag_enabled("LINEAR_ETL_ENABLED")
     enabled_sources = [
         source
@@ -1307,6 +1453,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             ("slack", slack_enabled),
             ("google_drive", google_drive_enabled),
             ("google_calendar", google_calendar_enabled),
+            ("google_chat", google_chat_enabled),
             ("linear", linear_enabled),
         )
         if enabled
@@ -1339,6 +1486,13 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     }
     if google_calendar_enabled:
         calendar_changed = await _load_changed_calendar_events(ctx._pool, since)
+    chat_changed = {
+        "threads": [],
+        "changed_messages": 0,
+        "max_updated_at": None,
+    }
+    if google_chat_enabled:
+        chat_changed = await _load_changed_chat_threads(ctx._pool, since)
     linear_changed = {
         "issues": [],
         "changed_issues": 0,
@@ -1485,6 +1639,38 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         if action in {"inserted", "updated"}:
             documents_upserted += 1
 
+    for space_id, thread_id in chat_changed["threads"]:
+        messages = await _load_chat_thread_messages(ctx._pool, space_id, thread_id)
+        document = _google_chat_thread_document(
+            space_id=space_id,
+            thread_id=thread_id,
+            messages=messages,
+        )
+        if document is None:
+            if await _delete_document(
+                ctx._pool, f"google_chat:thread:{space_id}:{thread_id}"
+            ):
+                documents_deleted += 1
+                record_company_context_documents_changed(
+                    "google_chat",
+                    "google_chat_thread",
+                    "deleted",
+                )
+            continue
+        observe_company_context_document_size(
+            "google_chat",
+            str(document["source_type"]),
+            len(str(document["body"] or "")),
+        )
+        action = await _upsert_document(ctx._pool, document)
+        record_company_context_documents_changed(
+            "google_chat",
+            str(document["source_type"]),
+            action,
+        )
+        if action in {"inserted", "updated"}:
+            documents_upserted += 1
+
     for row in linear_changed["issues"]:
         comments = await _load_linear_issue_comments(ctx._pool, str(row["issue_id"]))
         document = _linear_issue_document(row, comments)
@@ -1510,6 +1696,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             changed["max_updated_at"],
             drive_changed["max_updated_at"],
             calendar_changed["max_updated_at"],
+            chat_changed["max_updated_at"],
             linear_changed["max_updated_at"],
             last_watermark,
         )
@@ -1520,6 +1707,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "slack": changed["max_updated_at"] or last_watermark,
         "google_drive": drive_changed["max_updated_at"] or last_watermark,
         "google_calendar": calendar_changed["max_updated_at"] or last_watermark,
+        "google_chat": chat_changed["max_updated_at"] or last_watermark,
         "linear": linear_changed["max_updated_at"] or last_watermark,
     }
     _emit_company_context_projection_lag(enabled_sources, source_watermarks)
@@ -1531,12 +1719,14 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "changed_slack_attachments": changed["changed_attachments"],
         "changed_drive_files": drive_changed["changed_files"],
         "changed_calendar_events": calendar_changed["changed_events"],
+        "changed_chat_messages": chat_changed["changed_messages"],
         "changed_linear_issues": linear_changed["changed_issues"],
         "channel_day_documents": len(changed["channel_days"]),
         "thread_candidates": len(changed["threads"]),
         "slack_attachment_documents": len(changed["attachments"]),
         "drive_documents": len(drive_changed["files"]),
         "calendar_event_documents": len(calendar_changed["events"]),
+        "chat_thread_documents": len(chat_changed["threads"]),
         "linear_issue_documents": len(linear_changed["issues"]),
         "documents_upserted": documents_upserted,
         "documents_deleted": documents_deleted,
