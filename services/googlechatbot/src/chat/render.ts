@@ -18,8 +18,11 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   cardsV2?: Array<{ cardId: string; card: GoogleChatCard }>
 } {
   const trimmed = markdown.trim() || ' '
-  // Markdown tables aren't supported by Google Chat; preserve their alignment as
-  // a monospace code block instead of leaking raw pipes into the text.
+  // Google Chat renders no table widget and no Markdown/HTML tables on any
+  // surface, so re-emit Markdown tables as a column-aligned monospace code block
+  // (which DOES render — both in the plain `text` field and in card MARKDOWN).
+  // Apply it to BOTH the card body and the plain-text path so a table never
+  // leaks raw `| a | b |` pipes regardless of which delivery path is taken.
   const fenced = fenceMarkdownTables(trimmed)
 
   const cards = splitMarkdownToCards(fenced)
@@ -34,7 +37,7 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   }))
 
   return {
-    text: clampText(trimmed, chatReplyLimits.message.maxPlainTextChars),
+    text: clampText(fenced, chatReplyLimits.message.maxPlainTextChars),
     fallbackText: summarizeMarkdown(trimmed),
     cardsV2
   }
@@ -125,9 +128,11 @@ function buildTextWidgets(text: string): GoogleChatCardWidget[] {
 }
 
 /**
- * Wrap GitHub-flavoured Markdown tables in a fenced code block. Google Chat has
- * no table widget and no Markdown table support, so a fence keeps the columns
- * aligned in monospace rather than dumping raw `| a | b |` rows as prose.
+ * Convert GitHub-flavoured Markdown tables into a column-aligned monospace code
+ * block. Google Chat has no table widget and renders no Markdown/HTML table on
+ * any surface, so the only faithful option is a fixed-width block: parse the
+ * table, pad every cell to its column width, and fence it. Raw GFM rows (often
+ * unpadded, e.g. `| Name | Age |`) would otherwise render as ragged pipe text.
  */
 export function fenceMarkdownTables(markdown: string): string {
   const lines = markdown.split('\n')
@@ -163,15 +168,54 @@ export function fenceMarkdownTables(markdown: string): string {
       i += 1
     }
     i -= 1 // step back; outer loop re-increments
-    out.push('```', ...block, '```')
+    out.push('```', ...alignMarkdownTable(block), '```')
   }
 
   return out.join('\n')
 }
 
+/**
+ * Render a raw GFM table block (header, separator, data rows) as a list of
+ * fixed-width, space-padded lines so columns line up in a monospace fence.
+ * The separator row is rebuilt with dashes sized to each column; GFM alignment
+ * colons are dropped (they have no effect in a monospace block).
+ */
+function alignMarkdownTable(block: string[]): string[] {
+  const rows = block.map(splitTableRow)
+  const columnCount = Math.max(0, ...rows.map(row => row.length))
+  const widths = Array.from({ length: columnCount }, (_, c) =>
+    Math.max(3, ...rows.map((row, idx) => (idx === 1 ? 0 : (row[c]?.length ?? 0))))
+  )
+
+  return rows.map((row, idx) => {
+    if (idx === 1) {
+      return widths.map(width => '-'.repeat(width)).join(' | ')
+    }
+    return widths
+      .map((width, c) => (row[c] ?? '').padEnd(width))
+      .join(' | ')
+      .replace(/\s+$/, '')
+  })
+}
+
+/** Split one table row into trimmed cells, dropping the leading/trailing pipes. */
+function splitTableRow(line: string): string[] {
+  let trimmed = line.trim()
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1)
+  if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1)
+  // Split on unescaped pipes so `\|` inside a cell is kept, then unescape it.
+  return trimmed.split(/(?<!\\)\|/).map(cell => cell.replace(/\\\|/g, '|').trim())
+}
+
 function isTableSeparator(line: string): boolean {
   const trimmed = line.trim()
   return trimmed.includes('-') && trimmed.includes('|') && /^[\s|:-]+$/.test(trimmed)
+}
+
+/** A block is a Markdown table when its 2nd line is a GFM separator row. */
+function isTableBlock(block: string): boolean {
+  const lines = block.split('\n')
+  return lines.length >= 2 && lines[0]!.includes('|') && isTableSeparator(lines[1]!)
 }
 
 export function splitMarkdownText(input: string, maxChars: number): string[] {
@@ -194,10 +238,17 @@ export function splitMarkdownText(input: string, maxChars: number): string[] {
 
 /** Collapse Markdown into a short, single-line notification summary for `text`. */
 function summarizeMarkdown(markdown: string): string {
-  const firstBlock = markdown.split(/\n\s*\n/).find((b) => b.trim()) ?? markdown
+  // Prefer the first prose block: a table renders in the card, and collapsing it
+  // to one line would dump `| a | b | | --- | --- |` pipe soup into the summary.
+  const blocks = markdown
+    .split(/\n\s*\n/)
+    .map((b) => b.trim())
+    .filter(Boolean)
+  const firstBlock = blocks.find((b) => !isTableBlock(b)) ?? blocks[0] ?? markdown
   const plain = firstBlock
     .replace(/```[\s\S]*?```/g, '')
     .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\|/g, ' ')
     .replace(/[*_`~>#-]/g, '')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
     .replace(/\s+/g, ' ')
