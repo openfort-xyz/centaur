@@ -277,6 +277,20 @@ impl HarnessServer for ClaudeCodeHarness {
     ) -> Result<Vec<NormalizedEvent>> {
         Ok(normalizer.normalize(event))
     }
+
+    /// Complete the turn on the assistant's `end_turn` message rather than the
+    /// CLI's terminal `{"type":"result"}` line. The harness keeps the `claude
+    /// --print --input-format stream-json` process warm with stdin held open
+    /// across turns, so Claude never reaches stdin EOF and never emits a
+    /// `result` event — without this, the turn would hang open forever and no
+    /// `turn/completed` notification would be sent. Claude's final message
+    /// carries `stop_reason: "end_turn"` (tool-call messages use `"tool_use"`,
+    /// so interim steps don't trip this), which `flush_messages` turns into an
+    /// `AssistantMessage { stop_reason: Some("end_turn") }`. Mirrors the amp
+    /// harness, which runs the same persistent-process model.
+    fn finish_turn_on_assistant_end_turn(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +534,26 @@ mod tests {
         assert_eq!(
             agent_texts(&events),
             vec![(Some("end_turn".to_string()), "hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn finishes_turn_on_assistant_end_turn_without_a_result_line() {
+        // The persistent `claude --print` process never sees stdin EOF, so it
+        // never emits a terminal `{"type":"result"}` line. The turn must instead
+        // complete on the assistant's `end_turn` message, or it hangs open and
+        // no `turn/completed` is ever sent (the Google Chat "thinking…" hang).
+        assert!(ClaudeCodeHarness.finish_turn_on_assistant_end_turn());
+
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "assistant", "message": {"id": "msg_1", "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}),
+        );
+        // The emitted AssistantMessage must be recognized as the turn terminator.
+        assert!(
+            events.iter().any(NormalizedEvent::is_assistant_end_turn),
+            "expected an end_turn AssistantMessage to terminate the turn: {events:?}"
         );
     }
 
