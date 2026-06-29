@@ -10,6 +10,9 @@ from urllib.parse import urlencode
 from workflows.gsuite.http import build_http
 
 CHAT_API_BASE = "https://chat.googleapis.com/v1"
+# Bound every Chat call so a blocked egress rule fails fast instead of hanging
+# the workflow indefinitely (httplib2 has no default timeout).
+CHAT_HTTP_TIMEOUT_SECONDS = 60.0
 
 # Authentication is minted by iron-proxy's gcp_auth transform, exactly like the
 # Drive/Calendar ETLs (GOOGLE_TOKEN_JSON) and the gsc/gcp_logs tools: the proxy
@@ -43,7 +46,7 @@ class GoogleChatReadonlyClient:
 
     def _transport(self) -> Any:
         if self._http is None:
-            self._http = build_http()
+            self._http = build_http(timeout=CHAT_HTTP_TIMEOUT_SECONDS)
         return self._http
 
     def _get(self, url: str) -> dict[str, Any]:
