@@ -23,6 +23,12 @@ const EnvSchema = z.object({
   CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   CHAT_EVENT_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(60 * 5),
 
+  // Hard ceiling on every outbound Google Chat REST call (OAuth token exchange,
+  // message create/patch/list, attachment upload). A hung Chat backend on the
+  // ack or thread-history fetch must never stall the handoff to api-rs — these
+  // calls are best-effort and bounded, mirroring slackbotv2's slackApiTimeoutMs.
+  GOOGLECHATBOT_CHAT_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+
   // Comma/space-separated email-domain allowlist for inbound events. The bot is
   // OPEN to all domains until set; set it (e.g. "openfort.xyz") to fail closed.
   GOOGLECHATBOT_ALLOWED_DOMAIN: z

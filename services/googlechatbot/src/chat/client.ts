@@ -9,8 +9,10 @@ export class ChatEdgeClient {
   private tokenExpiry = 0
   private readonly serviceAccountEmail: string | null
   private readonly privateKey: string | null
+  private readonly apiTimeoutMs: number
 
   constructor(config: AppConfig) {
+    this.apiTimeoutMs = config.GOOGLECHATBOT_CHAT_API_TIMEOUT_MS
     if (config.GOOGLE_SERVICE_ACCOUNT_JSON) {
       try {
         const parsed = JSON.parse(config.GOOGLE_SERVICE_ACCOUNT_JSON) as {
@@ -56,13 +58,17 @@ export class ChatEdgeClient {
       exp: expiry
     })
 
+    // Bound the token exchange too: it runs before every request()'s own timed
+    // fetch, so an unbounded hang here would stall the whole handoff despite the
+    // downstream call being timed.
     const response = await fetch(TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
         assertion: jwt
-      })
+      }),
+      signal: AbortSignal.timeout(this.apiTimeoutMs)
     })
 
     if (!response.ok) {
@@ -94,7 +100,7 @@ export class ChatEdgeClient {
         ...(token ? { Authorization: `Bearer ${token}` } : {})
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(30_000)
+      signal: AbortSignal.timeout(this.apiTimeoutMs)
     })
 
     if (!response.ok) {
@@ -286,7 +292,7 @@ export class ChatEdgeClient {
       // Coerce to BufferSource — tsgo's BodyInit overload set rejects the bare
       // Uint8Array<ArrayBufferLike> shape Bun infers here.
       body: data as BodyInit,
-      signal: AbortSignal.timeout(30_000)
+      signal: AbortSignal.timeout(this.apiTimeoutMs)
     })
 
     if (!response.ok) {
