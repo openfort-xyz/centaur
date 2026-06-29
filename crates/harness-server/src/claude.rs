@@ -278,19 +278,17 @@ impl HarnessServer for ClaudeCodeHarness {
         Ok(normalizer.normalize(event))
     }
 
-    /// Complete the turn on the assistant's `end_turn` message rather than the
-    /// CLI's terminal `{"type":"result"}` line. The harness keeps the `claude
-    /// --print --input-format stream-json` process warm with stdin held open
-    /// across turns, so Claude never reaches stdin EOF and never emits a
-    /// `result` event — without this, the turn would hang open forever and no
-    /// `turn/completed` notification would be sent. Claude's final message
-    /// carries `stop_reason: "end_turn"` (tool-call messages use `"tool_use"`,
-    /// so interim steps don't trip this), which `flush_messages` turns into an
-    /// `AssistantMessage { stop_reason: Some("end_turn") }`. Mirrors the amp
-    /// harness, which runs the same persistent-process model.
-    fn finish_turn_on_assistant_end_turn(&self) -> bool {
-        true
-    }
+    // NOTE: ClaudeCodeHarness deliberately does NOT override
+    // `finish_turn_on_assistant_end_turn`. Claude Code emits a terminal
+    // `{"type":"result"}` line at the end of every turn even when stdin is held
+    // open (the persistent-process model), so the turn completes on that `result`
+    // event via `is_terminal()`. Completing earlier on the assistant `end_turn`
+    // message leaves the trailing `result` line unconsumed in the shared stdout;
+    // the NEXT turn then reads that stale `result` first and terminates instantly
+    // with no agent response (its real agentMessage arrives after the turn is
+    // already closed and is dropped) — i.e. follow-up turns render empty. Amp is
+    // different: its streaming process may not emit `result` until stdin closes,
+    // so amp legitimately completes on `end_turn`.
 }
 
 #[cfg(test)]
@@ -538,22 +536,22 @@ mod tests {
     }
 
     #[test]
-    fn finishes_turn_on_assistant_end_turn_without_a_result_line() {
-        // The persistent `claude --print` process never sees stdin EOF, so it
-        // never emits a terminal `{"type":"result"}` line. The turn must instead
-        // complete on the assistant's `end_turn` message, or it hangs open and
-        // no `turn/completed` is ever sent (the Google Chat "thinking…" hang).
-        assert!(ClaudeCodeHarness.finish_turn_on_assistant_end_turn());
+    fn completes_turns_on_result_not_end_turn() {
+        // Claude must NOT complete on the assistant `end_turn` message: it emits a
+        // terminal `result` line every turn (even with stdin held open), and
+        // completing on `end_turn` would leave that `result` unconsumed for the
+        // next turn to read as a stale terminal (follow-up turns then render
+        // empty). The terminal `result` event is what closes a Claude turn.
+        assert!(!ClaudeCodeHarness.finish_turn_on_assistant_end_turn());
 
         let mut normalizer = ClaudeEventNormalizer::default();
         let events = normalize(
             &mut normalizer,
-            json!({"type": "assistant", "message": {"id": "msg_1", "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}),
+            json!({"type": "result", "subtype": "success", "result": "done"}),
         );
-        // The emitted AssistantMessage must be recognized as the turn terminator.
         assert!(
-            events.iter().any(NormalizedEvent::is_assistant_end_turn),
-            "expected an end_turn AssistantMessage to terminate the turn: {events:?}"
+            events.iter().any(NormalizedEvent::is_terminal),
+            "expected the result line to be a terminal event: {events:?}"
         );
     }
 
