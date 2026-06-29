@@ -1226,7 +1226,18 @@ async def create_pool() -> Any:
         import asyncpg  # type: ignore
     except ImportError:
         return None
-    return await asyncpg.create_pool(database_url)
+
+    # asyncpg resets each connection on release with `RESET ALL`, which the
+    # iron-proxy pg policy blocks (it manages the session role/settings). Skip
+    # the automatic reset — workflow handlers use autocommit execute/fetch, so
+    # there is no per-connection state that needs clearing between acquisitions.
+    class _ProxySafeConnection(asyncpg.Connection):  # type: ignore[misc]
+        async def reset(self, *, timeout=None):
+            return None
+
+    return await asyncpg.create_pool(
+        database_url, connection_class=_ProxySafeConnection
+    )
 
 
 def jsonable(value: Any) -> Any:
