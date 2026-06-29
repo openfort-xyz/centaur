@@ -24,7 +24,14 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   // public test import; it now does more than fence.)
   const fenced = fenceMarkdownTables(trimmed)
 
-  const cards = splitMarkdownToCards(fenced)
+  // The card body and the plain `text` field disagree on newlines: the `text`
+  // field treats a single `\n` as a line break, but a card textParagraph
+  // collapses single newlines (only a blank line / list / heading breaks). So an
+  // answer where the agent separated a sentence, a `**bold**` subheading, and the
+  // next block with single newlines renders mashed onto one line in a card
+  // ("…every one.**Per person:**06-22"). Harden the CARD source only — insert a
+  // blank line between adjacent non-list text lines so each is its own paragraph.
+  const cards = splitMarkdownToCards(hardenCardParagraphs(fenced))
   const cardsV2 = cards.slice(0, MAX_CARDS).map((card, index) => ({
     cardId: `card-${index}`,
     card: {
@@ -53,6 +60,37 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
  * the card by LOOKS_RICH_RE before the `text` field is ever used, so the plain path
  * only sees inline prose markup — there is no fenced code here to corrupt.
  */
+/**
+ * Insert a blank line between adjacent non-list text lines so a card textParagraph
+ * renders them on separate lines. A card collapses single `\n` (CommonMark soft
+ * wrap), so consecutive prose/`**bold**` lines the agent wrote with single
+ * newlines otherwise mash together. List items (`- `, `1. `) and fenced code are
+ * left exactly as-is — lists handle their own breaks and a blank line would loosen
+ * them or corrupt a monospace table fence. Card-path only; the plain `text` field
+ * already treats single `\n` as a break.
+ */
+export function hardenCardParagraphs(markdown: string): string {
+  const isBlank = (l: string) => l.trim() === ''
+  const isListItem = (l: string) => /^\s*([-*+]|\d+\.)\s/.test(l)
+  const lines = markdown.split('\n')
+  const out: string[] = []
+  let inFence = false
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!
+    if (line.trimStart().startsWith('```')) inFence = !inFence
+    out.push(line)
+    if (inFence) continue
+    const next = lines[i + 1]
+    if (next === undefined) continue
+    // Already separated, or either side is a list item → leave the break alone.
+    if (isBlank(line) || isBlank(next) || isListItem(line) || isListItem(next)) continue
+    out.push('')
+  }
+
+  return out.join('\n')
+}
+
 export function toChatTextMarkup(text: string): string {
   return text
     // `[label](url)` → `<url|label>`; skip image embeds (`![alt](url)`).

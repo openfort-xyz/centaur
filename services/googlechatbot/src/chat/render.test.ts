@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup } from './render'
+import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, hardenCardParagraphs } from './render'
 import { chatReplyLimits } from '../constants'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
@@ -129,6 +129,26 @@ describe('markdownToChatMessage', () => {
   test('toChatTextMarkup leaves image embeds and plain prose untouched', () => {
     expect(toChatTextMarkup('plain prose, no markup')).toBe('plain prose, no markup')
     expect(toChatTextMarkup('![alt](https://img.example/x.png)')).toBe('![alt](https://img.example/x.png)')
+  })
+
+  test('hardenCardParagraphs separates mashed text lines but keeps lists/fences tight', () => {
+    // Single-newline text lines (the live "…every one.**Per person:**06-22" mash)
+    // become separate paragraphs; the bullet list under a date stays tight.
+    expect(
+      hardenCardParagraphs('every one.\n**Per person — 1 each:**\n**06-22**\n- Customer: x\n- State: y')
+    ).toBe('every one.\n\n**Per person — 1 each:**\n\n**06-22**\n- Customer: x\n- State: y')
+    // Already-separated paragraphs are not double-spaced.
+    expect(hardenCardParagraphs('a\n\nb')).toBe('a\n\nb')
+    // Fenced blocks (aligned tables) are left exactly as-is.
+    expect(hardenCardParagraphs('```\nname | age\nbob  | 30\n```')).toBe('```\nname | age\nbob  | 30\n```')
+  })
+
+  test('mashed single-newline card answer renders each block on its own line', () => {
+    const md = 'every one.\n**Per person — 1 each:**\n**06-22**\n- Customer: x\n- State: y'
+    const joined = paragraphs(markdownToChatMessage(md))
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('every one.\n\n**Per person — 1 each:**')
   })
 
   test('splits into multiple cards before exceeding the per-card widget limit', () => {
