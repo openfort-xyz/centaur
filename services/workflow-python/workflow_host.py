@@ -1206,9 +1206,22 @@ def coerce_input(raw: Any, input_cls: type | None) -> Any:
 
 
 async def create_pool() -> Any:
-    database_url = os.getenv("DATABASE_URL", "").strip()
+    # Prefer the iron-proxy-routed DSN. In a sandbox the egress NetworkPolicy
+    # only permits Postgres through the per-sandbox proxy, never the direct
+    # DATABASE_URL, so a workflow using DATABASE_URL fails at connect. The proxy
+    # DSN (CENTAUR_POSTGRES_DSN) carries no database path; borrow it from
+    # DATABASE_URL — mirroring how the company_context tool connects.
+    proxy_dsn = os.getenv("CENTAUR_POSTGRES_DSN", "").strip()
+    direct_dsn = os.getenv("DATABASE_URL", "").strip()
+    database_url = proxy_dsn or direct_dsn
     if not database_url:
         return None
+    if proxy_dsn and direct_dsn:
+        from urllib.parse import urlparse, urlunparse
+
+        proxy = urlparse(proxy_dsn)
+        if not proxy.path.strip("/"):
+            database_url = urlunparse(proxy._replace(path=urlparse(direct_dsn).path))
     try:
         import asyncpg  # type: ignore
     except ImportError:
