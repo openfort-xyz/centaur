@@ -13,8 +13,6 @@ const MARKDOWN = 'MARKDOWN' as const
 export function markdownToChatMessage(markdown: string, opts: { header?: string } = {}): {
   /** Full answer for the card-less (plain) path. */
   text: string
-  /** Short one-line summary shown above a card so the answer is not rendered twice. */
-  fallbackText: string
   cardsV2?: Array<{ cardId: string; card: GoogleChatCard }>
 } {
   const trimmed = markdown.trim() || ' '
@@ -39,7 +37,6 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
 
   return {
     text: clampText(fenced, chatReplyLimits.message.maxPlainTextChars),
-    fallbackText: summarizeMarkdown(trimmed),
     cardsV2
   }
 }
@@ -258,12 +255,6 @@ function isTableSeparator(line: string): boolean {
   return trimmed.includes('-') && trimmed.includes('|') && /^[\s|:-]+$/.test(trimmed)
 }
 
-/** A block is a Markdown table when its 2nd line is a GFM separator row. */
-function isTableBlock(block: string): boolean {
-  const lines = block.split('\n')
-  return lines.length >= 2 && lines[0]!.includes('|') && isTableSeparator(lines[1]!)
-}
-
 export function splitMarkdownText(input: string, maxChars: number): string[] {
   const chunks: string[] = []
   let remaining = input
@@ -280,26 +271,6 @@ export function splitMarkdownText(input: string, maxChars: number): string[] {
   }
   if (remaining) chunks.push(remaining)
   return chunks
-}
-
-/** Collapse Markdown into a short, single-line notification summary for `text`. */
-function summarizeMarkdown(markdown: string): string {
-  // Prefer the first prose block: a table renders in the card, and collapsing it
-  // to one line would dump `| a | b | | --- | --- |` pipe soup into the summary.
-  const blocks = markdown
-    .split(/\n\s*\n/)
-    .map((b) => b.trim())
-    .filter(Boolean)
-  const firstBlock = blocks.find((b) => !isTableBlock(b)) ?? blocks[0] ?? markdown
-  const plain = firstBlock
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/^#{1,6}\s+/gm, '')
-    .replace(/\|/g, ' ')
-    .replace(/[*_`~>#-]/g, '')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return clampText(plain || 'Centaur update', chatReplyLimits.message.maxFallbackChars)
 }
 
 function clampText(text: string, maxChars: number): string {
