@@ -12,9 +12,19 @@ export const INITIAL_STATUS = '_Condor is thinking…_'
 const STATUS_FLUSH_INTERVAL_MS = 1_000
 const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 
-// Google Chat renders the text fallback AND a card. For a plain-text answer we
-// drop the card so the user does not see the reply twice; rich markdown
-// (headers, lists, code, tables) is worth the card layout.
+// A message with both `text` and `cardsV2` renders the text as a bubble ABOVE
+// the card (Google Chat: "cards are displayed below the plain-text body"), so
+// putting answer content in both shows it twice. We therefore pick ONE surface:
+//   - rich markdown (headers, lists, code, tables, links) → card only. The card
+//     textParagraph (textSyntax: MARKDOWN) is the only surface that renders the
+//     agent's GitHub-flavoured markdown faithfully; the plain `text` field only
+//     supports Chat-flavoured markup (*bold*, <url|text>) and would leak `**`,
+//     `[]()`, `#`, `1.` as literals.
+//   - plain prose (no markdown) → `text` only, no card. It renders fine, stays
+//     searchable/Vault-captured (card text indexing is undocumented), and avoids
+//     card chrome on trivial replies.
+// Notification preview is not a factor: the answer is delivered by PATCHing the
+// already-posted "thinking" ack, and the ack's create already fired the push.
 const LOOKS_RICH_RE =
   /(^|\n)\s*#{1,6}\s|```|(^|\n)\s*[-*+]\s|(^|\n)\s*\d+\.\s|\|.*\|/
 
@@ -181,11 +191,11 @@ async function deliverFinal(
   const rendered = markdownToChatMessage(text)
   const looksRich = LOOKS_RICH_RE.test(text)
   const button = sessionButtonWidget(target.sessionUrl)
-  // Rich: a short summary in `text` (notification) + the card body — never the
-  // full answer in both, or Google Chat shows it twice. Plain: the whole answer
-  // in `text`, no card (plus a button-only card when a session URL is set).
+  // Rich: the answer lives in the card only — no `text`, or Google Chat renders
+  // it a second time as a bubble above the card. Plain: the whole answer in
+  // `text`, no card (plus a button-only card when a session URL is set).
   const body: Partial<GoogleChatMessage> = looksRich
-    ? { text: rendered.fallbackText, cardsV2: withButton(rendered.cardsV2, button) }
+    ? { cardsV2: withButton(rendered.cardsV2, button) }
     : { text: rendered.text, cardsV2: button ? [buttonCard(button)] : [] }
 
   if (target.ackMessageName) {

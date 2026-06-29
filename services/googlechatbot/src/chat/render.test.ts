@@ -98,18 +98,20 @@ describe('markdownToChatMessage', () => {
     expect(joined).toContain('name | age')
   })
 
-  test('table-first answers do not dump pipe soup into the notification summary', () => {
+  test('table-first answers fence the table and keep the prose in the card body', () => {
     const md = '| name | age |\n| --- | --- |\n| bob | 30 |\n\nSummary prose here.'
     const out = markdownToChatMessage(md)
-    expect(out.fallbackText).not.toContain('|')
-    expect(out.fallbackText).toContain('Summary prose here')
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('```')
+    expect(joined).toContain('Summary prose here')
   })
 
-  test('plain text path keeps the full answer; summary stays short', () => {
+  test('plain text path keeps the full answer', () => {
     const long = 'x'.repeat(10_000)
     const out = markdownToChatMessage(long)
-    expect(out.text.length).toBeGreaterThan(chatReplyLimits.message.maxFallbackChars)
-    expect(out.fallbackText.length).toBeLessThanOrEqual(chatReplyLimits.message.maxFallbackChars + 1)
+    expect(out.text.length).toBe(10_000)
   })
 
   test('splits into multiple cards before exceeding the per-card widget limit', () => {
