@@ -35,6 +35,14 @@ def _tool_allowlist() -> set[str] | None:
     return {name.strip() for name in raw.split(",") if name.strip()}
 
 
+def _tool_blocklist() -> set[str]:
+    """Tool package/project/script names to skip, from ``TOOL_BLOCKLIST``."""
+    raw = os.environ.get("TOOL_BLOCKLIST", "").strip()
+    if not raw:
+        return set()
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
 def _home_dir() -> Path:
     return Path.home()
 
@@ -98,12 +106,15 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
         raise RuntimeError(f"refreshed tools subdir does not exist: {published}")
 
     allowlist = _tool_allowlist()
+    blocklist = _tool_blocklist()
     existing = {package_dir.name: package_dir for package_dir in _tool_package_dirs(tool_dir)}
     for package_dir in _tool_package_dirs(published):
         tool_name = package_dir.name
         if allowlist is not None and tool_name not in allowlist:
             # Not in TOOL_ALLOWLIST -> don't install; keeps the agent's catalog
             # to configured tools (no phantom, credential-less tools).
+            continue
+        if tool_name in blocklist:
             continue
         if tool_name in existing:
             print(
@@ -337,6 +348,7 @@ def _refresh_skill_dirs(workspace_dir: Path) -> int:
 
 def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
     allowlist = _tool_allowlist()
+    blocklist = _tool_blocklist()
     scripts: dict[str, dict[str, str]] = {}
     for tool_dir in tool_dirs:
         if not tool_dir.is_dir():
@@ -363,10 +375,14 @@ def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
                 and project_name not in allowlist
             ):
                 continue
+            if package_dir in blocklist or project_name in blocklist:
+                continue
             project_scripts = project.get("scripts") or {}
             if not isinstance(project_scripts, dict):
                 continue
             for name in sorted(project_scripts):
+                if name in blocklist:
+                    continue
                 if "/" in name or "\0" in name:
                     print(f"warning: ignoring invalid script name {name!r}", file=sys.stderr)
                     continue
@@ -388,18 +404,11 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _write_tool_shim(path: Path, script: dict[str, str], pythonpath: str) -> None:
+def _write_tool_shim(path: Path, script: dict[str, str], _pythonpath: str) -> None:
+    catalog = path.parent / "centaur-tools"
     content = f"""#!/bin/sh
 set -e
-_centaur_tool_pythonpath={shlex.quote(pythonpath)}
-if [ -n "$_centaur_tool_pythonpath" ]; then
-  if [ -n "${{PYTHONPATH:-}}" ]; then
-    export PYTHONPATH="$_centaur_tool_pythonpath:$PYTHONPATH"
-  else
-    export PYTHONPATH="$_centaur_tool_pythonpath"
-  fi
-fi
-exec uvx --from {shlex.quote(script["project_dir"])} {shlex.quote(script["name"])} "$@"
+exec {shlex.quote(str(catalog))} run {shlex.quote(script["name"])} "$@"
 """
     _write_executable(path, content)
 
@@ -413,6 +422,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from datetime import datetime, timezone
+import time
 
 INDEX = {str(index_path)!r}
 PYTHONPATH_VALUE = {pythonpath!r}
@@ -486,33 +497,99 @@ print(json.dumps(result, default=str, separators=(",", ":")))
 '''
 
 
-def call_tool(tool, method, payload):
-    project_dir = Path(tool["project_dir"])
-    client_module = tool.get("client_module", "client.py")
+def tool_env():
     env = os.environ.copy()
     if PYTHONPATH_VALUE:
         if env.get("PYTHONPATH"):
             env["PYTHONPATH"] = f"{{PYTHONPATH_VALUE}}:{{env['PYTHONPATH']}}"
         else:
             env["PYTHONPATH"] = PYTHONPATH_VALUE
-    return subprocess.run(
-        [
-            "uvx",
-            "--from",
-            str(project_dir),
-            "python",
-            "-c",
-            CALL_RUNNER,
-            str(project_dir),
-            client_module,
-            method,
-            json.dumps(payload, separators=(",", ":")),
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-        env=env,
-    )
+    return env
+
+
+def analytics_log_path():
+    configured = os.environ.get("CENTAUR_TOOL_ANALYTICS_LOG_PATH")
+    if configured is not None:
+        return configured.strip()
+    return "/proc/1/fd/2"
+
+
+def emit_tool_call_event(event, tool, method, started_at=None, returncode=None):
+    path = analytics_log_path()
+    if path.lower() in {{"", "0", "false", "none", "off"}}:
+        return
+
+    payload = {{
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": "info",
+        "service": "sandbox",
+        "component": "tool_shim",
+        "event": event,
+        "msg": f"Centaur tool shim {{event}}",
+        "tool_name": str(tool.get("name") or "unknown"),
+        "tool_method": method,
+    }}
+    thread_key = os.environ.get("CENTAUR_THREAD_KEY", "").strip()
+    if thread_key:
+        payload["thread_key"] = thread_key
+    if started_at is not None:
+        payload["duration_ms"] = round((time.monotonic() - started_at) * 1000, 3)
+    if returncode is not None:
+        payload["exit_code"] = returncode
+        payload["success"] = "true" if returncode == 0 else "false"
+
+    try:
+        with open(path, "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(payload, separators=(",", ":"), default=str) + "\\n")
+    except Exception:
+        pass
+
+
+def run_tool(tool, args):
+    project_dir = Path(tool["project_dir"])
+    started_at = time.monotonic()
+    emit_tool_call_event("tool_call_started", tool, "cli")
+    try:
+        returncode = subprocess.call(
+            ["uvx", "--from", str(project_dir), tool["name"], *args],
+            env=tool_env(),
+        )
+    except Exception:
+        emit_tool_call_event("tool_call_completed", tool, "cli", started_at, 1)
+        raise
+    emit_tool_call_event("tool_call_completed", tool, "cli", started_at, returncode)
+    return returncode
+
+
+def call_tool(tool, method, payload):
+    project_dir = Path(tool["project_dir"])
+    client_module = tool.get("client_module", "client.py")
+    started_at = time.monotonic()
+    emit_tool_call_event("tool_call_started", tool, method)
+    try:
+        result = subprocess.run(
+            [
+                "uvx",
+                "--from",
+                str(project_dir),
+                "python",
+                "-c",
+                CALL_RUNNER,
+                str(project_dir),
+                client_module,
+                method,
+                json.dumps(payload, separators=(",", ":")),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=tool_env(),
+        )
+    except Exception:
+        emit_tool_call_event("tool_call_completed", tool, method, started_at, 1)
+        raise
+    emit_tool_call_event("tool_call_completed", tool, method, started_at, result.returncode)
+    return result
 
 
 def main(argv):
@@ -540,7 +617,7 @@ def main(argv):
         if name not in by_name:
             print(f"unknown tool: {{name}}", file=sys.stderr)
             return 1
-        return subprocess.call([name, *argv[3:]])
+        return run_tool(by_name[name], argv[3:])
     if command == "call" and len(argv) >= 4:
         # Internal compatibility for Python workflow ctx.call_tool(...). Agents
         # should use direct tool CLIs (`<tool> --help`, `<tool> ...`) instead.
