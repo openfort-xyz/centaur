@@ -1089,6 +1089,18 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     && normalized.is_assistant_end_turn());
         }
         if terminal {
+            // Emit turn/completed FIRST, before the best-effort usage export.
+            // The export does blocking OTLP/Laminar network I/O; if it ran first
+            // and the endpoint were slow or firewalled, it would stall (or with a
+            // bad connect, hang) the turn-completion path and the terminal
+            // notification would never reach the client. Telemetry must never
+            // delay protocol output.
+            if let Some(notification) = normalizer.finish_turn(None)? {
+                if let ServerNotification::TurnCompleted(completed) = &notification {
+                    completed_turn = Some(completed.turn.clone());
+                }
+                write_value(stdout, &notification_to_wire_value(&notification)?)?;
+            }
             export_harness_usage_if_available(
                 trace_context,
                 harness.kind(),
@@ -1100,12 +1112,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 usage_span_start,
                 latest_usage.as_ref(),
             );
-            if let Some(notification) = normalizer.finish_turn(None)? {
-                if let ServerNotification::TurnCompleted(completed) = &notification {
-                    completed_turn = Some(completed.turn.clone());
-                }
-                write_value(stdout, &notification_to_wire_value(&notification)?)?;
-            }
             break;
         }
     }
