@@ -36,9 +36,30 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   }))
 
   return {
-    text: clampText(fenced, chatReplyLimits.message.maxPlainTextChars),
+    text: clampText(toChatTextMarkup(fenced), chatReplyLimits.message.maxPlainTextChars),
     cardsV2
   }
+}
+
+/**
+ * Translate the GitHub-flavoured Markdown the agent emits into the Chat-flavoured
+ * markup the plain `text` field actually renders. The `text` field does NOT
+ * understand `**bold**` or `[label](url)` — it renders `*bold*` and `<url|label>`
+ * — so without this they leak as literal asterisks and raw URLs (observed live on
+ * a weather answer). Only the card path renders GFM natively (textSyntax MARKDOWN),
+ * so this is applied to the plain path only.
+ *
+ * Safe to run line-blind: anything with code fences, tables, or lists is routed to
+ * the card by LOOKS_RICH_RE before the `text` field is ever used, so the plain path
+ * only sees inline prose markup — there is no fenced code here to corrupt.
+ */
+export function toChatTextMarkup(text: string): string {
+  return text
+    // `[label](url)` → `<url|label>`; skip image embeds (`![alt](url)`).
+    .replace(/(?<!!)\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '*$1*') // **bold** → *bold*
+    .replace(/__([^_\n]+)__/g, '*$1*') // __bold__ → *bold*
+    .replace(/~~([^~\n]+)~~/g, '~$1~') // ~~strike~~ → ~strike~
 }
 
 /**
