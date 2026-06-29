@@ -45,14 +45,35 @@ describe('markdownToChatMessage', () => {
     expect(headers).toContain('Title')
   })
 
-  test('fences tables instead of leaking raw pipes', () => {
-    const md = '| a | b |\n| --- | --- |\n| 1 | 2 |'
+  test('fences and column-aligns tables instead of leaking raw pipes', () => {
+    const md = '| name | age |\n| --- | --- |\n| bob | 30 |'
     const out = markdownToChatMessage(md)
     const joined = paragraphs(out)
       .map((p) => p.text)
       .join('\n')
     expect(joined).toContain('```')
-    expect(joined).toContain('| a | b |')
+    // Cells are padded to the column width; outer pipes are dropped.
+    expect(joined).toContain('name | age')
+    expect(joined).toContain('bob  | 30')
+    expect(joined).not.toContain('| name | age |')
+  })
+
+  test('aligns ragged unpadded tables and tables without outer pipes', () => {
+    const md = 'Metric | Value\n--- | ---\nLatency | 42ms\nErrors | 0'
+    const out = markdownToChatMessage(md)
+    // No outer pipes => not "rich" by the delivery heuristic, so the plain `text`
+    // path must still carry an aligned, fenced table (never raw pipes).
+    expect(out.text).toContain('```')
+    expect(out.text).toContain('Metric  | Value')
+    expect(out.text).toContain('Latency | 42ms')
+    expect(out.text).not.toMatch(/\n[^`\n]*\|\s*\n/) // no unfenced pipe row leaks
+  })
+
+  test('table-first answers do not dump pipe soup into the notification summary', () => {
+    const md = '| name | age |\n| --- | --- |\n| bob | 30 |\n\nSummary prose here.'
+    const out = markdownToChatMessage(md)
+    expect(out.fallbackText).not.toContain('|')
+    expect(out.fallbackText).toContain('Summary prose here')
   })
 
   test('plain text path keeps the full answer; summary stays short', () => {
