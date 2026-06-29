@@ -517,6 +517,36 @@ networkPolicy:
     namespace: ""
     port: 8000
 
+# Optional in-cluster TCP relay to an OTLP trace collector that runs OFF-cluster
+# (e.g. Laminar via docker-compose on the node). Sandboxes cannot reach
+# off-cluster hosts directly (their egress NetworkPolicy denies it), and api-rs
+# only opens a per-sandbox OTLP egress rule when sandbox.extraEnv's
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is an in-cluster `<svc>.<ns>.svc` host.
+# Enable this to deploy a relay the sandboxes CAN reach, then point
+# sandbox.extraEnv.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT (and any LAMINAR_BASE_URL)
+# at `http://<service>.<namespace>.svc:<port>/v1/traces`. api-rs's own spans can
+# keep using the off-cluster endpoint directly (it is not sandbox-restricted).
+otlpForwarder:
+  enabled: false
+  # Namespace the relay lives in. Becomes the `<ns>` the sandbox endpoint host
+  # encodes, which api-rs maps to the per-sandbox egress rule.
+  namespace: laminar
+  service: otlp
+  port: 8000
+  # host:port of the off-cluster collector to relay TCP to (e.g. the node IP
+  # that exposes the docker-compose Laminar OTLP ingest).
+  target: "10.42.0.1:8000"
+  image:
+    repository: alpine/socat
+    tag: "1.8.0.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 64Mi
+
 podSecurityContext:
   fsGroupChangePolicy: OnRootMismatch
 

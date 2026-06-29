@@ -1,0 +1,67 @@
+{{- if .Values.otlpForwarder.enabled }}
+{{- $ns := .Values.otlpForwarder.namespace }}
+{{- $port := .Values.otlpForwarder.port | int }}
+# In-cluster TCP relay to an off-cluster OTLP collector (e.g. Laminar on the
+# node via docker-compose). Sandboxes reach this service; it forwards to
+# .Values.otlpForwarder.target. See values.yaml `otlpForwarder` for wiring.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    kubernetes.io/metadata.name: {{ $ns }}
+    {{- include "centaur.labels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otlp-forwarder
+  namespace: {{ $ns }}
+  labels:
+    app: otlp-forwarder
+    {{- include "centaur.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otlp-forwarder
+  template:
+    metadata:
+      labels:
+        app: otlp-forwarder
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: socat
+          image: {{ printf "%s:%s" .Values.otlpForwarder.image.repository .Values.otlpForwarder.image.tag | quote }}
+          imagePullPolicy: {{ .Values.otlpForwarder.image.pullPolicy }}
+          args:
+            - "-d"
+            - "-d"
+            - {{ printf "TCP-LISTEN:%d,fork,reuseaddr" $port | quote }}
+            - {{ printf "TCP:%s" .Values.otlpForwarder.target | quote }}
+          ports:
+            - containerPort: {{ $port }}
+          resources:
+{{ toYaml .Values.otlpForwarder.resources | indent 12 }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | indent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.otlpForwarder.service }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "centaur.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: otlp-forwarder
+  ports:
+    - name: otlp
+      port: {{ $port }}
+      targetPort: {{ $port }}
+{{- end }}
