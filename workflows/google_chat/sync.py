@@ -451,7 +451,16 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     explicit_since = _parse_datetime(inp.since)
     run_id = _workflow_run_id_to_sync_run_id(ctx.run_id)
     include_types = _include_space_types()
+    # Pinned spaces come from the input, falling back to GOOGLE_CHAT_SPACE_IDS
+    # (comma-separated) so scheduled runs — which pass no input — still cover the
+    # spaces the app reads but is not a listed member of.
     explicit_space_ids = {sid.strip() for sid in inp.space_ids if sid.strip()}
+    if not explicit_space_ids:
+        explicit_space_ids = {
+            sid.strip()
+            for sid in (os.getenv("GOOGLE_CHAT_SPACE_IDS") or "").split(",")
+            if sid.strip()
+        }
 
     # Record the run before any Chat call so an enumeration failure (auth,
     # blocked egress) lands in the ledger instead of disappearing silently.
