@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, normalizeCardBreaks } from './render'
+import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, normalizeCardBreaks, stripInlineMarkdown } from './render'
 import { chatReplyLimits } from '../constants'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
@@ -108,10 +108,33 @@ describe('markdownToChatMessage', () => {
     expect(joined).toContain('Summary prose here')
   })
 
-  test('plain text path keeps the full answer', () => {
+  test('plain text path is clamped to the 4096-char Chat cap (overflow routes to card)', () => {
     const long = 'x'.repeat(10_000)
     const out = markdownToChatMessage(long)
-    expect(out.text.length).toBe(10_000)
+    expect(out.text.length).toBe(chatReplyLimits.message.maxPlainTextChars)
+    expect(out.text.endsWith('…')).toBe(true)
+  })
+
+  test('stripInlineMarkdown removes markup card headers cannot render', () => {
+    expect(stripInlineMarkdown('**Q2** results')).toBe('Q2 results')
+    expect(stripInlineMarkdown('[Docs](https://x/y) and `code`')).toBe('Docs and code')
+    expect(stripInlineMarkdown('~~old~~ _new_')).toBe('old new')
+  })
+
+  test('card headings strip inline markdown from the section header title', () => {
+    const headers = (markdownToChatMessage('## **Q2** [report](https://x/y)').cardsV2 ?? [])
+      .flatMap((c) => c.card.sections ?? [])
+      .map((s) => s.header)
+      .filter(Boolean)
+    expect(headers).toContain('Q2 report')
+  })
+
+  test('normalizeCardBreaks turns a stray <br> into a real newline (outside fences)', () => {
+    expect(normalizeCardBreaks('**Head**<br>- item one\n- item two')).toBe(
+      '**Head**\n- item one\n- item two'
+    )
+    // inside a code fence, <br> is left literal
+    expect(normalizeCardBreaks('```\na<br>b\n```')).toBe('```\na<br>b\n```')
   })
 
   test('plain text path translates GFM the text field cannot render into Chat markup', () => {
