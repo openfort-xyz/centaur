@@ -27,7 +27,7 @@ pub struct TransformConfig {
 }
 
 impl TransformConfig {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.secrets.is_empty() && self.extra.is_empty()
     }
 }
@@ -53,6 +53,17 @@ impl Secret {
         self.replace
             .as_ref()
             .and_then(|replace| replace.proxy_value.as_deref())
+    }
+
+    /// A `token_broker` source is resolved by iron-control (it mints the access
+    /// token and delivers it inline at proxy sync); the raw source is meaningful
+    /// only to a managed proxy. The iron-proxy binary cannot parse it directly.
+    pub(crate) fn is_token_broker(&self) -> bool {
+        self.source
+            .as_ref()
+            .and_then(|source| source.get("type"))
+            .and_then(serde_yaml::Value::as_str)
+            == Some("token_broker")
     }
 }
 
