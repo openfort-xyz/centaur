@@ -261,12 +261,30 @@ async function driveSession(
   execute.text = overrides.cleanedText
   incr('googlechatbot_runs_total', { outcome: 'started' })
   try {
-    await createSession(
+    const session = await createSession(
       config,
       threadKey,
       conversationName(event),
       overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
     )
+
+    // A run is already in flight for this thread. Starting a second one would
+    // collide with api-rs's "one active execution per thread" index and 500,
+    // so mirror the Slack bot: fold the new message into the running turn by
+    // appending it (the live execution will pick it up) and let that run own
+    // the answer. The redundant "thinking…" ack is removed so the thread isn't
+    // left with a stranded placeholder.
+    if (session.activeExecution) {
+      await appendSessionMessages(config, threadKey, [...history, execute])
+      await removeAck(client, ackMessageName)
+      incr('googlechatbot_runs_total', { outcome: 'folded' })
+      logWarn('googlechatbot_folded_into_active_run', {
+        thread_key: threadKey,
+        message_id: execute.id
+      })
+      return
+    }
+
     await appendSessionMessages(config, threadKey, history)
     const execution = await executeSession(config, threadKey, execute, {
       idleTimeoutMs: config.SESSION_IDLE_TIMEOUT_MS,
@@ -337,6 +355,17 @@ async function deliverDriveError(
     await client.createMessage(event.space_name, { text }, { threadName: event.chat.thread_name })
   } catch (deliverError) {
     logError('googlechatbot_drive_error_delivery_failed', deliverError)
+  }
+}
+
+/** Best-effort removal of the eager "thinking…" ack when this event won't
+ * produce its own answer (it was folded into an already-running turn). */
+async function removeAck(client: ChatEdgeClient, ackMessageName: string): Promise<void> {
+  if (!ackMessageName) return
+  try {
+    await client.deleteMessage(ackMessageName)
+  } catch (error) {
+    logWarn('googlechatbot_fold_ack_delete_failed', error)
   }
 }
 

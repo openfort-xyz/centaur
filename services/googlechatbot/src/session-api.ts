@@ -72,6 +72,26 @@ export type ExecuteSessionResponse = {
   thread_key: string
 }
 
+/** api-rs marks a session `executing` for the lifetime of an in-flight run and
+ * flips it back to `idle`/`failed` when the run settles (see
+ * `mark_execution_running` / `mark_execution_completed` in centaur-session-sqlx).
+ * Treating that status as the source of truth lets a stateless bot detect an
+ * active run without its own state store. */
+const ACTIVE_SESSION_STATUS = 'executing'
+
+type CreateSessionResponse = {
+  session?: { status?: string }
+}
+
+export type CreateSessionResult = {
+  /** Lifecycle status reported by api-rs, e.g. `idle` / `executing` / `failed`. */
+  status: string
+  /** True when a run is already in flight for this thread. A second
+   * `/execute` would collide with the `one active execution per thread` index
+   * and 500, so the caller should append-and-fold instead of executing. */
+  activeExecution: boolean
+}
+
 export class SessionApiError extends Error {
   readonly action: string
   readonly body: string
@@ -141,7 +161,7 @@ export async function createSession(
   threadKey: string,
   conversationName?: string,
   harnessType?: string
-): Promise<void> {
+): Promise<CreateSessionResult> {
   const name = conversationName?.trim()
   const body: CreateSessionRequest = {
     harness_type: harnessType ?? 'codex',
@@ -159,6 +179,9 @@ export async function createSession(
     body: JSON.stringify(body)
   })
   await ensureApiOk(response, 'create session')
+  const payload = (await response.json().catch(() => ({}))) as CreateSessionResponse
+  const status = payload.session?.status ?? ''
+  return { status, activeExecution: status === ACTIVE_SESSION_STATUS }
 }
 
 export async function appendSessionMessages(
