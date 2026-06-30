@@ -15,7 +15,7 @@ use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
-    SessionRuntime,
+    SessionRuntime, final_answer_text_from_output_lines,
 };
 use centaur_session_sqlx::PgSessionStore;
 use chrono::{DateTime, Utc};
@@ -3592,19 +3592,18 @@ async fn run_agent_session_turn(
     ))
 }
 
+/// The text a workflow's `agent_turn` surfaces as `result_text`.
+///
+/// This must be the agent's *final answer* — the same thing an interactive
+/// session shows and what the workflow docs treat `result` as (a report or
+/// summary), not the streamed transcript. Concatenating every `delta` field
+/// (an earlier implementation) folded all intermediate narration — tool output
+/// the agent echoed, tracebacks, JSON it was reasoning over — into the result,
+/// so a debugging-heavy turn delivered its whole working log. Share the session
+/// runtime's canonical extraction instead so the two paths can never diverge
+/// again.
 fn result_text_from_output_lines(lines: &[String]) -> String {
-    lines
-        .iter()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| {
-            value
-                .get("delta")
-                .or_else(|| value.pointer("/params/delta"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    final_answer_text_from_output_lines(lines)
 }
 
 fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, WorkflowRuntimeError> {

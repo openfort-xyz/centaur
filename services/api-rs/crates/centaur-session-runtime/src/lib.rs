@@ -4840,6 +4840,46 @@ fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
     None
 }
 
+/// Extract the agent's final answer text from a turn's raw harness output lines.
+///
+/// This is the batch (non-streaming) counterpart of the live stdout pump's
+/// `final_answer_text_by_execution` accumulation: completed agent messages
+/// *replace* the working text (last final answer wins) while only streamed
+/// deltas append, so intermediate narration is never concatenated into the
+/// result. Workflow `agent_turn` collects the full set of output lines for a
+/// turn and must use this — concatenating every `delta` field instead yields
+/// the whole transcript, not the final answer.
+pub fn final_answer_text_from_output_lines(lines: &[String]) -> String {
+    match terminal_output_from_lines(lines) {
+        Some(TerminalOutput::Completed {
+            result_text: Some(text),
+            ..
+        }) => text,
+        // No terminal `Completed` carrying text (e.g. an interrupted/failed turn
+        // with only a partial answer): fall back to the accumulated final-answer
+        // text rather than the raw delta soup.
+        _ => {
+            let mut final_answer_text = String::new();
+            for line in lines {
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if let Some(update) = output_line_final_answer_text(&value) {
+                    match update {
+                        FinalAnswerTextUpdate::Append(delta) => {
+                            final_answer_text.push_str(&delta)
+                        }
+                        FinalAnswerTextUpdate::Replace(canonical) => {
+                            final_answer_text = canonical
+                        }
+                    }
+                }
+            }
+            final_answer_text.trim().to_owned()
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SessionRuntimeError {
     #[error("{0}")]
@@ -5021,6 +5061,53 @@ mod tests {
                 reason: "turn_done",
                 result_text: Some("Final answer".to_owned())
             })
+        );
+    }
+
+    #[test]
+    fn final_answer_from_lines_returns_only_the_final_answer() {
+        // A debugging-heavy turn: the agent streams narration deltas (echoing
+        // CLI output, a traceback) for an intermediate message, then emits a
+        // clean final answer. The result must be the final answer alone — never
+        // the concatenated narration.
+        let lines = vec![
+            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Running crisp --help...\n<huge --help dump>\n"}}).to_string(),
+            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Attio returned 404: <traceback>\n"}}).to_string(),
+            json!({"type": "item.completed", "item": {"id": "m-final", "type": "agentMessage", "phase": "final_answer", "text": "Crisp→Attio: synced 0 records."}}).to_string(),
+            json!({"type": "turn.completed", "turn": {"id": "t1", "status": "completed"}}).to_string(),
+        ];
+
+        assert_eq!(
+            final_answer_text_from_output_lines(&lines),
+            "Crisp→Attio: synced 0 records."
+        );
+    }
+
+    #[test]
+    fn final_answer_from_lines_keeps_a_full_report_intact() {
+        // A report digest's final answer is itself long and multi-section; the
+        // canonical extraction must deliver it whole, not truncate it.
+        let report = "# Releases\n\nLine one.\n\nLine two.\n\n## Details\n\n- a\n- b";
+        let lines = vec![
+            json!({"type": "item.completed", "item": {"id": "m-1", "type": "agentMessage", "phase": "final_answer", "text": report}}).to_string(),
+            json!({"type": "turn.completed", "turn": {"id": "t1", "status": "completed"}}).to_string(),
+        ];
+
+        assert_eq!(final_answer_text_from_output_lines(&lines), report);
+    }
+
+    #[test]
+    fn final_answer_from_lines_falls_back_to_partial_on_nonterminal_completion() {
+        // Streamed final-answer text with no terminal `Completed` (interrupted
+        // turn): fall back to the accumulated final-answer text, not raw delta
+        // soup or an empty string.
+        let lines = vec![
+            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Partial answer so far"}}).to_string(),
+        ];
+
+        assert_eq!(
+            final_answer_text_from_output_lines(&lines),
+            "Partial answer so far"
         );
     }
 
