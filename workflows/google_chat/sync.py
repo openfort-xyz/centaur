@@ -465,12 +465,22 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 
     client = _client()
 
-    # Enumerate the spaces the app can see (filtered to allowed types), unless
-    # the caller pinned an explicit set.
     spaces: list[dict[str, Any]] = []
+
+    # Pinned spaces: sync them directly without spaces.list. An app only appears
+    # in spaces.list for spaces it is a formal *member* of; it can still read
+    # message history (with chat.app.messages.readonly) in spaces it was added to
+    # or @mentioned in. Pinning lets the ETL cover those without membership.
+    if explicit_space_ids:
+        spaces = [
+            {"name": f"spaces/{sid}", "type": "SPACE"}
+            for sid in sorted(explicit_space_ids)
+        ]
+
+    # Otherwise enumerate the member spaces the app can see (filtered to types).
     page_token: str | None = None
     try:
-        while True:
+        while not explicit_space_ids:
             page = client.list_spaces(page_size=DEFAULT_PAGE_SIZE, page_token=page_token)
             for space in page.get("spaces", []):
                 if not isinstance(space, dict):
