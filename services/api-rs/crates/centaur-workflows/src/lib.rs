@@ -3441,6 +3441,8 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
         .post(format!("{base_url}/api/chat/messages"))
         .bearer_auth(&token)
         .json(&body)
+        // Bound the call so a blocked/slow bot can never hang the workflow run.
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await?;
     let status = response.status();
