@@ -19,6 +19,12 @@ const EnvSchema = z.object({
   // Preferred bearer token for api-rs; falls back to CENTAUR_API_KEY.
   GOOGLECHATBOT_API_KEY: z.string().optional(),
 
+  // Bearer token the `google-chat` workflow tool presents to the outbound
+  // /api/chat/messages routes (send/list/update/delete a Chat message on behalf
+  // of a scheduled digest workflow). The tool reads the same value from its own
+  // CHATBOT_API_KEY secret. When unset, those routes fail closed (503).
+  CHATBOT_API_KEY: z.string().optional(),
+
   CHAT_EVENTS_PATH: z.string().default('/api/chat/events'),
   CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   CHAT_EVENT_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(60 * 5),
