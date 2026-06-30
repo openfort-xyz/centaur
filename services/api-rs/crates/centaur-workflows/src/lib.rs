@@ -879,6 +879,12 @@ fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
         | "linear_sync"
         | "company_context_documents"
         | "slack_retention"
+        // Openfort overlay ETL (centaur-overlay/workflows): Notion sync + its
+        // company-context projection, and Google Chat retention. Routed to the
+        // single-concurrency ETL queue so scheduled runs don't overlap.
+        | "notion_sync"
+        | "notion_company_context"
+        | "google_chat_retention"
         | "chief_of_staff_daily" => WorkflowQueueClass::Etl,
         _ => WorkflowQueueClass::Standard,
     }
@@ -3780,6 +3786,9 @@ mod tests {
             "linear_sync",
             "company_context_documents",
             "slack_retention",
+            "notion_sync",
+            "notion_company_context",
+            "google_chat_retention",
             "chief_of_staff_daily",
         ] {
             assert_eq!(workflow_queue_class(workflow_name), WorkflowQueueClass::Etl);
