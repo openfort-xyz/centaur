@@ -108,6 +108,19 @@ class WorkflowContext:
             }
         )
 
+    async def post_to_google_chat(self, space_name: str, text: str, **kwargs: Any) -> Any:
+        # Mirrors post_to_slack: api-rs (the trusted host) holds CHATBOT_API_KEY
+        # and posts to the googlechatbot route, so the sandbox never handles the
+        # credential and never has to egress to the bot itself.
+        return await self._rpc.request(
+            {
+                "type": "ctx.post_to_google_chat",
+                "space_name": space_name,
+                "text": text,
+                "args": kwargs,
+            }
+        )
+
 
 class RpcClient:
     def __init__(self) -> None:

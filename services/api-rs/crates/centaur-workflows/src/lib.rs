@@ -3020,6 +3020,10 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.post_to_google_chat") => match post_google_chat_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         other => Err(format!("unsupported context request type {other:?}")),
     };
     match result {
@@ -3396,6 +3400,57 @@ async fn send_slack_message(token: &str, payload: Value) -> Result<Value, Workfl
         )));
     }
     Ok(response)
+}
+
+/// Deliver a Google Chat message on behalf of a workflow, mirroring
+/// `ctx.post_to_slack`: the `CHATBOT_API_KEY` lives only in this trusted host
+/// (never the sandbox), and the post goes to the in-cluster googlechatbot
+/// outbound route — so it bypasses the sandbox egress proxy entirely. The text
+/// is already rendered for Google Chat's plain `text` field by the caller
+/// (`_openfort_chat.to_chat_text`); this is a thin relay that also threads.
+async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let space_name = message
+        .get("space_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.post_to_google_chat requires space_name".to_owned(),
+            )
+        })?;
+    let text = message.get("text").and_then(Value::as_str).ok_or_else(|| {
+        WorkflowRuntimeError::BadRequest("ctx.post_to_google_chat requires text".to_owned())
+    })?;
+    let thread_name = message
+        .get("args")
+        .and_then(|args| args.get("thread_name"))
+        .and_then(Value::as_str);
+
+    let token = env::var("CHATBOT_API_KEY").map_err(|_| {
+        WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned())
+    })?;
+    let base_url = env::var("CHATBOT_URL")
+        .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
+    let base_url = base_url.trim_end_matches('/');
+
+    let mut body = json!({ "space_name": space_name, "text": text });
+    if let Some(thread) = thread_name {
+        body["thread_name"] = json!(thread);
+    }
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/api/chat/messages"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "google chat send failed: {status} {value}"
+        )));
+    }
+    Ok(value)
 }
 
 fn slack_post_result_from_response(channel: &str, response: Value) -> SlackPostResult {
