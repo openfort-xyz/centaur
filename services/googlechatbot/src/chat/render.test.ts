@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, hardenCardParagraphs } from './render'
+import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, normalizeCardBreaks } from './render'
 import { chatReplyLimits } from '../constants'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
@@ -131,24 +131,29 @@ describe('markdownToChatMessage', () => {
     expect(toChatTextMarkup('![alt](https://img.example/x.png)')).toBe('![alt](https://img.example/x.png)')
   })
 
-  test('hardenCardParagraphs separates mashed text lines but keeps lists/fences tight', () => {
-    // Single-newline text lines (the live "…every one.**Per person:**06-22" mash)
-    // become separate paragraphs; the bullet list under a date stays tight.
+  test('normalizeCardBreaks collapses mashing blank lines but keeps lists and gaps after lists', () => {
+    // Blank line between two TEXT lines (which a card collapses → mash) becomes a
+    // single `\n` break; a blank line AFTER a list item is kept (safe + a gap).
     expect(
-      hardenCardParagraphs('every one.\n**Per person — 1 each:**\n**06-22**\n- Customer: x\n- State: y')
-    ).toBe('every one.\n\n**Per person — 1 each:**\n\n**06-22**\n- Customer: x\n- State: y')
-    // Already-separated paragraphs are not double-spaced.
-    expect(hardenCardParagraphs('a\n\nb')).toBe('a\n\nb')
+      normalizeCardBreaks('releases.\n\n**Product & SDK**\n- api\n- dash\n\n**Farao**\n- tg')
+    ).toBe('releases.\n**Product & SDK**\n- api\n- dash\n\n**Farao**\n- tg')
+    // Standalone horizontal rules are dropped (cards cannot render them).
+    expect(normalizeCardBreaks('pad it.\n\n---\n\n**Pulse**')).toBe('pad it.\n**Pulse**')
     // Fenced blocks (aligned tables) are left exactly as-is.
-    expect(hardenCardParagraphs('```\nname | age\nbob  | 30\n```')).toBe('```\nname | age\nbob  | 30\n```')
+    expect(normalizeCardBreaks('```\nname | age\nbob  | 30\n```')).toBe('```\nname | age\nbob  | 30\n```')
   })
 
-  test('mashed single-newline card answer renders each block on its own line', () => {
-    const md = 'every one.\n**Per person — 1 each:**\n**06-22**\n- Customer: x\n- State: y'
+  test('real digest markdown no longer mashes heading into surrounding prose', () => {
+    const md = 'rather than pad it.\n\n---\n\n**🦅 Openfort Pulse — Tuesday, 30 Jun 2026**\n\nQuiet day; no new package releases.\n\n**Product & SDK**\n- `api` · foo · [#1077](https://x/1)\n- `dash` · bar · [#195](https://x/2)\n\n**Farao (app)**\n- New Telegram'
     const joined = paragraphs(markdownToChatMessage(md))
       .map((p) => p.text)
       .join('\n')
-    expect(joined).toContain('every one.\n\n**Per person — 1 each:**')
+    // No mashing: the title and "Product & SDK" sit on their own lines (single \n),
+    // the `---` rule is gone, and "Farao" keeps its blank-line gap after the list.
+    expect(joined).toContain('pad it.\n**🦅 Openfort Pulse — Tuesday, 30 Jun 2026**\nQuiet day')
+    expect(joined).toContain('no new package releases.\n**Product & SDK**\n- `api`')
+    expect(joined).toContain('[#195](https://x/2)\n\n**Farao (app)**\n- New Telegram')
+    expect(joined).not.toContain('---')
   })
 
   test('splits into multiple cards before exceeding the per-card widget limit', () => {

@@ -24,14 +24,13 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   // public test import; it now does more than fence.)
   const fenced = fenceMarkdownTables(trimmed)
 
-  // The card body and the plain `text` field disagree on newlines: the `text`
-  // field treats a single `\n` as a line break, but a card textParagraph
-  // collapses single newlines (only a blank line / list / heading breaks). So an
-  // answer where the agent separated a sentence, a `**bold**` subheading, and the
-  // next block with single newlines renders mashed onto one line in a card
-  // ("…every one.**Per person:**06-22"). Harden the CARD source only — insert a
-  // blank line between adjacent non-list text lines so each is its own paragraph.
-  const cards = splitMarkdownToCards(hardenCardParagraphs(fenced))
+  // The card body and the plain `text` field disagree on newlines (verified live
+  // by posting probe cards): a card textParagraph renders a single `\n` as a line
+  // break but COLLAPSES a blank line (`\n\n`) to nothing, mashing consecutive
+  // paragraphs onto one line ("…no new package releases.**Product & SDK**"). The
+  // plain `text` field does the opposite (blank line = paragraph break). So
+  // normalise the CARD source only — collapse blank lines to single breaks.
+  const cards = splitMarkdownToCards(normalizeCardBreaks(fenced))
   const cardsV2 = cards.slice(0, MAX_CARDS).map((card, index) => ({
     cardId: `card-${index}`,
     card: {
@@ -61,36 +60,65 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
  * only sees inline prose markup — there is no fenced code here to corrupt.
  */
 /**
- * Insert a blank line between adjacent non-list text lines so a card textParagraph
- * renders them on separate lines. A card collapses single `\n` (CommonMark soft
- * wrap), so consecutive prose/`**bold**` lines the agent wrote with single
- * newlines otherwise mash together. List items (`- `, `1. `) and fenced code are
- * left exactly as-is — lists handle their own breaks and a blank line would loosen
- * them or corrupt a monospace table fence. Card-path only; the plain `text` field
- * already treats single `\n` as a break.
+ * Normalise a card's Markdown so Google Chat renders each block on its own line.
+ * Empirically (probe cards posted to a live space): in a card textParagraph a
+ * single `\n` is a line break, but a blank line (`\n\n`) collapses to nothing and
+ * mashes the surrounding paragraphs; a blank line AFTER a list item is safe (the
+ * list block forces the break); and `<br>` immediately before a list item orphans
+ * the first item, so we never use it.
+ *
+ * Rules (fence-aware so monospace tables are never touched):
+ *  - collapse a run of blank lines to a single `\n` break between two text lines;
+ *  - keep ONE blank line when the previous content line is a list item (preserves
+ *    a gap there and avoids a list→text lazy continuation);
+ *  - drop standalone horizontal rules (`---`/`***`/`___`) — cards can't render them.
+ * Card-path only; the plain `text` field already treats a blank line as a break.
  */
-export function hardenCardParagraphs(markdown: string): string {
-  const isBlank = (l: string) => l.trim() === ''
+export function normalizeCardBreaks(markdown: string): string {
   const isListItem = (l: string) => /^\s*([-*+]|\d+\.)\s/.test(l)
+  const isHorizontalRule = (l: string) => /^\s*([-*_])\1{2,}\s*$/.test(l)
   const lines = markdown.split('\n')
   const out: string[] = []
   let inFence = false
+  let lastContent: string | null = null
+  let sawBlank = false
 
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i]!
-    if (line.trimStart().startsWith('```')) inFence = !inFence
+  for (const line of lines) {
+    if (line.trimStart().startsWith('```')) {
+      inFence = !inFence
+      out.push(line)
+      lastContent = line
+      sawBlank = false
+      continue
+    }
+    if (inFence) {
+      out.push(line)
+      continue
+    }
+    if (line.trim() === '') {
+      sawBlank = true
+      continue
+    }
+    if (isHorizontalRule(line)) continue // unsupported in cards; drop it
+
+    // Re-emit the break before this line: a blank only after a list item.
+    if (lastContent !== null && sawBlank && isListItem(lastContent)) out.push('')
     out.push(line)
-    if (inFence) continue
-    const next = lines[i + 1]
-    if (next === undefined) continue
-    // Already separated, or either side is a list item → leave the break alone.
-    if (isBlank(line) || isBlank(next) || isListItem(line) || isListItem(next)) continue
-    out.push('')
+    lastContent = line
+    sawBlank = false
   }
 
   return out.join('\n')
 }
 
+/**
+ * Translate the GitHub-flavoured Markdown the agent emits into the Chat-flavoured
+ * markup the plain `text` field actually renders. The `text` field does NOT
+ * understand `**bold**` or `[label](url)` — it renders `*bold*` and `<url|label>`
+ * — so without this they leak as literal asterisks and raw URLs (observed live on
+ * a weather answer). Only the card path renders GFM natively (textSyntax MARKDOWN),
+ * so this is applied to the plain path only.
+ */
 export function toChatTextMarkup(text: string): string {
   return text
     // `[label](url)` → `<url|label>`; skip image embeds (`![alt](url)`).
