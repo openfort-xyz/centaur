@@ -5,6 +5,24 @@ from typing import Any
 
 from centaur_sdk import secret
 
+# In-cluster default for the googlechatbot outbound API. Overridable via the
+# CHATBOT_URL secret (e.g. the `chatbot` iron-proxy alias).
+_DEFAULT_CHATBOT_URL = "http://centaur-centaur-googlechatbot:3002"
+
+
+def _base_url() -> str:
+    """Resolve CHATBOT_URL and guarantee an http(s) scheme.
+
+    A bare host like ``chatbot:3002`` makes httpx read ``chatbot`` as the URL
+    scheme and raise UnsupportedProtocol, so prepend ``http://`` when no
+    http(s) scheme is present.
+    """
+
+    url = (secret("CHATBOT_URL", _DEFAULT_CHATBOT_URL) or _DEFAULT_CHATBOT_URL).strip()
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+    return url.rstrip("/")
+
 
 class GoogleChatClient:
     def __init__(self, api_key: str | None = None):
@@ -24,7 +42,7 @@ class GoogleChatClient:
     ) -> dict[str, Any]:
         import httpx
 
-        base_url = secret("CHATBOT_URL", "http://localhost:3002").strip().rstrip("/")
+        base_url = _base_url()
         body: dict[str, Any] = {
             "space_name": space_name,
             "text": text,
@@ -52,7 +70,7 @@ class GoogleChatClient:
     ) -> dict[str, Any]:
         import httpx
 
-        base_url = secret("CHATBOT_URL", "http://localhost:3002").strip().rstrip("/")
+        base_url = _base_url()
         response = httpx.get(
             f"{base_url}/api/chat/messages",
             params={"space_name": space_name, "page_size": page_size},
@@ -72,7 +90,7 @@ class GoogleChatClient:
     ) -> dict[str, Any]:
         import httpx
 
-        base_url = secret("CHATBOT_URL", "http://localhost:3002").strip().rstrip("/")
+        base_url = _base_url()
         response = httpx.patch(
             f"{base_url}/api/chat/messages",
             headers={
@@ -94,7 +112,7 @@ class GoogleChatClient:
     ) -> dict[str, Any]:
         import httpx
 
-        base_url = secret("CHATBOT_URL", "http://localhost:3002").strip().rstrip("/")
+        base_url = _base_url()
         response = httpx.request(
             "DELETE",
             f"{base_url}/api/chat/messages",

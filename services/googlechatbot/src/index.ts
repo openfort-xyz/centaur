@@ -96,6 +96,87 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     app.post('/api/chat/events', chatEventsHandler)
   }
 
+  // Outbound message API used by the `google-chat` workflow tool so scheduled
+  // digest workflows can post/list/edit/delete Chat messages. A thin relay to
+  // the Chat REST client — the caller (the overlay _openfort_chat helper) has
+  // already rendered the text for the plain `text` field, so we pass it through.
+  const requireOutboundAuth = (c: Context<{ Variables: Variables }>): Response | null => {
+    if (!config.CHATBOT_API_KEY) return c.json({ error: 'CHATBOT_API_KEY not configured' }, 503)
+    const provided = (c.req.header('Authorization') ?? '').replace(/^Bearer\s+/i, '')
+    if (provided !== config.CHATBOT_API_KEY) return c.json({ error: 'unauthorized' }, 401)
+    return null
+  }
+
+  app.post('/api/chat/messages', async c => {
+    const denied = requireOutboundAuth(c)
+    if (denied) return denied
+    const body = (await c.req.json().catch(() => null)) as {
+      space_name?: string
+      text?: string
+      thread_name?: string
+    } | null
+    if (!body?.space_name || typeof body.text !== 'string') {
+      return c.json({ error: 'space_name and text are required' }, 400)
+    }
+    try {
+      const sent = await client.createMessage(
+        body.space_name,
+        { text: body.text },
+        body.thread_name ? { threadName: body.thread_name } : {}
+      )
+      return c.json(sent)
+    } catch (error) {
+      logError('googlechatbot_outbound_send_failed', error)
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+    }
+  })
+
+  app.get('/api/chat/messages', async c => {
+    const denied = requireOutboundAuth(c)
+    if (denied) return denied
+    const spaceName = c.req.query('space_name')
+    if (!spaceName) return c.json({ error: 'space_name is required' }, 400)
+    const pageSize = Number(c.req.query('page_size') ?? '20') || 20
+    try {
+      return c.json(await client.listMessages(spaceName, { pageSize }))
+    } catch (error) {
+      logError('googlechatbot_outbound_list_failed', error)
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+    }
+  })
+
+  app.patch('/api/chat/messages', async c => {
+    const denied = requireOutboundAuth(c)
+    if (denied) return denied
+    const body = (await c.req.json().catch(() => null)) as {
+      message_name?: string
+      text?: string
+    } | null
+    if (!body?.message_name || typeof body.text !== 'string') {
+      return c.json({ error: 'message_name and text are required' }, 400)
+    }
+    try {
+      return c.json(await client.updateMessage(body.message_name, { text: body.text }))
+    } catch (error) {
+      logError('googlechatbot_outbound_update_failed', error)
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+    }
+  })
+
+  app.delete('/api/chat/messages', async c => {
+    const denied = requireOutboundAuth(c)
+    if (denied) return denied
+    const body = (await c.req.json().catch(() => null)) as { message_name?: string } | null
+    if (!body?.message_name) return c.json({ error: 'message_name is required' }, 400)
+    try {
+      await client.deleteMessage(body.message_name)
+      return c.json({ ok: true })
+    } catch (error) {
+      logError('googlechatbot_outbound_delete_failed', error)
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+    }
+  })
+
   return { app, client }
 }
 
