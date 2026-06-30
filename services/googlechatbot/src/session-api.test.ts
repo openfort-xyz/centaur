@@ -1,6 +1,7 @@
-import { test, expect, describe } from 'bun:test'
-import { turnMessagesFromEvent } from './session-api'
+import { test, expect, describe, afterEach } from 'bun:test'
+import { turnMessagesFromEvent, createSession } from './session-api'
 import { parseChatBody } from './index'
+import { loadConfig } from './config'
 import type { NormalizedChatEvent } from './chat/types'
 
 const baseEvent: NormalizedChatEvent = {
@@ -43,6 +44,41 @@ describe('turnMessagesFromEvent', () => {
     expect(history[0]?.role).toBe('assistant')
     expect(history[0]?.text).toBe('earlier answer')
     expect(history[0]?.userName).toBe('Centaur')
+  })
+})
+
+describe('createSession', () => {
+  const realFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  const stubFetch = (body: unknown): void => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })) as unknown as typeof fetch
+  }
+
+  test('reports an active execution when api-rs says the session is executing', async () => {
+    stubFetch({ session: { status: 'executing' }, harness_switched: false })
+    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(result.status).toBe('executing')
+    expect(result.activeExecution).toBe(true)
+  })
+
+  test('reports no active execution when the session is idle', async () => {
+    stubFetch({ session: { status: 'idle' }, harness_switched: false })
+    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(result.activeExecution).toBe(false)
+  })
+
+  test('tolerates a response without a session status', async () => {
+    stubFetch({})
+    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(result.status).toBe('')
+    expect(result.activeExecution).toBe(false)
   })
 })
 
