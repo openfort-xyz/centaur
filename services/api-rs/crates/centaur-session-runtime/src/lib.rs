@@ -4212,8 +4212,14 @@ fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate>
                 Some("final_answer" | "answer") | None
             )
         {
+            // A completed final-answer agentMessage is the canonical final
+            // answer — including an *empty* one. Agents deliberately return an
+            // empty final message to signal "nothing to say" (e.g. the
+            // silent-if-nothing-new digests), so this must Replace even when
+            // empty; otherwise the working text falls back to accumulated
+            // intermediate narration deltas and that leaks out as the result.
             let text = terminal_payload_text(item).trim().to_owned();
-            return (!text.is_empty()).then_some(FinalAnswerTextUpdate::Replace(text));
+            return Some(FinalAnswerTextUpdate::Replace(text));
         }
     }
     None
@@ -5081,6 +5087,22 @@ mod tests {
             final_answer_text_from_output_lines(&lines),
             "Crisp→Attio: synced 0 records."
         );
+    }
+
+    #[test]
+    fn final_answer_from_lines_is_empty_when_agent_returns_empty_final_message() {
+        // The "silent if nothing new" path: the agent streams narration deltas
+        // while working, then deliberately completes its final-answer message
+        // with empty text. The result must be empty (→ nothing delivered), not
+        // the leaked accumulated narration.
+        let lines = vec![
+            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "I'll run the GitHub scan first, then dedup in Notion."}}).to_string(),
+            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Scanning repos... no new issues since yesterday."}}).to_string(),
+            json!({"method": "item/completed", "params": {"item": {"id": "m-final", "type": "agentMessage", "phase": "final_answer", "text": ""}}}).to_string(),
+            json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed"}}}).to_string(),
+        ];
+
+        assert_eq!(final_answer_text_from_output_lines(&lines), "");
     }
 
     #[test]
