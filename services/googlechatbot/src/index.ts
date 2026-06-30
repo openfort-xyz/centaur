@@ -8,6 +8,13 @@ import type { GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
 import { extractMessageOverrides } from './overrides'
+import { chatReplyLimits } from './constants'
+
+/** Clamp to Google Chat's plain `text` cap so an oversized body can't 400 the send. */
+function clampPlainText(text: string): string {
+  const max = chatReplyLimits.message.maxPlainTextChars
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
 import {
   INITIAL_STATUS,
   consumeRenderStream,
@@ -237,9 +244,10 @@ async function deliverDriveError(
   ackMessageName: string,
   error: unknown
 ): Promise<void> {
-  const text = `⚠️ Centaur could not start this run: ${
-    error instanceof Error ? error.message : String(error)
-  }`
+  const detail = error instanceof Error ? error.message : String(error)
+  // Keep under Google Chat's 4096-char plain `text` cap so a long upstream error
+  // message doesn't 400 the error delivery itself and leave the user on "thinking".
+  const text = clampPlainText(`⚠️ Centaur could not start this run: ${detail}`)
   try {
     if (ackMessageName) {
       await client.updateMessage(ackMessageName, { text, cardsV2: [] })

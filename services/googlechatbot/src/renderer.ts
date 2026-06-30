@@ -5,6 +5,7 @@ import {
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { ChatEdgeClient } from './chat/client'
 import { markdownToChatMessage } from './chat/render'
+import { chatReplyLimits } from './constants'
 import { logError, logWarn } from './logging'
 import type { GoogleChatCard, GoogleChatCardWidget, GoogleChatMessage } from './chat/types'
 
@@ -168,7 +169,10 @@ async function pulse(
   state: RenderState
 ): Promise<void> {
   if (!target.ackMessageName) return
-  const text = `_Condor · ${state.statusLine.slice(0, 80)}…_`
+  // Strip `_`/`*` from the agent-supplied status so a token like `test_foo`
+  // doesn't prematurely close the `_…_` italic wrapper.
+  const status = state.statusLine.slice(0, 80).replace(/[_*]/g, '')
+  const text = `_Condor · ${status}…_`
   if (text === state.lastSignature) return
   const now = Date.now()
   if (now - state.lastFlushAt < STATUS_FLUSH_INTERVAL_MS) return
@@ -189,11 +193,15 @@ async function deliverFinal(
 ): Promise<void> {
   const text = finalText(state)
   const rendered = markdownToChatMessage(text)
-  const looksRich = LOOKS_RICH_RE.test(text)
   const button = sessionButtonWidget(target.sessionUrl)
-  // Rich: the answer lives in the card only — no `text`, or Google Chat renders
-  // it a second time as a bubble above the card. Plain: the whole answer in
-  // `text`, no card (plus a button-only card when a session URL is set).
+  // Use the card (no `text`) for rich markdown OR when the plain answer would
+  // exceed Google Chat's 4096-char `text` cap — the card envelope is ~32 KB, so
+  // routing long answers there avoids a 400 (and a silent truncation). Plain:
+  // the whole answer in `text`, no card (plus a button-only card for the link).
+  // `rendered.text` is clamped to the 4096 cap; hitting it means the plain answer
+  // overflowed and must go to the (larger) card to avoid truncation / a 400.
+  const plainOverflows = rendered.text.length >= chatReplyLimits.message.maxPlainTextChars
+  const looksRich = LOOKS_RICH_RE.test(text) || plainOverflows
   const body: Partial<GoogleChatMessage> = looksRich
     ? { cardsV2: withButton(rendered.cardsV2, button) }
     : { text: rendered.text, cardsV2: button ? [buttonCard(button)] : [] }

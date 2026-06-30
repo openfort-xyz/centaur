@@ -35,7 +35,7 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
     cardId: `card-${index}`,
     card: {
       ...(index === 0 && opts.header
-        ? { header: { title: opts.header.slice(0, MAX_HEADER_CHARS) } }
+        ? { header: { title: stripInlineMarkdown(opts.header).slice(0, MAX_HEADER_CHARS) } }
         : {}),
       sections: card
     }
@@ -47,18 +47,6 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   }
 }
 
-/**
- * Translate the GitHub-flavoured Markdown the agent emits into the Chat-flavoured
- * markup the plain `text` field actually renders. The `text` field does NOT
- * understand `**bold**` or `[label](url)` — it renders `*bold*` and `<url|label>`
- * — so without this they leak as literal asterisks and raw URLs (observed live on
- * a weather answer). Only the card path renders GFM natively (textSyntax MARKDOWN),
- * so this is applied to the plain path only.
- *
- * Safe to run line-blind: anything with code fences, tables, or lists is routed to
- * the card by LOOKS_RICH_RE before the `text` field is ever used, so the plain path
- * only sees inline prose markup — there is no fenced code here to corrupt.
- */
 /**
  * Normalise a card's Markdown so Google Chat renders each block on its own line.
  * Empirically (probe cards posted to a live space): in a card textParagraph a
@@ -77,7 +65,11 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
 export function normalizeCardBreaks(markdown: string): string {
   const isListItem = (l: string) => /^\s*([-*+]|\d+\.)\s/.test(l)
   const isHorizontalRule = (l: string) => /^\s*([-*_])\1{2,}\s*$/.test(l)
-  const lines = markdown.split('\n')
+  // A `<br>` directly before a list item orphans the item (renders literal), and
+  // a card already breaks on a single `\n`, so a raw `<br>` the model emits is
+  // redundant at best and harmful before a list — turn each into a real newline
+  // (fence-aware: never touch `<br>` inside a ``` code block).
+  const lines = expandBreaksOutsideFences(markdown)
   const out: string[] = []
   let inFence = false
   let lastContent: string | null = null
@@ -109,6 +101,36 @@ export function normalizeCardBreaks(markdown: string): string {
   }
 
   return out.join('\n')
+}
+
+/** Split into lines, turning `<br>` into newlines on non-fence lines only. */
+function expandBreaksOutsideFences(markdown: string): string[] {
+  const out: string[] = []
+  let inFence = false
+  for (const line of markdown.split('\n')) {
+    if (line.trimStart().startsWith('```')) {
+      inFence = !inFence
+      out.push(line)
+      continue
+    }
+    if (inFence) {
+      out.push(line)
+      continue
+    }
+    out.push(...line.replace(/<br\s*\/?>/gi, '\n').split('\n'))
+  }
+  return out
+}
+
+/** Strip inline markdown that a card section `header` (plain text only) can't render. */
+export function stripInlineMarkdown(text: string): string {
+  return text
+    .replace(/!?\[([^\]]+)\]\([^)\s]+\)/g, '$1') // [label](url) / ![alt](url) → label
+    .replace(/(\*\*|__)(.+?)\1/g, '$2') // **bold** / __bold__ → bold
+    .replace(/(\*|_)(.+?)\1/g, '$2') // *italic* / _italic_ → italic
+    .replace(/~~(.+?)~~/g, '$1') // ~~strike~~ → strike
+    .replace(/`([^`]+)`/g, '$1') // `code` → code
+    .trim()
 }
 
 /**
@@ -181,7 +203,10 @@ function splitMarkdownToCards(markdown: string): GoogleChatCardSection[][] {
     const headingMatch = line.match(/^#{1,6}\s+(.+)/)
     if (headingMatch) {
       flushText()
-      pushSection({ header: headingMatch[1]!.slice(0, MAX_HEADER_CHARS), widgets: [] })
+      pushSection({
+        header: stripInlineMarkdown(headingMatch[1]!).slice(0, MAX_HEADER_CHARS),
+        widgets: []
+      })
       continue
     }
 
@@ -371,18 +396,4 @@ function sectionBytes(section: GoogleChatCardSection): number {
     bytes += (widget.textParagraph?.text.length ?? 0) + 48
   }
   return bytes
-}
-
-export function thinkingContextText(commentary: string): string {
-  const trimmed = commentary.trim()
-  if (!trimmed) return ''
-  const maxChars = 2_800
-  return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars - 13)}\n// truncated` : trimmed
-}
-
-export function fallbackTextForMessage(input: { markdown?: string; fallback?: string }): string {
-  const parts = [input.fallback, input.markdown].filter(Boolean)
-  const text = parts.join('\n').replace(/\s+/g, ' ').trim() || 'Centaur update'
-  const maxChars = chatReplyLimits.message.maxFallbackChars
-  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text
 }

@@ -11,9 +11,10 @@ export const chatReplyLimits = {
   },
   message: {
     maxTextChars: 32_000,
-    // `text` on a card-less reply carries the whole answer — allow most of the
-    // 32 KB envelope instead of the old 4 KB clamp that silently dropped tails.
-    maxPlainTextChars: 28_000,
+    // Google Chat hard-caps the plain `text` field at 4096 chars (unlike the
+    // ~32 KB card envelope) — over it the send 400s. Keep margin; an answer
+    // longer than this is routed to a card instead of being truncated.
+    maxPlainTextChars: 4_000,
     // Short notification/summary shown above a card (kept tiny to avoid
     // rendering the answer twice).
     maxFallbackChars: 280
