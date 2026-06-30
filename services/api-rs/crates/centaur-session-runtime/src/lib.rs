@@ -4648,23 +4648,42 @@ fn redact_prefixed_tokens(input: &str) -> String {
 
     let mut out = String::with_capacity(input.len());
     let mut index = 0;
+    let mut prev_char: Option<char> = None;
     while index < input.len() {
-        if let Some(prefix) = PREFIXES
-            .iter()
-            .find(|prefix| input[index..].starts_with(**prefix))
+        // Only treat a prefix as the start of a secret when it sits at a word
+        // boundary. A prefix glued inside a larger word/slug is part of that word,
+        // not a token — e.g. `sk-` appears inside a URL slug like
+        // ".../introducing-metamask-smart-accounts", and redacting from there
+        // mangled a digest's link. Real bare tokens are preceded by whitespace,
+        // quotes, `:`/`=`/`(` etc. (all non-word chars), so this keeps redacting
+        // them while sparing slugs.
+        let at_word_boundary = prev_char.is_none_or(|ch| !is_slug_word_char(ch));
+        if at_word_boundary
+            && let Some(prefix) = PREFIXES
+                .iter()
+                .find(|prefix| input[index..].starts_with(**prefix))
         {
             let token_end = consume_sensitive_token(input, index + prefix.len());
             out.push_str("[REDACTED_TOKEN]");
             index = token_end;
+            prev_char = Some(']');
             continue;
         }
 
         let ch = input[index..].chars().next().expect("valid char boundary");
         out.push(ch);
         index += ch.len_utf8();
+        prev_char = Some(ch);
     }
 
     out
+}
+
+/// A "word char" for slug/identifier purposes — used to decide whether a
+/// key-prefix match is glued inside a larger word (so NOT a token) or stands at
+/// a boundary (a real bare token).
+fn is_slug_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
 fn consume_sensitive_token(input: &str, start: usize) -> usize {
@@ -5235,6 +5254,23 @@ mod tests {
         assert!(redacted.contains("Authorization: Bearer [REDACTED_TOKEN]"));
         assert!(redacted.contains("SANDBOX_TOKEN=[REDACTED_TOKEN]"));
         assert!(redacted.contains("SLACK_BOT_TOKEN=[REDACTED_TOKEN]"));
+    }
+
+    #[test]
+    fn redaction_spares_key_prefixes_glued_inside_words() {
+        // A digest link whose slug happens to contain `sk-` (inside "metamask-")
+        // must survive intact — the prefix is part of the word, not a token.
+        let url = "https://metamask.io/news/introducing-metamask-smart-accounts";
+        assert_eq!(redact_sensitive_text(url), url);
+
+        // ...but a real bare token at a word boundary is still redacted.
+        let bare = "token is ghp_ABCDEFghijkl0123456789 here";
+        let redacted = redact_sensitive_text(bare);
+        assert!(!redacted.contains("ghp_ABCDEFghijkl0123456789"));
+        assert!(redacted.contains("[REDACTED_TOKEN]"));
+        // And a token right after a URL separator (not a word char) too.
+        let in_url = "https://host/path?key=sk-ant-LIVEsecret0123456789";
+        assert!(!redact_sensitive_text(in_url).contains("sk-ant-LIVEsecret0123456789"));
     }
 
     #[test]
