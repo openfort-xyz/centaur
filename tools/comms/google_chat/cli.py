@@ -112,7 +112,6 @@ def upload(
         google-chat upload spaces/AAAA report.pdf --thread spaces/AAAA/threads/BBBB
         google-chat upload spaces/AAAA chart.png -t "Latency over the last week"
     """
-    import base64
     import mimetypes
     from pathlib import Path
 
@@ -128,7 +127,7 @@ def upload(
     result = client.upload_attachment(
         space_name,
         path.name,
-        base64.b64encode(path.read_bytes()).decode("ascii"),
+        path.read_bytes(),
         mime_type=mime_type,
         text=text,
         thread_name=thread_name,

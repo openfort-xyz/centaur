@@ -124,6 +124,12 @@ pub struct GcpAuthSecret {
     pub secret_ref: String,
     pub hosts: Vec<String>,
     pub scopes: Vec<String>,
+    /// Domain-wide-delegation user to impersonate (`sub`). `None` = app auth.
+    pub subject: Option<String>,
+    /// Restrict the grant to these HTTP methods (empty = all).
+    pub http_methods: Vec<String>,
+    /// Restrict the grant to these request path prefixes (empty = all).
+    pub paths: Vec<String>,
 }
 
 /// A `type = "gcp_id_token"` secret.
@@ -664,6 +670,9 @@ fn parse_gcp(table: &toml::Table, name: &str, secret_ref: &str) -> Result<GcpAut
         secret_ref: secret_ref.to_owned(),
         hosts,
         scopes,
+        subject: opt_str(table, "subject"),
+        http_methods: str_array(table.get("http_methods")).unwrap_or_default(),
+        paths: str_array(table.get("paths")).unwrap_or_default(),
     })
 }
 
