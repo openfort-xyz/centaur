@@ -300,6 +300,12 @@ async function sessionApiRequest(
   }
 }
 
+/** Collapse a user-controlled value to a single trimmed line so it cannot break
+ * out of the Markdown instruction blocks it is interpolated into. */
+function sanitizeContextValue(value: string | undefined): string {
+  return (value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+}
+
 function textFromParts(parts: NormalizedPart[]): string {
   return parts
     .filter((part): part is Extract<NormalizedPart, { type: 'text' }> => part.type === 'text')
@@ -401,14 +407,18 @@ function chatSessionContext(message: GoogleChatTurnMessage, threadKey: string): 
  */
 function requesterIdentityContext(message: GoogleChatTurnMessage): string | undefined {
   if (!message.userId && !message.userName) return undefined
-  const promptedBy = message.userName.trim() || 'unknown Google Chat requester'
+  // The display name is attacker-controllable (Google Chat webhooks aren't
+  // signed), so flatten it to a single line before it enters this instruction
+  // block — a newline would otherwise let it inject its own attribution lines.
+  const userName = sanitizeContextValue(message.userName)
+  const promptedBy = userName || 'unknown Google Chat requester'
 
   const lines = [
     '# Requester Context',
     '',
     'The Google Chat user who prompted this turn is:',
-    ...(message.userId ? [`- Google Chat user ID: ${message.userId}`] : []),
-    ...(message.userName ? [`- Google Chat display name: ${message.userName}`] : []),
+    ...(message.userId ? [`- Google Chat user ID: ${sanitizeContextValue(message.userId)}`] : []),
+    ...(userName ? [`- Google Chat display name: ${userName}`] : []),
     '- GitHub handle: unavailable (Google Chat profiles carry no GitHub field)',
     '',
     '## GitHub PR Attribution',
@@ -436,15 +446,31 @@ function codexInputContent(threadKey: string, message: GoogleChatTurnMessage): J
   if (message.text.trim()) content.push({ type: 'text', text: message.text })
   for (const part of message.parts) {
     if (part.type === 'text') continue
-    if (part.type === 'image' && part.source?.data && part.mime_type) {
-      content.push({
-        type: 'image',
-        url: `data:${part.mime_type};base64,${part.source.data}`,
-        detail: 'auto',
-        name: part.name
-      })
+    if (part.source?.data && part.mime_type) {
+      if (part.type === 'image') {
+        content.push({
+          type: 'image',
+          url: `data:${part.mime_type};base64,${part.source.data}`,
+          detail: 'auto',
+          name: part.name
+        })
+      } else {
+        // Non-image files reach the agent as an attachment block carrying the
+        // bytes, matching slackbotv2's codexAttachmentInput shape — otherwise a
+        // CSV/PDF would arrive as a name-only placeholder the agent can't read.
+        content.push({
+          type: 'attachment',
+          attachment_type: part.type,
+          dataBase64: part.source.data,
+          mimeType: part.mime_type,
+          name: part.name,
+          size: part.size
+        })
+      }
       continue
     }
+    // No bytes (Drive file, oversized, or a failed download): a descriptive
+    // placeholder so the agent at least knows a file was attached.
     content.push({
       type: 'text',
       text: `[Google Chat attachment: name=${part.name} type=${part.type} mime=${part.mime_type}]`

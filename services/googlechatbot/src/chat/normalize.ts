@@ -37,6 +37,9 @@ const THREAD_HISTORY_LIMIT = 50
 // agent still sees the placeholder text.
 const MAX_INLINE_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
+// Bound the fan-out of media downloads triggered by a single inbound message.
+const MAX_ATTACHMENTS_PER_MESSAGE = 10
+
 export async function normalizeChatEnvelope(
   envelope: GoogleChatEnvelope,
   botUserName?: string,
@@ -83,14 +86,6 @@ export async function normalizeChatEnvelope(
     : normalizeChatText(message.text ?? '', senderName)
   const formattedText = isSlashCommand ? '' : message.formattedText ?? ''
 
-  const parts: NormalizedPart[] = []
-  const textPart = [formattedText, text].filter(Boolean).join('\n').trim()
-  if (textPart) parts.push({ type: 'text', text: textPart })
-
-  for (const attachment of message.attachment ?? []) {
-    parts.push(await toAttachmentPart(attachment, client, spaceName))
-  }
-
   const displayName = message.sender.displayName ?? message.sender.email ?? senderName
 
   // Determine if the bot was @mentioned.
@@ -100,6 +95,22 @@ export async function normalizeChatEnvelope(
     Boolean(botUserName && (message.text ?? '').includes(botUserName)) ||
     Boolean(botUserName && (message.text ?? '').includes('@')) ||
     envelope.space?.singleUserBotDm === true
+
+  const parts: NormalizedPart[] = []
+  const textPart = [formattedText, text].filter(Boolean).join('\n').trim()
+  if (textPart) parts.push({ type: 'text', text: textPart })
+
+  // Only hydrate attachment bytes for a message that will actually start a run
+  // (a mention / DM / slash command). The caller drops non-mention messages
+  // unless follow-up threads are enabled, so downloading their files here would
+  // be wasted work and an amplification vector on the unauthenticated webhook —
+  // one forged envelope with a big `attachment` array would fan out to that many
+  // authenticated media fetches. Bounded per message either way.
+  if (isMention) {
+    for (const attachment of (message.attachment ?? []).slice(0, MAX_ATTACHMENTS_PER_MESSAGE)) {
+      parts.push(await toAttachmentPart(attachment, client, spaceName))
+    }
+  }
 
   // Use the event-level thread if available, otherwise message.thread, otherwise message.name
   const threadField = envelope.thread || message.thread

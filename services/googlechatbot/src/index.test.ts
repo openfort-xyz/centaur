@@ -69,6 +69,25 @@ describe('outbound /api/chat/attachments', () => {
     const res = await post(app, { Authorization: 'Bearer secret' }, { space_name: 'spaces/A' })
     expect(res.status).toBe(400)
   })
+
+  test('rejects malformed base64 (400) instead of silently truncating', async () => {
+    const app = appWith({
+      CHATBOT_API_KEY: 'secret',
+      GOOGLECHATBOT_UPLOAD_USER: 'files@openfort.xyz',
+      GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
+        client_email: 'sa@example.iam.gserviceaccount.com',
+        private_key: 'key'
+      })
+    })
+    const res = await post(
+      app,
+      { Authorization: 'Bearer secret' },
+      { space_name: 'spaces/A', filename: 'a.txt', content_base64: 'SGVsbG8h%%%%V29ybGQh' }
+    )
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error?: string }
+    expect(body.error).toContain('not valid base64')
+  })
 })
 
 describe('parseChatBody', () => {

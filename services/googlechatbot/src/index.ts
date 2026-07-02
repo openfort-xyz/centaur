@@ -210,12 +210,14 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     if (!body?.space_name || !body.filename || !body.content_base64) {
       return c.json({ error: 'space_name, filename and content_base64 are required' }, 400)
     }
-    let data: Uint8Array
-    try {
-      data = Uint8Array.from(Buffer.from(body.content_base64, 'base64'))
-    } catch {
+    // Buffer.from(x, 'base64') never throws — it silently drops invalid chars,
+    // so a malformed payload would upload a truncated file with a 200. Validate
+    // explicitly (whitespace tolerated) so bad input fails as a clean 400.
+    const b64 = body.content_base64.replace(/\s+/g, '')
+    if (b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
       return c.json({ error: 'content_base64 is not valid base64' }, 400)
     }
+    const data = Uint8Array.from(Buffer.from(b64, 'base64'))
     if (data.byteLength === 0) return c.json({ error: 'content_base64 decoded to zero bytes' }, 400)
     // Same 100MB ceiling slackbotv2 applies to inline file content; the Chat
     // API itself allows up to 200MB per attachment.
@@ -394,8 +396,10 @@ async function driveSession(
     }
     await finalizeRender(client, target, state)
     incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
+    // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
+    // aggregate both: the final answer is written once and visible.
     incr('centaur_session_delivery_total', {
-      delivery_status: state.error ? 'error_visible' : 'delivered'
+      delivery_status: state.error ? 'error_visible' : 'answer_visible'
     })
   } catch (error) {
     incr('googlechatbot_runs_total', { outcome: 'failed' })

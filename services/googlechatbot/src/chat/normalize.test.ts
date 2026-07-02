@@ -299,6 +299,35 @@ describe('normalizeChatEnvelope (attachments)', () => {
     expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
   })
 
+  test('non-mention message → attachment download skipped (gated before the run)', async () => {
+    const client = downloader(new TextEncoder().encode('never'))
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'just a file, no mention',
+          sender: { name: 'users/U1', displayName: 'Alice' },
+          attachment: [uploadedImage]
+        }
+      }),
+      BOT_USER,
+      client
+    )
+    expect(normalized!.is_mention).toBe(false)
+    expect(client.calls).toEqual([])
+    expect(normalized!.parts.every(p => p.type === 'text')).toBe(true)
+  })
+
+  test('caps the number of attachments downloaded per message', async () => {
+    const client = downloader(new TextEncoder().encode('x'))
+    const many = Array.from({ length: 15 }, (_v, i) => ({
+      ...uploadedImage,
+      attachmentDataRef: { resourceName: `media-${i}` }
+    }))
+    await normalizeChatEnvelope(attachmentEnvelope(many), BOT_USER, client)
+    expect(client.calls).toHaveLength(10)
+  })
+
   test('missing attachmentDataRef or absent client → stub part, never throws', async () => {
     const noRef = await normalizeChatEnvelope(
       attachmentEnvelope([{ ...uploadedImage, attachmentDataRef: {} }]),

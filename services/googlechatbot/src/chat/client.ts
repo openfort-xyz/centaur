@@ -366,16 +366,20 @@ export class ChatEdgeClient {
       )
     }
 
-    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    const id = encodeURIComponent(
+      spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    )
     const url = `${CHAT_UPLOAD_BASE}/spaces/${id}/attachments:upload?uploadType=multipart`
     const boundary = `centaur-upload-${crypto.randomUUID()}`
     const encoder = new TextEncoder()
     const head = encoder.encode(
       `--${boundary}\r\n`
         + 'Content-Type: application/json; charset=UTF-8\r\n\r\n'
+        // filename is JSON-escaped; mimeType is validated to a token/token grammar
+        // so neither can inject CRLF or extra part headers into the multipart body.
         + `${JSON.stringify({ filename: fileName })}\r\n`
         + `--${boundary}\r\n`
-        + `Content-Type: ${contentType}\r\n\r\n`
+        + `Content-Type: ${safeMimeType(contentType)}\r\n\r\n`
     )
     const tail = encoder.encode(`\r\n--${boundary}--\r\n`)
     const body = new Uint8Array(head.byteLength + data.byteLength + tail.byteLength)
@@ -447,6 +451,12 @@ export class ChatEdgeClient {
 
     return (await response.json()) as GoogleChatMessage
   }
+}
+
+/** A `type/subtype` MIME token with no CR/LF, safe to place in a header. Falls
+ * back to a generic binary type for anything malformed or injection-shaped. */
+function safeMimeType(value: string): string {
+  return /^[\w.+-]+\/[\w.+-]+$/.test(value) ? value : 'application/octet-stream'
 }
 
 async function createJWT(opts: {
