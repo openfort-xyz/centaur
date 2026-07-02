@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
 import { logWarn } from './logging'
+import { incr } from './metrics'
 import type { NormalizedChatEvent, NormalizedPart } from './chat/types'
 
 // ---------------------------------------------------------------------------
@@ -173,12 +174,13 @@ export async function createSession(
       ...(name ? { googlechat_conversation_name: name } : {})
     }
   }
-  const response = await fetch(apiSessionUrl(config, threadKey), {
-    method: 'POST',
-    headers: apiHeaders(config),
-    body: JSON.stringify(body)
-  })
-  await ensureApiOk(response, 'create session')
+  const response = await sessionApiRequest('create_session', 'create session', () =>
+    fetch(apiSessionUrl(config, threadKey), {
+      method: 'POST',
+      headers: apiHeaders(config),
+      body: JSON.stringify(body)
+    })
+  )
   const payload = (await response.json().catch(() => ({}))) as CreateSessionResponse
   const status = payload.session?.status ?? ''
   return { status, activeExecution: status === ACTIVE_SESSION_STATUS }
@@ -198,12 +200,13 @@ export async function appendSessionMessages(
       metadata: sessionMetadata(threadKey, message)
     }))
   }
-  const response = await fetch(apiSessionUrl(config, threadKey, 'messages'), {
-    method: 'POST',
-    headers: apiHeaders(config),
-    body: JSON.stringify(body)
-  })
-  await ensureApiOk(response, 'append session messages')
+  await sessionApiRequest('append_messages', 'append session messages', () =>
+    fetch(apiSessionUrl(config, threadKey, 'messages'), {
+      method: 'POST',
+      headers: apiHeaders(config),
+      body: JSON.stringify(body)
+    })
+  )
 }
 
 export type TurnOverrides = {
@@ -225,12 +228,13 @@ export async function executeSession(
     ...(opts.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: opts.idleTimeoutMs }),
     ...(opts.maxDurationMs === undefined ? {} : { max_duration_ms: opts.maxDurationMs })
   }
-  const response = await fetch(apiSessionUrl(config, threadKey, 'execute'), {
-    method: 'POST',
-    headers: apiHeaders(config),
-    body: JSON.stringify(body)
-  })
-  await ensureApiOk(response, 'execute session')
+  const response = await sessionApiRequest('execute_session', 'execute session', () =>
+    fetch(apiSessionUrl(config, threadKey, 'execute'), {
+      method: 'POST',
+      headers: apiHeaders(config),
+      body: JSON.stringify(body)
+    })
+  )
   return (await response.json()) as ExecuteSessionResponse
 }
 
@@ -244,11 +248,12 @@ export async function openSessionEventStream(
   const url = new URL(apiSessionUrl(config, threadKey, 'events'))
   url.searchParams.set('after_event_id', String(afterEventId))
   if (executionId) url.searchParams.set('execution_id', executionId)
-  const response = await fetch(url.toString(), {
-    method: 'GET',
-    headers: apiHeaders(config, false)
-  })
-  await ensureApiOk(response, 'stream events')
+  const response = await sessionApiRequest('open_event_stream', 'stream events', () =>
+    fetch(url.toString(), {
+      method: 'GET',
+      headers: apiHeaders(config, false)
+    })
+  )
   if (!response.body) return emptyStream()
   return parseSessionEventStream(response.body, onEventId)
 }
@@ -264,6 +269,31 @@ export function sessionStreamError(error: unknown): RustSessionStreamEvent {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+type SessionApiOperation =
+  | 'create_session'
+  | 'append_messages'
+  | 'execute_session'
+  | 'open_event_stream'
+
+async function sessionApiRequest(
+  operation: SessionApiOperation,
+  action: string,
+  request: () => Promise<Response>
+): Promise<Response> {
+  try {
+    const response = await request()
+    await ensureApiOk(response, action)
+    incr('googlechatbot_session_api_operations_total', { operation, outcome: 'success' })
+    return response
+  } catch (error) {
+    incr('googlechatbot_session_api_operations_total', {
+      operation,
+      outcome: isRetryableSessionApiError(error) ? 'retryable_error' : 'error'
+    })
+    throw error
+  }
+}
 
 function textFromParts(parts: NormalizedPart[]): string {
   return parts
@@ -332,8 +362,44 @@ function toCodexInputLine(
   })
 }
 
+/**
+ * Identity block prepended to every executed turn, mirroring slackbotv2's
+ * "Requester Context". Google Chat profiles carry no custom fields, so there is
+ * no verified GitHub handle to resolve — attribution falls back to the display
+ * name, and the agent is told not to guess a GitHub username from it.
+ */
+function requesterIdentityContext(message: GoogleChatTurnMessage): string | undefined {
+  if (!message.userId && !message.userName) return undefined
+  const promptedBy = message.userName.trim() || 'unknown Google Chat requester'
+
+  const lines = [
+    '# Requester Context',
+    '',
+    'The Google Chat user who prompted this turn is:',
+    ...(message.userId ? [`- Google Chat user ID: ${message.userId}`] : []),
+    ...(message.userName ? [`- Google Chat display name: ${message.userName}`] : []),
+    '- GitHub handle: unavailable (Google Chat profiles carry no GitHub field)',
+    '',
+    '## GitHub PR Attribution',
+    '',
+    '- If you create a GitHub PR for this Google Chat request, '
+      + `the PR body MUST contain this standalone line: \`Prompted by: ${promptedBy}\``,
+    "- Use the requester's Google Chat display name because no verified GitHub "
+      + 'handle is available.',
+    '- Do not infer a GitHub username from the Google Chat display name or email.',
+    '- The credited prompter is the requester in this section, not the thread OP/root author.',
+    '- This is a GitHub PR body requirement, not a Google Chat response mention rule.',
+    '',
+    'The user message follows in the next content block.',
+    '---'
+  ]
+  return lines.join('\n')
+}
+
 function codexInputContent(message: GoogleChatTurnMessage): JsonValue[] {
   const content: JsonValue[] = []
+  const requesterContext = requesterIdentityContext(message)
+  if (requesterContext) content.push({ type: 'text', text: requesterContext })
   if (message.text.trim()) content.push({ type: 'text', text: message.text })
   for (const part of message.parts) {
     if (part.type === 'text') continue
@@ -428,6 +494,15 @@ async function* parseSessionEventStream(
         eventKind: event.event
       }
       if (isTerminalCodexOutputLine(event.data)) return
+      continue
+    }
+    if (event.event === 'session.activity_summary') {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event
+      }
       continue
     }
     if (event.event === 'session.execution_failed' || event.event === 'session.stream_error') {

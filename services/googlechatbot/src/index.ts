@@ -196,7 +196,7 @@ async function processChatEvent(
   envelope: GoogleChatEnvelope
 ): Promise<void> {
   const botUser = botResourceName(config)
-  const normalized = await normalizeChatEnvelope(envelope, botUser)
+  const normalized = await normalizeChatEnvelope(envelope, botUser, client)
   if (!normalized) return
 
   if (envelope.type === 'ADDED_TO_SPACE') {
@@ -299,7 +299,8 @@ async function driveSession(
       spaceName: event.space_name,
       ackMessageName,
       threadName: event.chat.thread_name,
-      sessionUrl: sessionUrl(config, threadKey, execution.execution_id)
+      sessionUrl: sessionUrl(config, threadKey, execution.execution_id),
+      plainTextOnly: isPlainTextOnlyRequest(execute.text)
     }
 
     // Resume-on-drop: a dropped SSE connection leaves the answer half-written.
@@ -330,8 +331,12 @@ async function driveSession(
     }
     await finalizeRender(client, target, state)
     incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
+    incr('centaur_session_delivery_total', {
+      delivery_status: state.error ? 'error_visible' : 'delivered'
+    })
   } catch (error) {
     incr('googlechatbot_runs_total', { outcome: 'failed' })
+    incr('centaur_session_delivery_total', { delivery_status: 'failed' })
     logError('googlechatbot_session_drive_failed', error)
     await deliverDriveError(client, event, ackMessageName, error)
   }
@@ -367,6 +372,17 @@ async function removeAck(client: ChatEdgeClient, ackMessageName: string): Promis
   } catch (error) {
     logWarn('googlechatbot_fold_ack_delete_failed', error)
   }
+}
+
+/** Same escape-hatch phrases slackbotv2 honors: the requester asked for plain
+ * text, so the final answer skips the card surface. */
+function isPlainTextOnlyRequest(text: string): boolean {
+  const normalized = text.toLowerCase()
+  return (
+    /\bplain\s+text\s+only\b/.test(normalized)
+    || /\bno\s+interactive\s+blocks?\b/.test(normalized)
+    || /\bno\s+dashboards?\b/.test(normalized)
+  )
 }
 
 /** Build the "View session" deep link from the configured template, if any. */

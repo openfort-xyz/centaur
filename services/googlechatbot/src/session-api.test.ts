@@ -1,7 +1,13 @@
-import { test, expect, describe, afterEach } from 'bun:test'
-import { turnMessagesFromEvent, createSession } from './session-api'
+import { test, expect, describe, afterEach, beforeEach } from 'bun:test'
+import {
+  turnMessagesFromEvent,
+  createSession,
+  executeSession,
+  openSessionEventStream
+} from './session-api'
 import { parseChatBody } from './index'
 import { loadConfig } from './config'
+import { renderMetrics, resetMetrics } from './metrics'
 import type { NormalizedChatEvent } from './chat/types'
 
 const baseEvent: NormalizedChatEvent = {
@@ -79,6 +85,73 @@ describe('createSession', () => {
     const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
     expect(result.status).toBe('')
     expect(result.activeExecution).toBe(false)
+  })
+})
+
+describe('executeSession', () => {
+  const realFetch = globalThis.fetch
+  beforeEach(() => {
+    resetMetrics()
+  })
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  test('prepends the requester context and counts the operation', async () => {
+    let captured: string | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ execution_id: 'e1', ok: true, status: 'executing', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+
+    const { execute } = turnMessagesFromEvent(baseEvent)
+    await executeSession(loadConfig({}), baseEvent.thread_key, execute)
+
+    const body = JSON.parse(captured ?? '{}') as { input_lines: string[] }
+    const line = JSON.parse(body.input_lines[0]!) as {
+      message: { content: Array<{ type: string; text?: string }> }
+    }
+    expect(line.message.content[0]?.text).toStartWith('# Requester Context')
+    expect(line.message.content[0]?.text).toContain('Prompted by: Alice')
+    expect(line.message.content[1]?.text).toBe('deploy the thing')
+    expect(renderMetrics()).toContain(
+      'googlechatbot_session_api_operations_total{operation="execute_session",outcome="success"} 1'
+    )
+  })
+})
+
+describe('openSessionEventStream', () => {
+  const realFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  test('passes activity summaries through as renderable events', async () => {
+    const sse = [
+      'event: session.activity_summary',
+      'data: {"summary":"Running tests"}',
+      '',
+      'event: session.execution_completed',
+      'data: {}',
+      '',
+      ''
+    ].join('\n')
+    globalThis.fetch = (async () =>
+      new Response(sse, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })) as unknown as typeof fetch
+
+    const stream = await openSessionEventStream(loadConfig({}), 'chat:spaces:AAAA:threads:T1', 0, 'e1', () => {})
+    const events = []
+    for await (const event of stream) events.push(event)
+
+    expect(events[0]?.eventKind).toBe('session.activity_summary')
+    expect((events[0]?.data as { summary?: string }).summary).toBe('Running tests')
+    expect(events[1]?.eventKind).toBe('session.execution_completed')
   })
 })
 
