@@ -1,5 +1,7 @@
 import { test, expect, describe, afterEach, beforeEach } from 'bun:test'
 import {
+  SessionApiError,
+  classifyExecuteConflict,
   turnMessagesFromEvent,
   createSession,
   executeSession,
@@ -265,5 +267,34 @@ describe('parseChatBody', () => {
 
   test('returns null for invalid JSON', () => {
     expect(parseChatBody('not json')).toBeNull()
+  })
+})
+
+describe('classifyExecuteConflict', () => {
+  const apiError = (status: number) =>
+    new SessionApiError({
+      action: 'execute session',
+      body: '',
+      retryable: status >= 500,
+      status,
+      statusText: 'x'
+    })
+
+  test('409 is the typed active-execution conflict', () => {
+    expect(classifyExecuteConflict(apiError(409))).toBe('conflict')
+  })
+
+  test('500 may be the same collision on older servers: recheck', () => {
+    expect(classifyExecuteConflict(apiError(500))).toBe('recheck')
+  })
+
+  test('other API statuses are unrelated', () => {
+    expect(classifyExecuteConflict(apiError(400))).toBe('unrelated')
+    expect(classifyExecuteConflict(apiError(503))).toBe('unrelated')
+  })
+
+  test('non-SessionApiError values are unrelated', () => {
+    expect(classifyExecuteConflict(new Error('boom'))).toBe('unrelated')
+    expect(classifyExecuteConflict(undefined)).toBe('unrelated')
   })
 })
