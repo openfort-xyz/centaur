@@ -6,6 +6,7 @@ import pytest
 
 from centaur_sdk import (
     ToolContext,
+    current_google_chat_space,
     current_session_context,
     current_slack_thread,
     reset_tool_context,
@@ -135,6 +136,71 @@ def test_current_slack_thread_returns_api_slack_destination(
     )
     try:
         assert current_slack_thread() == {"channel_id": "C123", "thread_ts": "123.456"}
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_google_chat_space_returns_api_chat_destination(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return (
+                b'{"thread_key":"chat:spaces:AAAA:spaces:AAAA:threads:BBBB",'
+                b'"google_chat":{"space_name":"spaces/AAAA",'
+                b'"thread_name":"spaces/AAAA/threads/BBBB"}}'
+            )
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda _request, timeout: FakeResponse())
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="chat:spaces:AAAA:spaces:AAAA:threads:BBBB",
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+    try:
+        assert current_google_chat_space() == {
+            "space_name": "spaces/AAAA",
+            "thread_name": "spaces/AAAA/threads/BBBB",
+        }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_google_chat_space_rejects_non_chat_threads(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return (
+                b'{"thread_key":"slack:C123:123.456",'
+                b'"slack":{"channel_id":"C123","thread_ts":"123.456"}}'
+            )
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda _request, timeout: FakeResponse())
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:C123:123.456",
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match="not a Google Chat thread"):
+            current_google_chat_space()
     finally:
         reset_tool_context(token)
 

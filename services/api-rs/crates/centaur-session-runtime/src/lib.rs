@@ -5201,11 +5201,22 @@ fn merge_session_context(
 }
 
 fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
-    let slack = slack_context_for_thread(thread_key)?;
-    let mut context = serde_json::Map::new();
-    context.insert("platform".to_owned(), Value::String("slack".to_owned()));
-    context.insert("slack".to_owned(), Value::Object(slack));
-    Some(context)
+    if let Some(slack) = slack_context_for_thread(thread_key) {
+        let mut context = serde_json::Map::new();
+        context.insert("platform".to_owned(), Value::String("slack".to_owned()));
+        context.insert("slack".to_owned(), Value::Object(slack));
+        return Some(context);
+    }
+    if let Some(google_chat) = google_chat_context_for_thread(thread_key) {
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "platform".to_owned(),
+            Value::String("google_chat".to_owned()),
+        );
+        context.insert("google_chat".to_owned(), Value::Object(google_chat));
+        return Some(context);
+    }
+    None
 }
 
 fn slack_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
@@ -5236,6 +5247,31 @@ fn slack_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<St
 
 fn is_slack_conversation_id(value: &str) -> bool {
     matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+}
+
+/// The googlechatbot encodes threads as `chat:<space_resource>:<thread_resource>`
+/// with `/` rewritten to `:` in each Google Chat resource name, e.g.
+/// `chat:spaces:AAAA:spaces:AAAA:threads:BBBB`. Recover the original resource
+/// names so agent tooling can address the space/thread through the Chat API.
+/// The Slack-compatible `chat:C…` adapter format never starts with `spaces:`.
+fn google_chat_context_for_thread(
+    thread_key: &ThreadKey,
+) -> Option<serde_json::Map<String, Value>> {
+    let rest = thread_key.as_str().strip_prefix("chat:spaces:")?;
+    let mut segments = rest.split(':');
+    let space_id = segments.next().filter(|space| !space.is_empty())?;
+    let thread_name = segments.collect::<Vec<_>>().join("/");
+    if thread_name.is_empty() {
+        return None;
+    }
+
+    let mut google_chat = serde_json::Map::new();
+    google_chat.insert(
+        "space_name".to_owned(),
+        Value::String(format!("spaces/{space_id}")),
+    );
+    google_chat.insert("thread_name".to_owned(), Value::String(thread_name));
+    Some(google_chat)
 }
 
 fn steering_input_lines(
@@ -6573,6 +6609,25 @@ mod tests {
         assert_eq!(
             value["session_context"]["slack"]["thread_ts"],
             "1780000000.000000"
+        );
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_google_chat_thread_context() {
+        let thread_key = ThreadKey::parse("chat:spaces:AAAA:spaces:AAAA:threads:BBBB").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "google_chat");
+        assert_eq!(
+            value["session_context"]["google_chat"]["space_name"],
+            "spaces/AAAA"
+        );
+        assert_eq!(
+            value["session_context"]["google_chat"]["thread_name"],
+            "spaces/AAAA/threads/BBBB"
         );
     }
 

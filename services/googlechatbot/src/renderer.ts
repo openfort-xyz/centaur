@@ -37,6 +37,8 @@ export type RenderTarget = {
   threadName?: string
   /** Optional deep link rendered as a "View session" button on the final answer. */
   sessionUrl?: string
+  /** Prompt asked for plain text — deliver via the `text` surface, no cards. */
+  plainTextOnly?: boolean
 }
 
 /**
@@ -201,7 +203,10 @@ async function deliverFinal(
   // `rendered.text` is clamped to the 4096 cap; hitting it means the plain answer
   // overflowed and must go to the (larger) card to avoid truncation / a 400.
   const plainOverflows = rendered.text.length >= chatReplyLimits.message.maxPlainTextChars
-  const looksRich = LOOKS_RICH_RE.test(text) || plainOverflows
+  // A "plain text only" prompt (same phrases slackbotv2 honors) forces the
+  // `text` surface even for rich markdown — unless the answer overflows the
+  // 4096-char cap, where the card is the only surface that fits it whole.
+  const looksRich = plainOverflows || (!target.plainTextOnly && LOOKS_RICH_RE.test(text))
   const body: Partial<GoogleChatMessage> = looksRich
     ? { cardsV2: withButton(rendered.cardsV2, button) }
     : { text: rendered.text, cardsV2: button ? [buttonCard(button)] : [] }

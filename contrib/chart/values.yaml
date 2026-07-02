@@ -363,6 +363,19 @@ apiRs:
     googleCalendar:
       enabled: false
       syncIntervalSeconds: 14400
+    googleChat:
+      enabled: false
+      syncIntervalSeconds: 14400
+      # Comma-separated Chat space types to sync (SPACE, GROUP_CHAT,
+      # DIRECT_MESSAGE). Defaults to named rooms only so DMs/group chats stay
+      # out of the company-wide corpus, mirroring the Slack ETL.
+      includeSpaceTypes: SPACE
+      # 0 = unlimited (page each space to completion every run). Set > 0 to
+      # bound a large first backfill so it converges across runs.
+      maxPagesPerRun: 0
+      # Comma-separated space IDs the Chat app reads but is not a listed
+      # member of (spaces.list only returns member spaces).
+      spaceIds: ""
     companyContextDocuments:
       enabled: true
       intervalSeconds: 14400
@@ -484,6 +497,11 @@ googlechatbot:
   eventsPath: /api/chat/events
   # Comma/space-separated email-domain allowlist for inbound events. Empty = open to all domains.
   allowedDomain: ""
+  # Workspace user the service account impersonates for attachment uploads
+  # (Google Chat's media.upload rejects app auth). Requires a one-time admin
+  # domain-wide-delegation grant of chat.messages.create to the SA's client ID.
+  # Empty = the /api/chat/attachments route fails closed.
+  uploadUser: ""
   # Public ingress for the webhook. Separate from the slackbotv2 ingress (which owns "/").
   ingress:
     enabled: false
@@ -491,6 +509,12 @@ googlechatbot:
     host: ""
     annotations: {}
     tls: []
+  metrics:
+    # googlechatbot serves Prometheus text metrics at /metrics. This flag only
+    # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
+    scrapeAnnotations: true
+    path: /metrics
+    annotations: {}
   extraEnv: {}
   resources: {}
 

@@ -95,8 +95,10 @@ def current_session_context() -> dict[str, Any]:
     """Return API-owned context for the current thread.
 
     For Slack-originated sessions this includes ``slack.channel_id`` and
-    ``slack.thread_ts``. The API remains the source of truth so warm pooled
-    sandboxes do not need per-thread environment mutation.
+    ``slack.thread_ts``. For Google Chat-originated sessions this includes
+    ``google_chat.space_name`` and ``google_chat.thread_name``. The API remains
+    the source of truth so warm pooled sandboxes do not need per-thread
+    environment mutation.
     """
     thread_key = current_thread_key()
     base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
@@ -122,6 +124,24 @@ def current_slack_thread() -> dict[str, str]:
     return {
         "channel_id": str(slack["channel_id"]),
         "thread_ts": str(slack["thread_ts"]),
+    }
+
+
+def current_google_chat_space() -> dict[str, str]:
+    """Return ``{"space_name": ..., "thread_name": ...}`` for the current Google Chat thread."""
+    context = current_session_context()
+    google_chat = context.get("google_chat")
+    if (
+        not isinstance(google_chat, dict)
+        or not google_chat.get("space_name")
+        or not google_chat.get("thread_name")
+    ):
+        raise RuntimeError(
+            f"current thread is not a Google Chat thread: {context.get('thread_key')!r}"
+        )
+    return {
+        "space_name": str(google_chat["space_name"]),
+        "thread_name": str(google_chat["thread_name"]),
     }
 
 

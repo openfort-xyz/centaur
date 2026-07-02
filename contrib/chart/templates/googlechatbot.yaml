@@ -1,5 +1,10 @@
 {{- if .Values.googlechatbot.enabled }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $googleChatBotMetricsAnnotations := dict -}}
+{{- if .Values.googlechatbot.metrics.scrapeAnnotations -}}
+{{- $googleChatBotMetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.googlechatbot.metrics.path "prometheus.io/port" "3002" -}}
+{{- $googleChatBotMetricsAnnotations = mergeOverwrite $googleChatBotMetricsAnnotations (.Values.googlechatbot.metrics.annotations | default dict) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,8 +20,12 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- with $googleChatBotMetricsAnnotations }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 8 }}
+        centaur.ai/metrics: googlechatbot
     spec:
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
@@ -55,6 +64,10 @@ spec:
 {{- if .Values.googlechatbot.allowedDomain }}
             - name: GOOGLECHATBOT_ALLOWED_DOMAIN
               value: {{ .Values.googlechatbot.allowedDomain | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.uploadUser }}
+            - name: GOOGLECHATBOT_UPLOAD_USER
+              value: {{ .Values.googlechatbot.uploadUser | quote }}
 {{- end }}
 {{- range $name, $value := .Values.googlechatbot.extraEnv }}
             - name: {{ $name }}

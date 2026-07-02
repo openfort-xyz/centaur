@@ -79,6 +79,11 @@
   (dict "name" "GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS" "value" (dig "googleDrive" "syncIntervalSeconds" 14400 $apiRsEtl))
   (dict "name" "GOOGLE_CALENDAR_ETL_ENABLED" "value" (dig "googleCalendar" "enabled" false $apiRsEtl))
   (dict "name" "GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS" "value" (dig "googleCalendar" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_ETL_ENABLED" "value" (dig "googleChat" "enabled" false $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_SYNC_INTERVAL_SECONDS" "value" (dig "googleChat" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_INCLUDE_SPACE_TYPES" "value" (dig "googleChat" "includeSpaceTypes" "SPACE" $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_MAX_PAGES_PER_RUN" "value" (dig "googleChat" "maxPagesPerRun" 0 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_SPACE_IDS" "value" (dig "googleChat" "spaceIds" "" $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_ENABLED" "value" (dig "companyContextDocuments" "enabled" true $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS" "value" (dig "companyContextDocuments" "intervalSeconds" 14400 $apiRsEtl))
 -}}

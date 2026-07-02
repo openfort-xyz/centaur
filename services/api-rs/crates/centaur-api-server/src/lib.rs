@@ -328,6 +328,41 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["thread_key"], "cli:test");
         assert!(body.get("slack").is_none());
+        assert!(body.get("google_chat").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_context_exposes_google_chat_space_and_thread() {
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        let app = build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["thread_key"],
+            "chat:spaces:AAAA:spaces:AAAA:threads:BBBB"
+        );
+        assert!(body.get("slack").is_none());
+        assert_eq!(body["google_chat"]["space_name"], "spaces/AAAA");
+        assert_eq!(
+            body["google_chat"]["thread_name"],
+            "spaces/AAAA/threads/BBBB"
+        );
     }
 
     #[derive(Default)]

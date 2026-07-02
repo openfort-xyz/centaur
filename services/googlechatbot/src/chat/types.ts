@@ -8,7 +8,9 @@ export type NormalizedBinaryPart = {
   name: string
   mime_type: string
   size: number
-  source: {
+  // Absent when the bytes could not be inlined (Drive file, oversized, or a
+  // failed download) — downstream renders a placeholder instead of data.
+  source?: {
     type: 'base64'
     media_type: string
     data: string
@@ -65,9 +67,13 @@ export type GoogleChatEnvelope = {
     argumentText?: string
     attachment?: Array<{
       name?: string
+      contentName?: string
       contentType?: string
       contentData?: string
       size?: string
+      source?: 'UPLOADED_CONTENT' | 'DRIVE_FILE'
+      attachmentDataRef?: { resourceName?: string }
+      driveDataRef?: { driveFileId?: string }
     }>
     annotations?: Array<{
       type?: string
@@ -135,6 +141,13 @@ export type GoogleChatMessage = {
     threadReply?: boolean
   }
   privateMessageViewer?: { name?: string }
+  // Outbound uploads: the whole UploadAttachmentResponse goes in this list,
+  // per the official "Upload media as a file attachment" flow.
+  attachment?: UploadAttachmentResponse[]
+}
+
+export type UploadAttachmentResponse = {
+  attachmentDataRef?: { resourceName?: string; attachmentUploadToken?: string }
 }
 
 export type GoogleChatCard = {

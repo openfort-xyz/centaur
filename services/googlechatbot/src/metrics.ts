@@ -13,7 +13,16 @@ type CounterSpec = {
 const COUNTERS: CounterSpec[] = [
   { name: 'googlechatbot_events_total', help: 'Inbound Chat events by outcome.' },
   { name: 'googlechatbot_runs_total', help: 'Agent runs by outcome.' },
-  { name: 'googlechatbot_render_resumes_total', help: 'Resumed SSE render passes after a stream drop.' }
+  { name: 'googlechatbot_render_resumes_total', help: 'Resumed SSE render passes after a stream drop.' },
+  {
+    name: 'googlechatbot_session_api_operations_total',
+    help: 'api-rs session API calls by operation and outcome.'
+  },
+  {
+    // Shared with slackbotv2 so cross-bot delivery dashboards aggregate both.
+    name: 'centaur_session_delivery_total',
+    help: 'User-visible delivery outcome of an agent run.'
+  }
 ]
 
 const values = new Map<string, number>()

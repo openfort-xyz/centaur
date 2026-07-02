@@ -13,6 +13,7 @@ from client import (
     CentaurInvestigatorClient,
     _database_url_with_name,
     _postgres_database_name,
+    parse_google_chat_reference,
     parse_slack_reference,
 )
 
@@ -228,6 +229,85 @@ def test_parse_slack_thread_key_with_team() -> None:
     ]
 
 
+def test_parse_google_chat_thread_resource_name() -> None:
+    result = parse_google_chat_reference("Investigate spaces/AAAA/threads/BBBB please")
+
+    assert result["status"] == "ok"
+    assert result["kind"] == "resource_name"
+    assert result["space_name"] == "spaces/AAAA"
+    assert result["thread_name"] == "spaces/AAAA/threads/BBBB"
+    assert result["thread_key"] == "chat:spaces:AAAA:spaces:AAAA:threads:BBBB"
+    assert result["thread_key_candidates"] == [
+        "chat:spaces:AAAA:spaces:AAAA:threads:BBBB",
+        "chat:spaces:AAAA:spaces:AAAA:messages:BBBB",
+    ]
+    assert result["thread_key_like"] == "chat:spaces:AAAA:%:BBBB"
+    assert result["channel_key_like"] == "chat:spaces:AAAA:%"
+
+
+def test_parse_google_chat_space_resource_name() -> None:
+    result = parse_google_chat_reference("spaces/AAAA")
+
+    assert result["status"] == "ok"
+    assert result["kind"] == "resource_name"
+    assert result["space_name"] == "spaces/AAAA"
+    assert result["thread_name"] == "spaces/AAAA"
+    assert result["thread_key_candidates"] == ["chat:spaces:AAAA:spaces:AAAA"]
+    assert result["thread_key_like"] is None
+
+
+def test_parse_google_chat_reply_message_resource_name() -> None:
+    result = parse_google_chat_reference("spaces/AAAA/messages/BBBB.CCCC")
+
+    assert result["status"] == "ok"
+    assert result["thread_name"] == "spaces/AAAA/messages/BBBB.CCCC"
+    assert result["thread_key_candidates"] == [
+        "chat:spaces:AAAA:spaces:AAAA:messages:BBBB.CCCC",
+        "chat:spaces:AAAA:spaces:AAAA:threads:BBBB",
+    ]
+
+
+def test_parse_google_chat_permalink() -> None:
+    result = parse_google_chat_reference("<https://chat.google.com/room/AAAA/BBBB>")
+
+    assert result["status"] == "ok"
+    assert result["kind"] == "google_chat_permalink"
+    assert result["space_name"] == "spaces/AAAA"
+    assert result["thread_name"] == "spaces/AAAA/threads/BBBB"
+    assert result["thread_key_candidates"] == [
+        "chat:spaces:AAAA:spaces:AAAA:threads:BBBB",
+        "chat:spaces:AAAA:spaces:AAAA:messages:BBBB",
+    ]
+
+
+def test_parse_google_chat_thread_key_decodes_resources() -> None:
+    result = parse_google_chat_reference("chat:spaces:AAAA:spaces:AAAA:threads:BBBB")
+
+    assert result["status"] == "ok"
+    assert result["kind"] == "thread_key"
+    assert result["space_name"] == "spaces/AAAA"
+    assert result["thread_name"] == "spaces/AAAA/threads/BBBB"
+    assert result["thread_key_candidates"] == [
+        "chat:spaces:AAAA:spaces:AAAA:threads:BBBB",
+        "chat:spaces:AAAA:spaces:AAAA:messages:BBBB",
+    ]
+
+
+def test_parse_thread_reference_falls_back_to_google_chat() -> None:
+    client = CentaurInvestigatorClient("postgresql://example")
+
+    slack = client.parse_thread_reference("slack:C0B0XS7BLA3:1780035646.228899")
+    assert slack["status"] == "ok"
+    assert slack["source"] == "slack"
+
+    google_chat = client.parse_thread_reference("spaces/AAAA/threads/BBBB")
+    assert google_chat["status"] == "ok"
+    assert google_chat["source"] == "chat"
+
+    invalid = client.parse_thread_reference("nothing to parse here")
+    assert invalid["status"] == "error"
+
+
 def test_investigation_queries_readonly_tables_without_message_context(monkeypatch) -> None:
     fake = _FakeConnection()
 
@@ -260,6 +340,36 @@ def test_investigation_queries_readonly_tables_without_message_context(monkeypat
     assert "url_private" not in str(result)
     assert "content_bytes" not in str(result)
     assert "secret user message" not in str(result)
+
+
+def test_google_chat_investigation_skips_slack_sync_tables(monkeypatch) -> None:
+    fake = _FakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+
+    result = CentaurInvestigatorClient("postgresql://example").investigate(
+        "https://chat.google.com/room/AAAA/BBBB",
+        include_observability=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["parsed"]["source"] == "chat"
+    assert fake.closed is True
+
+    sessions_query, sessions_args = fake.fetch_calls[0]
+    assert "FROM sessions" in sessions_query
+    assert sessions_args[0] == [
+        "chat:spaces:AAAA:spaces:AAAA:threads:BBBB",
+        "chat:spaces:AAAA:spaces:AAAA:messages:BBBB",
+    ]
+    assert sessions_args[1] == "chat:spaces:AAAA:%:BBBB"
+
+    all_queries = "\n".join(query for query, _args in fake.fetch_calls + fake.fetchrow_calls)
+    assert "FROM slack_sync_messages" not in all_queries
+    assert "FROM slack_sync_channels" not in all_queries
 
 
 def test_observability_never_requests_raw_log_context(monkeypatch) -> None:

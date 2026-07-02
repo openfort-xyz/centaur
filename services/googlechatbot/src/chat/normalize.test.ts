@@ -4,6 +4,7 @@ import {
   isThreadReply,
   normalizeChatEnvelope,
   normalizeChatText,
+  type ChatAttachmentDownloader,
   type ChatHistoryFetcher
 } from './normalize'
 import type { ChatListMessage, GoogleChatEnvelope } from './types'
@@ -141,6 +142,203 @@ describe('normalizeChatEnvelope', () => {
       BOT_USER
     )
     expect(own).toBeNull()
+  })
+})
+
+describe('normalizeChatEnvelope (attachments)', () => {
+  type StubDownloader = ChatAttachmentDownloader & { calls: string[] }
+  function downloader(result: Uint8Array | Error): StubDownloader {
+    const calls: string[] = []
+    return {
+      calls,
+      async downloadAttachment(resourceName) {
+        calls.push(resourceName)
+        if (result instanceof Error) throw result
+        return result.buffer as ArrayBuffer
+      }
+    }
+  }
+
+  function attachmentEnvelope(
+    attachment: NonNullable<NonNullable<GoogleChatEnvelope['message']>['attachment']>
+  ): GoogleChatEnvelope {
+    return messageEnvelope({
+      message: {
+        name: 'spaces/AAAA/messages/M1',
+        text: '<users/bot-account> look at this',
+        sender: { name: 'users/U1', displayName: 'Alice' },
+        attachment
+      }
+    })
+  }
+
+  const uploadedImage = {
+    name: 'spaces/AAAA/messages/M1/attachments/1',
+    contentName: 'diagram.png',
+    contentType: 'image/png',
+    source: 'UPLOADED_CONTENT' as const,
+    attachmentDataRef: { resourceName: 'media-resource-1' }
+  }
+
+  test('uploaded image → image part with inlined base64 data', async () => {
+    const client = downloader(new TextEncoder().encode('png-bytes'))
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([uploadedImage]),
+      BOT_USER,
+      client
+    )
+    expect(client.calls).toEqual(['media-resource-1'])
+    expect(normalized!.parts).toHaveLength(2)
+    expect(normalized!.parts[1]).toEqual({
+      type: 'image',
+      name: 'diagram.png',
+      mime_type: 'image/png',
+      size: 9,
+      source: {
+        type: 'base64',
+        media_type: 'image/png',
+        data: Buffer.from('png-bytes').toString('base64')
+      }
+    })
+  })
+
+  test('non-image upload → file part with inlined base64 data', async () => {
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([
+        {
+          ...uploadedImage,
+          contentName: 'report.pdf',
+          contentType: 'application/pdf'
+        }
+      ]),
+      BOT_USER,
+      downloader(new TextEncoder().encode('%PDF-'))
+    )
+    expect(normalized!.parts[1]).toMatchObject({
+      type: 'file',
+      name: 'report.pdf',
+      mime_type: 'application/pdf',
+      size: 5
+    })
+    expect((normalized!.parts[1] as { source?: unknown }).source).toBeDefined()
+  })
+
+  test('drive file → file part without data and no download attempt', async () => {
+    const client = downloader(new TextEncoder().encode('never'))
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([
+        {
+          name: 'spaces/AAAA/messages/M1/attachments/2',
+          contentName: 'roadmap.png',
+          contentType: 'image/png',
+          source: 'DRIVE_FILE',
+          driveDataRef: { driveFileId: 'drive-file-1' }
+        }
+      ]),
+      BOT_USER,
+      client
+    )
+    expect(client.calls).toEqual([])
+    // Always 'file' for Drive (even images): no bytes ever, so the part exists
+    // purely to reach the placeholder-text path with the name.
+    expect(normalized!.parts[1]).toEqual({
+      type: 'file',
+      name: 'roadmap.png',
+      mime_type: 'image/png',
+      size: 0
+    })
+  })
+
+  test('download failure → part survives without data', async () => {
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([uploadedImage]),
+      BOT_USER,
+      downloader(new Error('Chat API media download failed: 500 boom'))
+    )
+    expect(normalized!.parts[1]).toEqual({
+      type: 'image',
+      name: 'diagram.png',
+      mime_type: 'image/png',
+      size: 0
+    })
+  })
+
+  test('declared size over the inline cap → download skipped, part without data', async () => {
+    const client = downloader(new TextEncoder().encode('never'))
+    const declaredSize = 26 * 1024 * 1024
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([{ ...uploadedImage, size: String(declaredSize) }]),
+      BOT_USER,
+      client
+    )
+    expect(client.calls).toEqual([])
+    expect(normalized!.parts[1]).toEqual({
+      type: 'image',
+      name: 'diagram.png',
+      mime_type: 'image/png',
+      size: declaredSize
+    })
+  })
+
+  test('downloaded bytes over the inline cap → data dropped, real size kept', async () => {
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([uploadedImage]),
+      BOT_USER,
+      downloader(new Uint8Array(25 * 1024 * 1024 + 1))
+    )
+    const part = normalized!.parts[1] as { size: number; source?: unknown }
+    expect(part.size).toBe(25 * 1024 * 1024 + 1)
+    expect(part.source).toBeUndefined()
+  })
+
+  test('no attachments → text-only parts, unchanged behavior', async () => {
+    const client = downloader(new TextEncoder().encode('never'))
+    const normalized = await normalizeChatEnvelope(messageEnvelope(), BOT_USER, client)
+    expect(client.calls).toEqual([])
+    expect(normalized!.parts).toHaveLength(1)
+    expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
+  })
+
+  test('non-mention message → attachment download skipped (gated before the run)', async () => {
+    const client = downloader(new TextEncoder().encode('never'))
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'just a file, no mention',
+          sender: { name: 'users/U1', displayName: 'Alice' },
+          attachment: [uploadedImage]
+        }
+      }),
+      BOT_USER,
+      client
+    )
+    expect(normalized!.is_mention).toBe(false)
+    expect(client.calls).toEqual([])
+    expect(normalized!.parts.every(p => p.type === 'text')).toBe(true)
+  })
+
+  test('caps the number of attachments downloaded per message', async () => {
+    const client = downloader(new TextEncoder().encode('x'))
+    const many = Array.from({ length: 15 }, (_v, i) => ({
+      ...uploadedImage,
+      attachmentDataRef: { resourceName: `media-${i}` }
+    }))
+    await normalizeChatEnvelope(attachmentEnvelope(many), BOT_USER, client)
+    expect(client.calls).toHaveLength(10)
+  })
+
+  test('missing attachmentDataRef or absent client → stub part, never throws', async () => {
+    const noRef = await normalizeChatEnvelope(
+      attachmentEnvelope([{ ...uploadedImage, attachmentDataRef: {} }]),
+      BOT_USER,
+      downloader(new TextEncoder().encode('never'))
+    )
+    expect(noRef!.parts[1]).toMatchObject({ type: 'image', name: 'diagram.png', size: 0 })
+
+    const noClient = await normalizeChatEnvelope(attachmentEnvelope([uploadedImage]), BOT_USER)
+    expect(noClient!.parts[1]).toMatchObject({ type: 'image', name: 'diagram.png', size: 0 })
+    expect((noClient!.parts[1] as { source?: unknown }).source).toBeUndefined()
   })
 })
 

@@ -36,6 +36,10 @@ type WaitUntilContext = { waitUntil(promise: Promise<unknown>): void }
 /** Bounded re-opens of a dropped SSE stream before we give up and deliver. */
 const MAX_RESUME_ATTEMPTS = 3
 
+// Outbound upload ceiling — matches slackbotv2's inline file cap; the Chat API
+// itself accepts up to 200MB per attachment.
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
 const WELCOME_TEXT =
   'Hi, Centaur at your service! I can help with software engineering tasks. ' +
   'Mention me in a thread to get started.'
@@ -177,6 +181,67 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     }
   })
 
+  // Upload a file into a space (optionally threaded, with a caption). This is
+  // how agent tooling delivers files to the thread — the Slack analogue is the
+  // `slack upload` CLI hitting Slack directly; here the credential (a DWD
+  // user impersonation, see GOOGLECHATBOT_UPLOAD_USER) stays in the bot.
+  app.post('/api/chat/attachments', async c => {
+    const denied = requireOutboundAuth(c)
+    if (denied) return denied
+    if (!client.canUploadAttachments()) {
+      return c.json(
+        {
+          error:
+            'attachment uploads are not configured: set GOOGLECHATBOT_UPLOAD_USER '
+            + 'and grant the service account domain-wide delegation for the '
+            + 'chat.messages.create scope'
+        },
+        503
+      )
+    }
+    const body = (await c.req.json().catch(() => null)) as {
+      space_name?: string
+      filename?: string
+      content_base64?: string
+      mime_type?: string
+      text?: string
+      thread_name?: string
+    } | null
+    if (!body?.space_name || !body.filename || !body.content_base64) {
+      return c.json({ error: 'space_name, filename and content_base64 are required' }, 400)
+    }
+    // Buffer.from(x, 'base64') never throws — it silently drops invalid chars,
+    // so a malformed payload would upload a truncated file with a 200. Validate
+    // explicitly (whitespace tolerated) so bad input fails as a clean 400.
+    const b64 = body.content_base64.replace(/\s+/g, '')
+    if (b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+      return c.json({ error: 'content_base64 is not valid base64' }, 400)
+    }
+    const data = Uint8Array.from(Buffer.from(b64, 'base64'))
+    if (data.byteLength === 0) return c.json({ error: 'content_base64 decoded to zero bytes' }, 400)
+    // Same 100MB ceiling slackbotv2 applies to inline file content; the Chat
+    // API itself allows up to 200MB per attachment.
+    if (data.byteLength > MAX_UPLOAD_BYTES) {
+      return c.json({ error: `attachment exceeds the ${MAX_UPLOAD_BYTES} byte limit` }, 413)
+    }
+    try {
+      const uploaded = await client.uploadAttachment(
+        body.space_name,
+        body.filename,
+        body.mime_type ?? 'application/octet-stream',
+        data
+      )
+      const sent = await client.createAttachmentMessage(body.space_name, uploaded, {
+        ...(body.text ? { text: body.text } : {}),
+        ...(body.thread_name ? { threadName: body.thread_name } : {})
+      })
+      return c.json(sent)
+    } catch (error) {
+      logError('googlechatbot_outbound_upload_failed', error)
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+    }
+  })
+
   return { app, client }
 }
 
@@ -196,7 +261,7 @@ async function processChatEvent(
   envelope: GoogleChatEnvelope
 ): Promise<void> {
   const botUser = botResourceName(config)
-  const normalized = await normalizeChatEnvelope(envelope, botUser)
+  const normalized = await normalizeChatEnvelope(envelope, botUser, client)
   if (!normalized) return
 
   if (envelope.type === 'ADDED_TO_SPACE') {
@@ -299,7 +364,8 @@ async function driveSession(
       spaceName: event.space_name,
       ackMessageName,
       threadName: event.chat.thread_name,
-      sessionUrl: sessionUrl(config, threadKey, execution.execution_id)
+      sessionUrl: sessionUrl(config, threadKey, execution.execution_id),
+      plainTextOnly: isPlainTextOnlyRequest(execute.text)
     }
 
     // Resume-on-drop: a dropped SSE connection leaves the answer half-written.
@@ -330,8 +396,14 @@ async function driveSession(
     }
     await finalizeRender(client, target, state)
     incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
+    // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
+    // aggregate both: the final answer is written once and visible.
+    incr('centaur_session_delivery_total', {
+      delivery_status: state.error ? 'error_visible' : 'answer_visible'
+    })
   } catch (error) {
     incr('googlechatbot_runs_total', { outcome: 'failed' })
+    incr('centaur_session_delivery_total', { delivery_status: 'failed' })
     logError('googlechatbot_session_drive_failed', error)
     await deliverDriveError(client, event, ackMessageName, error)
   }
@@ -367,6 +439,17 @@ async function removeAck(client: ChatEdgeClient, ackMessageName: string): Promis
   } catch (error) {
     logWarn('googlechatbot_fold_ack_delete_failed', error)
   }
+}
+
+/** Same escape-hatch phrases slackbotv2 honors: the requester asked for plain
+ * text, so the final answer skips the card surface. */
+function isPlainTextOnlyRequest(text: string): boolean {
+  const normalized = text.toLowerCase()
+  return (
+    /\bplain\s+text\s+only\b/.test(normalized)
+    || /\bno\s+interactive\s+blocks?\b/.test(normalized)
+    || /\bno\s+dashboards?\b/.test(normalized)
+  )
 }
 
 /** Build the "View session" deep link from the configured template, if any. */

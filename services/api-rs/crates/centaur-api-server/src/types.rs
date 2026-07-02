@@ -40,12 +40,20 @@ pub struct SessionContextResponse {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackThreadContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_chat: Option<GoogleChatThreadContext>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SlackThreadContext {
     pub channel_id: String,
     pub thread_ts: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GoogleChatThreadContext {
+    pub space_name: String,
+    pub thread_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

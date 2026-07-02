@@ -25,6 +25,13 @@ const EnvSchema = z.object({
   // CHATBOT_API_KEY secret. When unset, those routes fail closed (503).
   CHATBOT_API_KEY: z.string().optional(),
 
+  // Workspace user the service account impersonates for attachment uploads.
+  // Google Chat's media.upload rejects app auth (chat.bot) — the official path
+  // for a headless app is domain-wide delegation: an admin grants the SA's
+  // client ID the chat.messages.create scope, and uploads run as this user.
+  // Unset = the /api/chat/attachments route fails closed (503).
+  GOOGLECHATBOT_UPLOAD_USER: z.string().default(''),
+
   CHAT_EVENTS_PATH: z.string().default('/api/chat/events'),
   CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   CHAT_EVENT_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(60 * 5),
