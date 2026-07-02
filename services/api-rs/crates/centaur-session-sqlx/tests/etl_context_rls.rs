@@ -19,7 +19,7 @@ const DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL: &str =
 const CENTAUR_READONLY_RLS_POLICIES_SQL: &str =
     include_str!("../migrations/0023_centaur_readonly_rls_policies.sql");
 const GOOGLE_CHAT_CONTEXT_RLS_SQL: &str =
-    include_str!("../migrations/0035_google_chat_context_rls.sql");
+    include_str!("../migrations/0037_google_chat_context_rls.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_sync_channels",
