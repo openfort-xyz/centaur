@@ -18,6 +18,8 @@ const DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL: &str =
     include_str!("../migrations/0022_drop_slack_context_rls_admin_channels.sql");
 const CENTAUR_READONLY_RLS_POLICIES_SQL: &str =
     include_str!("../migrations/0023_centaur_readonly_rls_policies.sql");
+const GOOGLE_CHAT_CONTEXT_RLS_SQL: &str =
+    include_str!("../migrations/0035_google_chat_context_rls.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_sync_channels",
@@ -37,6 +39,10 @@ const RLS_TABLES: &[&str] = &[
     "linear_sync_issues",
     "linear_sync_comments",
     "linear_sync_checkpoints",
+    "google_chat_sync_runs",
+    "google_chat_sync_spaces",
+    "google_chat_sync_messages",
+    "google_chat_sync_checkpoints",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +64,10 @@ struct VisibleRows {
     linear_issues: i64,
     linear_comments: i64,
     linear_checkpoints: i64,
+    google_chat_spaces: Vec<String>,
+    google_chat_messages: Vec<String>,
+    google_chat_runs: i64,
+    google_chat_checkpoints: i64,
 }
 
 #[tokio::test]
@@ -84,6 +94,7 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     execute_migration(conn, ETL_CONTEXT_RLS_SQL).await?;
     execute_migration(conn, DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL).await?;
     execute_migration(conn, CENTAUR_READONLY_RLS_POLICIES_SQL).await?;
+    execute_migration(conn, GOOGLE_CHAT_CONTEXT_RLS_SQL).await?;
     grant_schema_usage(conn, schema).await?;
 
     assert_rls_enabled(conn).await?;
@@ -92,7 +103,7 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
 
     insert_fixture_rows(conn).await?;
 
-    let c_alpha = visible_rows(conn, schema, "centaur_slack_reader", Some("C_ALPHA")).await?;
+    let c_alpha = visible_rows(conn, schema, "centaur_slack_reader", Some("C_ALPHA"), None).await?;
     assert_eq!(
         c_alpha,
         VisibleRows {
@@ -113,10 +124,14 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
             linear_issues: 0,
             linear_comments: 0,
             linear_checkpoints: 0,
+            google_chat_spaces: vec![],
+            google_chat_messages: vec![],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
         }
     );
 
-    let c_beta = visible_rows(conn, schema, "centaur_slack_reader", Some("C_BETA")).await?;
+    let c_beta = visible_rows(conn, schema, "centaur_slack_reader", Some("C_BETA"), None).await?;
     assert_eq!(
         c_beta,
         VisibleRows {
@@ -137,18 +152,22 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
             linear_issues: 0,
             linear_comments: 0,
             linear_checkpoints: 0,
+            google_chat_spaces: vec![],
+            google_chat_messages: vec![],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
         }
     );
 
     let dm_or_missing_channel =
-        visible_rows(conn, schema, "centaur_slack_reader", Some("")).await?;
+        visible_rows(conn, schema, "centaur_slack_reader", Some(""), None).await?;
     assert_eq!(dm_or_missing_channel, empty_visible_rows());
 
-    let unset_channel = visible_rows(conn, schema, "centaur_slack_reader", None).await?;
+    let unset_channel = visible_rows(conn, schema, "centaur_slack_reader", None, None).await?;
     assert_eq!(unset_channel, empty_visible_rows());
 
     let formerly_admin_channel =
-        visible_rows(conn, schema, "centaur_slack_reader", Some("C_ADMIN")).await?;
+        visible_rows(conn, schema, "centaur_slack_reader", Some("C_ADMIN"), None).await?;
     assert_eq!(
         formerly_admin_channel,
         VisibleRows {
@@ -169,10 +188,87 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
             linear_issues: 0,
             linear_comments: 0,
             linear_checkpoints: 0,
+            google_chat_spaces: vec![],
+            google_chat_messages: vec![],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
         }
     );
 
-    let readonly_role = visible_rows(conn, schema, "centaur_readonly", None).await?;
+    let space_alpha = visible_rows(
+        conn,
+        schema,
+        "centaur_slack_reader",
+        None,
+        Some("SPACE_ALPHA"),
+    )
+    .await?;
+    assert_eq!(
+        space_alpha,
+        VisibleRows {
+            slack_channels: vec![],
+            slack_users: vec![],
+            slack_messages: vec![],
+            slack_attachments: vec![],
+            context_docs: vec![],
+            google_drive_runs: 0,
+            google_drive_files: 0,
+            google_drive_checkpoints: 0,
+            google_calendar_runs: 0,
+            google_calendar_calendars: 0,
+            google_calendar_events: 0,
+            google_calendar_checkpoints: 0,
+            linear_runs: 0,
+            linear_projects: 0,
+            linear_issues: 0,
+            linear_comments: 0,
+            linear_checkpoints: 0,
+            google_chat_spaces: vec!["SPACE_ALPHA".to_owned()],
+            google_chat_messages: vec!["SPACE_ALPHA:msg_alpha".to_owned()],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
+        }
+    );
+
+    let space_beta = visible_rows(
+        conn,
+        schema,
+        "centaur_slack_reader",
+        None,
+        Some("SPACE_BETA"),
+    )
+    .await?;
+    assert_eq!(
+        space_beta,
+        VisibleRows {
+            slack_channels: vec![],
+            slack_users: vec![],
+            slack_messages: vec![],
+            slack_attachments: vec![],
+            context_docs: vec![],
+            google_drive_runs: 0,
+            google_drive_files: 0,
+            google_drive_checkpoints: 0,
+            google_calendar_runs: 0,
+            google_calendar_calendars: 0,
+            google_calendar_events: 0,
+            google_calendar_checkpoints: 0,
+            linear_runs: 0,
+            linear_projects: 0,
+            linear_issues: 0,
+            linear_comments: 0,
+            linear_checkpoints: 0,
+            google_chat_spaces: vec!["SPACE_BETA".to_owned()],
+            google_chat_messages: vec!["SPACE_BETA:msg_beta".to_owned()],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
+        }
+    );
+
+    let missing_space = visible_rows(conn, schema, "centaur_slack_reader", None, Some("")).await?;
+    assert_eq!(missing_space, empty_visible_rows());
+
+    let readonly_role = visible_rows(conn, schema, "centaur_readonly", None, None).await?;
     assert_eq!(readonly_role, all_visible_rows());
 
     Ok(())
@@ -298,6 +394,15 @@ async fn create_minimal_non_slack_etl_tables(conn: &mut PgConnection) -> Result<
         create table linear_sync_issues (issue_id text primary key);
         create table linear_sync_comments (comment_id text primary key);
         create table linear_sync_checkpoints (scope_id text primary key);
+
+        create table google_chat_sync_runs (run_id text primary key);
+        create table google_chat_sync_spaces (space_id text primary key);
+        create table google_chat_sync_messages (
+            space_id text not null,
+            message_id text not null,
+            primary key (space_id, message_id)
+        );
+        create table google_chat_sync_checkpoints (space_id text primary key);
         "#,
     )
     .execute(&mut *conn)
@@ -472,6 +577,22 @@ fn expected_policies() -> Vec<(String, String)> {
             "centaur_readonly_linear_sync_checkpoints_select",
         ),
         (
+            "google_chat_sync_runs",
+            "centaur_google_chat_runs_reader_select",
+        ),
+        (
+            "google_chat_sync_spaces",
+            "centaur_google_chat_spaces_reader_select",
+        ),
+        (
+            "google_chat_sync_messages",
+            "centaur_google_chat_messages_reader_select",
+        ),
+        (
+            "google_chat_sync_checkpoints",
+            "centaur_google_chat_checkpoints_reader_select",
+        ),
+        (
             "slack_sync_channels",
             "centaur_readonly_slack_sync_channels_select",
         ),
@@ -568,6 +689,17 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
         insert into linear_sync_issues (issue_id) values ('linear_issue');
         insert into linear_sync_comments (comment_id) values ('linear_comment');
         insert into linear_sync_checkpoints (scope_id) values ('linear_scope');
+
+        insert into google_chat_sync_runs (run_id) values ('gchat_run');
+        insert into google_chat_sync_spaces (space_id) values
+            ('SPACE_ALPHA'),
+            ('SPACE_BETA');
+        insert into google_chat_sync_messages (space_id, message_id) values
+            ('SPACE_ALPHA', 'msg_alpha'),
+            ('SPACE_BETA', 'msg_beta');
+        insert into google_chat_sync_checkpoints (space_id) values
+            ('SPACE_ALPHA'),
+            ('SPACE_BETA');
         "#,
     )
     .execute(&mut *conn)
@@ -580,6 +712,7 @@ async fn visible_rows(
     schema: &str,
     role: &str,
     slack_channel_id: Option<&str>,
+    google_chat_space_id: Option<&str>,
 ) -> Result<VisibleRows, sqlx::Error> {
     let mut tx = conn.begin().await?;
     tx.execute(format!(r#"set local search_path to "{}", public"#, schema).as_str())
@@ -588,6 +721,12 @@ async fn visible_rows(
     if let Some(channel_id) = slack_channel_id {
         sqlx::query("select set_config('centaur.slack_channel_id', $1, true)")
             .bind(channel_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(space_id) = google_chat_space_id {
+        sqlx::query("select set_config('centaur.google_chat_space_id', $1, true)")
+            .bind(space_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -630,6 +769,18 @@ async fn visible_rows(
         linear_issues: count(&mut tx, "linear_sync_issues").await?,
         linear_comments: count(&mut tx, "linear_sync_comments").await?,
         linear_checkpoints: count(&mut tx, "linear_sync_checkpoints").await?,
+        google_chat_spaces: text_array(
+            &mut tx,
+            "select coalesce(array_agg(space_id order by space_id), '{}') from google_chat_sync_spaces",
+        )
+        .await?,
+        google_chat_messages: text_array(
+            &mut tx,
+            "select coalesce(array_agg(space_id || ':' || message_id order by space_id, message_id), '{}') from google_chat_sync_messages",
+        )
+        .await?,
+        google_chat_runs: count(&mut tx, "google_chat_sync_runs").await?,
+        google_chat_checkpoints: count(&mut tx, "google_chat_sync_checkpoints").await?,
     };
 
     tx.execute("reset role").await?;
@@ -672,6 +823,10 @@ fn empty_visible_rows() -> VisibleRows {
         linear_issues: 0,
         linear_comments: 0,
         linear_checkpoints: 0,
+        google_chat_spaces: vec![],
+        google_chat_messages: vec![],
+        google_chat_runs: 0,
+        google_chat_checkpoints: 0,
     }
 }
 
@@ -710,5 +865,12 @@ fn all_visible_rows() -> VisibleRows {
         linear_issues: 1,
         linear_comments: 1,
         linear_checkpoints: 1,
+        google_chat_spaces: vec!["SPACE_ALPHA".to_owned(), "SPACE_BETA".to_owned()],
+        google_chat_messages: vec![
+            "SPACE_ALPHA:msg_alpha".to_owned(),
+            "SPACE_BETA:msg_beta".to_owned(),
+        ],
+        google_chat_runs: 1,
+        google_chat_checkpoints: 2,
     }
 }
