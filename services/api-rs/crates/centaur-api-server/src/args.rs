@@ -98,10 +98,6 @@ impl Args {
         self.sandbox.sandbox_cleanup_config()
     }
 
-    pub(crate) fn session_input_ack_timeout(&self) -> Option<Duration> {
-        self.sandbox.session_input_ack_timeout()
-    }
-
     pub(crate) async fn workflow_host_sandbox_runtime(
         &self,
         bootstrap_iron_control_principal: Option<&str>,
@@ -577,25 +573,6 @@ struct SandboxArgs {
         default_value_t = 21_600
     )]
     sandbox_idle_cleanup_backstop_secs: u64,
-    /// Fail executions still queued/running after this many seconds regardless
-    /// of sandbox state — the last-resort bound for runs whose caller supplied
-    /// no max_duration_ms. 0 disables the backstop.
-    #[arg(
-        long = "session-max-execution-age-secs",
-        env = "SESSION_MAX_EXECUTION_AGE_SECS",
-        default_value_t = 7_200
-    )]
-    max_execution_age_secs: u64,
-    /// Fail an execution whose input produced no harness output within this
-    /// many seconds (a written-but-never-delivered input on a dead attach
-    /// stream otherwise leaves the run silently stuck). 0 disables the
-    /// watchdog.
-    #[arg(
-        long = "session-input-ack-timeout-secs",
-        env = "SESSION_INPUT_ACK_TIMEOUT_SECS",
-        default_value_t = 120
-    )]
-    session_input_ack_timeout_secs: u64,
     #[arg(
         long = "session-sandbox-k8s-context",
         alias = "kubernetes-context",
@@ -1233,13 +1210,7 @@ impl SandboxArgs {
         SessionSandboxCleanupConfig {
             interval: duration(self.sandbox_cleanup_interval_secs),
             idle_backstop: duration(self.sandbox_idle_cleanup_backstop_secs),
-            max_execution_age: duration(self.max_execution_age_secs),
         }
-    }
-
-    fn session_input_ack_timeout(&self) -> Option<Duration> {
-        (self.session_input_ack_timeout_secs > 0)
-            .then(|| Duration::from_secs(self.session_input_ack_timeout_secs))
     }
 }
 

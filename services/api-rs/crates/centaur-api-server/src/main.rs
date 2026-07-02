@@ -86,7 +86,6 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     }
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
-    runtime = runtime.with_input_ack_timeout(args.session_input_ack_timeout());
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(workflow_host_principal.as_deref())
         .await?;

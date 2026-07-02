@@ -50,15 +50,8 @@ use title_generator::{
     OpenAiSessionTitleGenerator, sanitize_session_title, session_title_source_from_parts,
 };
 
-pub use centaur_session_sqlx::SESSION_OUTPUT_LINE_EVENT;
+pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
-
-/// Default deadline for the first harness output line after input is written.
-/// Input travels over a kube attach stream whose writes are fire-and-forget: a
-/// half-dead stream accepts the line and delivers nothing. If the harness has
-/// produced no output at all by this deadline the execution is failed and the
-/// cached pipe dropped so the next run opens a fresh attach.
-const DEFAULT_SESSION_INPUT_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -99,7 +92,6 @@ pub struct SessionRuntime {
     session_title_rerun_requested: SessionTitleThreadSet,
     capacity: Option<Arc<SandboxCapacityController>>,
     stdout_owner_id: String,
-    input_ack_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -685,14 +677,7 @@ impl SessionRuntime {
             session_title_rerun_requested: Arc::new(DashSet::new()),
             capacity: None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
-            input_ack_timeout: Some(DEFAULT_SESSION_INPUT_ACK_TIMEOUT),
         }
-    }
-
-    /// Override the input-ack watchdog deadline. `None` disables the watchdog.
-    pub fn with_input_ack_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.input_ack_timeout = timeout;
-        self
     }
 
     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
@@ -1577,15 +1562,6 @@ impl SessionRuntime {
                     execution.execution_id.clone(),
                     max_duration,
                     idle_timeout,
-                );
-            }
-            if let Some(input_ack_timeout) = self.input_ack_timeout {
-                spawn_input_ack_watchdog(
-                    self.context(),
-                    thread_key.clone(),
-                    execution.execution_id.clone(),
-                    sandbox_id.clone(),
-                    input_ack_timeout,
                 );
             }
 
@@ -3289,24 +3265,12 @@ async fn reattach_session_pipe(
     pipe: &SessionPipe,
 ) -> ReattachOutcome {
     let _open_guard = open_lock.lock().await;
-    // A different pipe means another pump took over and owns the execution
-    // from here. A *missing* pipe means the sandbox was stopped or reaped out
-    // from under an active execution (e.g. by the cleanup worker): nobody else
-    // will finalize it, so treat it like a dead sandbox and fail it instead of
-    // leaving the execution running forever.
-    let current_pipe_state = match ctx.sandbox_pipes.get(sandbox_id) {
-        None => None,
-        Some(current) => Some(Arc::ptr_eq(&current.stdin, &pipe.stdin)),
-    };
-    match current_pipe_state {
-        None => {
-            return ReattachOutcome::Dead(
-                "session pipe removed while execution active (sandbox stopped or reaped)"
-                    .to_owned(),
-            );
-        }
-        Some(false) => return ReattachOutcome::Superseded,
-        Some(true) => {}
+    if ctx
+        .sandbox_pipes
+        .get(sandbox_id)
+        .is_none_or(|current| !Arc::ptr_eq(&current.stdin, &pipe.stdin))
+    {
+        return ReattachOutcome::Superseded;
     }
 
     let id = SandboxId::new(sandbox_id);
@@ -4413,78 +4377,6 @@ fn spawn_max_duration_failure(
             warn!(%thread_key, %execution_id, %error, "max duration failure task failed");
         }
     });
-}
-
-/// Fails an execution whose input produced no harness output at all within the
-/// deadline. Input travels over an attach stream whose writes cannot be
-/// acknowledged; when the stream is half-dead the write "succeeds" but the
-/// harness never sees the line, and without this watchdog the execution stays
-/// `running` forever and blocks its thread on the one-active-execution index.
-fn spawn_input_ack_watchdog(
-    ctx: RuntimeContext,
-    thread_key: ThreadKey,
-    execution_id: String,
-    sandbox_id: String,
-    timeout: Duration,
-) {
-    tokio::spawn(async move {
-        sleep(timeout).await;
-        if let Err(error) =
-            fail_unacknowledged_input(&ctx, &thread_key, &execution_id, &sandbox_id, timeout).await
-        {
-            warn!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "session_input_ack_watchdog_failed",
-                thread_key = %thread_key,
-                execution_id,
-                sandbox_id,
-                %error,
-                "input ack watchdog task failed"
-            );
-        }
-    });
-}
-
-async fn fail_unacknowledged_input(
-    ctx: &RuntimeContext,
-    thread_key: &ThreadKey,
-    execution_id: &str,
-    sandbox_id: &str,
-    timeout: Duration,
-) -> Result<(), SessionRuntimeError> {
-    let still_active = ctx
-        .store
-        .active_execution_for_thread(thread_key)
-        .await?
-        .is_some_and(|execution| execution.execution_id == execution_id);
-    if !still_active || ctx.store.execution_has_output(execution_id).await? {
-        return Ok(());
-    }
-    let timeout_secs = timeout.as_secs();
-    warn!(
-        component = COMPONENT_SESSION_RUNTIME,
-        event = "session_input_ack_timeout",
-        thread_key = %thread_key,
-        execution_id,
-        sandbox_id,
-        timeout_secs,
-        "no harness output after input write; failing execution and dropping pipe"
-    );
-    // Drop the cached pipe so the next run opens a fresh attach stream instead
-    // of reusing the one that swallowed this input.
-    ctx.sandbox_pipes.remove(sandbox_id);
-    record_terminal_output(
-        ctx,
-        thread_key,
-        sandbox_id,
-        execution_id,
-        TerminalOutput::Failed {
-            error: format!(
-                "no harness output within {timeout_secs}s of input write; session pipe presumed broken"
-            ),
-        },
-    )
-    .await
 }
 
 fn spawn_stdout_owner_renewer(ctx: RuntimeContext, execution_id: String) {
@@ -5757,8 +5649,12 @@ pub fn final_answer_text_from_output_lines(lines: &[String]) -> String {
                 };
                 if let Some(update) = output_line_final_answer_text(&value) {
                     match update {
-                        FinalAnswerTextUpdate::Append(delta) => final_answer_text.push_str(&delta),
-                        FinalAnswerTextUpdate::Replace(canonical) => final_answer_text = canonical,
+                        FinalAnswerTextUpdate::Append(delta) => {
+                            final_answer_text.push_str(&delta)
+                        }
+                        FinalAnswerTextUpdate::Replace(canonical) => {
+                            final_answer_text = canonical
+                        }
                     }
                 }
             }
