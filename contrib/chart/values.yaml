@@ -363,6 +363,19 @@ apiRs:
     googleCalendar:
       enabled: false
       syncIntervalSeconds: 14400
+    googleChat:
+      enabled: false
+      syncIntervalSeconds: 14400
+      # Comma-separated Chat space types to sync (SPACE, GROUP_CHAT,
+      # DIRECT_MESSAGE). Defaults to named rooms only so DMs/group chats stay
+      # out of the company-wide corpus, mirroring the Slack ETL.
+      includeSpaceTypes: SPACE
+      # 0 = unlimited (page each space to completion every run). Set > 0 to
+      # bound a large first backfill so it converges across runs.
+      maxPagesPerRun: 0
+      # Comma-separated space IDs the Chat app reads but is not a listed
+      # member of (spaces.list only returns member spaces).
+      spaceIds: ""
     companyContextDocuments:
       enabled: true
       intervalSeconds: 14400
@@ -491,6 +504,12 @@ googlechatbot:
     host: ""
     annotations: {}
     tls: []
+  metrics:
+    # googlechatbot serves Prometheus text metrics at /metrics. This flag only
+    # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
+    scrapeAnnotations: true
+    path: /metrics
+    annotations: {}
   extraEnv: {}
   resources: {}
 
