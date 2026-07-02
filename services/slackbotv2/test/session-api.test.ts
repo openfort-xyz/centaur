@@ -2,8 +2,11 @@ import { describe, expect, test } from 'bun:test'
 import {
   clearConversationNameCacheForTests,
   clearRequesterIdentityCacheForTests,
+  DEFAULT_SESSION_IDLE_TIMEOUT_MS,
   forwardToSessionApi,
   harnessRestartPreamble,
+  openSessionEventStream,
+  serializeAttachment,
   serializeMessage
 } from '../src/session-api'
 import { renderSlackDisplayText } from '../src/slack-display-text'
@@ -98,9 +101,13 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
   }
 }
 
-function executeLine(requests: RecordedRequest[]): JsonObject {
+function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   const execute = requests.find(request => request.url.endsWith('/execute'))
-  const inputLines = (execute?.body as { input_lines: string[] }).input_lines
+  return (execute?.body ?? {}) as Record<string, unknown>
+}
+
+function executeLine(requests: RecordedRequest[]): JsonObject {
+  const inputLines = (executeBody(requests) as { input_lines: string[] }).input_lines
   return JSON.parse(inputLines[0]!) as JsonObject
 }
 
@@ -129,6 +136,56 @@ function textPartIncludes(part: JsonObject, text: string): boolean {
 function isJsonRecord(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
+
+describe('session event streaming', () => {
+  test('passes activity summary events through to the renderer source stream', async () => {
+    const encoded = new TextEncoder().encode(
+      [
+        'id: 1',
+        'event: session.activity_summary',
+        'data: {"summary":"The agent is reading App Server events."}',
+        '',
+        'id: 2',
+        'event: session.execution_completed',
+        'data: {"result_text":"done"}',
+        '',
+      ].join('\n')
+    )
+    const fetchFn: SlackbotV2Options['fetch'] = async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoded)
+            controller.close()
+          }
+        }),
+        { headers: { 'content-type': 'text/event-stream' } }
+      )
+    const seenEventIds: number[] = []
+
+    const stream = await openSessionEventStream(options(fetchFn), {
+      afterEventId: 0,
+      executionId: 'exec-1',
+      onEventId: eventId => seenEventIds.push(eventId),
+      threadId: 'slack:C1:1700000000.000100'
+    })
+    const events = []
+    for await (const event of stream) events.push(event)
+
+    expect(events[0]).toEqual({
+      data: { summary: 'The agent is reading App Server events.' },
+      event: 'session.activity_summary',
+      eventId: 1,
+      eventKind: 'session.activity_summary'
+    })
+    expect(events[1]).toMatchObject({
+      event: 'session.execution_completed',
+      eventId: 2,
+      eventKind: 'session.execution_completed'
+    })
+    expect(seenEventIds).toEqual([1, 2])
+  })
+})
 
 describe('Slack display text fallback', () => {
   test('serializeMessage extracts raw Slack blocks when adapter text is empty', async () => {
@@ -370,6 +427,24 @@ describe('Slack display text fallback', () => {
   })
 })
 
+describe('Slack attachment serialization', () => {
+  test('records timeout errors when attachment fetchData hangs', async () => {
+    const fetchFn = (async () => Response.json({ ok: true })) as SlackbotV2Options['fetch']
+    const startedAt = Date.now()
+    const attachment = await serializeAttachment(
+      {
+        fetchData: () => new Promise<Buffer>(() => undefined),
+        name: 'hung.txt',
+        type: 'file'
+      } as Parameters<typeof serializeAttachment>[0],
+      { ...options(fetchFn), slackApiTimeoutMs: 25 }
+    )
+
+    expect(Date.now() - startedAt).toBeLessThan(500)
+    expect(attachment.fetchError).toBe('fetch Slack attachment timed out after 25ms')
+  })
+})
+
 describe('forwardToSessionApi overrides', () => {
   test('creates session with default codex harness', async () => {
     const { fetchFn, requests } = fakeApi()
@@ -431,6 +506,31 @@ describe('forwardToSessionApi overrides', () => {
     const execute = requests.find(request => request.url.endsWith('/execute'))
     const line = JSON.parse((execute?.body as { input_lines: string[] }).input_lines[0]!)
     expect('reasoning' in line).toBe(false)
+  })
+
+  test('includes default idle timeout on execute requests', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
+    expect(executeBody(requests).idle_timeout_ms).toBe(DEFAULT_SESSION_IDLE_TIMEOUT_MS)
+  })
+
+  test('caps default idle timeout to max duration on execute requests', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      { ...options(fetchFn), maxDurationMs: 60_000 },
+      forwardInput(apiMessage('hi'))
+    )
+    expect(executeBody(requests).idle_timeout_ms).toBe(60_000)
+    expect(executeBody(requests).max_duration_ms).toBe(60_000)
+  })
+
+  test('allows idle timeout override on execute requests', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      { ...options(fetchFn), idleTimeoutMs: 12_345 },
+      forwardInput(apiMessage('hi'))
+    )
+    expect(executeBody(requests).idle_timeout_ms).toBe(12_345)
   })
 
   test('retries session creation with existing harness on 409 conflict', async () => {

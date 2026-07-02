@@ -106,6 +106,17 @@ console:
   # _SECRET), which must exist or the console pods CreateContainerConfigError.
   googleOauth:
     enabled: false
+  # Slack as an OIDC identity provider for console sign-in. Off by default —
+  # not every deployment uses Slack to log in. When enabled, the
+  # CENTAUR_CONSOLE_SLACK_CLIENT_ID and CENTAUR_CONSOLE_SLACK_CLIENT_SECRET
+  # env vars are sourced from the shared infra Secret (keys
+  # <secretManager.envPrefix>CENTAUR_CONSOLE_SLACK_CLIENT_ID / _SECRET), which
+  # must exist or the console pods CreateContainerConfigError. This is the
+  # Sign-in-with-Slack OIDC app (scopes openid/email/profile, redirect URL
+  # <publicUrl>/auth/slack/callback) — not the DB-managed Slack OAuth app the
+  # bot and DM sync use.
+  slackOauth:
+    enabled: false
   # OAuth app slug whose user-level Slack credentials are used by the DM sync
   # worker. Keep this aligned with the Console OAuth app users authorize.
   slackDmSync:
@@ -232,6 +243,7 @@ sandbox:
 
 repoCache:
   enabled: true
+  autoReload: true
   hostPath: /var/lib/centaur/repos
   storage:
     # hostPath preserves the existing DaemonSet/node-local behavior. Set to
@@ -304,6 +316,11 @@ apiRs:
   sandboxReadyTimeoutSecs: 90
   sandboxWarmPoolSize: 3
   sandboxWarmPoolReplenishIntervalSecs: 5
+  # Capacity manager: when nonzero, api-rs keeps observed running-like
+  # sandboxes at or below this limit by discarding ready warm sandboxes first,
+  # then pausing least-recently-active idle session sandboxes. 0 disables.
+  sandboxRunningLimit: 0
+  sandboxHotIdleGraceSecs: 300
   # When true, api-rs upserts the shared iron-control infra role and its
   # backing secrets at startup and on tool-secret reconciliation intervals.
   # Set false when multiple Centaur instances share one console/1Password
@@ -314,16 +331,59 @@ apiRs:
   # in workflowAllowedNames as a comma/whitespace-separated string.
   workflowEnableMode: all
   workflowAllowedNames: ""
-  # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than
-  # the max lifetime. 0 disables that sweep. Interval must be >= 1.
-  sandboxIdleStopTtlSecs: 10800 # 3 hours
+  # Scheduled ETL workflow configuration. The chart renders these into api-rs
+  # env so workflow discovery sees the right schedules, then derives the
+  # workflow-host passthrough list from the same non-secret config.
+  etl:
+    slack:
+      enabled: false
+      syncIntervalSeconds: 3600
+      syncBackfillLookbackDays: 30
+      syncThreadLookbackDays: 3
+      excludedChannelPatterns: ""
+      attachments:
+        enabled: true
+        maxBytes: 10485760
+      backfill:
+        enabled: true
+        intervalSeconds: 600
+        channelBatchLimit: 50
+        channelPagesPerJob: 5
+      retention:
+        enabled: true
+        intervalMinutes: 60
+        etlDays: 0
+        dmDays: 0
+    linear:
+      enabled: false
+      syncIntervalSeconds: 14400
+    googleDrive:
+      enabled: false
+      syncIntervalSeconds: 14400
+    googleCalendar:
+      enabled: false
+      syncIntervalSeconds: 14400
+    companyContextDocuments:
+      enabled: true
+      intervalSeconds: 14400
+  # Reaper: stop sandboxes older than the max lifetime, regardless of whether
+  # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
   # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
-  # 0 disables the corresponding arm.
+  # The idle backstop is only used when older execution rows have no persisted
+  # idle_timeout_ms. 0 disables the corresponding arm.
   sandboxCleanupIntervalSecs: 300
   sandboxIdleCleanupBackstopSecs: 21600 # 6 hours
+  activitySummary:
+    enabled: false
+    model: gpt-5.4-nano
+    openaiBaseUrl: https://api.openai.com/v1
+    minIntervalSecs: 8
+    timeoutSecs: 5
+    maxFacts: 12
+    maxOutputTokens: 128
   ironProxy:
     mode: enabled
   metrics:

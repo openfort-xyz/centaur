@@ -37,15 +37,14 @@ const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
 const MANAGED_BY_LABEL: &str = "centaur.ai/managed-by";
 const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
+const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
 const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-principal";
-// RFC 3339 instant stamped when the sandbox is paused for idleness and
-// cleared on resume. The reaper uses it to stop sandboxes whose pause
-// outlived the idle TTL, surviving api-rs restarts (the pause timer is
-// otherwise in-memory only).
+// RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
+// on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,10 +65,9 @@ pub struct AgentSandboxConfig {
     /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
     /// is set so the agent's shim installer finds them.
     pub tools: Option<ToolsConfig>,
-    /// In-cluster OTLP collector (e.g. Laminar) the sandbox exports harness
-    /// traces to directly. The per-sandbox egress NetworkPolicy denies all
-    /// destinations except the proxy/control plane, so without this rule the
-    /// harness's usage/cost spans never leave the pod.
+    /// In-cluster OTLP collector (e.g. Laminar) used for observability-capable
+    /// sandboxes. Sandbox pod egress is granted by chart-level label policy;
+    /// the per-sandbox proxy uses this target for its own explicit egress.
     pub otlp_egress: Option<OtlpEgressTarget>,
     pub ready_timeout: Duration,
 }
@@ -573,6 +571,9 @@ fn build_agent_sandbox(
     labels.extend(spec.labels.clone());
     labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
     labels.insert(SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned());
+    if spec.capabilities.observability_enabled {
+        labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
+    }
 
     let mut pod_labels = labels.clone();
     pod_labels.insert(
@@ -903,6 +904,66 @@ mod tests {
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
         assert!(container.resources.as_ref().unwrap().limits.is_some());
+    }
+
+    #[test]
+    fn labels_observability_enabled_sandboxes_for_chart_policy() {
+        let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+            repo_cache_enabled: true,
+            observability_enabled: true,
+        });
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert_eq!(
+            sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(OBSERVABILITY_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .and_then(|labels| labels.get(OBSERVABILITY_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn omits_observability_enabled_label_for_restricted_sandboxes() {
+        let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+            repo_cache_enabled: true,
+            observability_enabled: false,
+        });
+        let config = AgentSandboxConfig::new("centaur");
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+
+        assert!(
+            sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .is_none_or(|labels| !labels.contains_key(OBSERVABILITY_ENABLED_LABEL))
+        );
+        assert!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .is_none_or(|labels| !labels.contains_key(OBSERVABILITY_ENABLED_LABEL))
+        );
     }
 
     #[test]
