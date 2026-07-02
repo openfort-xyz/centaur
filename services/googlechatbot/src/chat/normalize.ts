@@ -1,12 +1,15 @@
+import { logWarn } from '../logging'
 import type {
   ChatListMessage,
   ChatSpaceType,
   GoogleChatEnvelope,
+  NormalizedBinaryPart,
   NormalizedChatEvent,
   NormalizedPart
 } from './types'
 
 type ChatHistoryMessage = NonNullable<NormalizedChatEvent['history_messages']>[number]
+type ChatAttachment = NonNullable<NonNullable<GoogleChatEnvelope['message']>['attachment']>[number]
 
 // Minimal interface we need from ChatEdgeClient — keeps normalize.ts unit-testable
 // without instantiating the real client (which needs a service-account JSON).
@@ -17,13 +20,27 @@ export interface ChatHistoryFetcher {
   ): Promise<{ messages?: ChatListMessage[]; nextPageToken?: string }>
 }
 
+// Same idea as ChatHistoryFetcher, for attachment content downloads.
+export interface ChatAttachmentDownloader {
+  downloadAttachment(resourceName: string): Promise<ArrayBuffer>
+}
+
 // Cap on how many thread messages we ship to the agent. A typical 4-5 turn
 // thread fits well under this; mega-threads would blow up the LLM context.
 const THREAD_HISTORY_LIMIT = 50
 
+// Largest attachment we buffer and inline as base64 into the agent turn. The
+// whole turn ships as ONE blocks-protocol input line, so this mirrors
+// slackbotv2's inline cap scaled down to what a single line can safely carry —
+// slackbotv2 stages bigger files as attachment.chunk lines, which googlechatbot
+// does not do yet. Over the cap we keep the part but drop the bytes, so the
+// agent still sees the placeholder text.
+const MAX_INLINE_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
 export async function normalizeChatEnvelope(
   envelope: GoogleChatEnvelope,
-  botUserName?: string
+  botUserName?: string,
+  client?: ChatAttachmentDownloader
 ): Promise<NormalizedChatEvent | null> {
   if (!envelope.type) return null
   if (!envelope.space?.name) return null
@@ -70,6 +87,10 @@ export async function normalizeChatEnvelope(
   const textPart = [formattedText, text].filter(Boolean).join('\n').trim()
   if (textPart) parts.push({ type: 'text', text: textPart })
 
+  for (const attachment of message.attachment ?? []) {
+    parts.push(await toAttachmentPart(attachment, client, spaceName))
+  }
+
   const displayName = message.sender.displayName ?? message.sender.email ?? senderName
 
   // Determine if the bot was @mentioned.
@@ -99,6 +120,64 @@ export async function normalizeChatEnvelope(
       message_name: message.name,
       thread_name: threadName
     }
+  }
+}
+
+/**
+ * Turn a Google Chat Attachment into a NormalizedBinaryPart.
+ *
+ * UPLOADED_CONTENT is downloaded and inlined as base64 (up to
+ * MAX_INLINE_ATTACHMENT_BYTES). DRIVE_FILE is never downloaded — we hold no
+ * Drive scope — so the part carries name/mime only and downstream renders the
+ * placeholder text. Any failure degrades the same way: the part survives
+ * without bytes, the event never fails.
+ */
+async function toAttachmentPart(
+  attachment: ChatAttachment,
+  client: ChatAttachmentDownloader | undefined,
+  spaceName: string
+): Promise<NormalizedBinaryPart> {
+  const mimeType = attachment.contentType ?? 'application/octet-stream'
+  const resourceName = attachment.attachmentDataRef?.resourceName
+  const name = attachment.contentName ?? resourceName ?? attachment.name ?? 'attachment'
+  const declaredSize = attachment.size ? Number(attachment.size) : undefined
+  const partType: NormalizedBinaryPart['type'] =
+    attachment.source !== 'DRIVE_FILE' && mimeType.startsWith('image/') ? 'image' : 'file'
+  const stub: NormalizedBinaryPart = {
+    type: partType,
+    name,
+    mime_type: mimeType,
+    size: declaredSize ?? 0
+  }
+
+  if (attachment.source === 'DRIVE_FILE' || !resourceName || !client) return stub
+  if (declaredSize !== undefined && declaredSize > MAX_INLINE_ATTACHMENT_BYTES) return stub
+
+  try {
+    const buffer = await client.downloadAttachment(resourceName)
+    const bytes = new Uint8Array(buffer)
+    // Envelopes don't always declare a size, so re-check after the download.
+    if (bytes.byteLength > MAX_INLINE_ATTACHMENT_BYTES) {
+      return { ...stub, size: bytes.byteLength }
+    }
+    return {
+      ...stub,
+      size: bytes.byteLength,
+      source: {
+        type: 'base64',
+        media_type: mimeType,
+        // Buffer instead of btoa(String.fromCharCode(...bytes)): spreading a
+        // multi-MB array as call arguments overflows the stack.
+        data: Buffer.from(bytes).toString('base64')
+      }
+    }
+  } catch (error) {
+    logWarn('chat_attachment_download_failed', {
+      space: spaceName,
+      attachment: attachment.name,
+      error: error instanceof Error ? error.message : String(error)
+    })
+    return stub
   }
 }
 

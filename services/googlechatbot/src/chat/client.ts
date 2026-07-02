@@ -270,6 +270,34 @@ export class ChatEdgeClient {
   }
 
   /**
+   * Download the content of an uploaded attachment.
+   * Path: GET /v1/media/{resourceName}?alt=media
+   *
+   * Media downloads live on the same chat.googleapis.com host but under
+   * /v1/media/, not /v1/spaces/, and return raw bytes rather than JSON — so
+   * this bypasses request() the same way uploadAttachment does.
+   */
+  async downloadAttachment(resourceName: string): Promise<ArrayBuffer> {
+    const token = await this.getAccessToken()
+    const url = `${CHAT_API_BASE}/media/${resourceName.replace(/^\//, '')}?alt=media`
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      },
+      signal: AbortSignal.timeout(this.apiTimeoutMs)
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Chat API media download failed: ${response.status} ${errorText}`)
+    }
+
+    return response.arrayBuffer()
+  }
+
+  /**
    * Upload a file attachment to a space.
    * Path: POST /upload/v1/spaces/{space}/attachments:upload
    */
