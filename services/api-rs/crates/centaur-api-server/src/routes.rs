@@ -57,8 +57,8 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        GoogleChatThreadContext, ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse,
+        SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -419,6 +419,7 @@ async fn get_session_context(
     };
     Ok(Json(SessionContextResponse {
         slack: slack_thread_context(&thread_key),
+        google_chat: google_chat_thread_context(&thread_key),
         title,
         thread_key,
     }))
@@ -451,6 +452,26 @@ fn slack_thread_context(thread_key: &ThreadKey) -> Option<SlackThreadContext> {
 
 fn is_slack_conversation_id(value: &str) -> bool {
     matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+}
+
+/// The googlechatbot encodes threads as `chat:<space_resource>:<thread_resource>`
+/// with `/` rewritten to `:` in each Google Chat resource name, e.g.
+/// `chat:spaces:AAAA:spaces:AAAA:threads:BBBB`. Recover the original resource
+/// names so agents can address the space/thread through the Chat API. The
+/// Slack-compatible `chat:C…` adapter format never starts with `spaces:` and is
+/// left to the Slack parser.
+fn google_chat_thread_context(thread_key: &ThreadKey) -> Option<GoogleChatThreadContext> {
+    let rest = thread_key.as_str().strip_prefix("chat:spaces:")?;
+    let mut segments = rest.split(':');
+    let space_id = segments.next().filter(|space| !space.is_empty())?;
+    let thread_name = segments.collect::<Vec<_>>().join("/");
+    if thread_name.is_empty() {
+        return None;
+    }
+    Some(GoogleChatThreadContext {
+        space_name: format!("spaces/{space_id}"),
+        thread_name,
+    })
 }
 
 async fn append_messages(
