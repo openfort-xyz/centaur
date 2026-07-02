@@ -1,7 +1,9 @@
 mod cleanup;
+mod title_generator;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -20,15 +22,16 @@ use centaur_session_core::{
     Session, SessionEvent, SessionExecution, SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
+    PgSessionStore, SandboxCapacityCandidate, SessionEventListener, SessionStoreError,
+    default_metadata,
 };
 use centaur_telemetry::{
     export_thread_trace_root_span, record_sandbox_warm_pool_claim,
     record_session_execution_finished, record_session_execution_started, record_session_failure,
     record_session_first_token_latency, set_span_parent_trace,
 };
-use dashmap::DashMap;
-use futures_util::{SinkExt, Stream, StreamExt, stream};
+use dashmap::{DashMap, DashSet};
+use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -42,6 +45,10 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use tracing::{Instrument, Span, error, info, info_span, warn};
 
 pub use cleanup::SessionSandboxCleanupConfig;
+pub use title_generator::SessionTitleGenerationError;
+use title_generator::{
+    OpenAiSessionTitleGenerator, sanitize_session_title, session_title_source_from_parts,
+};
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
@@ -51,6 +58,8 @@ const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
+const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
+const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const OBSERVABILITY_TOOL_BLOCKLIST: &str =
@@ -63,6 +72,10 @@ type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type SessionTitleThreadSet = Arc<DashSet<ThreadKey>>;
+type SessionTitleGenerator = Arc<
+    dyn Fn(String) -> BoxFuture<'static, Result<String, SessionTitleGenerationError>> + Send + Sync,
+>;
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -74,6 +87,23 @@ pub struct SessionRuntime {
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
+    session_title_generator: Option<SessionTitleGenerator>,
+    session_title_in_flight: SessionTitleThreadSet,
+    session_title_rerun_requested: SessionTitleThreadSet,
+    capacity: Option<Arc<SandboxCapacityController>>,
+    stdout_owner_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SandboxCapacityConfig {
+    pub max_running: usize,
+    pub hot_idle_grace: Duration,
+}
+
+impl SandboxCapacityConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.max_running > 0
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -266,6 +296,329 @@ struct RuntimeContext {
     manager: Arc<SandboxManager>,
     sandbox_pipes: SessionPipeMap,
     execution_spans: ExecutionSpanRegistry,
+    stdout_owner_id: String,
+}
+
+struct SandboxCapacityController {
+    store: PgSessionStore,
+    manager: Arc<SandboxManager>,
+    sandbox_pipes: SessionPipeMap,
+    lock: Mutex<()>,
+    config: SandboxCapacityConfig,
+}
+
+impl SandboxCapacityController {
+    fn new(
+        store: PgSessionStore,
+        manager: Arc<SandboxManager>,
+        sandbox_pipes: SessionPipeMap,
+        config: SandboxCapacityConfig,
+    ) -> Self {
+        Self {
+            store,
+            manager,
+            sandbox_pipes,
+            lock: Mutex::new(()),
+            config,
+        }
+    }
+
+    async fn run_with_capacity<T, F, Fut>(
+        &self,
+        protected_thread_key: &ThreadKey,
+        trigger_execution_id: &str,
+        operation: &'static str,
+        action: F,
+    ) -> Result<T, SessionRuntimeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, SessionRuntimeError>>,
+    {
+        let _guard = self.lock.lock().await;
+        self.ensure_running_slot(protected_thread_key, trigger_execution_id, operation)
+            .await?;
+        action().await
+    }
+
+    async fn ensure_running_slot(
+        &self,
+        protected_thread_key: &ThreadKey,
+        trigger_execution_id: &str,
+        operation: &'static str,
+    ) -> Result<(), SessionRuntimeError> {
+        let running = self.running_slot_count().await?;
+        if running < self.config.max_running {
+            return Ok(());
+        }
+
+        let mut slots_needed = running.saturating_sub(self.config.max_running) + 1;
+        let mut stopped_warm = 0usize;
+        let mut paused_idle = 0usize;
+        let mut stale_candidates_reconciled = 0usize;
+
+        for sandbox_id in self
+            .store
+            .reserve_ready_warm_sandboxes_for_eviction(candidate_fetch_limit(slots_needed))
+            .await?
+        {
+            if slots_needed == 0 {
+                break;
+            }
+            let id = SandboxId::new(sandbox_id.as_str());
+            match self.manager.status(&id).await {
+                Ok(status) if status_consumes_running_slot(&status) => {}
+                Ok(_) | Err(SandboxError::NotFound(_)) => {
+                    let _ = self
+                        .store
+                        .mark_warm_sandbox_failed(
+                            sandbox_id.as_str(),
+                            "not running during sandbox capacity admission",
+                        )
+                        .await;
+                    continue;
+                }
+                Err(error) => {
+                    let failure =
+                        format!("status failed during sandbox capacity admission: {error}");
+                    let _ = self
+                        .store
+                        .mark_warm_sandbox_failed(sandbox_id.as_str(), &failure)
+                        .await;
+                    return Err(SessionRuntimeError::Sandbox(error));
+                }
+            }
+
+            match self.manager.stop(&id).await {
+                Ok(()) | Err(SandboxError::NotFound(_)) => {
+                    stopped_warm += 1;
+                    slots_needed -= 1;
+                    let _ = self
+                        .store
+                        .mark_warm_sandbox_failed(
+                            sandbox_id.as_str(),
+                            "stopped for sandbox capacity pressure",
+                        )
+                        .await;
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "sandbox_capacity_warm_stopped",
+                        sandbox_id,
+                        trigger_thread_key = %protected_thread_key,
+                        trigger_execution_id,
+                        operation,
+                        max_running = self.config.max_running,
+                        "stopped warm sandbox for capacity"
+                    );
+                }
+                Err(error) => {
+                    let failure = format!("stop failed during sandbox capacity admission: {error}");
+                    let _ = self
+                        .store
+                        .mark_warm_sandbox_failed(sandbox_id.as_str(), &failure)
+                        .await;
+                    return Err(SessionRuntimeError::Sandbox(error));
+                }
+            }
+        }
+
+        if slots_needed > 0 {
+            loop {
+                let candidates = self
+                    .store
+                    .list_sandbox_capacity_candidates(
+                        Some(protected_thread_key),
+                        self.config.hot_idle_grace,
+                        candidate_fetch_limit(slots_needed),
+                    )
+                    .await?;
+                if candidates.is_empty() {
+                    break;
+                }
+
+                let mut made_progress = false;
+                for candidate in candidates {
+                    if slots_needed == 0 {
+                        break;
+                    }
+                    match self
+                        .pause_capacity_candidate(
+                            &candidate,
+                            protected_thread_key,
+                            trigger_execution_id,
+                            operation,
+                        )
+                        .await?
+                    {
+                        CapacityCandidateAction::Paused => {
+                            paused_idle += 1;
+                            slots_needed -= 1;
+                            made_progress = true;
+                        }
+                        CapacityCandidateAction::ReconciledStale => {
+                            stale_candidates_reconciled += 1;
+                            made_progress = true;
+                        }
+                        CapacityCandidateAction::Skipped => {}
+                    }
+                }
+
+                if slots_needed == 0 || !made_progress {
+                    break;
+                }
+            }
+        }
+
+        if slots_needed == 0 {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "sandbox_capacity_admitted",
+                trigger_thread_key = %protected_thread_key,
+                trigger_execution_id,
+                operation,
+                running_before = running,
+                max_running = self.config.max_running,
+                stopped_warm,
+                paused_idle,
+                stale_candidates_reconciled,
+                "admitted sandbox operation under capacity pressure"
+            );
+            return Ok(());
+        }
+
+        Err(SessionRuntimeError::CapacityExceeded {
+            max_running: self.config.max_running,
+            running,
+            operation,
+        })
+    }
+
+    async fn pause_capacity_candidate(
+        &self,
+        candidate: &SandboxCapacityCandidate,
+        protected_thread_key: &ThreadKey,
+        trigger_execution_id: &str,
+        operation: &'static str,
+    ) -> Result<CapacityCandidateAction, SessionRuntimeError> {
+        let id = SandboxId::new(candidate.sandbox_id.as_str());
+        match self.manager.status(&id).await {
+            Ok(SandboxStatus::Running | SandboxStatus::Created | SandboxStatus::Unknown(_)) => {}
+            Ok(SandboxStatus::Suspended) => {
+                return Ok(CapacityCandidateAction::Skipped);
+            }
+            Ok(SandboxStatus::Stopped | SandboxStatus::Gone) => {
+                return self.reconcile_stale_capacity_candidate(candidate).await;
+            }
+            Err(SandboxError::NotFound(_)) => {
+                return self.reconcile_stale_capacity_candidate(candidate).await;
+            }
+            Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+        }
+
+        self.sandbox_pipes.remove(candidate.sandbox_id.as_str());
+        match self.manager.pause(&id).await {
+            Ok(()) => {
+                self.store
+                    .append_event(
+                        &candidate.thread_key,
+                        candidate.latest_execution_id.as_deref(),
+                        "session.sandbox_paused",
+                        json!({
+                            "thread_key": candidate.thread_key.as_str(),
+                            "sandbox_id": candidate.sandbox_id.as_str(),
+                            "reason": "capacity_pressure",
+                            "trigger_thread_key": protected_thread_key.as_str(),
+                            "trigger_execution_id": trigger_execution_id,
+                            "operation": operation,
+                            "last_active_at": candidate.last_active_at,
+                            "hot_idle_grace_ms": duration_millis_u64(self.config.hot_idle_grace),
+                            "max_running": self.config.max_running,
+                        }),
+                    )
+                    .await?;
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "sandbox_capacity_idle_paused",
+                    thread_key = %candidate.thread_key,
+                    sandbox_id = %candidate.sandbox_id,
+                    trigger_thread_key = %protected_thread_key,
+                    trigger_execution_id,
+                    operation,
+                    last_active_at = %candidate.last_active_at,
+                    max_running = self.config.max_running,
+                    "paused idle sandbox for capacity"
+                );
+                Ok(CapacityCandidateAction::Paused)
+            }
+            Err(error) => {
+                self.store
+                    .append_event(
+                        &candidate.thread_key,
+                        candidate.latest_execution_id.as_deref(),
+                        "session.sandbox_pause_failed",
+                        json!({
+                            "thread_key": candidate.thread_key.as_str(),
+                            "sandbox_id": candidate.sandbox_id.as_str(),
+                            "reason": "capacity_pressure",
+                            "trigger_thread_key": protected_thread_key.as_str(),
+                            "trigger_execution_id": trigger_execution_id,
+                            "operation": operation,
+                            "error": error.to_string(),
+                        }),
+                    )
+                    .await?;
+                Err(SessionRuntimeError::Sandbox(error))
+            }
+        }
+    }
+
+    async fn reconcile_stale_capacity_candidate(
+        &self,
+        candidate: &SandboxCapacityCandidate,
+    ) -> Result<CapacityCandidateAction, SessionRuntimeError> {
+        let cleared = self
+            .store
+            .clear_sandbox_id_if_matches(&candidate.thread_key, candidate.sandbox_id.as_str())
+            .await?;
+        if cleared {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "sandbox_capacity_stale_reconciled",
+                thread_key = %candidate.thread_key,
+                sandbox_id = %candidate.sandbox_id,
+                "cleared stale sandbox assignment during capacity admission"
+            );
+            Ok(CapacityCandidateAction::ReconciledStale)
+        } else {
+            Ok(CapacityCandidateAction::Skipped)
+        }
+    }
+
+    async fn running_slot_count(&self) -> Result<usize, SessionRuntimeError> {
+        Ok(self
+            .manager
+            .list_observed()
+            .await?
+            .into_iter()
+            .filter(|observed| status_consumes_running_slot(&observed.status))
+            .count())
+    }
+}
+
+enum CapacityCandidateAction {
+    Paused,
+    ReconciledStale,
+    Skipped,
+}
+
+fn candidate_fetch_limit(slots_needed: usize) -> i64 {
+    slots_needed.saturating_mul(4).clamp(16, 1000) as i64
+}
+
+fn status_consumes_running_slot(status: &SandboxStatus) -> bool {
+    matches!(
+        status,
+        SandboxStatus::Created | SandboxStatus::Running | SandboxStatus::Unknown(_)
+    )
 }
 
 struct EventStreamState {
@@ -319,7 +672,32 @@ impl SessionRuntime {
             iron_control: None,
             warm_pool: None,
             personas: None,
+            session_title_generator: None,
+            session_title_in_flight: Arc::new(DashSet::new()),
+            session_title_rerun_requested: Arc::new(DashSet::new()),
+            capacity: None,
+            stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
         }
+    }
+
+    pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, SessionTitleGenerationError>> + Send + 'static,
+    {
+        self.session_title_generator = Some(Arc::new(move |source| generator(source).boxed()));
+        self
+    }
+
+    pub fn with_openai_session_title_generator_from_env(mut self) -> Self {
+        let Some(generator) = OpenAiSessionTitleGenerator::from_env() else {
+            return self;
+        };
+        self.session_title_generator = Some(Arc::new(move |source| {
+            let generator = generator.clone();
+            async move { generator.generate(source).await }.boxed()
+        }));
+        self
     }
 
     pub fn with_personas(mut self, personas: PersonaRegistry) -> Self {
@@ -332,6 +710,13 @@ impl SessionRuntime {
             .as_ref()
             .map(|personas| personas.summaries())
             .unwrap_or_default()
+    }
+
+    pub async fn session_title(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<String>, SessionRuntimeError> {
+        Ok(self.store.get_session_title(thread_key).await?)
     }
 
     fn resolve_persona_for_create(
@@ -388,7 +773,36 @@ impl SessionRuntime {
             manager: self.sandbox_runtime.manager.clone(),
             sandbox_pipes: self.sandbox_pipes.clone(),
             execution_spans: self.execution_spans.clone(),
+            stdout_owner_id: self.stdout_owner_id.clone(),
         }
+    }
+
+    async fn claim_stdout_owner(&self, execution_id: &str) -> Result<(), SessionRuntimeError> {
+        let claimed = self
+            .store
+            .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
+            .await?;
+        if !claimed {
+            return Err(SessionRuntimeError::BadRequest(format!(
+                "execution {execution_id} stdout is owned by another control plane process"
+            )));
+        }
+        spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
+        Ok(())
+    }
+
+    async fn claim_expired_stdout_owner(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        let claimed = self
+            .store
+            .claim_expired_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
+            .await?;
+        if claimed {
+            spawn_stdout_owner_renewer(self.context(), execution_id.to_owned());
+        }
+        Ok(claimed)
     }
 
     /// Attach an iron-control registrar so each new session upserts its
@@ -426,8 +840,41 @@ impl SessionRuntime {
         self
     }
 
-    /// Spawn the background reaper that stops sandboxes whose idle pause or
-    /// total lifetime expired. No-op when both TTLs are disabled.
+    pub fn with_sandbox_capacity(mut self, config: SandboxCapacityConfig) -> Self {
+        if !config.is_enabled() {
+            return self;
+        }
+        self.capacity = Some(Arc::new(SandboxCapacityController::new(
+            self.store.clone(),
+            self.sandbox_runtime.manager.clone(),
+            self.sandbox_pipes.clone(),
+            config,
+        )));
+        self
+    }
+
+    async fn run_with_running_capacity<T, F, Fut>(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        operation: &'static str,
+        action: F,
+    ) -> Result<T, SessionRuntimeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, SessionRuntimeError>>,
+    {
+        if let Some(capacity) = self.capacity.as_ref() {
+            capacity
+                .run_with_capacity(thread_key, execution_id, operation, action)
+                .await
+        } else {
+            action().await
+        }
+    }
+
+    /// Spawn the background reaper that stops sandboxes whose total lifetime
+    /// expired. No-op when max-lifetime reaping is disabled.
     pub fn with_sandbox_reaper(self, config: SandboxReaperConfig) -> Self {
         if !config.is_enabled() {
             return self;
@@ -683,6 +1130,15 @@ impl SessionRuntime {
                 "appending session messages"
             );
             let message_ids = self.store.append_messages(thread_key, messages).await?;
+            if let Err(error) = self.store.touch_session_sandbox_activity(thread_key).await {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_sandbox_activity_touch_failed",
+                    thread_key = %thread_key,
+                    %error,
+                    "failed to touch sandbox activity after message append"
+                );
+            }
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_messages_append_completed",
@@ -712,7 +1168,43 @@ impl SessionRuntime {
         };
         self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
             .await;
+        self.spawn_session_title_generation(thread_key);
         Ok(message_ids)
+    }
+
+    fn spawn_session_title_generation(&self, thread_key: &ThreadKey) {
+        let Some(generator) = self.session_title_generator.clone() else {
+            return;
+        };
+        if !self.session_title_in_flight.insert(thread_key.clone()) {
+            self.session_title_rerun_requested
+                .insert(thread_key.clone());
+            return;
+        }
+        let store = self.store.clone();
+        let in_flight = self.session_title_in_flight.clone();
+        let rerun_requested = self.session_title_rerun_requested.clone();
+        let thread_key = thread_key.clone();
+        tokio::spawn(async move {
+            // Appends skipped while generation is in flight request one more pass,
+            // which lets low-signal wakeups defer to a later substantive message.
+            loop {
+                rerun_requested.remove(&thread_key);
+                maybe_generate_session_title(store.clone(), generator.clone(), thread_key.clone())
+                    .await;
+                if rerun_requested.remove(&thread_key).is_some() {
+                    continue;
+                }
+
+                in_flight.remove(&thread_key);
+                if rerun_requested.remove(&thread_key).is_some()
+                    && in_flight.insert(thread_key.clone())
+                {
+                    continue;
+                }
+                break;
+            }
+        });
     }
 
     /// Stop every non-terminal sandbox the backend currently owns.
@@ -963,6 +1455,11 @@ impl SessionRuntime {
                 );
                 return Ok(execution);
             }
+            if let Err(error) = self.claim_stdout_owner(&execution.execution_id).await {
+                self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                    .await;
+                return Err(error);
+            }
             let execution_trace_span = info_span!(
                 "centaur.api_rs.session.execution",
                 component = COMPONENT_SESSION_RUNTIME,
@@ -1104,6 +1601,19 @@ impl SessionRuntime {
     ) {
         self.execution_spans.lock().await.remove(execution_id);
         let error_message = error.to_string();
+        let execution = match self
+            .store
+            .fail_execution_if_active_and_stdout_owner(
+                execution_id,
+                &self.stdout_owner_id,
+                &error_message,
+            )
+            .await
+        {
+            Ok(Some(execution)) => execution,
+            Ok(None) => return,
+            Err(_) => return,
+        };
         let _ = self
             .store
             .append_event(
@@ -1117,20 +1627,14 @@ impl SessionRuntime {
                 }),
             )
             .await;
-        if let Ok(execution) = self
-            .store
-            .fail_execution(execution_id, &error_message)
-            .await
-        {
-            record_finished_execution_metric(
-                &self.store,
-                thread_key,
-                &execution,
-                "failed",
-                Some(runtime_error_failure_class(error)),
-            )
-            .await;
-        }
+        record_finished_execution_metric(
+            &self.store,
+            thread_key,
+            &execution,
+            "failed",
+            Some(runtime_error_failure_class(error)),
+        )
+        .await;
     }
 
     async fn forward_messages_to_active_execution(
@@ -1429,7 +1933,22 @@ impl SessionRuntime {
                         }
                         ExistingSandboxAction::ResumeOrReplace => {
                             self.sandbox_pipes.remove(sandbox_id);
-                            match self.sandbox_runtime.manager.resume(&id).await {
+                            let resume_id = id.clone();
+                            match self
+                                .run_with_running_capacity(
+                                    thread_key,
+                                    execution_id,
+                                    "resume",
+                                    || async {
+                                        self.sandbox_runtime
+                                            .manager
+                                            .resume(&resume_id)
+                                            .await
+                                            .map_err(SessionRuntimeError::Sandbox)
+                                    },
+                                )
+                                .await
+                            {
                                 Ok(()) => {
                                     span.record("centaur.sandbox_id", sandbox_id);
                                     span.record("sandbox_id", sandbox_id);
@@ -1469,7 +1988,7 @@ impl SessionRuntime {
                                     );
                                     return Ok(sandbox_id.to_owned());
                                 }
-                                Err(error) => {
+                                Err(SessionRuntimeError::Sandbox(error)) => {
                                     warn!(
                                         component = COMPONENT_SESSION_RUNTIME,
                                         event = "sandbox_ensure_resume_failed",
@@ -1493,6 +2012,7 @@ impl SessionRuntime {
                                         )
                                         .await?;
                                 }
+                                Err(error) => return Err(error),
                             }
                         }
                         ExistingSandboxAction::Replace => {
@@ -1620,7 +2140,15 @@ impl SessionRuntime {
             }
             apply_sandbox_capabilities(&mut spec, desired_capabilities);
             let create_started = Instant::now();
-            let handle = self.sandbox_runtime.manager.create_running(spec).await?;
+            let handle = self
+                .run_with_running_capacity(thread_key, execution_id, "cold_create", || async {
+                    self.sandbox_runtime
+                        .manager
+                        .create_running(spec)
+                        .await
+                        .map_err(SessionRuntimeError::Sandbox)
+                })
+                .await?;
             let startup_duration = create_started.elapsed();
             let ready_duration = ensure_started.elapsed();
             span.record("centaur.sandbox_id", handle.id.as_str());
@@ -1699,6 +2227,22 @@ impl SessionRuntime {
         let ready_duration_ms = duration_millis_u64(ready_duration);
         let startup_duration_ms = startup_duration.map(duration_millis_u64).unwrap_or(0);
         let sandbox_started_for_request = startup_duration.is_some();
+
+        if let Err(error) = self
+            .store
+            .touch_sandbox_activity(thread_key, sandbox_id)
+            .await
+        {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_sandbox_activity_touch_failed",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                %error,
+                "failed to touch sandbox activity after sandbox ready"
+            );
+        }
 
         if let Err(error) = self
             .store
@@ -1974,6 +2518,26 @@ impl SessionRuntime {
             .await;
             return Ok(());
         }
+        if !self.claim_expired_stdout_owner(execution_id).await? {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_adoption_deferred",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                "active stdout owner lease still exists; deferring adoption"
+            );
+            let _ = self
+                .store
+                .append_event(
+                    thread_key,
+                    Some(execution_id),
+                    "session.execution_adoption_deferred",
+                    json!({ "sandbox_id": sandbox_id, "reason": "stdout_owner_lease_active" }),
+                )
+                .await;
+            return Ok(());
+        }
 
         // The turn may have finished while no control plane was attached. An
         // attach stream cannot replay that output, but the backend's recorded
@@ -2033,7 +2597,13 @@ impl SessionRuntime {
         // No terminal in the recorded output: treat the turn as still in
         // flight. Re-attach the stdout pump and re-arm the remaining
         // max-duration budget so an adopted-but-silent turn stays bounded.
-        self.ensure_session_pipe(thread_key, sandbox_id).await?;
+        if let Err(error) = self.ensure_session_pipe(thread_key, sandbox_id).await {
+            let _ = self
+                .store
+                .release_stdout_owner(execution_id, &self.stdout_owner_id)
+                .await;
+            return Err(error);
+        }
         info!(
             component = COMPONENT_SESSION_RUNTIME,
             event = "execution_adopted",
@@ -2074,6 +2644,10 @@ impl SessionRuntime {
         sandbox_id: &str,
         detail: &str,
     ) {
+        let _ = self
+            .store
+            .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
+            .await;
         let error = format!("execution orphaned by control plane restart; {detail}");
         if let Err(record_error) = record_terminal_output(
             &self.context(),
@@ -2091,6 +2665,73 @@ impl SessionRuntime {
                 execution_id,
                 error = %record_error,
                 "failed to record orphaned execution failure"
+            );
+        }
+    }
+}
+
+async fn maybe_generate_session_title(
+    store: PgSessionStore,
+    generator: SessionTitleGenerator,
+    thread_key: ThreadKey,
+) {
+    let parts = match store.title_generation_candidate(&thread_key).await {
+        Ok(Some(parts)) => parts,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_title_candidate_failed",
+                thread_key = %thread_key,
+                %error,
+                "failed to load session title candidate"
+            );
+            return;
+        }
+    };
+    let Some(source) = session_title_source_from_parts(&parts) else {
+        return;
+    };
+    let raw_title = match generator(source).await {
+        Ok(title) => title,
+        Err(error) => {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_title_generation_failed",
+                thread_key = %thread_key,
+                %error,
+                "failed to generate session title"
+            );
+            return;
+        }
+    };
+    let Some(title) = sanitize_session_title(&raw_title) else {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_title_generation_empty",
+            thread_key = %thread_key,
+            "session title generation returned an empty title"
+        );
+        return;
+    };
+    match store.set_session_title_if_empty(&thread_key, &title).await {
+        Ok(true) => {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_title_set",
+                thread_key = %thread_key,
+                title,
+                "session title set"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_title_set_failed",
+                thread_key = %thread_key,
+                %error,
+                "failed to set session title"
             );
         }
     }
@@ -2784,6 +3425,7 @@ async fn run_stdout_pump(
             "session stdout pump started"
         );
         let mut output_state = StdoutPumpState::default();
+        let mut lost_stdout_ownership = HashSet::new();
         let mut line_count = 0_u64;
         while let Some(line) = stdout.next().await {
             let line = match line {
@@ -2812,6 +3454,9 @@ async fn run_stdout_pump(
             else {
                 continue;
             };
+            if lost_stdout_ownership.contains(&output_execution_id) {
+                continue;
+            }
             let first_token_execution = active_execution
                 .as_ref()
                 .filter(|execution| {
@@ -2834,10 +3479,24 @@ async fn run_stdout_pump(
                 sandbox_id,
                 &output_execution_id,
             );
-            let output_event =
-                append_output_line(&ctx.store, &thread_key, Some(&output_execution_id), &line)
-                .instrument(output_span.clone())
-                .await?;
+            let Some(output_event) =
+                append_output_line(&ctx, &thread_key, &output_execution_id, &line)
+                    .instrument(output_span.clone())
+                    .await?
+            else {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_stdout_owner_lost",
+                    thread_key = %thread_key,
+                    execution_id = %output_execution_id,
+                    sandbox_id,
+                    stdout_owner_id = %ctx.stdout_owner_id,
+                    "stdout pump no longer owns execution output; suppressing further rows"
+                );
+                lost_stdout_ownership.insert(output_execution_id.clone());
+                output_state.forget(&output_execution_id);
+                continue;
+            };
             if let Some(execution) = first_token_execution {
                 record_first_token_observation(
                     &ctx,
@@ -3606,7 +4265,10 @@ async fn record_terminal_output(
             reason,
             result_text,
         } => {
-            let Some(execution) = ctx.store.complete_execution_if_active(execution_id).await?
+            let Some(execution) = ctx
+                .store
+                .complete_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id)
+                .await?
             else {
                 return Ok(());
             };
@@ -3634,7 +4296,11 @@ async fn record_terminal_output(
             failure_class = Some(terminal_failure_class(&error));
             let Some(execution) = ctx
                 .store
-                .fail_execution_if_active(execution_id, &error)
+                .fail_execution_if_active_and_stdout_owner(
+                    execution_id,
+                    &ctx.stdout_owner_id,
+                    &error,
+                )
                 .await?
             else {
                 return Ok(());
@@ -3655,6 +4321,21 @@ async fn record_terminal_output(
         }
     };
     ctx.execution_spans.lock().await.remove(execution_id);
+    if let Err(error) = ctx
+        .store
+        .touch_sandbox_activity(thread_key, sandbox_id)
+        .await
+    {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_sandbox_activity_touch_failed",
+            thread_key = %thread_key,
+            execution_id,
+            sandbox_id,
+            %error,
+            "failed to touch sandbox activity after terminal output"
+        );
+    }
     record_finished_execution_metric(
         &ctx.store,
         thread_key,
@@ -3698,6 +4379,33 @@ fn spawn_max_duration_failure(
     });
 }
 
+fn spawn_stdout_owner_renewer(ctx: RuntimeContext, execution_id: String) {
+    tokio::spawn(async move {
+        loop {
+            sleep(STDOUT_OWNER_RENEW_INTERVAL).await;
+            match ctx
+                .store
+                .renew_stdout_owner(&execution_id, &ctx.stdout_owner_id, STDOUT_OWNER_LEASE)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_owner_renew_failed",
+                        execution_id,
+                        stdout_owner_id = %ctx.stdout_owner_id,
+                        %error,
+                        "failed to renew stdout owner lease"
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
 async fn record_max_duration_failure(
     ctx: &RuntimeContext,
     thread_key: &ThreadKey,
@@ -3709,12 +4417,22 @@ async fn record_max_duration_failure(
     let error = format!("execution exceeded max_duration_ms={max_duration_ms}");
     let Some(execution) = ctx
         .store
-        .fail_execution_if_active(execution_id, &error)
+        .fail_execution_if_active_and_stdout_owner(execution_id, &ctx.stdout_owner_id, &error)
         .await?
     else {
         return Ok(());
     };
     ctx.execution_spans.lock().await.remove(execution_id);
+    if let Err(error) = ctx.store.touch_session_sandbox_activity(thread_key).await {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_sandbox_activity_touch_failed",
+            thread_key = %thread_key,
+            execution_id,
+            %error,
+            "failed to touch sandbox activity after max duration"
+        );
+    }
     ctx.store
         .append_event(
             thread_key,
@@ -4042,6 +4760,7 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
         SessionRuntimeError::Sandbox(SandboxError::InvalidSpec(_)) => "sandbox_invalid_spec",
         SessionRuntimeError::IronControl(_) => "iron_control",
         SessionRuntimeError::WarmPool(_) => "warm_pool",
+        SessionRuntimeError::CapacityExceeded { .. } => "capacity",
     }
 }
 
@@ -4557,16 +5276,19 @@ fn steering_input_line(
 }
 
 async fn append_output_line(
-    store: &PgSessionStore,
+    ctx: &RuntimeContext,
     thread_key: &ThreadKey,
-    execution_id: Option<&str>,
+    execution_id: &str,
     line: &str,
-) -> Result<SessionEvent, SessionRuntimeError> {
+) -> Result<Option<SessionEvent>, SessionRuntimeError> {
     let safe_line = redact_sensitive_text(line);
-    let event = store
-        .append_event(
+    let event = ctx
+        .store
+        .append_event_if_stdout_owner(
             thread_key,
             execution_id,
+            &ctx.stdout_owner_id,
+            STDOUT_OWNER_LEASE,
             SESSION_OUTPUT_LINE_EVENT,
             Value::String(safe_line),
         )
@@ -4917,6 +5639,14 @@ pub enum SessionRuntimeError {
     IronControl(#[from] centaur_iron_control::IronControlError),
     #[error(transparent)]
     WarmPool(#[from] WarmPoolError),
+    #[error(
+        "sandbox running capacity exceeded during {operation}: running={running}, max_running={max_running}"
+    )]
+    CapacityExceeded {
+        max_running: usize,
+        running: usize,
+        operation: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -5919,6 +6649,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         Session {
             thread_key,
+            title: None,
             sandbox_id: Some(sandbox_id.to_owned()),
             sandbox_capabilities: None,
             harness_type: HarnessType::Codex,
@@ -5926,6 +6657,7 @@ mod tests {
             persona_id: None,
             status: SessionStatus::Idle,
             iron_control_principal: None,
+            sandbox_last_active_at: Some(now),
             created_at: now,
             updated_at: now,
         }
@@ -5978,7 +6710,7 @@ mod tests {
 #[cfg(test)]
 mod adoption_tests {
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
@@ -5997,6 +6729,7 @@ mod adoption_tests {
         recorded_output: std::sync::Mutex<Vec<String>>,
         open_count: AtomicUsize,
         status: std::sync::Mutex<SandboxStatus>,
+        observed_statuses: std::sync::Mutex<BTreeMap<String, SandboxStatus>>,
         create_id: String,
         created_specs: std::sync::Mutex<Vec<SandboxSpec>>,
         resume_fails: AtomicBool,
@@ -6012,6 +6745,7 @@ mod adoption_tests {
                 recorded_output: std::sync::Mutex::new(recorded_output),
                 open_count: AtomicUsize::new(0),
                 status: std::sync::Mutex::new(status),
+                observed_statuses: std::sync::Mutex::new(BTreeMap::new()),
                 create_id: "mock-sbx".to_owned(),
                 created_specs: std::sync::Mutex::new(Vec::new()),
                 resume_fails: AtomicBool::new(false),
@@ -6035,6 +6769,21 @@ mod adoption_tests {
 
         fn set_status(&self, status: SandboxStatus) {
             *self.status.lock().unwrap() = status;
+        }
+
+        fn set_observed_status(&self, sandbox_id: &str, status: SandboxStatus) {
+            self.observed_statuses
+                .lock()
+                .unwrap()
+                .insert(sandbox_id.to_owned(), status);
+        }
+
+        fn status_of(&self, sandbox_id: &str) -> Option<SandboxStatus> {
+            self.observed_statuses
+                .lock()
+                .unwrap()
+                .get(sandbox_id)
+                .cloned()
         }
 
         fn fail_resume(&self) {
@@ -6069,6 +6818,7 @@ mod adoption_tests {
 
         async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
             self.created_specs.lock().unwrap().push(spec);
+            self.set_observed_status(&self.create_id, SandboxStatus::Running);
             Ok(SandboxHandle::new(
                 SandboxId::new(self.create_id.clone()),
                 "mock",
@@ -6093,6 +6843,9 @@ mod adoption_tests {
         }
 
         async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            if let Some(status) = self.status_of(_id.as_str()) {
+                return Ok(status);
+            }
             Ok(self.status.lock().unwrap().clone())
         }
 
@@ -6102,7 +6855,13 @@ mod adoption_tests {
         }
 
         async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
-            Ok(Vec::new())
+            Ok(self
+                .observed_statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, status)| ObservedSandbox::new(id.as_str(), "mock", status.clone()))
+                .collect())
         }
 
         async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -6110,6 +6869,7 @@ mod adoption_tests {
                 return Err(SandboxError::NotFound(id.as_str().to_owned()));
             }
             self.stopped.lock().unwrap().push(id.as_str().to_owned());
+            self.set_observed_status(id.as_str(), SandboxStatus::Stopped);
             Ok(())
         }
 
@@ -6126,6 +6886,7 @@ mod adoption_tests {
         }
 
         async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            self.set_observed_status(_id.as_str(), SandboxStatus::Suspended);
             Ok(())
         }
 
@@ -6133,6 +6894,7 @@ mod adoption_tests {
             if self.resume_fails.load(Ordering::SeqCst) {
                 return Err(SandboxError::NotFound(_id.as_str().to_owned()));
             }
+            self.set_observed_status(_id.as_str(), SandboxStatus::Running);
             Ok(())
         }
     }
@@ -6232,6 +6994,22 @@ mod adoption_tests {
         }
     }
 
+    async fn wait_for_session_title(
+        store: &PgSessionStore,
+        thread_key: &ThreadKey,
+        expected: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let session = store.get_session(thread_key).await.expect("get session");
+            if session.title.as_deref() == Some(expected) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for title");
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn events(store: &PgSessionStore, thread_key: &ThreadKey) -> Vec<SessionEvent> {
         store
             .list_events_after(thread_key, 0, None, 1000)
@@ -6244,6 +7022,116 @@ mod adoption_tests {
             store.clone(),
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_messages_generates_missing_session_title_once() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:title-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sources = Arc::new(Mutex::new(Vec::<String>::new()));
+        let generator_started = Arc::new(tokio::sync::Notify::new());
+        let generator_release = Arc::new(tokio::sync::Notify::new());
+        let calls_for_generator = calls.clone();
+        let sources_for_generator = sources.clone();
+        let started_for_generator = generator_started.clone();
+        let release_for_generator = generator_release.clone();
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        )
+        .with_session_title_generator(move |source| {
+            let calls = calls_for_generator.clone();
+            let sources = sources_for_generator.clone();
+            let started = started_for_generator.clone();
+            let release = release_for_generator.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                sources.lock().await.push(source);
+                started.notify_one();
+                release.notified().await;
+                Ok("Fix worker memory leak".to_owned())
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("first".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![
+                        json!({
+                            "type": "text",
+                            "text": "# Requester Context\n\nThe Slack user who prompted this turn is Alice."
+                        }),
+                        json!({
+                            "type": "text",
+                            "text": "<@U123> please fix the memory leak in the worker"
+                        }),
+                    ],
+                    metadata: json!({}),
+                }],
+            ),
+        )
+        .await
+        .expect("append first message should not wait for title generation")
+        .expect("append first message");
+
+        generator_started.notified().await;
+
+        let session = store.get_session(&thread_key).await.unwrap();
+        assert_eq!(session.title, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sources.lock().await.clone(),
+            vec!["please fix the memory leak in the worker".to_owned()]
+        );
+
+        runtime
+            .append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("burst".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "add more logging"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .expect("append burst message");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        generator_release.notify_one();
+        wait_for_session_title(&store, &thread_key, "Fix worker memory leak").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        runtime
+            .append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("second".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "add more logging"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .expect("append second message");
+
+        let session = store.get_session(&thread_key).await.unwrap();
+        assert_eq!(session.title.as_deref(), Some("Fix worker memory leak"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn env_value<'a>(spec: &'a SandboxSpec, name: &str) -> Option<&'a str> {
@@ -6298,6 +7186,7 @@ mod adoption_tests {
                 target_size: 1,
                 replenish_interval: Duration::from_secs(60),
                 bootstrap_iron_control_principal: None,
+                max_running_sandboxes: None,
             },
         ));
         runtime.warm_pool = Some(warm_pool);
@@ -6481,6 +7370,142 @@ mod adoption_tests {
             backend.proxy_ensures(),
             vec![("sbx-existing".to_owned(), "principal-existing".to_owned())]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_pressure_pauses_oldest_idle_assigned_sandbox() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status(
+            "sbx-old",
+            SandboxStatus::Unknown("status temporarily unavailable".to_owned()),
+        );
+        backend.set_observed_status("sbx-hot", SandboxStatus::Running);
+        backend.set_observed_status("sbx-stale", SandboxStatus::Gone);
+        backend.set_observed_status("sbx-paused", SandboxStatus::Suspended);
+
+        let stale_thread =
+            ThreadKey::parse(format!("test:capacity-stale-{}", uuid::Uuid::new_v4())).unwrap();
+        let paused_thread =
+            ThreadKey::parse(format!("test:capacity-paused-{}", uuid::Uuid::new_v4())).unwrap();
+        let old_thread =
+            ThreadKey::parse(format!("test:capacity-old-{}", uuid::Uuid::new_v4())).unwrap();
+        let hot_thread =
+            ThreadKey::parse(format!("test:capacity-hot-{}", uuid::Uuid::new_v4())).unwrap();
+        let trigger_thread =
+            ThreadKey::parse(format!("test:capacity-trigger-{}", uuid::Uuid::new_v4())).unwrap();
+
+        store
+            .create_or_get_session(&stale_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create stale session");
+        store
+            .update_sandbox_id(&stale_thread, Some("sbx-stale"))
+            .await
+            .expect("assign stale sandbox");
+        store
+            .create_or_get_session(&paused_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create paused session");
+        store
+            .update_sandbox_id(&paused_thread, Some("sbx-paused"))
+            .await
+            .expect("assign paused sandbox");
+        store
+            .append_event(
+                &paused_thread,
+                None,
+                "session.sandbox_paused",
+                json!({
+                    "thread_key": paused_thread.as_str(),
+                    "sandbox_id": "sbx-paused",
+                    "reason": "capacity_pressure",
+                }),
+            )
+            .await
+            .expect("append paused event");
+        store
+            .create_or_get_session(&old_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create old session");
+        store
+            .update_sandbox_id(&old_thread, Some("sbx-old"))
+            .await
+            .expect("assign old sandbox");
+        store
+            .create_or_get_session(&hot_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create hot session");
+        store
+            .update_sandbox_id(&hot_thread, Some("sbx-hot"))
+            .await
+            .expect("assign hot sandbox");
+        sqlx::query(
+            r#"
+            update sessions
+            set sandbox_last_active_at = case
+                    when thread_key = $1 then now() - interval '3 hours'
+                    when thread_key = $2 then now() - interval '2 hours'
+                    when thread_key = $3 then now() - interval '1 hour'
+                end
+            where thread_key in ($1, $2, $3)
+            "#,
+        )
+        .bind(stale_thread.as_str())
+        .bind(paused_thread.as_str())
+        .bind(old_thread.as_str())
+        .execute(store.pool())
+        .await
+        .expect("age capacity candidates");
+
+        let controller = SandboxCapacityController::new(
+            store.clone(),
+            Arc::new(SandboxManager::new(backend.clone())),
+            Arc::new(DashMap::new()),
+            SandboxCapacityConfig {
+                max_running: 2,
+                hot_idle_grace: Duration::from_secs(300),
+            },
+        );
+
+        controller
+            .run_with_capacity(&trigger_thread, "exe-trigger", "cold_create", || async {
+                Ok(())
+            })
+            .await
+            .expect("admit under capacity");
+
+        assert_eq!(backend.status_of("sbx-old"), Some(SandboxStatus::Suspended));
+        assert_eq!(backend.status_of("sbx-hot"), Some(SandboxStatus::Running));
+        assert_eq!(
+            store
+                .get_session(&stale_thread)
+                .await
+                .expect("get stale session")
+                .sandbox_id,
+            None
+        );
+        assert_eq!(
+            store
+                .get_session(&paused_thread)
+                .await
+                .expect("get paused session")
+                .sandbox_id
+                .as_deref(),
+            Some("sbx-paused")
+        );
+        let old_events = store
+            .list_events_after(&old_thread, 0, None, 100)
+            .await
+            .expect("list old events");
+        assert!(old_events.iter().any(|event| {
+            event.event_type == "session.sandbox_paused"
+                && event.payload.get("reason").and_then(Value::as_str) == Some("capacity_pressure")
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

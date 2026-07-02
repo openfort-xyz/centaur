@@ -98,6 +98,11 @@ export type SlackbotV2Options = {
   apiKey?: string
   apiUrl: string
   assistantStatus?: string
+  /**
+   * When enabled, session.activity_summary events update Slack's assistant
+   * status and structured task output is hidden from the Slack stream.
+   */
+  activitySummaryStatusEnabled?: boolean
   botToken: string
   botUserId?: string
   /**
@@ -106,6 +111,7 @@ export type SlackbotV2Options = {
    */
   defaultHarnessType?: string
   fetch?: SlackbotV2Fetch
+  /** Milliseconds before an idle execution pauses its sandbox. Defaults to up to 3h. */
   idleTimeoutMs?: number
   logger?: Logger
   maxDurationMs?: number
@@ -123,7 +129,7 @@ export type SlackbotV2Options = {
   slackApiTimeoutMs?: number
   state?: StateAdapter
   stateKeyPrefix?: string
-  streamTaskDisplayMode?: 'plan' | 'timeline'
+  streamTaskDisplayMode?: 'none' | 'plan' | 'timeline'
   triggerBotAllowlist?: readonly string[]
   userName?: string
   mapper?: CodexAppServerToChatStreamOptions
@@ -138,8 +144,14 @@ export type SlackbotV2ThreadState = {
   activeExecution?: boolean
   executedMessageIds?: string[]
   forwardedMessageIds?: string[]
+  /** Last thread-level harness selected by Slack flags. Null clears persisted state. */
+  harnessType?: string | null
   historyForwarded?: boolean
   lastEventId?: number
+  /** Last thread-level model selected by Slack flags. Null clears persisted state. */
+  model?: string | null
+  /** Last thread-level model provider selected by Slack flags. Null clears persisted state. */
+  provider?: string | null
   renderObligation?: SlackbotV2RenderObligation | null
 }
 
@@ -174,12 +186,12 @@ export type ForwardSessionInput = {
   contextPreamble?: string
   executionId?: string
   executeMessage?: SlackbotV2ApiMessage
-  /** Harness override parsed from message flags (--claude/--amp/--codex). */
+  /** Effective harness selected by sticky thread flags (--claude/--amp/--codex). */
   harnessType?: string
   messages: SlackbotV2ApiMessage[]
-  /** Per-turn model override parsed from message flags (--model/--opus/...). */
+  /** Effective model selected by sticky thread flags (--model/--opus/...). */
   model?: string
-  /** Model provider override parsed from message flags (--bedrock); codex only. */
+  /** Effective model provider selected by sticky thread flags (--bedrock); codex only. */
   provider?: string
   /** Per-turn reasoning effort parsed from the `-rsn` flag (codex only). */
   reasoning?: string
