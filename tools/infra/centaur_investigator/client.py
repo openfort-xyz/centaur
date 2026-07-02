@@ -34,6 +34,23 @@ _SLACK_THREAD_KEY_RE = re.compile(
 _CHANNEL_TS_RE = re.compile(r"\b(?P<channel>[CDG][A-Z0-9]+):(?P<thread_ts>\d{10}\.\d{1,6})\b")
 _KEY_SOURCE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*:")
 
+# The googlechatbot encodes threads as `chat:<space_resource>:<thread_resource>`
+# with `/` rewritten to `:` in each Google Chat resource name, e.g. space
+# `spaces/AAAA` + thread `spaces/AAAA/threads/BBBB` becomes
+# `chat:spaces:AAAA:spaces:AAAA:threads:BBBB`. The Slack-compatible `chat:C…`
+# adapter format never starts with `spaces:` and stays with the Slack parser.
+_GCHAT_URL_RE = re.compile(
+    r"https?://chat\.google\.com/(?:room|dm)/(?P<space>[A-Za-z0-9_-]+)"
+    r"(?:/(?P<thread>[A-Za-z0-9_.-]+))?"
+)
+_GCHAT_RESOURCE_RE = re.compile(
+    r"\bspaces/(?P<space>[A-Za-z0-9_-]+)"
+    r"(?:/(?P<collection>threads|messages)/(?P<thread>[A-Za-z0-9_.-]+))?\b"
+)
+_GCHAT_THREAD_KEY_RE = re.compile(
+    r"\bchat:spaces:(?P<space>[A-Za-z0-9_-]+)(?::(?P<rest>[A-Za-z0-9_.:-]+))?"
+)
+
 
 def _clamp(value: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, int(value)))
@@ -156,6 +173,32 @@ def _thread_key_candidates(
             f"chat:{channel_id}:{thread_ts}",
         ]
     )
+    return _dedupe(candidates)
+
+
+def _google_chat_segment(value: str) -> str:
+    return re.sub(r"\s+", "_", value.replace("/", ":"))
+
+
+def _google_chat_thread_key(space_name: str, resource_name: str) -> str:
+    return f"chat:{_google_chat_segment(space_name)}:{_google_chat_segment(resource_name)}"
+
+
+def _google_chat_thread_key_candidates(space_name: str, thread_name: str) -> list[str]:
+    candidates = [_google_chat_thread_key(space_name, thread_name)]
+    if thread_name != space_name:
+        # The googlechatbot keys sessions by thread resource when the event
+        # carries one and falls back to the message resource otherwise; a
+        # thread-root message id equals its thread id and replies append a
+        # ".<reply>" suffix, so probe both forms.
+        resource_id = thread_name.rsplit("/", 1)[-1]
+        thread_id = resource_id.split(".", 1)[0] if "/messages/" in thread_name else resource_id
+        candidates.extend(
+            [
+                _google_chat_thread_key(space_name, f"{space_name}/threads/{thread_id}"),
+                _google_chat_thread_key(space_name, f"{space_name}/messages/{resource_id}"),
+            ]
+        )
     return _dedupe(candidates)
 
 
@@ -285,6 +328,78 @@ def parse_slack_reference(reference: str) -> dict[str, Any]:
     }
 
 
+def _google_chat_result(
+    reference: str,
+    *,
+    kind: str,
+    space_name: str,
+    thread_name: str,
+) -> dict[str, Any]:
+    space_id = space_name.removeprefix("spaces/")
+    is_space = thread_name == space_name
+    resource_id = None if is_space else thread_name.rsplit("/", 1)[-1]
+    return {
+        "status": "ok",
+        "input": reference,
+        "kind": kind,
+        "source": "chat",
+        "space_name": space_name,
+        "thread_name": thread_name,
+        "thread_key": _google_chat_thread_key(space_name, thread_name),
+        "thread_key_candidates": _google_chat_thread_key_candidates(space_name, thread_name),
+        "thread_key_like": None if is_space else f"chat:spaces:{space_id}:%:{resource_id}",
+        "channel_key_like": f"chat:spaces:{space_id}:%",
+    }
+
+
+def parse_google_chat_reference(reference: str) -> dict[str, Any]:
+    """Parse a Google Chat resource name, permalink, or thread key into identifiers only."""
+    text = _clean_reference_text(reference)
+    direct = _GCHAT_THREAD_KEY_RE.search(text)
+    if direct:
+        space_name = f"spaces/{direct.group('space')}"
+        rest = direct.group("rest")
+        thread_name = rest.replace(":", "/") if rest else space_name
+        return _google_chat_result(
+            reference,
+            kind="thread_key",
+            space_name=space_name,
+            thread_name=thread_name,
+        )
+
+    resource = _GCHAT_RESOURCE_RE.search(text)
+    if resource:
+        space_name = f"spaces/{resource.group('space')}"
+        thread_name = (
+            f"{space_name}/{resource.group('collection')}/{resource.group('thread')}"
+            if resource.group("thread")
+            else space_name
+        )
+        return _google_chat_result(
+            reference,
+            kind="resource_name",
+            space_name=space_name,
+            thread_name=thread_name,
+        )
+
+    url_match = _GCHAT_URL_RE.search(text)
+    if url_match:
+        space_name = f"spaces/{url_match.group('space')}"
+        thread_id = url_match.group("thread")
+        thread_name = f"{space_name}/threads/{thread_id}" if thread_id else space_name
+        return _google_chat_result(
+            reference,
+            kind="google_chat_permalink",
+            space_name=space_name,
+            thread_name=thread_name,
+        )
+
+    return {
+        "status": "error",
+        "error": "no Google Chat resource name, permalink, or thread_key found",
+    }
+
+
 def _safe_load_module(module_name: str, path: Path) -> Any | None:
     if not path.exists():
         return None
@@ -344,8 +459,14 @@ class CentaurInvestigatorClient:
             return {"status": "unavailable", "label": label, "error": str(exc), "row": None}
 
     def parse_thread_reference(self, reference: str) -> dict[str, Any]:
-        """Parse a Slack thread permalink or Centaur thread key."""
-        return parse_slack_reference(reference)
+        """Parse a Slack or Google Chat thread permalink or Centaur thread key."""
+        parsed = parse_slack_reference(reference)
+        if parsed.get("status") == "ok":
+            return parsed
+        google_chat = parse_google_chat_reference(reference)
+        if google_chat.get("status") == "ok":
+            return google_chat
+        return parsed
 
     async def _session_state_async(
         self,
@@ -1097,6 +1218,56 @@ class CentaurInvestigatorClient:
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
 
+    async def _investigate_google_chat_thread_async(
+        self,
+        reference: str,
+        *,
+        limit: int,
+        include_observability: bool,
+        window_hours: int,
+        logs_limit: int,
+    ) -> dict[str, Any]:
+        parsed = parse_google_chat_reference(reference)
+        if parsed.get("status") != "ok":
+            return parsed
+
+        conn = await self._connect()
+        try:
+            result = await self._collect_state(conn, parsed=parsed, limit=limit)
+        finally:
+            await conn.close()
+
+        if include_observability:
+            result["observability"] = self._observability(
+                thread_keys=result.get("thread_keys") or parsed.get("thread_key_candidates") or [],
+                execution_ids=result.get("execution_ids") or [],
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+        return result
+
+    def investigate_google_chat_thread(
+        self,
+        reference: str,
+        limit: int = DEFAULT_LIMIT,
+        include_observability: bool = True,
+        window_hours: int = DEFAULT_WINDOW_HOURS,
+        logs_limit: int = 100,
+    ) -> dict[str, Any]:
+        """Investigate a Google Chat thread link with sanitized readonly Postgres metadata."""
+        try:
+            return asyncio.run(
+                self._investigate_google_chat_thread_async(
+                    reference,
+                    limit=_clamp(limit, minimum=1, maximum=MAX_LIMIT),
+                    include_observability=include_observability,
+                    window_hours=_clamp(window_hours, minimum=1, maximum=MAX_WINDOW_HOURS),
+                    logs_limit=_clamp(logs_limit, minimum=1, maximum=MAX_LOG_LIMIT),
+                )
+            )
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
     def investigate(
         self,
         query: str,
@@ -1105,10 +1276,19 @@ class CentaurInvestigatorClient:
         window_hours: int = DEFAULT_WINDOW_HOURS,
         logs_limit: int = 100,
     ) -> dict[str, Any]:
-        """Investigate natural-language text containing a Slack link or thread_key."""
+        """Investigate text containing a Slack or Google Chat link or thread_key."""
         parsed = parse_slack_reference(query)
         if parsed.get("status") == "ok":
             return self.investigate_slack_thread(
+                query,
+                limit=limit,
+                include_observability=include_observability,
+                window_hours=window_hours,
+                logs_limit=logs_limit,
+            )
+        google_chat = parse_google_chat_reference(query)
+        if google_chat.get("status") == "ok":
+            return self.investigate_google_chat_thread(
                 query,
                 limit=limit,
                 include_observability=include_observability,
@@ -1126,7 +1306,7 @@ class CentaurInvestigatorClient:
             )
         return {
             "status": "error",
-            "error": "query must contain a Slack permalink or Centaur thread_key",
+            "error": "query must contain a Slack or Google Chat permalink or Centaur thread_key",
         }
 
     async def _search_sessions_async(
