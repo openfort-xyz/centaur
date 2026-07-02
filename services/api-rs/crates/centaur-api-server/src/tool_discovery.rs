@@ -564,6 +564,16 @@ struct GcpAuthSecret {
     labels: BTreeMap<String, String>,
     hosts: Vec<String>,
     scopes: Vec<String>,
+    /// Domain-wide-delegation user to impersonate (`sub` claim). `None` mints an
+    /// app-auth token; `Some` requires the service account to have DWD for these
+    /// scopes. Lets one keyfile serve both app-auth reads and impersonated writes.
+    subject: Option<String>,
+    /// Restrict the grant to these HTTP methods (empty = all). With `paths`, this
+    /// lets an app-auth read grant and an impersonated write grant coexist on one
+    /// host without colliding.
+    http_methods: Vec<String>,
+    /// Restrict the grant to request paths matching these prefixes (empty = all).
+    paths: Vec<String>,
 }
 
 /// A `type = "gcp_id_token"` secret. The proxy mints a Google-signed OIDC ID
@@ -803,6 +813,9 @@ fn parse_gcp_auth_secret(
         labels: labels.clone(),
         hosts: optional_string_array(table.get("hosts"))?.unwrap_or_default(),
         scopes: optional_string_array(table.get("scopes"))?.unwrap_or_default(),
+        subject: optional_str(table, "subject").map(ToOwned::to_owned),
+        http_methods: optional_string_array(table.get("http_methods"))?.unwrap_or_default(),
+        paths: optional_string_array(table.get("paths"))?.unwrap_or_default(),
     }))
 }
 
@@ -1083,24 +1096,44 @@ impl From<&HttpSecret> for HttpSecretKey {
     }
 }
 
+/// Grants collapse into one transform only when they share a keyfile AND the
+/// same impersonation subject and method/path scoping — so an app-auth read
+/// grant and an impersonated write grant on the same service account stay
+/// distinct (each with its own token minting and rules).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GcpAuthGroupKey {
+    secret_ref: String,
+    subject: Option<String>,
+    http_methods: Vec<String>,
+    paths: Vec<String>,
+}
+
 fn gcp_auth_transforms(secrets: &[ToolSecret]) -> Result<Vec<Transform>, ToolDiscoveryError> {
-    let mut by_ref =
-        BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>, BTreeMap<String, String>)>::new();
+    let mut by_key = BTreeMap::<
+        GcpAuthGroupKey,
+        (BTreeSet<String>, BTreeSet<String>, BTreeMap<String, String>),
+    >::new();
     for secret in secrets {
         let ToolSecret::GcpAuth(secret) = secret else {
             continue;
         };
-        let entry = by_ref.entry(secret.secret_ref.clone()).or_default();
+        let key = GcpAuthGroupKey {
+            secret_ref: secret.secret_ref.clone(),
+            subject: secret.subject.clone(),
+            http_methods: secret.http_methods.clone(),
+            paths: secret.paths.clone(),
+        };
+        let entry = by_key.entry(key).or_default();
         entry.0.extend(secret.hosts.iter().cloned());
         entry.1.extend(secret.scopes.iter().cloned());
         merge_tool_labels(&mut entry.2, &secret.labels);
     }
     let mut transforms = Vec::new();
-    for (secret_ref, (hosts, scopes, labels)) in by_ref {
+    for (key, (hosts, scopes, labels)) in by_key {
         let mut config = BTreeMap::new();
         config.insert(
             "keyfile".to_owned(),
-            yaml_map([("placeholder", yaml_string(&secret_ref))])?,
+            yaml_map([("placeholder", yaml_string(&key.secret_ref))])?,
         );
         config.insert(
             "scopes".to_owned(),
@@ -1110,12 +1143,18 @@ fn gcp_auth_transforms(secrets: &[ToolSecret]) -> Result<Vec<Transform>, ToolDis
                 scopes.into_iter().collect()
             })?,
         );
+        if let Some(subject) = &key.subject {
+            config.insert("subject".to_owned(), yaml_string(subject));
+        }
         let hosts = if hosts.is_empty() {
             BTreeSet::from(["*.googleapis.com".to_owned()])
         } else {
             hosts
         };
-        config.insert("rules".to_owned(), yaml_value(host_rules(hosts)?)?);
+        config.insert(
+            "rules".to_owned(),
+            yaml_value(scoped_rules(hosts, &key.http_methods, &key.paths)?)?,
+        );
         config.insert("labels".to_owned(), yaml_value(labels)?);
         transforms.push(Transform {
             name: "gcp_auth".to_owned(),
@@ -1363,6 +1402,31 @@ fn host_rules(hosts: BTreeSet<String>) -> Result<Vec<YamlValue>, ToolDiscoveryEr
         .collect()
 }
 
+/// Host rules optionally narrowed to specific HTTP methods and path prefixes, so
+/// iron-proxy injects the grant only for matching requests.
+fn scoped_rules(
+    hosts: BTreeSet<String>,
+    http_methods: &[String],
+    paths: &[String],
+) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
+    if http_methods.is_empty() && paths.is_empty() {
+        return host_rules(hosts);
+    }
+    hosts
+        .into_iter()
+        .map(|host| {
+            let mut rule = vec![("host".to_owned(), yaml_string(&host))];
+            if !http_methods.is_empty() {
+                rule.push(("http_methods".to_owned(), yaml_value(http_methods)?));
+            }
+            if !paths.is_empty() {
+                rule.push(("paths".to_owned(), yaml_value(paths)?));
+            }
+            yaml_map_owned(rule)
+        })
+        .collect()
+}
+
 fn host_rules_set(hosts: &[String]) -> Result<Vec<YamlValue>, ToolDiscoveryError> {
     host_rules(hosts.iter().cloned().collect())
 }
@@ -1377,6 +1441,14 @@ fn yaml_map<const N: usize>(
     let map = values
         .into_iter()
         .map(|(key, value)| (YamlValue::String(key.to_owned()), value))
+        .collect();
+    Ok(YamlValue::Mapping(map))
+}
+
+fn yaml_map_owned(values: Vec<(String, YamlValue)>) -> Result<YamlValue, ToolDiscoveryError> {
+    let map = values
+        .into_iter()
+        .map(|(key, value)| (YamlValue::String(key), value))
         .collect();
     Ok(YamlValue::Mapping(map))
 }
@@ -1755,6 +1827,65 @@ secrets = [
         let placeholders =
             centaur_iron_proxy::placeholder_env(std::slice::from_ref(&discovered.fragment));
         assert!(placeholders.is_empty());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn gcp_auth_app_and_impersonated_grants_stay_distinct() {
+        let temp = temp_dir("api-rs-tools-gcp-auth-dwd");
+        let base = temp.join("base");
+        // One keyfile, two grants: app-auth reads (GET) and a domain-wide
+        // delegation writer (POST, impersonating a user) — the Google Chat
+        // upload pattern. They must NOT merge into one transform.
+        write_tool(
+            &base.join("comms").join("chat"),
+            r#"
+[project]
+description = "chat"
+
+[tool.centaur]
+secrets = [
+  { type = "gcp_auth", name = "CHAT_SA", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.bot"], http_methods = ["GET"] },
+  { type = "gcp_auth", name = "CHAT_SA", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.messages.create"], subject = "uploader@example.com", http_methods = ["POST"], paths = ["/upload/", "/v1/spaces/"] },
+]
+"#,
+        );
+
+        let discovered = discover_tool_proxy_fragment(std::slice::from_ref(&base)).unwrap();
+
+        let gcp: Vec<_> = discovered
+            .fragment
+            .transforms
+            .iter()
+            .filter(|t| t.name == "gcp_auth")
+            .collect();
+        assert_eq!(
+            gcp.len(),
+            2,
+            "app and DWD grants must be separate transforms"
+        );
+
+        let dwd = gcp
+            .iter()
+            .find(|t| t.config.extra.contains_key("subject"))
+            .expect("impersonated grant present");
+        assert_eq!(
+            dwd.config.extra["subject"].as_str(),
+            Some("uploader@example.com")
+        );
+        let rule = &dwd.config.extra["rules"].as_sequence().unwrap()[0];
+        assert_eq!(rule["host"].as_str(), Some("chat.googleapis.com"));
+        assert_eq!(rule["http_methods"][0].as_str(), Some("POST"));
+        assert_eq!(rule["paths"][0].as_str(), Some("/upload/"));
+
+        let app = gcp
+            .iter()
+            .find(|t| !t.config.extra.contains_key("subject"))
+            .expect("app grant present");
+        let app_rule = &app.config.extra["rules"].as_sequence().unwrap()[0];
+        assert_eq!(app_rule["http_methods"][0].as_str(), Some("GET"));
+        assert!(app_rule.get("paths").is_none());
 
         let _ = fs::remove_dir_all(temp);
     }

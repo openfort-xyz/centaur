@@ -40,6 +40,24 @@ fn rules_from_hosts(hosts: &[String]) -> Vec<RequestRule> {
     hosts.iter().map(RequestRule::host).collect()
 }
 
+/// Host rules optionally narrowed to specific HTTP methods and path prefixes, so
+/// an app-auth read grant and an impersonated write grant can share a host.
+fn rules_from_hosts_scoped(
+    hosts: &[String],
+    http_methods: &[String],
+    paths: &[String],
+) -> Vec<RequestRule> {
+    hosts
+        .iter()
+        .map(|host| RequestRule {
+            host: Some(host.clone()),
+            cidr: None,
+            http_methods: http_methods.to_vec(),
+            paths: paths.to_vec(),
+        })
+        .collect()
+}
+
 /// Translate every secret declared by a tool into iron-control inputs to grant
 /// to the tool's role (`role_foreign_id`, e.g. `tool-github`).
 #[cfg(test)]
@@ -254,10 +272,10 @@ fn gcp_input(
         name: Some(format!("GCP Auth ({role})")),
         labels: labels.clone(),
         scopes: gcp_auth_scopes_or_default(gcp.scopes.clone()),
-        subject: None,
+        subject: gcp.subject.clone(),
         keyfile: Some(source_from_placeholder(policy, &gcp.secret_ref, None)),
         credentials_provider: None,
-        rules: rules_from_hosts(&gcp.hosts),
+        rules: rules_from_hosts_scoped(&gcp.hosts, &gcp.http_methods, &gcp.paths),
     }
 }
 

@@ -31,10 +31,19 @@ hosts = ["chatbot", "chat.googleapis.com"]
 # gcp_auth on GOOGLE_SERVICE_ACCOUNT_JSON registers the iron-proxy grant the
 # Google Chat ETL (workflows/google_chat) relies on: the proxy mints an OAuth
 # token for the Chat scopes from the Chat-app service account and injects
-# Authorization: Bearer on outbound requests to chat.googleapis.com, so the
+# Authorization: Bearer on outbound reads (GET) to chat.googleapis.com, so the
 # workflow host never holds the key. chat.app.messages.readonly is what enables
 # history reads and needs the one-time Workspace-admin Marketplace install.
+# The read grant is scoped to GET so it never collides with the impersonated
+# WRITE grant (POST) below. `google-chat upload` posts directly to the real Chat
+# API — exactly like the Slack tool uploads to slack.com — and iron-proxy injects
+# the token at the edge. But Google's media.upload REJECTS app auth, so the write
+# grant mints a domain-wide-delegation token for a real user (`subject`) with the
+# chat.messages.create scope, injected only on POSTs to /upload and /v1/spaces.
+# The `subject` is deployment-specific (the Workspace user the service account is
+# authorized to impersonate); ideally a dedicated uploads account.
 secrets = [
     {type = "http", name = "CHATBOT_API_KEY", match_headers = ["Authorization"], hosts = ["chatbot"]},
-    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/chat.app.messages.readonly"]},
+    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/chat.app.messages.readonly"], http_methods = ["GET"]},
+    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.messages.create"], subject = "jaume@openfort.xyz", http_methods = ["POST"], paths = ["/upload/", "/v1/spaces/"]},
 ]
