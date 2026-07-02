@@ -1085,6 +1085,43 @@ impl SandboxArgs {
         }
     }
 
+    fn sandbox_observability_egress_targets(&self) -> Result<Vec<OtlpEgressTarget>, ServerError> {
+        if !matches!(self.workload, SandboxWorkloadKind::CodexAppServer) {
+            return Ok(Vec::new());
+        }
+        let envs = self.codex_app_server_env_template()?;
+        Ok(["VICTORIAMETRICS_URL", "VICTORIALOGS_URL"]
+            .into_iter()
+            .filter_map(|key| {
+                let endpoint = envs
+                    .iter()
+                    .find(|(name, value)| name == key && !value.trim().is_empty())
+                    .map(|(_, value)| value.trim().to_owned())?;
+                match parse_otlp_egress_target(&endpoint) {
+                    Some(target) => {
+                        info!(
+                            env = key,
+                            namespace = %target.namespace,
+                            port = target.port,
+                            endpoint = %endpoint,
+                            "sandbox observability egress enabled"
+                        );
+                        Some(target)
+                    }
+                    None => {
+                        warn!(
+                            env = key,
+                            endpoint = %endpoint,
+                            "sandbox observability endpoint is not an in-cluster service DNS name; \
+                             no sandbox egress NetworkPolicy rule will be created for it"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect())
+    }
+
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
         let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
 
@@ -1316,10 +1353,9 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         }
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
-        // Direct harness OTLP export (codex usage/cost spans) needs a hole in
-        // the per-sandbox egress NetworkPolicy; derived from the sandbox's own
-        // OTLP endpoint env so there is a single source of truth.
+        // Direct harness OTLP export needs a per-sandbox egress rule.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
+        config.observability_egress = args.sandbox_observability_egress_targets()?;
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -1855,9 +1891,9 @@ fn parse_host_port(value: &str) -> Option<u16> {
     value.rsplit_once(':')?.1.parse().ok()
 }
 
-/// Map an OTLP endpoint URL onto a NetworkPolicy egress target. Only
-/// in-cluster service DNS hosts (`<service>.<namespace>.svc[.<cluster-domain>]`)
-/// are mapped; the namespace label is the policy's `kubernetes.io/metadata.name`
+/// Map an OTLP/observability endpoint URL onto a NetworkPolicy egress target.
+/// Only in-cluster service DNS hosts (`<service>.<namespace>.svc[...]`) are
+/// mapped; the namespace label is the policy's `kubernetes.io/metadata.name`
 /// selector. Ports default by scheme when absent.
 fn parse_otlp_egress_target(endpoint: &str) -> Option<OtlpEgressTarget> {
     let trimmed = endpoint.trim();
@@ -2497,6 +2533,75 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(mock.sandbox.sandbox_otlp_egress_target().unwrap(), None);
+    }
+
+    #[test]
+    fn sandbox_observability_egress_absent_without_endpoint_env() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+        ])
+        .unwrap();
+
+        assert!(
+            args.sandbox
+                .sandbox_observability_egress_targets()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sandbox_observability_egress_uses_endpoint_env() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-extra-env",
+            r#"[
+                {"name":"VICTORIAMETRICS_URL","value":"http://victoriametrics.telemetry.svc:18428"},
+                {"name":"VICTORIALOGS_URL","value":"https://victorialogs.logs.svc.cluster.local"}
+            ]"#,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.sandbox_observability_egress_targets().unwrap(),
+            vec![
+                OtlpEgressTarget {
+                    namespace: "telemetry".to_owned(),
+                    port: 18428,
+                },
+                OtlpEgressTarget {
+                    namespace: "logs".to_owned(),
+                    port: 443,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_observability_egress_absent_for_mock_workload() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"VICTORIAMETRICS_URL","value":"http://victoriametrics.telemetry.svc:18428"}]"#,
+        ])
+        .unwrap();
+
+        assert!(
+            args.sandbox
+                .sandbox_observability_egress_targets()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The only test that mutates the process-level OTLP env keys: keeps all
