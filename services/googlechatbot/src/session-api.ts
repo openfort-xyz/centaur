@@ -128,6 +128,20 @@ export function isRetryableSessionApiError(error: unknown): boolean {
   return error.name === 'AbortError' || error.name === 'TypeError'
 }
 
+/** How an `/execute` failure relates to api-rs's one-active-execution-per-thread
+ * invariant. `conflict` is the typed 409; `recheck` is an opaque 500 that *may*
+ * be the same collision on servers that predate the typed conflict, so the
+ * caller must confirm a run is active before folding; `unrelated` is any other
+ * failure. */
+export type ExecuteConflictClass = 'conflict' | 'recheck' | 'unrelated'
+
+export function classifyExecuteConflict(error: unknown): ExecuteConflictClass {
+  if (!(error instanceof SessionApiError)) return 'unrelated'
+  if (error.status === 409) return 'conflict'
+  if (error.status === 500) return 'recheck'
+  return 'unrelated'
+}
+
 /**
  * Build the turn message executed for a Google Chat event, plus the prior
  * thread turns appended as context.

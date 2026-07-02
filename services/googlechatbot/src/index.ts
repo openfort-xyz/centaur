@@ -22,7 +22,9 @@ import {
   finalizeRender
 } from './renderer'
 import {
+  type GoogleChatTurnMessage,
   appendSessionMessages,
+  classifyExecuteConflict,
   createSession,
   executeSession,
   openSessionEventStream,
@@ -351,15 +353,30 @@ async function driveSession(
     }
 
     await appendSessionMessages(config, threadKey, history)
-    const execution = await executeSession(config, threadKey, execute, {
-      idleTimeoutMs: config.SESSION_IDLE_TIMEOUT_MS,
-      maxDurationMs: config.SESSION_MAX_DURATION_MS,
-      overrides: {
-        model: overrides.model,
-        provider: overrides.provider,
-        reasoning: overrides.reasoning
-      }
-    })
+    let execution
+    try {
+      execution = await executeSession(config, threadKey, execute, {
+        idleTimeoutMs: config.SESSION_IDLE_TIMEOUT_MS,
+        maxDurationMs: config.SESSION_MAX_DURATION_MS,
+        overrides: {
+          model: overrides.model,
+          provider: overrides.provider,
+          reasoning: overrides.reasoning
+        }
+      })
+    } catch (error) {
+      // The activeExecution check above is read-then-act: a run that starts
+      // between the check and this execute makes api-rs reject the second
+      // execute on its one-active-execution index (409 once api-rs types the
+      // conflict; an opaque 500 on older servers). Re-check and fold into the
+      // live run instead of erroring into the thread.
+      const folded = await foldIntoActiveRun(config, client, threadKey, execute, ackMessageName, error, {
+        conversationName: conversationName(event),
+        harnessType: overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+      })
+      if (folded) return
+      throw error
+    }
     const target = {
       spaceName: event.space_name,
       ackMessageName,
@@ -428,6 +445,50 @@ async function deliverDriveError(
   } catch (deliverError) {
     logError('googlechatbot_drive_error_delivery_failed', deliverError)
   }
+}
+
+/** Recovery for the execute-vs-execute race: when `/execute` is rejected
+ * because another run is already active for the thread, append the message so
+ * the live run picks it up (steering) and drop the redundant ack. Returns true
+ * when the message was folded and this event needs no run of its own. */
+async function foldIntoActiveRun(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  threadKey: string,
+  execute: GoogleChatTurnMessage,
+  ackMessageName: string,
+  error: unknown,
+  session: { conversationName?: string; harnessType?: string }
+): Promise<boolean> {
+  const conflictClass = classifyExecuteConflict(error)
+  if (conflictClass === 'unrelated') return false
+  let active = conflictClass === 'conflict'
+  if (!active) {
+    try {
+      // Same harness/name as the original createSession: a mismatched
+      // harness_type would turn this idempotent re-check into its own 409.
+      const recheck = await createSession(
+        config,
+        threadKey,
+        session.conversationName,
+        session.harnessType
+      )
+      active = recheck.activeExecution
+    } catch (recheckError) {
+      logWarn('googlechatbot_fold_recheck_failed', recheckError)
+      return false
+    }
+  }
+  if (!active) return false
+  await appendSessionMessages(config, threadKey, [execute])
+  await removeAck(client, ackMessageName)
+  incr('googlechatbot_runs_total', { outcome: 'folded' })
+  logWarn('googlechatbot_folded_into_active_run', {
+    thread_key: threadKey,
+    message_id: execute.id,
+    reason: 'execute_conflict'
+  })
+  return true
 }
 
 /** Best-effort removal of the eager "thinking…" ack when this event won't
