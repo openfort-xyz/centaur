@@ -20,6 +20,10 @@ use uuid::Uuid;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
+
+/// Event type of harness stdout lines recorded by the session runtime. Defined
+/// here so store queries and the runtime share one spelling.
+pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
 
 #[derive(Clone, Debug)]
@@ -313,9 +317,44 @@ impl PgSessionStore {
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(metadata)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(|error| match &error {
+            // `session_executions_one_active_idx` allows one queued/running
+            // execution per thread. Surface that as a typed conflict so the
+            // API can answer 409 instead of a generic 500.
+            sqlx::Error::Database(db)
+                if db.constraint() == Some("session_executions_one_active_idx") =>
+            {
+                SessionStoreError::ActiveExecutionConflict {
+                    thread_key: thread_key.as_str().to_owned(),
+                }
+            }
+            _ => SessionStoreError::Sqlx(error),
+        })?;
 
         row.try_into()
+    }
+
+    /// True when the harness has produced at least one output line for this
+    /// execution. Used by the input-ack watchdog to detect input that was
+    /// written into a dead session pipe and never reached the harness.
+    pub async fn execution_has_output(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1 from session_events
+                where execution_id = $1 and event_type = $2
+            )
+            "#,
+        )
+        .bind(execution_id)
+        .bind(SESSION_OUTPUT_LINE_EVENT)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
     }
 
     pub async fn active_execution_for_thread(
@@ -1420,6 +1459,8 @@ pub enum SessionStoreError {
         existing: Option<String>,
         requested: Option<String>,
     },
+    #[error("an execution is already active for session {thread_key}")]
+    ActiveExecutionConflict { thread_key: String },
     #[error("invalid persisted value: {0}")]
     InvalidPersistedValue(String),
     #[error("invalid notification payload on {channel}: {payload}: {error}")]

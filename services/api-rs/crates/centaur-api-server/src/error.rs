@@ -63,6 +63,9 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PersonaConflict {
                 ..
             })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(
+                SessionStoreError::ActiveExecutionConflict { .. },
+            )) => StatusCode::CONFLICT,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::NotFound(_)) => StatusCode::NOT_FOUND,
@@ -101,6 +104,14 @@ impl IntoResponse for ApiError {
             body["code"] = json!("harness_conflict");
             body["existing_harness"] = json!(existing);
             body["requested_harness"] = json!(requested);
+        }
+        if let Self::Runtime(SessionRuntimeError::Store(
+            SessionStoreError::ActiveExecutionConflict { .. },
+        )) = &self
+        {
+            // Lets bot clients fold the rejected turn into the run already in
+            // flight instead of surfacing an error into the thread.
+            body["code"] = json!("active_execution_conflict");
         }
         (status, Json(body)).into_response()
     }
