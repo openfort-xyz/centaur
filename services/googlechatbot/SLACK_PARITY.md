@@ -31,7 +31,7 @@ Legend: ✅ fixed in this pass · 🔜 follow-up (tracked, out of scope here) ·
 | 1.13 | Session titles | Assistant thread title from prompt + `renderer.title.update` | N/A — Chat has no thread-title API | 🟰 no platform surface |
 | 1.14 | Metrics depth | ~15 metric families (webhooks, forwards, renders, recovery, session-API ops, delivery status) | 3 counters (events, runs, resumes) | ✅ added session-API operation counters + delivery-outcome counter; full render-recovery families 🔜 with 1.6 |
 | 1.15 | Outbound post surface for workflows | None on the bot — api-rs posts straight to `chat.postMessage` with the bot token | `/api/chat/messages` CRUD guarded by `CHATBOT_API_KEY`; api-rs relays | 🟰 deliberate: keeps the Google SA credential in one place; Chat's model is strictly safer |
-| 1.16 | Agent file-upload destination context | "Slack Session Context" block (team/channel/thread_ts + `slack upload` example) | No upload path at all (`uploadAttachment` client method unused; google_chat tool has no upload) | 🔜 needs a `google_chat upload` tool command + context block |
+| 1.16 | Agent file uploads into the thread | "Slack Session Context" block (team/channel/thread_ts + `slack upload` example); agent uploads with the bot token | Dead `uploadAttachment` (wrong URL, app-auth token that `media.upload` rejects); no tool command; no context block | ✅ official DWD flow: `GOOGLECHATBOT_UPLOAD_USER` impersonation (`chat.messages.create`), multipart `media.upload` + attachment message, `/api/chat/attachments` relay route, `google-chat upload` tool command, "Google Chat Session Context" block on every turn |
 | 1.17 | Rich outbound payloads via workflow relay | `ctx.post_to_slack` supports blocks/unfurl/broadcast/thread_ts | `ctx.post_to_google_chat` supports text + thread_name only | 🟰 Chat cards are bot-rendered; overlay `_openfort_chat.py` handles formatting/chunking/threading client-side |
 
 ## 2. Platform surface (api-rs, workflows, chart, console, docs, tools)
@@ -51,7 +51,7 @@ Legend: ✅ fixed in this pass · 🔜 follow-up (tracked, out of scope here) ·
 | 2.11 | Archive import + DM sync (workflows, admin API, console UI) | Full pipeline | None | 🟰 Slack-export ZIPs and user-token DM scraping have no Google Chat analogue (Chat history comes via the same app-member API the sync already uses; Vault covers compliance export) |
 | 2.12 | Console sign-in / OAuth broker | Slack OIDC login + OAuth v2 user-token provider | None Chat-specific (Google OIDC login exists; bot auth is a service account, not a brokered user token) | 🟰 deliberate credential model difference |
 | 2.13 | Docs (centaur.run) | Quickstart, config reference, ETL page, permissioning examples | Zero mentions | 🔜 docs pass once feature set settles |
-| 2.14 | Agent comms tool | `slack` CLI ~26 commands incl. `health`, search, upload | `google_chat` CLI 4 commands (send/list/update/delete), no health | 🔜 at minimum `health` + `upload`; ties into 1.16 |
+| 2.14 | Agent comms tool | `slack` CLI ~26 commands incl. `health`, search, upload | `google_chat` CLI 4 commands (send/list/update/delete), no health | ✅ `upload` + `health` added; the long tail of Slack-specific commands (search, usergroups, dumps) 🟰 covered by ETL/company-context on the Chat side |
 | 2.15 | `centaur_investigator` thread-key resolution | `slack:` keys resolvable | `chat:spaces:` form not generated | ✅ added candidate form |
 | 2.16 | `centaur_sdk` helper | `current_slack_thread()` | none | ✅ `current_google_chat_space()` |
 | 2.17 | Demo workflow / delivery derivation | `tool_and_slack` workflow, `slack_channel` delivery objects | none | 🔜 low value; skip unless needed |
@@ -63,8 +63,17 @@ Legend: ✅ fixed in this pass · 🔜 follow-up (tracked, out of scope here) ·
 1. **State store for the bot** — unlocks 1.4 (sticky model overrides), 1.6 (crash-safe
    render obligations), cross-replica dedup. Recommended: reuse `@chat-adapter/state-pg`
    pattern or persist overrides in api-rs session metadata.
-2. **`google_chat upload` tool command + Session Context block** (1.16, 2.14) so agents
-   can deliver files into the thread like they do on Slack.
-3. **Backfill workflow + ETL metrics module** (2.8, 2.9).
-4. **Docs page for Google Chat setup/ETL** (2.13).
-5. **Dev/QA tooling** (2.19).
+2. **Backfill workflow + ETL metrics module** (2.8, 2.9).
+3. **Docs page for Google Chat setup/ETL** (2.13) — including the upload DWD admin grant.
+4. **Dev/QA tooling** (2.19).
+5. **`attachment.chunk` staging** for inbound files over the 25 MB inline cap (1.1).
+
+## 4. Deploy note: enabling uploads (1.16)
+
+Uploads need a one-time Workspace admin step, per the official Chat docs
+(`media.upload` rejects app auth): grant the service account's client ID
+domain-wide delegation for `https://www.googleapis.com/auth/chat.messages.create`
+(Admin console → Security → API controls → Domain-wide delegation), then set
+`googlechatbot.uploadUser` (chart) / `GOOGLECHATBOT_UPLOAD_USER` (env) to the
+impersonated user. Until then `/api/chat/attachments` fails closed with a 503
+explaining the setup.

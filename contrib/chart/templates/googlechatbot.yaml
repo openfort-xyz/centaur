@@ -65,6 +65,10 @@ spec:
             - name: GOOGLECHATBOT_ALLOWED_DOMAIN
               value: {{ .Values.googlechatbot.allowedDomain | quote }}
 {{- end }}
+{{- if .Values.googlechatbot.uploadUser }}
+            - name: GOOGLECHATBOT_UPLOAD_USER
+              value: {{ .Values.googlechatbot.uploadUser | quote }}
+{{- end }}
 {{- range $name, $value := .Values.googlechatbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

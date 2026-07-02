@@ -114,9 +114,12 @@ describe('executeSession', () => {
     const line = JSON.parse(body.input_lines[0]!) as {
       message: { content: Array<{ type: string; text?: string }> }
     }
-    expect(line.message.content[0]?.text).toStartWith('# Requester Context')
-    expect(line.message.content[0]?.text).toContain('Prompted by: Alice')
-    expect(line.message.content[1]?.text).toBe('deploy the thing')
+    expect(line.message.content[0]?.text).toStartWith('# Google Chat Session Context')
+    expect(line.message.content[0]?.text).toContain('spaces/AAAA')
+    expect(line.message.content[0]?.text).toContain(`thread_key: ${baseEvent.thread_key}`)
+    expect(line.message.content[1]?.text).toStartWith('# Requester Context')
+    expect(line.message.content[1]?.text).toContain('Prompted by: Alice')
+    expect(line.message.content[2]?.text).toBe('deploy the thing')
     expect(renderMetrics()).toContain(
       'googlechatbot_session_api_operations_total{operation="execute_session",outcome="success"} 1'
     )

@@ -96,3 +96,61 @@ def delete_message(
         return
 
     console.print(f"[green]Message deleted[/green] → {message_name}")
+
+
+@app.command()
+def upload(
+    space_name: str = typer.Argument(..., help="Google Chat space resource name, e.g. spaces/AAAA"),
+    file: str = typer.Argument(..., help="Path of the file to upload"),
+    thread_name: str | None = typer.Option(None, "--thread", help="Thread resource name to reply into"),
+    text: str | None = typer.Option(None, "--text", "-t", help="Caption to post with the file"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Upload a file into a Google Chat space (optionally threaded).
+
+    Examples:
+        google-chat upload spaces/AAAA report.pdf --thread spaces/AAAA/threads/BBBB
+        google-chat upload spaces/AAAA chart.png -t "Latency over the last week"
+    """
+    import base64
+    import mimetypes
+    from pathlib import Path
+
+    from .client import _client
+
+    path = Path(file)
+    if not path.is_file():
+        console.print(f"[red]Error: no such file: {file}[/red]")
+        raise typer.Exit(1)
+
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    client = _client()
+    result = client.upload_attachment(
+        space_name,
+        path.name,
+        base64.b64encode(path.read_bytes()).decode("ascii"),
+        mime_type=mime_type,
+        text=text,
+        thread_name=thread_name,
+    )
+
+    if json_output:
+        print(json.dumps(result, indent=2))
+        return
+
+    console.print(f"[green]File uploaded[/green] → {result.get('name', 'unknown')}")
+
+
+@app.command()
+def health():
+    """Assert googlechatbot connectivity with the unauthenticated health check."""
+    from .client import _client
+
+    try:
+        details = _client().health()
+        payload = {"ok": True, "tool": "google_chat", "error": None, "details": details}
+    except Exception as exc:
+        payload = {"ok": False, "tool": "google_chat", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        raise typer.Exit(1) from exc
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))

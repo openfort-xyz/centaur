@@ -375,6 +375,7 @@
         },
         "eventsPath": { "type": "string" },
         "allowedDomain": { "type": "string" },
+        "uploadUser": { "type": "string" },
         "ingress": {
           "type": "object",
           "properties": {

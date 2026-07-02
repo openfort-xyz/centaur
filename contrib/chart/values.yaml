@@ -497,6 +497,11 @@ googlechatbot:
   eventsPath: /api/chat/events
   # Comma/space-separated email-domain allowlist for inbound events. Empty = open to all domains.
   allowedDomain: ""
+  # Workspace user the service account impersonates for attachment uploads
+  # (Google Chat's media.upload rejects app auth). Requires a one-time admin
+  # domain-wide-delegation grant of chat.messages.create to the SA's client ID.
+  # Empty = the /api/chat/attachments route fails closed.
+  uploadUser: ""
   # Public ingress for the webhook. Separate from the slackbotv2 ingress (which owns "/").
   ingress:
     enabled: false

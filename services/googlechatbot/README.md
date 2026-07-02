@@ -48,7 +48,20 @@ See `.env.example`. Key variables:
 | `CENTAUR_API_URL` | `api-rs` base URL (default `http://127.0.0.1:8080`). |
 | `GOOGLECHATBOT_API_KEY` / `CENTAUR_API_KEY` | Bearer token for `api-rs`. |
 | `GOOGLECHATBOT_ALLOWED_DOMAIN` | Comma/space-separated email-domain allowlist (empty = open). |
+| `GOOGLECHATBOT_UPLOAD_USER` | Workspace user impersonated for attachment uploads (see below). Empty = uploads fail closed. |
 | `CHAT_EVENTS_PATH` | Webhook path (default `/api/chat/events`). |
+
+## Attachment uploads
+
+`POST /api/chat/attachments` (Bearer `CHATBOT_API_KEY`) uploads a file into a
+space and posts a message referencing it — the relay behind the `google-chat
+upload` agent tool. Google Chat's `media.upload` rejects app auth (`chat.bot`),
+so per the official docs the bot uses domain-wide delegation: a Workspace admin
+grants the service account's client ID the
+`https://www.googleapis.com/auth/chat.messages.create` scope
+(Admin console → Security → API controls → Domain-wide delegation), and the bot
+impersonates `GOOGLECHATBOT_UPLOAD_USER` for the upload and the message that
+carries it. The upload message is therefore authored by that user, not the app.
 
 ## Tests
 

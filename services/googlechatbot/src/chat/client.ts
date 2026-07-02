@@ -1,18 +1,23 @@
 import type { AppConfig } from '../config'
-import type { ChatListMessage, GoogleChatMessage } from './types'
+import type { ChatListMessage, GoogleChatMessage, UploadAttachmentResponse } from './types'
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1'
+const CHAT_UPLOAD_BASE = 'https://chat.googleapis.com/upload/v1'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 
 export class ChatEdgeClient {
   private accessToken: string | null = null
   private tokenExpiry = 0
+  private uploadUserToken: string | null = null
+  private uploadUserTokenExpiry = 0
   private readonly serviceAccountEmail: string | null
   private readonly privateKey: string | null
+  private readonly uploadUser: string
   private readonly apiTimeoutMs: number
 
   constructor(config: AppConfig) {
     this.apiTimeoutMs = config.GOOGLECHATBOT_CHAT_API_TIMEOUT_MS
+    this.uploadUser = config.GOOGLECHATBOT_UPLOAD_USER
     if (config.GOOGLE_SERVICE_ACCOUNT_JSON) {
       try {
         const parsed = JSON.parse(config.GOOGLE_SERVICE_ACCOUNT_JSON) as {
@@ -47,15 +52,53 @@ export class ChatEdgeClient {
       'https://www.googleapis.com/auth/chat.bot',
       'https://www.googleapis.com/auth/chat.app.messages.readonly'
     ].join(' ')
+    const grant = await this.exchangeJwtForToken(scope)
+    this.accessToken = grant.token
+    this.tokenExpiry = grant.expiry
+    return this.accessToken
+  }
+
+  /**
+   * Token for attachment uploads. media.upload rejects app auth (chat.bot) —
+   * the official headless path is domain-wide delegation: the SA impersonates
+   * a Workspace user (`sub` claim) with the chat.messages.create scope, so the
+   * upload AND the message referencing it both run as that user.
+   */
+  private async getUploadUserToken(): Promise<string | null> {
+    if (!this.canUploadAttachments()) return null
+
+    if (this.uploadUserToken && Date.now() < this.uploadUserTokenExpiry - 60_000) {
+      return this.uploadUserToken
+    }
+
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/chat.messages.create',
+      this.uploadUser
+    )
+    this.uploadUserToken = grant.token
+    this.uploadUserTokenExpiry = grant.expiry
+    return this.uploadUserToken
+  }
+
+  /** True when uploads are configured: SA credentials + a user to impersonate. */
+  canUploadAttachments(): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey && this.uploadUser)
+  }
+
+  private async exchangeJwtForToken(
+    scope: string,
+    sub?: string
+  ): Promise<{ token: string | null; expiry: number }> {
+    if (!this.serviceAccountEmail || !this.privateKey) return { token: null, expiry: 0 }
     const now = Math.floor(Date.now() / 1000)
-    const expiry = now + 3600
 
     const jwt = await createJWT({
       email: this.serviceAccountEmail,
       key: this.privateKey,
       scope,
+      sub,
       iat: now,
-      exp: expiry
+      exp: now + 3600
     })
 
     // Bound the token exchange too: it runs before every request()'s own timed
@@ -80,9 +123,10 @@ export class ChatEdgeClient {
       access_token?: string
       expires_in?: number
     }
-    this.accessToken = data.access_token ?? null
-    this.tokenExpiry = Date.now() + ((data.expires_in ?? 3600) - 120) * 1000
-    return this.accessToken
+    return {
+      token: data.access_token ?? null,
+      expiry: Date.now() + ((data.expires_in ?? 3600) - 120) * 1000
+    }
   }
 
   private async request<T = unknown>(
@@ -299,27 +343,55 @@ export class ChatEdgeClient {
 
   /**
    * Upload a file attachment to a space.
-   * Path: POST /upload/v1/spaces/{space}/attachments:upload
+   * Path: POST https://chat.googleapis.com/upload/v1/spaces/{space}/attachments:upload
+   *
+   * Official flow ("Upload media as a file attachment"): a multipart upload
+   * whose JSON metadata part carries the required UploadAttachmentRequest
+   * `filename`, followed by the media bytes. Runs on the impersonated-user
+   * token — app auth (chat.bot) is rejected by media.upload. The returned
+   * UploadAttachmentResponse is what a message's `attachment` list expects.
    */
   async uploadAttachment(
     spaceName: string,
     fileName: string,
     contentType: string,
     data: Uint8Array
-  ): Promise<{ attachmentDataRef?: { resourceName?: string } }> {
-    const token = await this.getAccessToken()
-    const url = `${CHAT_API_BASE}/upload/v1/spaces/${spaceName}/attachments:upload?uploadType=media`
+  ): Promise<UploadAttachmentResponse> {
+    const token = await this.getUploadUserToken()
+    if (!token) {
+      throw new Error(
+        'attachment uploads are not configured: set GOOGLECHATBOT_UPLOAD_USER '
+          + '(a Workspace user the service account may impersonate via '
+          + 'domain-wide delegation with the chat.messages.create scope)'
+      )
+    }
+
+    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    const url = `${CHAT_UPLOAD_BASE}/spaces/${id}/attachments:upload?uploadType=multipart`
+    const boundary = `centaur-upload-${crypto.randomUUID()}`
+    const encoder = new TextEncoder()
+    const head = encoder.encode(
+      `--${boundary}\r\n`
+        + 'Content-Type: application/json; charset=UTF-8\r\n\r\n'
+        + `${JSON.stringify({ filename: fileName })}\r\n`
+        + `--${boundary}\r\n`
+        + `Content-Type: ${contentType}\r\n\r\n`
+    )
+    const tail = encoder.encode(`\r\n--${boundary}--\r\n`)
+    const body = new Uint8Array(head.byteLength + data.byteLength + tail.byteLength)
+    body.set(head, 0)
+    body.set(data, head.byteLength)
+    body.set(tail, head.byteLength + data.byteLength)
 
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        'Content-Type': contentType,
-        'Content-Disposition': `attachment; filename="${fileName}"`,
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+        Authorization: `Bearer ${token}`
       },
       // Coerce to BufferSource — tsgo's BodyInit overload set rejects the bare
       // Uint8Array<ArrayBufferLike> shape Bun infers here.
-      body: data as BodyInit,
+      body: body as BodyInit,
       signal: AbortSignal.timeout(this.apiTimeoutMs)
     })
 
@@ -328,7 +400,52 @@ export class ChatEdgeClient {
       throw new Error(`Chat API upload failed: ${response.status} ${errorText}`)
     }
 
-    return (await response.json()) as { attachmentDataRef?: { resourceName?: string } }
+    return (await response.json()) as UploadAttachmentResponse
+  }
+
+  /**
+   * Create a message carrying an uploaded attachment.
+   * Path: POST /v1/spaces/{space}/messages
+   *
+   * Must run on the SAME impersonated-user credential as the upload — the
+   * attachment reference is bound to it, and app auth can't attach files.
+   */
+  async createAttachmentMessage(
+    spaceName: string,
+    attachment: UploadAttachmentResponse,
+    opts: { text?: string; threadName?: string } = {}
+  ): Promise<GoogleChatMessage> {
+    const token = await this.getUploadUserToken()
+    if (!token) {
+      throw new Error('attachment uploads are not configured: set GOOGLECHATBOT_UPLOAD_USER')
+    }
+
+    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    const body: Partial<GoogleChatMessage> = {
+      attachment: [attachment],
+      ...(opts.text ? { text: opts.text } : {})
+    }
+    if (opts.threadName) body.thread = { name: opts.threadName }
+    const path = opts.threadName
+      ? `spaces/${id}/messages?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
+      : `spaces/${id}/messages`
+
+    const response = await fetch(`${CHAT_API_BASE}/${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.apiTimeoutMs)
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Chat API attachment message failed: ${response.status} ${errorText}`)
+    }
+
+    return (await response.json()) as GoogleChatMessage
   }
 }
 
@@ -336,6 +453,8 @@ async function createJWT(opts: {
   email: string
   key: string
   scope: string
+  // Domain-wide delegation: the Workspace user to impersonate.
+  sub?: string
   iat: number
   exp: number
 }): Promise<string> {
@@ -345,7 +464,7 @@ async function createJWT(opts: {
   const payload = base64urlEncode(
     JSON.stringify({
       iss: opts.email,
-      sub: opts.email,
+      sub: opts.sub ?? opts.email,
       scope: opts.scope,
       aud: 'https://oauth2.googleapis.com/token',
       iat: opts.iat,

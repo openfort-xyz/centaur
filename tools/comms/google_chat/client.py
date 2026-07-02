@@ -126,6 +126,57 @@ class GoogleChatClient:
         response.raise_for_status()
         return response.json() if response.text else {}
 
+    def upload_attachment(
+        self,
+        space_name: str,
+        filename: str,
+        content_base64: str,
+        *,
+        mime_type: str | None = None,
+        text: str | None = None,
+        thread_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a file into a space via the bot's /api/chat/attachments relay.
+
+        The bot holds the upload credential (a domain-wide-delegation user
+        impersonation — Google Chat's media.upload rejects app auth), so this
+        tool only ships bytes; longer timeout because uploads can be large.
+        """
+        import httpx
+
+        base_url = _base_url()
+        body: dict[str, Any] = {
+            "space_name": space_name,
+            "filename": filename,
+            "content_base64": content_base64,
+        }
+        if mime_type:
+            body["mime_type"] = mime_type
+        if text:
+            body["text"] = text
+        if thread_name:
+            body["thread_name"] = thread_name
+
+        response = httpx.post(
+            f"{base_url}/api/chat/attachments",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        return response.json() if response.text else {}
+
+    def health(self) -> dict[str, Any]:
+        """Read the bot's unauthenticated /health endpoint."""
+        import httpx
+
+        response = httpx.get(f"{_base_url()}/health", timeout=10.0)
+        response.raise_for_status()
+        return response.json() if response.text else {}
+
 
 def _client() -> GoogleChatClient:
     return GoogleChatClient()

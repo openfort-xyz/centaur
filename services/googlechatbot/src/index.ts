@@ -36,6 +36,10 @@ type WaitUntilContext = { waitUntil(promise: Promise<unknown>): void }
 /** Bounded re-opens of a dropped SSE stream before we give up and deliver. */
 const MAX_RESUME_ATTEMPTS = 3
 
+// Outbound upload ceiling — matches slackbotv2's inline file cap; the Chat API
+// itself accepts up to 200MB per attachment.
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
 const WELCOME_TEXT =
   'Hi, Centaur at your service! I can help with software engineering tasks. ' +
   'Mention me in a thread to get started.'
@@ -173,6 +177,65 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
       return c.json({ ok: true })
     } catch (error) {
       logError('googlechatbot_outbound_delete_failed', error)
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
+    }
+  })
+
+  // Upload a file into a space (optionally threaded, with a caption). This is
+  // how agent tooling delivers files to the thread — the Slack analogue is the
+  // `slack upload` CLI hitting Slack directly; here the credential (a DWD
+  // user impersonation, see GOOGLECHATBOT_UPLOAD_USER) stays in the bot.
+  app.post('/api/chat/attachments', async c => {
+    const denied = requireOutboundAuth(c)
+    if (denied) return denied
+    if (!client.canUploadAttachments()) {
+      return c.json(
+        {
+          error:
+            'attachment uploads are not configured: set GOOGLECHATBOT_UPLOAD_USER '
+            + 'and grant the service account domain-wide delegation for the '
+            + 'chat.messages.create scope'
+        },
+        503
+      )
+    }
+    const body = (await c.req.json().catch(() => null)) as {
+      space_name?: string
+      filename?: string
+      content_base64?: string
+      mime_type?: string
+      text?: string
+      thread_name?: string
+    } | null
+    if (!body?.space_name || !body.filename || !body.content_base64) {
+      return c.json({ error: 'space_name, filename and content_base64 are required' }, 400)
+    }
+    let data: Uint8Array
+    try {
+      data = Uint8Array.from(Buffer.from(body.content_base64, 'base64'))
+    } catch {
+      return c.json({ error: 'content_base64 is not valid base64' }, 400)
+    }
+    if (data.byteLength === 0) return c.json({ error: 'content_base64 decoded to zero bytes' }, 400)
+    // Same 100MB ceiling slackbotv2 applies to inline file content; the Chat
+    // API itself allows up to 200MB per attachment.
+    if (data.byteLength > MAX_UPLOAD_BYTES) {
+      return c.json({ error: `attachment exceeds the ${MAX_UPLOAD_BYTES} byte limit` }, 413)
+    }
+    try {
+      const uploaded = await client.uploadAttachment(
+        body.space_name,
+        body.filename,
+        body.mime_type ?? 'application/octet-stream',
+        data
+      )
+      const sent = await client.createAttachmentMessage(body.space_name, uploaded, {
+        ...(body.text ? { text: body.text } : {}),
+        ...(body.thread_name ? { threadName: body.thread_name } : {})
+      })
+      return c.json(sent)
+    } catch (error) {
+      logError('googlechatbot_outbound_upload_failed', error)
       return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
     }
   })

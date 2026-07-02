@@ -141,6 +141,13 @@ export type GoogleChatMessage = {
     threadReply?: boolean
   }
   privateMessageViewer?: { name?: string }
+  // Outbound uploads: the whole UploadAttachmentResponse goes in this list,
+  // per the official "Upload media as a file attachment" flow.
+  attachment?: UploadAttachmentResponse[]
+}
+
+export type UploadAttachmentResponse = {
+  attachmentDataRef?: { resourceName?: string; attachmentUploadToken?: string }
 }
 
 export type GoogleChatCard = {

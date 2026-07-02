@@ -42,6 +42,9 @@ export type GoogleChatTurnMessage = {
   userId: string
   userName: string
   timestamp?: string
+  /** Upload destination for the session-context block (executing turn only). */
+  spaceName?: string
+  threadName?: string
 }
 
 type CreateSessionRequest = {
@@ -151,7 +154,9 @@ export function turnMessagesFromEvent(event: NormalizedChatEvent): {
     isMention: event.is_mention,
     userId: event.user_id,
     userName: event.user_name,
-    timestamp: event.chat.event_time
+    timestamp: event.chat.event_time,
+    spaceName: event.space_name,
+    threadName: event.chat.thread_name
   }
 
   return { execute, history }
@@ -357,9 +362,35 @@ function toCodexInputLine(
     ...(overrides?.reasoning ? { reasoning: overrides.reasoning } : {}),
     message: {
       role: 'user',
-      content: codexInputContent(message)
+      content: codexInputContent(threadKey, message)
     }
   })
+}
+
+/**
+ * Upload-destination block prepended to every executed turn, mirroring
+ * slackbotv2's "Slack Session Context". Gives the agent the exact space/thread
+ * resource names so `google-chat upload` can deliver files into this thread
+ * (the bot relays the upload; the DWD credential never leaves it).
+ */
+function chatSessionContext(message: GoogleChatTurnMessage, threadKey: string): string | undefined {
+  if (!message.spaceName) return undefined
+  const thread = message.threadName
+
+  const lines = [
+    '# Google Chat Session Context',
+    '',
+    'API-owned Google Chat upload destination for this turn:',
+    `- session_context.google_chat.space_name: ${message.spaceName}`,
+    ...(thread ? [`- session_context.google_chat.thread_name: ${thread}`] : []),
+    `- thread_key: ${threadKey}`,
+    '',
+    'Use these exact resource names for Google Chat file uploads in this thread.',
+    `Example: google-chat upload ${message.spaceName} /path/to/file${thread ? ` --thread ${thread}` : ''}`,
+    'Do not recover this destination with Google Chat search.',
+    '---'
+  ]
+  return lines.join('\n')
 }
 
 /**
@@ -396,8 +427,10 @@ function requesterIdentityContext(message: GoogleChatTurnMessage): string | unde
   return lines.join('\n')
 }
 
-function codexInputContent(message: GoogleChatTurnMessage): JsonValue[] {
+function codexInputContent(threadKey: string, message: GoogleChatTurnMessage): JsonValue[] {
   const content: JsonValue[] = []
+  const sessionContext = chatSessionContext(message, threadKey)
+  if (sessionContext) content.push({ type: 'text', text: sessionContext })
   const requesterContext = requesterIdentityContext(message)
   if (requesterContext) content.push({ type: 'text', text: requesterContext })
   if (message.text.trim()) content.push({ type: 'text', text: message.text })
