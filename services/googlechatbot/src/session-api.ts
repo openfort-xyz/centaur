@@ -84,6 +84,10 @@ export type ExecuteSessionResponse = {
 const ACTIVE_SESSION_STATUS = 'executing'
 
 type CreateSessionResponse = {
+  // api-rs returns the session object flat on the response body; the nested
+  // `session` shape never existed in api-rs and made activeExecution always
+  // false (so execute-vs-execute conflicts 500'd instead of folding).
+  status?: string
   session?: { status?: string }
 }
 
@@ -201,7 +205,7 @@ export async function createSession(
     })
   )
   const payload = (await response.json().catch(() => ({}))) as CreateSessionResponse
-  const status = payload.session?.status ?? ''
+  const status = payload.status ?? payload.session?.status ?? ''
   return { status, activeExecution: status === ACTIVE_SESSION_STATUS }
 }
 

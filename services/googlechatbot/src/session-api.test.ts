@@ -70,16 +70,24 @@ describe('createSession', () => {
   }
 
   test('reports an active execution when api-rs says the session is executing', async () => {
-    stubFetch({ session: { status: 'executing' }, harness_switched: false })
+    // api-rs returns the session fields flat on the response body — mirror the
+    // real shape here so the stub can't drift from production again.
+    stubFetch({ thread_key: 'chat:spaces:AAAA:threads:T1', status: 'executing', harness_switched: false })
     const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
     expect(result.status).toBe('executing')
     expect(result.activeExecution).toBe(true)
   })
 
   test('reports no active execution when the session is idle', async () => {
-    stubFetch({ session: { status: 'idle' }, harness_switched: false })
+    stubFetch({ thread_key: 'chat:spaces:AAAA:threads:T1', status: 'idle', harness_switched: false })
     const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
     expect(result.activeExecution).toBe(false)
+  })
+
+  test('tolerates the legacy nested session shape', async () => {
+    stubFetch({ session: { status: 'executing' } })
+    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(result.activeExecution).toBe(true)
   })
 
   test('tolerates a response without a session status', async () => {
