@@ -1,0 +1,33 @@
+name: Tool import check
+
+# Guards against centaur_sdk drift breaking tool CLIs at import time
+# (e.g. upstream #828 removed the Table re-export and silently broke every
+# tool that still imported it — the agent just loses the tool at runtime).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'centaur_sdk/**'
+      - 'tools/**'
+      - 'scripts/check_tool_imports.py'
+      - '.github/workflows/tool-import-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tool-imports:
+    name: Import tool CLIs against centaur_sdk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        run: python3 -m pip install --user uv
+
+      - name: Check tool imports
+        run: python3 scripts/check_tool_imports.py --sdk centaur_sdk .

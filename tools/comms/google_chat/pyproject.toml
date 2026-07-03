@@ -3,12 +3,9 @@ name = "google-chat"
 version = "0.1.0"
 description = "Google Chat messaging"
 requires-python = ">=3.11"
-# rich: importing `centaur_sdk` (for secret()/ToolContext) eagerly pulls in
-# centaur_sdk.cli_tables -> rich, so the tool needs rich installed even though
-# it renders no tables itself. Without it, `centaur-tools call google-chat ...`
-# fails with ModuleNotFoundError in the isolated per-tool uv env (e.g. the
-# workflow host's ctx.call_tool path). Matches every other centaur_sdk tool.
-dependencies = ["httpx", "rich>=13.0", "python-dotenv>=1.0.0"]
+# rich: the CLI renders tables directly via rich.table (centaur_sdk no longer
+# re-exports Table since upstream #828 removed the cli_tables helpers).
+dependencies = ["httpx", "typer>=0.12.0", "rich>=13.0", "python-dotenv>=1.0.0"]
 
 [project.scripts]
 google-chat = "centaur_tool_google_chat.cli:app"

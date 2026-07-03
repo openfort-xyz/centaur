@@ -7,7 +7,7 @@ load_dotenv()
 import json
 import typer
 from rich.console import Console
-from centaur_sdk import Table, render_text_table
+from rich.table import Table
 
 app = typer.Typer(name="google-chat", help="Google Chat CLI for AI agents")
 console = Console()
