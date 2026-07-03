@@ -26,10 +26,7 @@ pub(crate) fn user_input_to_anthropic_content(input: &[UserInput]) -> Vec<Value>
         .iter()
         .map(|item| match item {
             UserInput::Text { text, .. } => json!({"type": "text", "text": text}),
-            UserInput::Image { url, .. } => json!({
-                "type": "text",
-                "text": format!("[image: {url}]"),
-            }),
+            UserInput::Image { url, .. } => image_url_to_content_block(url),
             UserInput::LocalImage { path, .. } => json!({
                 "type": "text",
                 "text": format!("[local image: {}]", path.display()),
@@ -44,6 +41,50 @@ pub(crate) fn user_input_to_anthropic_content(input: &[UserInput]) -> Vec<Value>
             }),
         })
         .collect()
+}
+
+/// Convert an inline image URL into an Anthropic `image` content block.
+///
+/// Google Chat (unlike Slack, which uploads attachments to disk and passes them
+/// as file-backed `attachment` blocks) delivers pasted images as
+/// `UserInput::Image` carrying a `data:<mime>;base64,<data>` URL. Emitting that
+/// URL verbatim inside a `text` block inlined the entire base64 payload - often
+/// >2 MB / ~500k tokens - into the prompt, blowing past the model context
+/// window so every turn on the thread failed with "Prompt is too long".
+/// Emitting a real `image` block instead lets the model count it as (cheap)
+/// image tokens and actually see the picture.
+fn image_url_to_content_block(url: &str) -> Value {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, data)) = rest.split_once(',') {
+            let media_type = meta.split(';').next().unwrap_or("");
+            if meta.contains("base64") && !media_type.is_empty() && !data.is_empty() {
+                return json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                });
+            }
+        }
+        // Malformed or non-base64 data URL: never inline the raw payload as text.
+        return json!({
+            "type": "text",
+            "text": "[image: unsupported inline data URL omitted]",
+        });
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        });
+    }
+    // Unknown scheme: keep a short textual marker rather than the raw value.
+    json!({
+        "type": "text",
+        "text": format!("[image: {url}]"),
+    })
 }
 
 pub(crate) fn write_value<W: Write>(stdout: &mut W, value: &Value) -> Result<()> {
