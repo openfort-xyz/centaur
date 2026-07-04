@@ -9,6 +9,7 @@
     "moduleResolution": "Bundler",
     "types": ["bun", "node"],
     "skipLibCheck": true,
+    "resolveJsonModule": true,
     "esModuleInterop": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,

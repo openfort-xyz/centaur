@@ -63,6 +63,18 @@ const EnvSchema = z.object({
   // "https://centaur.example/sessions/{thread}". Button is omitted if unset.
   GOOGLECHATBOT_SESSION_URL_TEMPLATE: z.string().optional(),
 
+  // Public origin of the Console UI (same env name the Console and slackbotv2
+  // use). When set, the first assistant message in a Chat thread carries an
+  // "Open chat in Console · MODEL · Harness" line linking to the Console
+  // thread view. Unset = no line (matches slackbotv2).
+  CENTAUR_CONSOLE_PUBLIC_URL: z.string().optional(),
+
+  // Deployment defaults for the harness models (mirrored from sandbox.extraEnv
+  // by the chart, same as slackbotv2) so the Console-link line names the model
+  // sandboxes actually run instead of the repo-baked default.
+  CLAUDE_MODEL: z.string().optional(),
+  CODEX_MODEL: z.string().optional(),
+
   // Opt-in: continue a thread on a plain reply (no re-@mention), like Slack's
   // subscribed-thread mode. OFF by default — only enable when the app is
   // configured to receive all messages in the space, or it will not see replies.
