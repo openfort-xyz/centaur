@@ -134,16 +134,41 @@ def test_bad_mime_type_falls_back_to_octet_stream(monkeypatch) -> None:
     assert b"not a" not in body  # injection-shaped value is dropped
 
 
-def test_message_crud_still_hits_bot_relay(monkeypatch) -> None:
+def test_send_update_delete_hit_bot_relay(monkeypatch) -> None:
     fake = _patch_httpx(monkeypatch, {"upload": {}, "default": {"name": "ok"}})
     monkeypatch.setattr(gc, "_base_url", lambda: "http://chatbot:3002")
 
     client = _client()
     client.send_message("spaces/AAAA", "hi")
-    client.list_messages("spaces/AAAA")
     client.update_message("spaces/AAAA/messages/M", "edit")
     client.delete_message("spaces/AAAA/messages/M")
 
     for call in fake.calls:
         assert call["url"].startswith("http://chatbot:3002/api/chat/")
         assert call["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_list_messages_reads_chat_api_directly(monkeypatch) -> None:
+    # Reads go to the real Chat API (edge-injected app auth), NOT the relay a
+    # sandbox's CONNECT-only firewall cannot reach — so no Authorization header.
+    fake = _patch_httpx(monkeypatch, {"upload": {}, "default": {"messages": []}})
+
+    _client().list_messages("spaces/AAAA", page_size=7, filter='thread.name="spaces/AAAA/threads/T"')
+
+    call = fake.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://chat.googleapis.com/v1/spaces/AAAA/messages"
+    assert call["params"] == {"pageSize": 7, "filter": 'thread.name="spaces/AAAA/threads/T"'}
+    assert "Authorization" not in call["headers"]
+
+
+def test_health_probes_chat_api_with_configured_space(monkeypatch) -> None:
+    fake = _patch_httpx(monkeypatch, {"upload": {}, "default": {"messages": []}})
+    monkeypatch.setenv("GOOGLE_CHAT_SPACE_IDS", "AAQA42QLdws,AAQAOs")
+
+    result = _client().health()
+
+    call = fake.calls[0]
+    assert call["url"] == "https://chat.googleapis.com/v1/spaces/AAQA42QLdws/messages"
+    assert "Authorization" not in call["headers"]
+    assert result["reachable"] is True and result["space"] == "AAQA42QLdws"
