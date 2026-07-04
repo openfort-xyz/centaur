@@ -519,6 +519,20 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_includes sql, "t123"
   end
 
+  test "visible thread scope matches Google Chat threads by requester email" do
+    controller = threads_controller_for(@operator)
+
+    sql = controller.send(:visible_thread_scope).to_sql
+
+    # googlechatbot records the Chat sender's workspace email as user_email in
+    # the session metadata; console logins are Google SSO, so the signed-in
+    # email is the Chat identity — visibility needs no broker credential.
+    assert_includes sql, "thread_key LIKE 'chat:%'"
+    assert_includes sql, "metadata ->> 'platform' = 'googlechat'"
+    assert_includes sql, "metadata ->> 'source' = 'googlechatbot'"
+    assert_includes sql, @operator.email.downcase
+  end
+
   test "visible thread scope keeps current user's console threads without Slack OAuth" do
     controller = threads_controller_for(@operator)
     sql = controller.send(:visible_thread_scope).to_sql

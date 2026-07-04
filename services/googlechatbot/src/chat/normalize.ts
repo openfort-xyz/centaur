@@ -87,6 +87,11 @@ export async function normalizeChatEnvelope(
   const formattedText = isSlashCommand ? '' : message.formattedText ?? ''
 
   const displayName = message.sender.displayName ?? message.sender.email ?? senderName
+  // Requester email (same-workspace human senders carry it). Recorded in the
+  // session metadata so the Console can attribute the thread to the signed-in
+  // user — Openfort console logins are Google SSO, so the email IS the console
+  // identity (the Chat analogue of Slack's slack_user_id ownership, #875).
+  const userEmail = (message.sender.email ?? envelope.user?.email ?? '').trim()
 
   // Determine if the bot was @mentioned.
   // In Google Chat, mentions use <users/{botUserId}> syntax in message text.
@@ -124,6 +129,7 @@ export async function normalizeChatEnvelope(
     space_type: spaceType,
     user_id: senderName,
     user_name: displayName,
+    ...(userEmail ? { user_email: userEmail } : {}),
     is_mention: isMention,
     parts,
     chat: {

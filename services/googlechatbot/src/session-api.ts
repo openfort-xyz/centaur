@@ -41,6 +41,10 @@ export type GoogleChatTurnMessage = {
   isMention: boolean
   userId: string
   userName: string
+  /** Requester email when the Chat sender profile exposes it (see
+   * NormalizedChatEvent.user_email). Rides the session/message metadata so the
+   * Console can attribute the thread to the signed-in user (#875 analogue). */
+  userEmail?: string
   timestamp?: string
   /** Upload destination for the session-context block (executing turn only). */
   spaceName?: string
@@ -172,6 +176,7 @@ export function turnMessagesFromEvent(event: NormalizedChatEvent): {
     isMention: event.is_mention,
     userId: event.user_id,
     userName: event.user_name,
+    ...(event.user_email ? { userEmail: event.user_email } : {}),
     timestamp: event.chat.event_time,
     spaceName: event.space_name,
     threadName: event.chat.thread_name
@@ -180,11 +185,18 @@ export function turnMessagesFromEvent(event: NormalizedChatEvent): {
   return { execute, history }
 }
 
+export type SessionRequester = {
+  userId?: string
+  userName?: string
+  userEmail?: string
+}
+
 export async function createSession(
   config: AppConfig,
   threadKey: string,
   conversationName?: string,
-  harnessType?: string
+  harnessType?: string,
+  requester?: SessionRequester
 ): Promise<CreateSessionResult> {
   const name = conversationName?.trim()
   const body: CreateSessionRequest = {
@@ -193,6 +205,12 @@ export async function createSession(
       source: 'googlechatbot',
       platform: 'googlechat',
       thread_id: threadKey,
+      // Requester identity mirrored from slackbotv2's session metadata
+      // (slack_user_id/…): the Console matches user_email against the
+      // signed-in user's email to grant thread visibility (#875 analogue).
+      ...(requester?.userId ? { user_id: requester.userId } : {}),
+      ...(requester?.userName ? { user_name: requester.userName } : {}),
+      ...(requester?.userEmail ? { user_email: requester.userEmail } : {}),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }
@@ -367,6 +385,7 @@ function sessionMetadata(
     ...(message.timestamp ? { timestamp: message.timestamp } : {}),
     user_id: message.userId,
     user_name: message.userName,
+    ...(message.userEmail ? { user_email: message.userEmail } : {}),
     ...extra
   }
 }

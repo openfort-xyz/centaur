@@ -57,6 +57,7 @@ class Console::ThreadsController < ApplicationController
   SLACK_CREDENTIAL_EMAIL_LABEL_KEYS = %w[email slack_email].freeze
   SLACK_TEAM_LABEL = "slack_team_id"
   CONSOLE_THREAD_OWNER_METADATA_KEYS = %w[actor_email user_email].freeze
+  GOOGLECHAT_THREAD_OWNER_METADATA_KEYS = %w[user_email actor_email].freeze
   SLACK_USER_ID_PATTERN = /\A[UW][A-Z0-9]+\z/.freeze
   SLACK_MENTION_PATTERN = /<@([UW][A-Z0-9]+)(?:\|([^>]+))?>|@([UW][A-Z0-9]+)/.freeze
   READ_ONLY_REASON =
@@ -280,6 +281,7 @@ class Console::ThreadsController < ApplicationController
     slack_owners = slack_thread_owners_for_current_user
     conditions = [
       console_thread_owner_sql,
+      googlechat_thread_owner_sql,
       (slack_thread_owner_sql(slack_owners) if slack_owners.any?)
     ].compact
 
@@ -385,6 +387,27 @@ class Console::ThreadsController < ApplicationController
     end
 
     clauses.join(" OR ")
+  end
+
+  # Google Chat threads are owned by requester email: googlechatbot records
+  # the Chat sender's workspace email in the session metadata (user_email),
+  # and console logins are Google SSO, so the signed-in user's email IS the
+  # Chat identity — no broker credential or identity mapping needed. The Chat
+  # analogue of the Slack ownership clause below (#875).
+  def googlechat_thread_owner_sql
+    email = normalize_email(current_user&.email)
+    return if email.blank?
+
+    googlechat_source = [
+      "thread_key LIKE 'chat:%'",
+      "metadata ->> 'platform' = 'googlechat'",
+      "metadata ->> 'source' = 'googlechatbot'"
+    ].join(" OR ")
+    owner_clauses = GOOGLECHAT_THREAD_OWNER_METADATA_KEYS.map do |key|
+      "lower(metadata ->> #{sql_quote(key)}) = #{sql_quote(email)}"
+    end
+
+    "(#{googlechat_source}) AND (#{owner_clauses.join(" OR ")})"
   end
 
   def slack_thread_owner_sql(owners)

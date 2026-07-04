@@ -333,7 +333,12 @@ async function driveSession(
       config,
       threadKey,
       conversationName(event),
-      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
+      {
+        userId: event.user_id,
+        userName: event.user_name,
+        ...(event.user_email ? { userEmail: event.user_email } : {})
+      }
     )
 
     // A run is already in flight for this thread. Starting a second one would
