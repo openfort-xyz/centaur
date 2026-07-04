@@ -1544,7 +1544,21 @@ impl IronProxyArgs {
         let (ca_cert_secret_name, ca_key_secret_name) =
             ca.ok_or(ServerError::MissingIronProxyCaSecret)?;
 
-        let harness_fragments = self.harness.fragments()?;
+        // This config is baked into the locally-configured (unmanaged) egress
+        // proxy — the one that boots from a file with no IRON_CONTROL_PLANE_URL.
+        // It cannot resolve `token_broker` sources (only an iron-control-managed
+        // proxy can, via inline tokens delivered at sync), so strip them here or
+        // the proxy crashes building its pipeline. Managed proxies keep them:
+        // they register the unstripped infra fragment (see `infra_fragment`).
+        let harness_fragments = self
+            .harness
+            .fragments()?
+            .into_iter()
+            .map(|mut fragment| {
+                fragment.strip_broker_token_secrets();
+                fragment
+            })
+            .collect();
         let mut config =
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.image_pull_policy = self.image_pull_policy.clone();
