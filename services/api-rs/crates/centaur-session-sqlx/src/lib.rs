@@ -37,6 +37,28 @@ pub struct ClaimExecutionResult {
     pub claimed: bool,
 }
 
+/// An active execution whose stdout-owner lease was released by
+/// [`PgSessionStore::release_stdout_owned_executions`].
+#[derive(Clone, Debug)]
+pub struct ReleasedExecution {
+    pub execution_id: String,
+    pub thread_key: ThreadKey,
+}
+
+/// An active execution together with its stdout-owner lease state, as
+/// returned by [`PgSessionStore::list_active_executions_with_ownership`].
+/// The lease snapshot is advisory — only the conditional
+/// `claim_expired_stdout_owner` update decides ownership — but it lets an
+/// adoption scan skip executions with a live owner without touching the
+/// session row or the sandbox backend.
+#[derive(Clone, Debug)]
+pub struct ActiveExecutionOwnership {
+    pub execution: SessionExecution,
+    pub stdout_owner_id: Option<String>,
+    /// True when a stdout-owner lease exists and has not expired yet.
+    pub stdout_owner_lease_active: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdleSandboxCandidate {
     pub thread_key: ThreadKey,
@@ -135,7 +157,7 @@ impl PgSessionStore {
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
-            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
             from sessions
             where thread_key = $1
             "#,
@@ -359,6 +381,35 @@ impl PgSessionStore {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn list_active_executions_with_ownership(
+        &self,
+    ) -> Result<Vec<ActiveExecutionOwnership>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, ActiveExecutionOwnershipRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at,
+                   stdout_owner_id,
+                   coalesce(stdout_owner_lease_expires_at > now(), false) as stdout_owner_lease_active
+            from session_executions
+            where status in ($1, $2)
+            order by created_at, execution_id
+            "#,
+        )
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(ActiveExecutionOwnership {
+                    execution: row.execution.try_into()?,
+                    stdout_owner_id: row.stdout_owner_id,
+                    stdout_owner_lease_active: row.stdout_owner_lease_active,
+                })
+            })
+            .collect()
+    }
+
     pub async fn latest_execution_for_thread(
         &self,
         thread_key: &ThreadKey,
@@ -538,6 +589,60 @@ impl PgSessionStore {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn count_executions_with_stdout_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<u64, SessionStoreError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            select count(*)
+            from session_executions
+            where stdout_owner_id = $1 and status in ($2, $3)
+            "#,
+        )
+        .bind(owner_id)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
+    /// Releases every active stdout-owner lease held by `owner_id` in one
+    /// statement, returning the affected executions. Used by a clean
+    /// control-plane shutdown so a peer's adoption scan can claim the
+    /// executions immediately instead of waiting out the lease TTL.
+    pub async fn release_stdout_owned_executions(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<ReleasedExecution>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            r#"
+            update session_executions
+            set stdout_owner_id = null,
+                stdout_owner_lease_expires_at = null,
+                updated_at = now()
+            where stdout_owner_id = $1 and status in ($2, $3)
+            returning execution_id, thread_key
+            "#,
+        )
+        .bind(owner_id)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(execution_id, thread_key)| {
+                Ok(ReleasedExecution {
+                    execution_id,
+                    thread_key: parse_persisted(thread_key)?,
+                })
+            })
+            .collect()
     }
 
     pub async fn complete_execution(
@@ -1015,13 +1120,14 @@ impl PgSessionStore {
                 sandbox_id = $2,
                 sandbox_repo_cache_enabled = null,
                 sandbox_observability_enabled = null,
+                sandbox_api_server_enabled = null,
                 sandbox_last_active_at = case
                     when $2::text is null then null
                     else now()
                 end,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1045,16 +1151,18 @@ impl PgSessionStore {
                 sandbox_id = $2,
                 sandbox_repo_cache_enabled = $3,
                 sandbox_observability_enabled = $4,
+                sandbox_api_server_enabled = $5,
                 sandbox_last_active_at = now(),
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
         .bind(sandbox_id)
         .bind(capabilities.repo_cache_enabled)
         .bind(capabilities.observability_enabled)
+        .bind(capabilities.api_server_enabled)
         .fetch_one(&self.pool)
         .await?;
 
@@ -1073,6 +1181,7 @@ impl PgSessionStore {
                 sandbox_id = null,
                 sandbox_repo_cache_enabled = null,
                 sandbox_observability_enabled = null,
+                sandbox_api_server_enabled = null,
                 sandbox_last_active_at = null,
                 updated_at = now()
             where thread_key = $1 and sandbox_id = $2
@@ -1102,11 +1211,12 @@ impl PgSessionStore {
                 sandbox_id = null,
                 sandbox_repo_cache_enabled = null,
                 sandbox_observability_enabled = null,
+                sandbox_api_server_enabled = null,
                 sandbox_last_active_at = null,
                 status = $3,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1131,7 +1241,7 @@ impl PgSessionStore {
             update sessions
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1301,7 +1411,7 @@ impl PgSessionStore {
             update sessions
             set harness_thread_id = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1441,6 +1551,7 @@ struct SessionRow {
     sandbox_id: Option<String>,
     sandbox_repo_cache_enabled: Option<bool>,
     sandbox_observability_enabled: Option<bool>,
+    sandbox_api_server_enabled: Option<bool>,
     harness_type: String,
     harness_thread_id: Option<String>,
     persona_id: Option<String>,
@@ -1462,13 +1573,17 @@ impl TryFrom<SessionRow> for Session {
             sandbox_capabilities: match (
                 row.sandbox_repo_cache_enabled,
                 row.sandbox_observability_enabled,
+                row.sandbox_api_server_enabled,
             ) {
-                (Some(repo_cache_enabled), Some(observability_enabled)) => {
-                    Some(SandboxCapabilities {
-                        repo_cache_enabled,
-                        observability_enabled,
-                    })
-                }
+                (
+                    Some(repo_cache_enabled),
+                    Some(observability_enabled),
+                    Some(api_server_enabled),
+                ) => Some(SandboxCapabilities {
+                    repo_cache_enabled,
+                    observability_enabled,
+                    api_server_enabled,
+                }),
                 _ => None,
             },
             harness_type: parse_persisted(row.harness_type)?,
@@ -1526,6 +1641,14 @@ struct SessionExecutionRow {
     updated_at: OffsetDateTime,
     started_at: Option<OffsetDateTime>,
     completed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, FromRow)]
+struct ActiveExecutionOwnershipRow {
+    #[sqlx(flatten)]
+    execution: SessionExecutionRow,
+    stdout_owner_id: Option<String>,
+    stdout_owner_lease_active: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -1961,6 +2084,131 @@ mod tests {
         assert_eq!(
             completed.status,
             centaur_session_core::ExecutionStatus::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn releases_all_stdout_leases_held_by_one_owner() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let owner = format!("owner-{}", Uuid::new_v4().simple());
+        let peer = format!("peer-{}", Uuid::new_v4().simple());
+        let mut owned = Vec::new();
+        for label in ["a", "b"] {
+            let thread_key =
+                ThreadKey::parse(format!("test:handoff-{label}-{}", Uuid::new_v4())).unwrap();
+            store
+                .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+                .await
+                .expect("create session");
+            let execution_id = store
+                .create_execution(&thread_key, None, json!({}))
+                .await
+                .expect("create execution")
+                .execution
+                .execution_id;
+            store
+                .mark_execution_running(&execution_id)
+                .await
+                .expect("mark running");
+            assert!(
+                store
+                    .claim_stdout_owner(&execution_id, &owner, Duration::from_secs(60))
+                    .await
+                    .expect("claim stdout owner")
+            );
+            owned.push((execution_id, thread_key));
+        }
+        // A bystander owner's lease must survive the release untouched.
+        let bystander_thread =
+            ThreadKey::parse(format!("test:handoff-bystander-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&bystander_thread, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create bystander session");
+        let bystander_execution = store
+            .create_execution(&bystander_thread, None, json!({}))
+            .await
+            .expect("create bystander execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&bystander_execution)
+            .await
+            .expect("mark bystander running");
+        let bystander = format!("bystander-{}", Uuid::new_v4().simple());
+        assert!(
+            store
+                .claim_stdout_owner(&bystander_execution, &bystander, Duration::from_secs(60))
+                .await
+                .expect("claim bystander lease")
+        );
+        assert_eq!(
+            store
+                .count_executions_with_stdout_owner(&owner)
+                .await
+                .expect("count owned"),
+            2
+        );
+
+        let released = store
+            .release_stdout_owned_executions(&owner)
+            .await
+            .expect("release owned leases");
+        assert_eq!(released.len(), 2);
+        for (execution_id, thread_key) in &owned {
+            assert!(
+                released.iter().any(|execution| {
+                    execution.execution_id == *execution_id && execution.thread_key == *thread_key
+                }),
+                "released set must include {execution_id}"
+            );
+        }
+        assert_eq!(
+            store
+                .count_executions_with_stdout_owner(&owner)
+                .await
+                .expect("count after release"),
+            0
+        );
+
+        // Released leases are immediately claimable by a peer, without
+        // waiting for expiry.
+        assert!(
+            store
+                .claim_stdout_owner(&owned[0].0, &peer, Duration::from_secs(60))
+                .await
+                .expect("peer claims released lease")
+        );
+
+        assert_eq!(
+            store
+                .count_executions_with_stdout_owner(&bystander)
+                .await
+                .expect("count bystander"),
+            1,
+            "release must be scoped to the requested owner"
+        );
+        store
+            .fail_execution_if_active(&bystander_execution, "test cleanup")
+            .await
+            .expect("terminalize bystander");
+
+        // Terminal executions are never part of a release, even if a lease
+        // column is still populated.
+        for (execution_id, _) in &owned {
+            store
+                .fail_execution_if_active(execution_id, "test cleanup")
+                .await
+                .expect("terminalize execution");
+        }
+        assert!(
+            store
+                .release_stdout_owned_executions(&peer)
+                .await
+                .expect("release for peer")
+                .is_empty()
         );
     }
 

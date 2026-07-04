@@ -517,7 +517,8 @@ export async function forwardToSessionApi(
       input.executeContextMessages,
       input.contextPreamble,
       input.reasoning,
-      input.provider
+      input.provider,
+      input.metadataModel
     ),
     sessionApiTimeoutMs(options),
     'execute session'
@@ -670,6 +671,7 @@ type RequesterIdentity = {
   githubUnavailableReason?: string
   slackDisplayName?: string
   slackMention?: string
+  slackTeamId?: string
   slackUserId?: string
   slackUserName?: string
 }
@@ -817,14 +819,21 @@ function sessionRequesterMetadata(
   identity?: RequesterIdentity
 ): JsonObject {
   const slackUserId = identity?.slackUserId ?? messageRequesterUserId(message)
+  const slackTeamId = identity?.slackTeamId ?? messageSlackTeamId(message)
   const slackUserName = identity?.slackUserName ?? message?.author.userName
   const slackDisplayName = identity?.slackDisplayName ?? message?.author.fullName
   return {
     ...(slackUserId ? { slack_user_id: slackUserId } : {}),
+    ...(slackTeamId ? { slack_team_id: slackTeamId } : {}),
     ...(slackUserName ? { slack_user_name: slackUserName } : {}),
     ...(slackDisplayName ? { slack_display_name: slackDisplayName } : {}),
     ...(identity?.githubHandle ? { github_handle: identity.githubHandle } : {})
   }
+}
+
+function messageSlackTeamId(message: SlackbotV2ApiMessage | undefined): string | undefined {
+  if (!message) return undefined
+  return message.teamId || slackTeamId(message.raw) || rawSlackString(message.raw, 'team_id')
 }
 
 function messageRequesterUserId(message: SlackbotV2ApiMessage | undefined): string | undefined {
@@ -842,6 +851,7 @@ async function resolveRequesterIdentity(
   const identity: RequesterIdentity = {
     slackDisplayName: stringValue(message.author.fullName),
     slackMention: slackUserId ? `<@${slackUserId}>` : undefined,
+    slackTeamId: messageSlackTeamId(message),
     slackUserId,
     slackUserName: stringValue(message.author.userName)
   }
@@ -914,6 +924,7 @@ function mergeRequesterIdentity(
     ...cached,
     slackDisplayName: cached.slackDisplayName ?? fallback.slackDisplayName,
     slackMention: fallback.slackMention ?? cached.slackMention,
+    slackTeamId: fallback.slackTeamId ?? cached.slackTeamId,
     slackUserId: fallback.slackUserId ?? cached.slackUserId,
     slackUserName: cached.slackUserName ?? fallback.slackUserName
   }
@@ -1171,14 +1182,24 @@ async function executeSession(
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
   reasoning?: string,
-  provider?: string
+  provider?: string,
+  metadataModel?: string
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
   const idleTimeoutMs = sessionIdleTimeoutMs(options)
+  const recordedModel = metadataModel ?? model
   const body: SlackbotV2ExecuteSessionRequest = {
     idempotency_key: message.id,
-    metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
+    // Record the model this execution runs on (explicit override, else the
+    // configured/baked harness default) so readers like the Console can show
+    // it. Metadata only; the harness receives `model` via input_lines and only
+    // when explicitly overridden.
+    metadata: sessionMetadata(
+      message,
+      { action: 'execute', ...(recordedModel ? { model: recordedModel } : {}) },
+      requesterIdentity
+    ),
     input_lines: toCodexInputLines(
       message,
       threadId,
