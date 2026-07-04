@@ -144,8 +144,19 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     const spaceName = c.req.query('space_name')
     if (!spaceName) return c.json({ error: 'space_name is required' }, 400)
     const pageSize = Number(c.req.query('page_size') ?? '20') || 20
+    // `impersonate` (a requester email) lets reads fall back to DWD user auth so
+    // DM history is readable — app auth cannot read DMs. `filter` scopes to a
+    // single thread (thread.name = "..."), matching thread-history collection.
+    const impersonate = c.req.query('impersonate')
+    const filter = c.req.query('filter')
     try {
-      return c.json(await client.listMessages(spaceName, { pageSize }))
+      return c.json(
+        await client.listMessages(spaceName, {
+          pageSize,
+          ...(filter ? { filter } : {}),
+          ...(impersonate ? { impersonateSubject: impersonate } : {})
+        })
+      )
     } catch (error) {
       logError('googlechatbot_outbound_list_failed', error)
       return c.json({ error: error instanceof Error ? error.message : String(error) }, 502)
@@ -303,7 +314,8 @@ async function processChatEvent(
     spaceName: normalized.space_name,
     threadName: normalized.chat.thread_name,
     currentMessageName: normalized.message_id,
-    botUserName: botUser
+    botUserName: botUser,
+    ...(normalized.user_email ? { requesterEmail: normalized.user_email } : {})
   }).catch(error => {
     logWarn('googlechatbot_thread_history_failed', error)
     return [] as NonNullable<NormalizedChatEvent['history_messages']>

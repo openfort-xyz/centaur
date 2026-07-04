@@ -10,6 +10,9 @@ export class ChatEdgeClient {
   private tokenExpiry = 0
   private uploadUserToken: string | null = null
   private uploadUserTokenExpiry = 0
+  // DWD read tokens are keyed by the impersonated user (the requester), since a
+  // DM's history is only readable by that DM's human member — not a fixed user.
+  private readonly userReadTokens = new Map<string, { token: string | null; expiry: number }>()
   private readonly serviceAccountEmail: string | null
   private readonly privateKey: string | null
   private readonly uploadUser: string
@@ -85,6 +88,41 @@ export class ChatEdgeClient {
     return Boolean(this.serviceAccountEmail && this.privateKey && this.uploadUser)
   }
 
+  /**
+   * Token for READING messages as an impersonated Workspace user (domain-wide
+   * delegation). App auth (chat.bot / chat.app.messages.readonly) CANNOT read
+   * DM spaces — Google rejects it with 400 "DMs are not supported for methods
+   * requiring app authentication with administrator approval." The only headless
+   * way to read a DM's history is to impersonate a HUMAN member of that DM —
+   * i.e. the requester (`subject`), never a fixed service user, who would not be
+   * in someone else's DM. Scope is read-only so this grant can never write.
+   * Requires the SA's DWD client to be authorized for chat.messages.readonly in
+   * the Workspace Admin console (same client already authorized for
+   * chat.messages.create used by uploads). `subject` must be a user in the SA's
+   * Workspace domain; out-of-domain requesters cannot be impersonated and the
+   * token exchange will fail (caller degrades to app auth / empty history).
+   */
+  private async getUserReadToken(subject: string): Promise<string | null> {
+    if (!this.serviceAccountEmail || !this.privateKey || !subject) return null
+
+    const cached = this.userReadTokens.get(subject)
+    if (cached && cached.token && Date.now() < cached.expiry - 60_000) {
+      return cached.token
+    }
+
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/chat.messages.readonly',
+      subject
+    )
+    this.userReadTokens.set(subject, grant)
+    return grant.token
+  }
+
+  /** True when DWD user impersonation is possible: SA credentials are configured. */
+  canImpersonateUser(): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey)
+  }
+
   private async exchangeJwtForToken(
     scope: string,
     sub?: string
@@ -133,10 +171,11 @@ export class ChatEdgeClient {
     method: string,
     path: string,
     body?: unknown,
-    baseUrl = CHAT_API_BASE
+    baseUrl = CHAT_API_BASE,
+    tokenOverride?: string | null
   ): Promise<T> {
     const url = `${baseUrl}/${path.replace(/^\//, '')}`
-    const token = await this.getAccessToken()
+    const token = tokenOverride ?? (await this.getAccessToken())
     const response = await fetch(url, {
       method,
       headers: {
@@ -227,6 +266,11 @@ export class ChatEdgeClient {
    * to a single thread — this is how thread-history context is fetched after a
    * bot @mention. Requires `chat.app.messages.readonly` (admin-approved) or a
    * user-auth scope; the self-granted `chat.bot` scope is rejected with 403.
+   *
+   * App auth cannot read DM spaces at all (Google returns 400 "DMs are not
+   * supported for methods requiring app authentication..."). When that happens
+   * we transparently retry as the impersonated user (DWD), which is the only
+   * headless way to read a DM's history — mirroring how uploads impersonate.
    */
   async listMessages(
     spaceName: string,
@@ -235,6 +279,8 @@ export class ChatEdgeClient {
       pageToken?: string
       filter?: string
       orderBy?: string
+      /** Requester email to impersonate (DWD) if app auth is refused on a DM. */
+      impersonateSubject?: string
     } = {}
   ): Promise<{ messages?: ChatListMessage[]; nextPageToken?: string }> {
     const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
@@ -244,7 +290,28 @@ export class ChatEdgeClient {
     if (opts.filter) params.set('filter', opts.filter)
     if (opts.orderBy) params.set('orderBy', opts.orderBy)
     const query = params.toString()
-    return this.request('GET', `spaces/${id}/messages${query ? `?${query}` : ''}`)
+    const path = `spaces/${id}/messages${query ? `?${query}` : ''}`
+    try {
+      return await this.request('GET', path)
+    } catch (error) {
+      // DMs reject app auth; retry as the requesting human, the only member who
+      // can read the DM. No subject (e.g. out-of-domain requester) → give up.
+      if (!this.isAppAuthDmError(error) || !opts.impersonateSubject) throw error
+      const userToken = await this.getUserReadToken(opts.impersonateSubject)
+      if (!userToken) throw error
+      return await this.request('GET', path, undefined, CHAT_API_BASE, userToken)
+    }
+  }
+
+  /**
+   * True for the specific Google Chat failure where app auth is refused on a DM
+   * space. The message is stable ("DMs are not supported for methods requiring
+   * app authentication...") and rides a 400; match on it so we only fall back to
+   * the heavier user-impersonation path for this case, not for every read error.
+   */
+  private isAppAuthDmError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    return message.includes('DMs are not supported')
   }
 
   /**
