@@ -16,7 +16,13 @@ type ChatAttachment = NonNullable<NonNullable<GoogleChatEnvelope['message']>['at
 export interface ChatHistoryFetcher {
   listMessages(
     spaceName: string,
-    opts: { pageSize?: number; pageToken?: string; filter?: string; orderBy?: string }
+    opts: {
+      pageSize?: number
+      pageToken?: string
+      filter?: string
+      orderBy?: string
+      impersonateSubject?: string
+    }
   ): Promise<{ messages?: ChatListMessage[]; nextPageToken?: string }>
 }
 
@@ -223,6 +229,9 @@ export async function collectThreadHistory(
     threadName: string | undefined
     currentMessageName: string
     botUserName?: string
+    /** Requester email; used to read DM history as that user when app auth
+     * (which cannot read DMs) is refused. */
+    requesterEmail?: string
   }
 ): Promise<ChatHistoryMessage[]> {
   // No thread, or this message *is* the thread root → nothing earlier exists.
@@ -250,6 +259,7 @@ export async function collectThreadHistory(
         pageSize: 100,
         pageToken,
         filter,
+        ...(opts.requesterEmail ? { impersonateSubject: opts.requesterEmail } : {}),
         // Newest first so the cap drops the OLDEST messages — recency carries
         // the most context for a reply. Long threads will lose their head turn;
         // acceptable for an assistant in conversational use.
