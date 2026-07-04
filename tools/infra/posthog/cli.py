@@ -32,9 +32,28 @@ def health():
 console = Console()
 
 
+_SELECTED_PROJECT = {"name": "openfort"}
+
+
+@app.callback()
+def _main(
+    project: str = typer.Option(
+        "openfort",
+        "--project",
+        "-p",
+        help="PostHog project to query: 'openfort' (default) or 'farao'.",
+    ),
+) -> None:
+    """Select which PostHog project subsequent commands target."""
+    _SELECTED_PROJECT["name"] = project
+
+
 def get_client():
     from .client import PostHogClient
 
+    if _SELECTED_PROJECT["name"] == "farao":
+        # Proxy swaps FARAO_PID_PLACEHOLDER -> real id (op://.../FARAO_POSTHOG_PROJECT_ID).
+        return PostHogClient(project_id="FARAO_PID_PLACEHOLDER")
     return PostHogClient()
 
 
