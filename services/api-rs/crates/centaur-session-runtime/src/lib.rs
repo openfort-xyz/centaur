@@ -4,7 +4,10 @@ mod title_generator;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -39,10 +42,11 @@ use thiserror::Error;
 use tokio::{
     io,
     sync::Mutex,
-    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep},
+    time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
-use tracing::{Instrument, Span, error, info, info_span, warn};
+use tracing::{Instrument, Span, debug, error, info, info_span, warn};
+use uuid::Uuid;
 
 pub use cleanup::SessionSandboxCleanupConfig;
 pub use title_generator::SessionTitleGenerationError;
@@ -60,6 +64,15 @@ const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
+/// Executions are queued only between `create_execution` and the
+/// running transition a few statements later in `execute_session`, so a
+/// healthy row spends milliseconds in that state. An adoption scan racing a
+/// live `execute_session` (another control plane mid-rollout, or this
+/// process's own request handler) must not fail a young queued row it
+/// happens to observe in that window.
+const QUEUED_ORPHAN_GRACE: Duration = Duration::from_secs(120);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const OBSERVABILITY_TOOL_BLOCKLIST: &str =
@@ -72,6 +85,7 @@ type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type ToolHostCallLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type SessionTitleThreadSet = Arc<DashSet<ThreadKey>>;
 type SessionTitleGenerator = Arc<
     dyn Fn(String) -> BoxFuture<'static, Result<String, SessionTitleGenerationError>> + Send + Sync,
@@ -83,6 +97,7 @@ pub struct SessionRuntime {
     sandbox_runtime: SandboxRuntime,
     sandbox_pipes: SessionPipeMap,
     sandbox_pipe_open_locks: SessionPipeOpenLocks,
+    tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
@@ -92,6 +107,10 @@ pub struct SessionRuntime {
     session_title_rerun_requested: SessionTitleThreadSet,
     capacity: Option<Arc<SandboxCapacityController>>,
     stdout_owner_id: String,
+    /// Set once a shutdown handoff begins; fences new stdout-owner claims
+    /// so an execution cannot start on a control plane that is about to
+    /// exit and release its leases.
+    shutting_down: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -283,9 +302,51 @@ pub struct ExecuteSessionInput {
     pub max_duration_ms: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct ToolHostCallInput {
+    pub principal_id: String,
+    pub token_id: Option<String>,
+    pub tool_name: String,
+    pub method: String,
+    pub arguments: Value,
+    pub timeout: Duration,
+}
+
+#[derive(Debug)]
+pub struct ToolHostCallOutput {
+    pub sandbox_id: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_status: Option<i32>,
+    pub timed_out: bool,
+}
+
 #[derive(Clone)]
 struct SessionPipe {
     stdin: Arc<Mutex<SessionInputSink>>,
+}
+
+#[derive(Serialize)]
+struct ToolHostRequest {
+    id: String,
+    tool: String,
+    method: String,
+    arguments: Value,
+    principal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<String>,
+    timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct ToolHostResponse {
+    status: Option<i32>,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    timed_out: bool,
 }
 
 /// Shared handles threaded through background session tasks (stdout pump,
@@ -655,6 +716,25 @@ struct EnsureSessionSandboxRequest<'a> {
     execution_id: &'a str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SandboxBootMode {
+    Harness,
+    ToolHost { principal_id: String },
+}
+
+impl SandboxBootMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::ToolHost { .. } => "tool_host",
+        }
+    }
+
+    fn uses_warm_pool(&self) -> bool {
+        matches!(self, Self::Harness)
+    }
+}
+
 struct PersonaResolution {
     persona_id: Option<String>,
     context: Option<PersonaContext>,
@@ -668,6 +748,7 @@ impl SessionRuntime {
             sandbox_runtime,
             sandbox_pipes: Arc::new(DashMap::new()),
             sandbox_pipe_open_locks: Arc::new(DashMap::new()),
+            tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
             warm_pool: None,
@@ -677,6 +758,7 @@ impl SessionRuntime {
             session_title_rerun_requested: Arc::new(DashSet::new()),
             capacity: None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -777,7 +859,258 @@ impl SessionRuntime {
         }
     }
 
+    pub async fn run_tool_host_call(
+        &self,
+        input: ToolHostCallInput,
+    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+        let principal_id = input.principal_id.trim().to_owned();
+        let tool_name = input.tool_name.trim().to_owned();
+        let method = input.method.trim().to_owned();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "tool host principal_id is required".to_owned(),
+            ));
+        }
+        if tool_name.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "tool host tool_name is required".to_owned(),
+            ));
+        }
+        if method.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "tool host method is required".to_owned(),
+            ));
+        }
+        if input.timeout.is_zero() {
+            return Err(SessionRuntimeError::BadRequest(
+                "tool host timeout must be non-zero".to_owned(),
+            ));
+        }
+
+        let thread_key = tool_host_thread_key(&principal_id)?;
+        let input = ToolHostCallInput {
+            principal_id,
+            tool_name,
+            method,
+            ..input
+        };
+        let call_lock = self.tool_host_call_lock(&thread_key);
+        let result = {
+            let _call_guard = call_lock.lock().await;
+            self.locked_tool_host_call(&thread_key, input).await
+        };
+        // Drop our clone so an idle entry is only referenced by the map, then
+        // evict it; remove_if holds the shard lock, so no concurrent caller
+        // can clone the entry between the count check and the removal.
+        drop(call_lock);
+        self.tool_host_call_locks
+            .remove_if(thread_key.as_str(), |_, lock| Arc::strong_count(lock) == 1);
+        result
+    }
+
+    fn tool_host_call_lock(&self, thread_key: &ThreadKey) -> Arc<Mutex<()>> {
+        self.tool_host_call_locks
+            .entry(thread_key.as_str().to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn locked_tool_host_call(
+        &self,
+        thread_key: &ThreadKey,
+        input: ToolHostCallInput,
+    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+        let ToolHostCallInput {
+            principal_id,
+            token_id,
+            tool_name,
+            method,
+            arguments,
+            timeout,
+        } = input;
+        self.create_or_get_tool_host_session(thread_key, &principal_id)
+            .await?;
+
+        let request_id = format!("mcp-call-{}", Uuid::new_v4().simple());
+        let request = ToolHostRequest {
+            id: request_id.clone(),
+            tool: tool_name.clone(),
+            method: method.clone(),
+            arguments,
+            principal_id,
+            token_id,
+            timeout_seconds: timeout.as_secs().max(1),
+        };
+        let input_line = serde_json::to_string(&request).map_err(|error| {
+            SessionRuntimeError::Sandbox(SandboxError::io_source("encode tool host request", error))
+        })?;
+        let response_timeout = timeout.saturating_add(Duration::from_secs(5));
+        let execution = self
+            .execute_session(
+                thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some(request_id.clone()),
+                    metadata: Some(json!({
+                        "mcp_tool_host_call": true,
+                        "request_id": request_id,
+                        "tool": tool_name,
+                        "method": method,
+                        "timeout_ms": duration_millis_u64(timeout),
+                    })),
+                    input_lines: vec![input_line],
+                    idle_timeout_ms: None,
+                    max_duration_ms: Some(duration_millis_u64(response_timeout)),
+                },
+            )
+            .await?;
+        self.wait_for_tool_host_call(thread_key, &execution.execution_id, response_timeout)
+            .await
+    }
+
+    async fn create_or_get_tool_host_session(
+        &self,
+        thread_key: &ThreadKey,
+        principal_id: &str,
+    ) -> Result<(), SessionRuntimeError> {
+        let harness = self
+            .sandbox_runtime
+            .warm_harness
+            .clone()
+            .unwrap_or(HarnessType::Codex);
+        let metadata = tool_host_session_metadata(principal_id);
+        let session = self
+            .store
+            .create_or_get_session(thread_key, &harness, None, metadata)
+            .await?;
+        if self.iron_control.is_some()
+            && session.iron_control_principal.as_deref() != Some(principal_id)
+        {
+            self.store
+                .set_iron_control_principal(thread_key, Some(principal_id))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_tool_host_call(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        response_timeout: Duration,
+    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+        let events = self
+            .stream_events(thread_key, 0, Some(execution_id))
+            .await?;
+        futures_util::pin_mut!(events);
+        match timeout(response_timeout, async {
+            while let Some(event) = events.next().await {
+                let event = event?;
+                match event.event_type.as_str() {
+                    "session.execution_completed" => {
+                        return self.tool_host_completed_output(thread_key, &event).await;
+                    }
+                    "session.execution_failed" => {
+                        return self.tool_host_failed_output(thread_key, &event).await;
+                    }
+                    _ => {}
+                }
+            }
+            Err(SessionRuntimeError::Sandbox(SandboxError::io(
+                "session event stream ended before tool host call completed",
+            )))
+        })
+        .await
+        {
+            Ok(output) => output,
+            // Best-effort sandbox id: a store error must not replace the
+            // timeout result with an internal error.
+            Err(_) => Ok(ToolHostCallOutput {
+                sandbox_id: self
+                    .current_sandbox_id(thread_key)
+                    .await
+                    .unwrap_or_default(),
+                stdout: String::new(),
+                stderr: format!(
+                    "tool host call timed out after {} ms",
+                    response_timeout.as_millis()
+                ),
+                exit_status: None,
+                timed_out: true,
+            }),
+        }
+    }
+
+    async fn tool_host_completed_output(
+        &self,
+        thread_key: &ThreadKey,
+        event: &SessionEvent,
+    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+        let sandbox_id = self.current_sandbox_id(thread_key).await?;
+        let Some(result_text) = event.payload.get("result_text").and_then(Value::as_str) else {
+            return Ok(ToolHostCallOutput {
+                sandbox_id,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_status: Some(0),
+                timed_out: false,
+            });
+        };
+        let response = serde_json::from_str::<ToolHostResponse>(result_text).map_err(|error| {
+            SessionRuntimeError::Sandbox(SandboxError::io_source(
+                "decode tool host response",
+                error,
+            ))
+        })?;
+        Ok(ToolHostCallOutput {
+            sandbox_id,
+            stdout: response.stdout,
+            stderr: response.stderr,
+            exit_status: response.status,
+            timed_out: response.timed_out,
+        })
+    }
+
+    async fn tool_host_failed_output(
+        &self,
+        thread_key: &ThreadKey,
+        event: &SessionEvent,
+    ) -> Result<ToolHostCallOutput, SessionRuntimeError> {
+        let error = event
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("tool host execution failed")
+            .to_owned();
+        let timed_out = event
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == "max_duration_exceeded");
+        Ok(ToolHostCallOutput {
+            sandbox_id: self.current_sandbox_id(thread_key).await?,
+            stdout: String::new(),
+            stderr: error,
+            exit_status: None,
+            timed_out,
+        })
+    }
+
+    async fn current_sandbox_id(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<String, SessionRuntimeError> {
+        Ok(self
+            .store
+            .get_session(thread_key)
+            .await?
+            .sandbox_id
+            .unwrap_or_default())
+    }
+
     async fn claim_stdout_owner(&self, execution_id: &str) -> Result<(), SessionRuntimeError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
         let claimed = self
             .store
             .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
@@ -806,10 +1139,43 @@ impl SessionRuntime {
     }
 
     /// Attach an iron-control registrar so each new session upserts its
-    /// principal and assigns the configured roles.
+    /// principal and assigns it the configured roles.
     pub fn with_iron_control(mut self, registrar: SessionRegistrar) -> Self {
         self.iron_control = Some(registrar);
         self
+    }
+
+    /// Register the shared unauthenticated MCP tool-host principal when
+    /// iron-control is enabled, so proxy-backed tool calls can resolve an
+    /// effective config without minting per-user credentials in this layer.
+    pub async fn register_mcp_tool_host_principal(
+        &self,
+        principal_id: &str,
+    ) -> Result<String, SessionRuntimeError> {
+        let principal_id = principal_id.trim();
+        if principal_id.is_empty() {
+            return Err(SessionRuntimeError::BadRequest(
+                "mcp tool host principal_id is required".to_owned(),
+            ));
+        }
+        if principal_id.contains(':') {
+            return Err(SessionRuntimeError::BadRequest(
+                "mcp tool host principal_id must not contain ':'".to_owned(),
+            ));
+        }
+        let thread_key = tool_host_thread_key(principal_id)?;
+        if let Some(registrar) = &self.iron_control {
+            // Serialize with run_tool_host_call so concurrent registrations
+            // for the same principal cannot interleave with session setup.
+            let call_lock = self.tool_host_call_lock(&thread_key);
+            let _call_guard = call_lock.lock().await;
+            let metadata = tool_host_session_metadata(principal_id);
+            let principal = registrar
+                .register_session(thread_key.as_str(), Some(&metadata))
+                .await?;
+            return Ok(principal.id);
+        }
+        Ok(principal_id.to_owned())
     }
 
     pub fn with_warm_pool(mut self, config: WarmPoolConfig) -> Self {
@@ -1842,6 +2208,7 @@ impl SessionRuntime {
             desired_capabilities,
             execution_id,
         } = request;
+        let boot_mode = sandbox_boot_mode_for_thread(thread_key, iron_control_principal);
         let span = info_span!(
             "centaur.api_rs.sandbox.ensure",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1855,8 +2222,10 @@ impl SessionRuntime {
             existing_sandbox_id = existing_sandbox_id.unwrap_or(""),
             iron_control_principal_present = iron_control_principal.is_some(),
             persona_id = persona_id.unwrap_or(""),
+            sandbox_boot_mode = boot_mode.as_str(),
             sandbox_repo_cache_enabled = desired_capabilities.repo_cache_enabled,
             sandbox_observability_enabled = desired_capabilities.observability_enabled,
+            sandbox_api_server_enabled = desired_capabilities.api_server_enabled,
         );
         let ensure_started = Instant::now();
         let result = async {
@@ -1893,6 +2262,7 @@ impl SessionRuntime {
                         sandbox_id,
                         sandbox_repo_cache_enabled = desired_capabilities.repo_cache_enabled,
                         sandbox_observability_enabled = desired_capabilities.observability_enabled,
+                        sandbox_api_server_enabled = desired_capabilities.api_server_enabled,
                         "replacing existing sandbox whose capabilities do not match"
                     );
                 } else {
@@ -2063,7 +2433,8 @@ impl SessionRuntime {
                 .warm_pool
                 .as_ref()
                 .filter(|_| {
-                    warm_harness_matches
+                    boot_mode.uses_warm_pool()
+                        && warm_harness_matches
                         && warm_persona_matches
                         && desired_capabilities.is_default_enabled()
                 })
@@ -2138,6 +2509,7 @@ impl SessionRuntime {
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
+            apply_sandbox_boot_mode(&mut spec, &boot_mode);
             apply_sandbox_capabilities(&mut spec, desired_capabilities);
             let create_started = Instant::now();
             let handle = self
@@ -2211,6 +2583,7 @@ impl SessionRuntime {
         Ok(SessionSandboxCapabilities {
             repo_cache_enabled: principal.sandbox_repo_cache_enabled,
             observability_enabled: principal.sandbox_observability_enabled,
+            api_server_enabled: principal.sandbox_api_server_enabled,
         })
     }
 
@@ -2436,7 +2809,43 @@ impl SessionRuntime {
     ///    and re-arm the remaining max-duration deadline.
     /// 3. The sandbox is gone: record the failure honestly.
     pub async fn adopt_orphaned_executions(&self) {
-        let executions = match self.store.list_active_executions().await {
+        // A one-shot scan has no later tick to revisit skipped rows, so
+        // queued orphans are failed immediately regardless of age — the
+        // pre-rescan startup behavior.
+        self.run_orphan_adoption_scan(&mut OrphanAdoptionState::default(), None)
+            .await;
+    }
+
+    /// Re-run the orphan adoption scan every `interval` for the lifetime of
+    /// the process (the first scan runs immediately). A startup-only scan
+    /// misses executions orphaned after it ran — most commonly the previous
+    /// pod of a rolling deploy reaching its termination grace period
+    /// mid-turn after the new pod already scanned — and those stay wedged
+    /// until the next deploy.
+    pub fn spawn_orphan_adoption(&self, interval: Duration) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut state = OrphanAdoptionState::default();
+            let mut ticker = interval_at(Instant::now(), interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                runtime
+                    .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+                    .await;
+            }
+        });
+    }
+
+    /// One pass over all active executions. `queued_grace` is the minimum
+    /// age before a queued row is treated as orphaned; `None` fails queued
+    /// rows immediately and is only correct when no re-scan will follow.
+    async fn run_orphan_adoption_scan(
+        &self,
+        state: &mut OrphanAdoptionState,
+        queued_grace: Option<Duration>,
+    ) {
+        let executions = match self.store.list_active_executions_with_ownership().await {
             Ok(executions) => executions,
             Err(error) => {
                 warn!(
@@ -2449,37 +2858,135 @@ impl SessionRuntime {
             }
         };
         if executions.is_empty() {
+            state.deferred.clear();
             return;
         }
-        info!(
-            component = COMPONENT_SESSION_RUNTIME,
-            event = "execution_adoption_scan",
-            orphan_count = executions.len(),
-            "adopting executions orphaned by a previous control plane process"
-        );
-        for execution in executions {
-            if let Err(error) = self.adopt_orphaned_execution(&execution).await {
-                warn!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "execution_adoption_failed",
-                    thread_key = %execution.thread_key,
-                    execution_id = %execution.execution_id,
-                    %error,
-                    "failed to adopt orphaned execution; will retry on next startup"
-                );
+        let mut adopted = 0_usize;
+        let mut failed = 0_usize;
+        let mut skipped = 0_usize;
+        let mut own = 0_usize;
+        let mut deferred = HashSet::new();
+        for candidate in executions {
+            let execution_id = candidate.execution.execution_id.clone();
+            // Advisory fast path: a live lease means the execution has an
+            // active pump somewhere. Skip our own executions silently and
+            // defer peers' without touching the session row or the sandbox
+            // backend — the conditional claim below stays the sole authority
+            // on ownership.
+            if candidate.stdout_owner_lease_active {
+                if candidate.stdout_owner_id.as_deref() == Some(self.stdout_owner_id.as_str()) {
+                    own += 1;
+                    continue;
+                }
+                if !state.deferred.contains(&execution_id) {
+                    self.record_adoption_deferral(&candidate.execution).await;
+                }
+                deferred.insert(execution_id);
+                continue;
+            }
+            let record_deferral = !state.deferred.contains(&execution_id);
+            match self
+                .adopt_orphaned_execution(&candidate.execution, record_deferral, queued_grace)
+                .await
+            {
+                Ok(OrphanAdoption::Adopted) => adopted += 1,
+                Ok(OrphanAdoption::Failed) => failed += 1,
+                Ok(OrphanAdoption::Skipped) => skipped += 1,
+                Ok(OrphanAdoption::Deferred) => {
+                    deferred.insert(execution_id);
+                }
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_adoption_failed",
+                        thread_key = %candidate.execution.thread_key,
+                        execution_id = %candidate.execution.execution_id,
+                        %error,
+                        "failed to adopt orphaned execution; will retry on the next scan"
+                    );
+                    // Keep the dedup entry across transient errors so a
+                    // recovered deferral is not re-recorded.
+                    if state.deferred.contains(&execution_id) {
+                        deferred.insert(execution_id);
+                    }
+                }
             }
         }
+        state.deferred = deferred;
+        if adopted > 0 || failed > 0 {
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_adoption_scan",
+                adopted,
+                failed,
+                deferred = state.deferred.len(),
+                skipped,
+                own,
+                "adopted executions orphaned by a previous control plane process"
+            );
+        } else {
+            debug!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_adoption_scan",
+                adopted,
+                failed,
+                deferred = state.deferred.len(),
+                skipped,
+                own,
+                "orphan adoption scan found nothing adoptable"
+            );
+        }
+    }
+
+    async fn record_adoption_deferral(&self, execution: &SessionExecution) {
+        info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "execution_adoption_deferred",
+            thread_key = %execution.thread_key,
+            execution_id = %execution.execution_id,
+            "active stdout owner lease still exists; deferring adoption"
+        );
+        let _ = self
+            .store
+            .append_event(
+                &execution.thread_key,
+                Some(&execution.execution_id),
+                "session.execution_adoption_deferred",
+                json!({ "reason": "stdout_owner_lease_active" }),
+            )
+            .await;
     }
 
     async fn adopt_orphaned_execution(
         &self,
         execution: &SessionExecution,
-    ) -> Result<(), SessionRuntimeError> {
+        record_deferral: bool,
+        queued_grace: Option<Duration>,
+    ) -> Result<OrphanAdoption, SessionRuntimeError> {
         let thread_key = &execution.thread_key;
         let execution_id = execution.execution_id.as_str();
         if execution.status == ExecutionStatus::Queued {
             // Input is only written after an execution is marked running, so
             // a queued orphan never reached the harness: nothing can come.
+            // On a periodic scan, young queued rows are skipped instead of
+            // failed: they are most likely a live execute_session observed
+            // mid-transition, and a later tick revisits them.
+            if let Some(grace) = queued_grace {
+                let age = SystemTime::now()
+                    .duration_since(SystemTime::from(execution.created_at))
+                    .unwrap_or_default();
+                if age < grace {
+                    debug!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_adoption_skipped",
+                        thread_key = %thread_key,
+                        execution_id,
+                        age_ms = duration_millis_u64(age),
+                        "skipping young queued execution; a live execute may still claim it"
+                    );
+                    return Ok(OrphanAdoption::Skipped);
+                }
+            }
             self.fail_orphaned_execution(
                 thread_key,
                 execution_id,
@@ -2487,7 +2994,7 @@ impl SessionRuntime {
                 "orphaned before input was sent",
             )
             .await;
-            return Ok(());
+            return Ok(OrphanAdoption::Failed);
         }
         let session = self.store.get_session(thread_key).await?;
         let Some(sandbox_id) = session.sandbox_id.as_deref() else {
@@ -2498,7 +3005,7 @@ impl SessionRuntime {
                 "orphaned with no sandbox assigned",
             )
             .await;
-            return Ok(());
+            return Ok(OrphanAdoption::Failed);
         };
         let id = SandboxId::new(sandbox_id);
         let status = match self.sandbox_runtime.manager.status(&id).await {
@@ -2516,27 +3023,25 @@ impl SessionRuntime {
                 &format!("sandbox no longer accepts io (status {status:?})"),
             )
             .await;
-            return Ok(());
+            return Ok(OrphanAdoption::Failed);
         }
         if !self.claim_expired_stdout_owner(execution_id).await? {
-            info!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "execution_adoption_deferred",
-                thread_key = %thread_key,
-                execution_id,
-                sandbox_id,
-                "active stdout owner lease still exists; deferring adoption"
-            );
-            let _ = self
-                .store
-                .append_event(
-                    thread_key,
-                    Some(execution_id),
-                    "session.execution_adoption_deferred",
-                    json!({ "sandbox_id": sandbox_id, "reason": "stdout_owner_lease_active" }),
-                )
-                .await;
-            return Ok(());
+            // Deferrals repeat on every periodic scan while another control
+            // plane pumps the execution; only the first observation is worth
+            // an info log and a durable event.
+            if record_deferral {
+                self.record_adoption_deferral(execution).await;
+            } else {
+                debug!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_deferred",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    "active stdout owner lease still exists; deferring adoption"
+                );
+            }
+            return Ok(OrphanAdoption::Deferred);
         }
 
         // The turn may have finished while no control plane was attached. An
@@ -2591,7 +3096,7 @@ impl SessionRuntime {
                 terminal,
             )
             .await?;
-            return Ok(());
+            return Ok(OrphanAdoption::Adopted);
         }
 
         // No terminal in the recorded output: treat the turn as still in
@@ -2634,7 +3139,7 @@ impl SessionRuntime {
                 idle_timeout_from_execution(execution),
             );
         }
-        Ok(())
+        Ok(OrphanAdoption::Adopted)
     }
 
     async fn fail_orphaned_execution(
@@ -2668,6 +3173,147 @@ impl SessionRuntime {
             );
         }
     }
+
+    /// Hands off this control plane's in-flight executions before process
+    /// exit. Waits up to `timeout` for owned executions to finish naturally
+    /// (their stdout pumps keep running until the process exits), then
+    /// releases the remaining stdout-owner leases so another control
+    /// plane's adoption scan can claim the executions right away instead of
+    /// waiting out the lease TTL. Turn output produced after the release is
+    /// not lost: adoption replays it from the sandbox backend's recorded
+    /// output.
+    pub async fn handoff_owned_executions(&self, timeout: Duration) {
+        // Fence new stdout-owner claims first: an execution accepted after
+        // this point would otherwise claim a lease that outlives the
+        // process, stranding it until the lease TTL expires.
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        loop {
+            let count = tokio::time::timeout(
+                EXECUTION_HANDOFF_DB_TIMEOUT,
+                self.store
+                    .count_executions_with_stdout_owner(&self.stdout_owner_id),
+            )
+            .await;
+            let Ok(count) = count else {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_handoff_count_timeout",
+                    "timed out counting in-flight executions; releasing leases now"
+                );
+                break;
+            };
+            match count {
+                Ok(0) => {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_handoff_idle",
+                        "no in-flight executions to hand off at shutdown"
+                    );
+                    return;
+                }
+                Ok(in_flight) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_handoff_waiting",
+                        in_flight,
+                        "waiting for in-flight executions to finish before shutdown"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_handoff_count_failed",
+                        %error,
+                        "failed to count in-flight executions; releasing leases now"
+                    );
+                    break;
+                }
+            }
+            sleep(EXECUTION_HANDOFF_POLL_INTERVAL).await;
+        }
+        let released = tokio::time::timeout(
+            EXECUTION_HANDOFF_DB_TIMEOUT,
+            self.store
+                .release_stdout_owned_executions(&self.stdout_owner_id),
+        )
+        .await;
+        let Ok(released) = released else {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "execution_handoff_release_timeout",
+                "timed out releasing stdout-owner leases; peers must wait for lease expiry"
+            );
+            return;
+        };
+        match released {
+            Ok(released) => {
+                for execution in &released {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_handoff_released",
+                        thread_key = %execution.thread_key,
+                        execution_id = %execution.execution_id,
+                        "released stdout-owner lease at shutdown for adoption by a peer"
+                    );
+                    let _ = self
+                        .store
+                        .append_event(
+                            &execution.thread_key,
+                            Some(&execution.execution_id),
+                            "session.stdout_owner_released",
+                            json!({
+                                "execution_id": execution.execution_id,
+                                "reason": "control_plane_shutdown",
+                            }),
+                        )
+                        .await;
+                }
+                if released.is_empty() {
+                    info!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "execution_handoff_idle",
+                        "in-flight executions finished during the shutdown drain"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_handoff_release_failed",
+                    %error,
+                    "failed to release stdout-owner leases at shutdown"
+                );
+            }
+        }
+    }
+}
+
+/// Outcome of one orphan-adoption attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrphanAdoption {
+    /// Terminal output was recovered or a live pump was re-attached.
+    Adopted,
+    /// Another control plane still holds the stdout-owner lease.
+    Deferred,
+    /// The execution was failed as unrecoverable.
+    Failed,
+    /// Too young to judge (freshly queued); revisit on a later scan.
+    Skipped,
+}
+
+/// Scan state carried across periodic orphan-adoption ticks.
+#[derive(Debug, Default)]
+struct OrphanAdoptionState {
+    /// Executions whose deferral was already recorded, so long-lived leases
+    /// do not produce a `session.execution_adoption_deferred` event on every
+    /// tick.
+    deferred: HashSet<String>,
 }
 
 async fn maybe_generate_session_title(
@@ -4639,6 +5285,7 @@ fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSand
     spec.capabilities = BackendSandboxCapabilities {
         repo_cache_enabled: capabilities.repo_cache_enabled,
         observability_enabled: capabilities.observability_enabled,
+        api_server_enabled: capabilities.api_server_enabled,
     };
     upsert_spec_env(
         spec,
@@ -4649,6 +5296,11 @@ fn apply_sandbox_capabilities(spec: &mut SandboxSpec, capabilities: &SessionSand
         spec,
         "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED",
         capabilities.observability_enabled.to_string(),
+    );
+    upsert_spec_env(
+        spec,
+        "CENTAUR_SANDBOX_API_SERVER_ENABLED",
+        capabilities.api_server_enabled.to_string(),
     );
     if !capabilities.repo_cache_enabled {
         spec.mounts
@@ -4751,6 +5403,7 @@ fn execution_duration(execution: &SessionExecution) -> Option<Duration> {
 fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     match error {
         SessionRuntimeError::BadRequest(_) => "bad_request",
+        SessionRuntimeError::ShuttingDown => "shutting_down",
         SessionRuntimeError::Store(_) => "store",
         SessionRuntimeError::Sandbox(SandboxError::NotFound(_)) => "sandbox_not_found",
         SessionRuntimeError::Sandbox(SandboxError::Unsupported { .. }) => "sandbox_unsupported",
@@ -5568,6 +6221,66 @@ fn nonzero_duration_millis(value: u64) -> Result<Duration, SessionRuntimeError> 
     Ok(Duration::from_millis(value))
 }
 
+fn tool_host_thread_key(principal_id: &str) -> Result<ThreadKey, SessionRuntimeError> {
+    ThreadKey::parse(format!("mcp:{principal_id}"))
+        .map_err(|error| SessionRuntimeError::BadRequest(error.to_string()))
+}
+
+/// Session/principal metadata recorded for observability; runtime behavior
+/// derives from the `mcp:` thread-key prefix, not from these fields.
+fn tool_host_session_metadata(principal_id: &str) -> Value {
+    json!({
+        "mcp_tool_host": true,
+        "mcp_principal_id": principal_id,
+    })
+}
+
+fn sandbox_boot_mode_for_thread(
+    thread_key: &ThreadKey,
+    iron_control_principal: Option<&str>,
+) -> SandboxBootMode {
+    let Some(thread_principal_id) = thread_key.as_str().strip_prefix("mcp:") else {
+        return SandboxBootMode::Harness;
+    };
+    let principal_id = iron_control_principal
+        .unwrap_or(thread_principal_id)
+        .to_owned();
+    SandboxBootMode::ToolHost { principal_id }
+}
+
+fn apply_sandbox_boot_mode(spec: &mut SandboxSpec, boot_mode: &SandboxBootMode) {
+    let SandboxBootMode::ToolHost { principal_id } = boot_mode else {
+        return;
+    };
+    spec.labels
+        .insert("centaur.ai/component".to_owned(), "tool-host".to_owned());
+    spec.labels
+        .insert("centaur.ai/workload".to_owned(), "mcp-tool-host".to_owned());
+    if !principal_id.trim().is_empty() {
+        spec.iron_control_principal = Some(principal_id.to_owned());
+        upsert_spec_env(spec, "CENTAUR_MCP_PRINCIPAL_ID", principal_id.to_owned());
+    }
+    configure_tool_host_command(spec);
+}
+
+fn configure_tool_host_command(spec: &mut SandboxSpec) {
+    if should_preserve_entrypoint_for_tool_host(spec) {
+        spec.command = Some(vec!["/entrypoint.sh".to_owned()]);
+        spec.args = vec!["centaur-tool-host".to_owned()];
+    } else {
+        spec.command = Some(vec!["centaur-tool-host".to_owned()]);
+        spec.args.clear();
+    }
+}
+
+fn should_preserve_entrypoint_for_tool_host(spec: &SandboxSpec) -> bool {
+    spec.command
+        .as_ref()
+        .and_then(|command| command.first())
+        .is_some_and(|program| program == "/entrypoint.sh")
+        || spec.args.first().is_some_and(|arg| arg == "harness-server")
+}
+
 fn execution_metadata(
     metadata: Option<Value>,
     idle_timeout_ms: Option<u64>,
@@ -5667,6 +6380,8 @@ pub fn final_answer_text_from_output_lines(lines: &[String]) -> String {
 pub enum SessionRuntimeError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("control plane is shutting down")]
+    ShuttingDown,
     #[error(transparent)]
     Store(#[from] SessionStoreError),
     #[error(transparent)]
@@ -5720,6 +6435,23 @@ mod tests {
                 .is_none()
         );
         assert!(PersonaRegistry::new(Vec::new(), Some("missing".to_owned()), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn tool_host_command_preserves_sandbox_entrypoint_for_tool_setup() {
+        let thread_key = ThreadKey::parse("mcp:test").unwrap();
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [("TOOL_DIRS".to_owned(), "/app/tools".to_owned())],
+            HarnessType::Codex,
+        );
+        let mut spec = workload.spec(&thread_key, &HarnessType::Codex, None);
+
+        configure_tool_host_command(&mut spec);
+
+        assert_eq!(spec.command, Some(vec!["/entrypoint.sh".to_owned()]));
+        assert_eq!(spec.args, vec!["centaur-tool-host"]);
+        assert_eq!(env_value(&spec, "TOOL_DIRS"), Some("/app/tools"));
     }
 
     #[test]
@@ -7031,6 +7763,37 @@ mod adoption_tests {
         execution_id
     }
 
+    /// Ages an execution row past `QUEUED_ORPHAN_GRACE` so adoption treats it
+    /// as a genuine orphan instead of a young row racing a live execute.
+    async fn backdate_execution(store: &PgSessionStore, execution_id: &str, seconds: f64) {
+        let result = sqlx::query(
+            "update session_executions set created_at = created_at - make_interval(secs => $2) \
+             where execution_id = $1",
+        )
+        .bind(execution_id)
+        .bind(seconds)
+        .execute(store.pool())
+        .await
+        .expect("backdate execution");
+        assert_eq!(result.rows_affected(), 1, "expected to backdate one row");
+    }
+
+    /// Expires an execution's stdout-owner lease in place, simulating an
+    /// owner that died without releasing, deterministically (no sleeps
+    /// racing real lease TTLs).
+    async fn expire_stdout_lease(store: &PgSessionStore, execution_id: &str) {
+        let result = sqlx::query(
+            "update session_executions \
+             set stdout_owner_lease_expires_at = now() - interval '1 second' \
+             where execution_id = $1",
+        )
+        .bind(execution_id)
+        .execute(store.pool())
+        .await
+        .expect("expire stdout lease");
+        assert_eq!(result.rows_affected(), 1, "expected to expire one lease");
+    }
+
     async fn wait_for_event(store: &PgSessionStore, thread_key: &ThreadKey, event_type: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -7204,6 +7967,7 @@ mod adoption_tests {
         SessionSandboxCapabilities {
             repo_cache_enabled: false,
             observability_enabled: false,
+            api_server_enabled: false,
         }
     }
 
@@ -7299,8 +8063,13 @@ mod adoption_tests {
         let spec = backend.created_specs().pop().expect("created cold spec");
         assert!(!spec.capabilities.repo_cache_enabled);
         assert!(!spec.capabilities.observability_enabled);
+        assert!(!spec.capabilities.api_server_enabled);
         assert_eq!(
             env_value(&spec, "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED"),
+            Some("false")
+        );
+        assert_eq!(
+            env_value(&spec, "CENTAUR_SANDBOX_API_SERVER_ENABLED"),
             Some("false")
         );
         let blocklist = env_value(&spec, "TOOL_BLOCKLIST").unwrap_or("");
@@ -7383,6 +8152,7 @@ mod adoption_tests {
         let spec = backend.created_specs().pop().expect("created cold spec");
         assert!(!spec.capabilities.repo_cache_enabled);
         assert!(!spec.capabilities.observability_enabled);
+        assert!(!spec.capabilities.api_server_enabled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8066,6 +8836,8 @@ mod adoption_tests {
             ThreadKey::parse(format!("test:adopt-queued-{}", uuid::Uuid::new_v4())).unwrap();
         orphaned_execution(&store, &thread_key, Some("sbx-mock"), false).await;
 
+        // The one-shot scan has no later tick to revisit skipped rows, so it
+        // fails queued orphans immediately regardless of age.
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let runtime = runtime_with(&store, backend.clone());
         runtime.adopt_orphaned_executions().await;
@@ -8082,5 +8854,344 @@ mod adoption_tests {
             "unexpected error: {error}"
         );
         assert_eq!(backend.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_scan_skips_young_queued_executions_until_grace_passes() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-young-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), false).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        let mut state = OrphanAdoptionState::default();
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+
+        // A queued row younger than the grace window may belong to a live
+        // execute_session mid-transition; a periodic scan must leave it
+        // alone and revisit it later.
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .all(|event| event.event_type != "session.execution_failed"),
+            "young queued execution must not be failed"
+        );
+        let active = store
+            .list_active_executions()
+            .await
+            .expect("list active executions");
+        assert!(
+            active
+                .iter()
+                .any(|execution| execution.execution_id == execution_id),
+            "young queued execution must stay active"
+        );
+
+        // Once the row ages past the grace window, a later tick fails it.
+        backdate_execution(&store, &execution_id, 300.0).await;
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopts_deferred_execution_after_lease_expires() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-deferred-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        store
+            .claim_stdout_owner(
+                &execution_id,
+                "other-control-plane",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim lease for other owner");
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            vec![
+                json!({"type": "item.completed", "item": {"id": "msg-1", "type": "agentMessage", "text": "Done: recovered after handoff.", "phase": "final_answer"}}).to_string(),
+                json!({"type": "turn.completed", "turn": {"id": "turn-1", "status": "completed"}}).to_string(),
+            ],
+        ));
+        let runtime = runtime_with(&store, backend.clone());
+
+        // While another control plane holds the stdout-owner lease the scan
+        // must defer instead of stealing the execution.
+        runtime.adopt_orphaned_executions().await;
+        wait_for_event(&store, &thread_key, "session.execution_adoption_deferred").await;
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .all(|event| event.event_type != "session.execution_completed"),
+            "deferred execution must not be terminalized"
+        );
+
+        // Once the lease expires (owner died without releasing), a later
+        // scan adopts the execution and recovers the recorded terminal. The
+        // expiry is forced in the database rather than slept through so slow
+        // test databases cannot turn the first scan into the adopting one.
+        expire_stdout_lease(&store, &execution_id).await;
+        runtime.adopt_orphaned_executions().await;
+        wait_for_event(&store, &thread_key, "session.execution_adopted").await;
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_scan_ignores_executions_owned_by_this_process() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-own-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60)
+                )
+                .await
+                .expect("claim as this control plane")
+        );
+
+        // A healthy execution owned by the scanning process must be skipped
+        // silently: no deferral event, no sandbox status probe.
+        let mut state = OrphanAdoptionState::default();
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter().all(|event| {
+                event.event_type != "session.execution_adoption_deferred"
+                    && event.event_type != "session.execution_adopted"
+                    && event.event_type != "session.execution_failed"
+            }),
+            "self-owned execution must not be touched by the scan"
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawned_adoption_loop_recovers_orphans() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-loop-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            vec![
+                json!({"type": "item.completed", "item": {"id": "msg-1", "type": "agentMessage", "text": "Done: recovered by the loop.", "phase": "final_answer"}}).to_string(),
+                json!({"type": "turn.completed", "turn": {"id": "turn-1", "status": "completed"}}).to_string(),
+            ],
+        ));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime.spawn_orphan_adoption(Duration::from_millis(50));
+
+        wait_for_event(&store, &thread_key, "session.execution_adopted").await;
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_scans_record_deferral_once() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-dedup-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        store
+            .claim_stdout_owner(
+                &execution_id,
+                "other-control-plane",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim lease for other owner");
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Running,
+            vec![
+                json!({"type": "item.completed", "item": {"id": "msg-1", "type": "agentMessage", "text": "Done: recovered after release.", "phase": "final_answer"}}).to_string(),
+                json!({"type": "turn.completed", "turn": {"id": "turn-1", "status": "completed"}}).to_string(),
+            ],
+        ));
+        let runtime = runtime_with(&store, backend.clone());
+
+        // Repeated periodic scans over the same held lease must record the
+        // deferral event only once.
+        let mut state = OrphanAdoptionState::default();
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+        let all = events(&store, &thread_key).await;
+        let deferrals = all
+            .iter()
+            .filter(|event| event.event_type == "session.execution_adoption_deferred")
+            .count();
+        assert_eq!(deferrals, 1, "deferral event must be recorded once");
+
+        // Releasing the lease (a clean shutdown handoff) lets the next scan
+        // adopt immediately; this also terminalizes the execution before the
+        // test releases TEST_LOCK.
+        store
+            .release_stdout_owner(&execution_id, "other-control-plane")
+            .await
+            .expect("release lease");
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(QUEUED_ORPHAN_GRACE))
+            .await;
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_handoff_releases_owned_leases() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:handoff-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60)
+                )
+                .await
+                .expect("claim as this control plane")
+        );
+
+        runtime.handoff_owned_executions(Duration::ZERO).await;
+
+        wait_for_event(&store, &thread_key, "session.stdout_owner_released").await;
+        // The lease is immediately claimable by a peer control plane; without
+        // the handoff it would only expire after the lease TTL.
+        assert!(
+            store
+                .claim_stdout_owner(&execution_id, "peer-control-plane", Duration::from_secs(5))
+                .await
+                .expect("peer claims released lease")
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize execution");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_handoff_waits_for_executions_to_finish() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:handoff-wait-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60)
+                )
+                .await
+                .expect("claim as this control plane")
+        );
+
+        // The execution finishes while the drain is waiting; no lease should
+        // be released and no handoff event recorded.
+        let completer_store = store.clone();
+        let completer_id = execution_id.clone();
+        let completer = tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            completer_store
+                .complete_execution_if_active(&completer_id)
+                .await
+                .expect("complete execution")
+        });
+        runtime
+            .handoff_owned_executions(Duration::from_secs(5))
+            .await;
+        let completed = completer.await.expect("completer task");
+        assert!(
+            completed.is_some(),
+            "the completer, not the handoff, must terminalize the execution"
+        );
+
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .all(|event| event.event_type != "session.stdout_owner_released"),
+            "finished execution must not be handed off"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_fences_new_stdout_claims() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+
+        // Nothing owned: the handoff returns immediately but still flips
+        // the shutdown fence.
+        runtime.handoff_owned_executions(Duration::ZERO).await;
+
+        let thread_key =
+            ThreadKey::parse(format!("test:handoff-fence-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+        let error = runtime
+            .claim_stdout_owner(&execution_id)
+            .await
+            .expect_err("claims after shutdown must be rejected");
+        assert!(
+            matches!(error, SessionRuntimeError::ShuttingDown),
+            "unexpected error: {error}"
+        );
+        store
+            .fail_execution_if_active(&execution_id, "test cleanup")
+            .await
+            .expect("terminalize execution");
     }
 }

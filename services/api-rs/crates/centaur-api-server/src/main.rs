@@ -1,6 +1,5 @@
 mod activity_summary;
 mod args;
-mod tool_discovery;
 
 use centaur_api_server::{AppState, build_router_with_app_state};
 use centaur_session_runtime::SessionRuntime;
@@ -28,9 +27,20 @@ async fn main() -> Result<(), ServerError> {
 
     let app_state = AppState::unready();
     let app = build_router_with_app_state(app_state.clone());
+    let shutdown_state = app_state.clone();
+    let drain_timeout = args.shutdown_execution_drain_timeout();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                info!("shutdown signal received; handing off in-flight executions");
+                // Hand off before axum starts draining connections: open SSE
+                // streams can keep the server future alive until SIGKILL, and
+                // the lease release must not be lost to that.
+                if let Some(runtime) = shutdown_state.session_runtime() {
+                    runtime.handoff_owned_executions(drain_timeout).await;
+                }
+            })
             .await
     });
 
@@ -98,13 +108,21 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         .await?,
     );
 
-    // Adopt executions orphaned by the previous process (deploy/crash):
-    // recover finished turns from recorded sandbox output, re-attach still
-    // running sandboxes, and fail the rest so their threads unwedge.
-    let adoption_runtime = runtime.clone();
-    tokio::spawn(async move {
-        adoption_runtime.adopt_orphaned_executions().await;
-    });
+    // Adopt executions orphaned by another control plane process
+    // (deploy/crash): recover finished turns from recorded sandbox output,
+    // re-attach still running sandboxes, and fail the rest so their threads
+    // unwedge. The scan re-runs periodically because executions can be
+    // orphaned after startup — e.g. a rolling deploy terminates the previous
+    // pod mid-turn after this pod's startup scan already ran.
+    match args.execution_adoption_interval() {
+        Some(interval) => runtime.spawn_orphan_adoption(interval),
+        None => {
+            let adoption_runtime = runtime.clone();
+            tokio::spawn(async move {
+                adoption_runtime.adopt_orphaned_executions().await;
+            });
+        }
+    }
 
     app_state.mark_ready(runtime, workflows, Some(pool));
     info!("centaur api-rs runtime initialized");
@@ -115,8 +133,32 @@ fn init_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — the signal Kubernetes
+/// sends on pod termination. The binary runs as PID 1 in its container, and
+/// PID 1 ignores signals without installed handlers: without the SIGTERM arm
+/// every rollout burned the full termination grace period and ended in
+/// SIGKILL, never reaching the graceful shutdown path.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler; using ctrl-c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[derive(Debug, Error)]
@@ -144,7 +186,7 @@ pub(crate) enum ServerError {
     #[error(transparent)]
     Telemetry(#[from] centaur_telemetry::TelemetryError),
     #[error(transparent)]
-    ToolDiscovery(#[from] tool_discovery::ToolDiscoveryError),
+    ToolDiscovery(#[from] centaur_api_server::ToolDiscoveryError),
     #[error(transparent)]
     ActivitySummary(#[from] activity_summary::ActivitySummaryError),
     #[error("tool source error: {0}")]

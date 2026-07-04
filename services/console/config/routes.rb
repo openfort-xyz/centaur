@@ -22,10 +22,26 @@ Rails.application.routes.draw do
   get "auth/:provider/start", to: "session_oauth#start", as: :auth_start
   get "auth/:provider/callback", to: "session_oauth#callback", as: :auth_callback
 
+  # MCP OAuth authorization server. MCP clients discover this from api-rs'
+  # OAuth protected-resource metadata and register public PKCE clients here.
+  get ".well-known/oauth-authorization-server", to: "mcp/oauth#metadata"
+  get ".well-known/openid-configuration", to: "mcp/oauth#metadata"
+  post "mcp/oauth/register", to: "mcp/oauth#register"
+  get "mcp/oauth/authorize", to: "mcp/oauth#authorize"
+  post "mcp/oauth/authorize", to: "mcp/oauth#approve"
+  post "mcp/oauth/token", to: "mcp/oauth#token"
+
   # Operator console (server-rendered HTML UI).
   root "console#principals"
   get "console/principals", to: "console#principals", as: :console_principals
   get "console/principals/:id", to: "console#principal", as: :console_principal
+  namespace :console do
+    resources :threads, only: %i[index create]
+    # Lazily-loaded sidebar thread list (Turbo Frame src). Kept off the main
+    # page render so the unindexed cross-database sessions query does not block
+    # every console page. See ApplicationController#load_console_sidebar_threads.
+    get "sidebar_threads", to: "threads#sidebar", as: :sidebar_threads
+  end
   namespace :console do
     resources :roles, only: %i[index show new create edit update] do
       member do
