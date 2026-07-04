@@ -88,7 +88,9 @@ export function consoleSessionUrl(
 ): string | undefined {
   const base = consoleBaseUrl?.trim()
   if (!base) return undefined
-  const normalized = base.replace(/\/+$/, '')
+  // Trailing-slash strip without a `/+$/` regex (polynomial-ReDoS lint).
+  let normalized = base
+  while (normalized.endsWith('/')) normalized = normalized.slice(0, -1)
   return `${normalized}/console/threads?thread=${encodeURIComponent(threadKey)}`
 }
 
