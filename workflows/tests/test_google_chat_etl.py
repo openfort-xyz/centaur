@@ -37,6 +37,11 @@ def _install_api_stubs() -> None:
     ):
         setattr(vm_metrics, name, lambda *_args, **_kwargs: None)
 
+    metrics = types.ModuleType("api.metrics")
+    metrics.increment_metric = lambda *_args, **_kwargs: None
+    metrics.set_gauge = lambda *_args, **_kwargs: None
+    metrics.observe_histogram = lambda *_args, **_kwargs: None
+
     workflow_engine = types.ModuleType("api.workflow_engine")
     workflow_engine.WorkflowContext = object
 
@@ -46,10 +51,12 @@ def _install_api_stubs() -> None:
     api_module = sys.modules.get("api") or types.ModuleType("api")
     api_module.runtime_control = runtime_control
     api_module.vm_metrics = vm_metrics
+    api_module.metrics = metrics
     api_module.workflow_engine = workflow_engine
     sys.modules["api"] = api_module
     sys.modules["api.runtime_control"] = runtime_control
     sys.modules["api.vm_metrics"] = vm_metrics
+    sys.modules["api.metrics"] = metrics
     sys.modules["api.workflow_engine"] = workflow_engine
     sys.modules["centaur_sdk"] = centaur_sdk
 
@@ -156,6 +163,59 @@ def test_message_text_prefers_text_then_formatted():
     assert chat_sync._message_text({"text": " hi "}) == "hi"
     assert chat_sync._message_text({"formattedText": "*bold*"}) == "*bold*"
     assert chat_sync._message_text({}) == ""
+
+
+def test_message_text_falls_back_to_card_content_for_app_messages():
+    # Chat apps (GitHub, alerting bots) post with empty `text` and all content
+    # in cardsV2 — the Chat analogue of Slack attachment-only app messages
+    # (upstream #887). The card widgets become the captured text.
+    message = {
+        "text": "",
+        "cardsV2": [
+            {
+                "cardId": "c1",
+                "card": {
+                    "header": {"title": "Deploy failed", "subtitle": "prod"},
+                    "sections": [
+                        {
+                            "header": "Details",
+                            "widgets": [
+                                {"textParagraph": {"text": "build 123 broke"}},
+                                {
+                                    "decoratedText": {
+                                        "topLabel": "Service",
+                                        "text": "api-rs",
+                                        "bottomLabel": "eu-west",
+                                    }
+                                },
+                                {
+                                    "columns": {
+                                        "columnItems": [
+                                            {
+                                                "widgets": [
+                                                    {"textParagraph": {"text": "col text"}}
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                },
+                            ],
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+    text = chat_sync._message_text(message)
+    assert "Deploy failed — prod" in text
+    assert "Details" in text
+    assert "build 123 broke" in text
+    assert "Service\napi-rs\neu-west" in text
+    assert "col text" in text
+    # Real text still wins over card content.
+    assert chat_sync._message_text({**message, "text": "plain"}) == "plain"
+    # Cards with no readable widgets stay empty (message is skipped as before).
+    assert chat_sync._message_text({"cardsV2": [{"card": {"sections": []}}]}) == ""
 
 
 def test_resource_id_strips_prefix():
@@ -273,3 +333,55 @@ def test_sync_space_uses_overlapped_watermark_filter_when_checkpoint_exists():
 
     # 12:00 watermark minus 60s overlap -> filter from 11:59.
     assert client.calls[0]["filter"] == 'createTime > "2026-06-01T11:59:00Z"'
+
+
+def test_sync_space_never_regresses_watermark_below_checkpoint():
+    # An explicit `since` re-backfill truncated by max_pages must not pull the
+    # checkpoint back into already-synced history (upstream #887's watermark
+    # non-regression guard, ported to the Chat sync).
+    checkpoint_time = dt.datetime(2026, 6, 10, 12, 0, tzinfo=dt.UTC)
+    old_created = dt.datetime(2026, 6, 1, 10, 0, tzinfo=dt.UTC)
+
+    class CheckpointPool(FakeSyncPool):
+        async def fetchrow(self, query, *args):
+            return {"watermark_time": checkpoint_time, "last_error": ""}
+
+    client = FakeChatClient(
+        [
+            {
+                "messages": [
+                    {
+                        "name": "spaces/S1/messages/m1",
+                        "text": "old message",
+                        "thread": {"name": "spaces/S1/threads/T1"},
+                        "sender": {"name": "users/1", "type": "HUMAN"},
+                        "createTime": old_created.isoformat().replace("+00:00", "Z"),
+                    }
+                ],
+                "nextPageToken": "1",
+            },
+            {"messages": []},
+        ]
+    )
+    pool = CheckpointPool()
+    counts = {"spaces_seen": 1, "spaces_synced": 0, "messages_seen": 0, "messages_upserted": 0}
+
+    watermark = asyncio.run(
+        chat_sync._sync_space(
+            pool,
+            client=client,
+            space={"name": "spaces/S1", "displayName": "Eng", "type": "SPACE"},
+            run_id="run_1",
+            page_size=100,
+            overlap_seconds=60,
+            max_pages=1,  # truncate mid-backfill
+            explicit_since=dt.datetime(2026, 5, 1, tzinfo=dt.UTC),
+            counts=counts,
+        )
+    )
+
+    # The old message was still (re-)upserted…
+    assert counts["messages_upserted"] == 1
+    # …but the stored watermark stays clamped at the pre-run checkpoint.
+    assert watermark == checkpoint_time
+    assert pool.checkpoint_watermark == checkpoint_time

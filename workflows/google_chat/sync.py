@@ -134,8 +134,71 @@ def _scope_ref(space_id: str, reason: str | None = None) -> dict[str, str]:
     return result
 
 
+def _card_fallback_text(message: dict[str, Any]) -> str:
+    """Plain-text stand-in for app messages whose content lives in cards.
+
+    Chat apps (GitHub, alerting integrations, our own bots) often post with an
+    empty top-level `text` and put everything in `cardsV2` widgets — the Chat
+    analogue of Slack's legacy attachment-only app messages (upstream #887).
+    Collect the human-readable widget strings so the message is captured
+    instead of dropped.
+    """
+    parts: list[str] = []
+
+    def _collect_widgets(widgets: Any) -> None:
+        if not isinstance(widgets, list):
+            return
+        for widget in widgets:
+            if not isinstance(widget, dict):
+                continue
+            text_paragraph = widget.get("textParagraph")
+            if isinstance(text_paragraph, dict):
+                text = str(text_paragraph.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+            decorated = widget.get("decoratedText")
+            if isinstance(decorated, dict):
+                pieces = [
+                    str(decorated.get(key) or "").strip()
+                    for key in ("topLabel", "text", "bottomLabel")
+                ]
+                joined = "\n".join(piece for piece in pieces if piece)
+                if joined:
+                    parts.append(joined)
+            columns = widget.get("columns")
+            if isinstance(columns, dict):
+                for item in columns.get("columnItems") or []:
+                    if isinstance(item, dict):
+                        _collect_widgets(item.get("widgets"))
+
+    for entry in message.get("cardsV2") or []:
+        if not isinstance(entry, dict):
+            continue
+        card = entry.get("card")
+        if not isinstance(card, dict):
+            continue
+        header = card.get("header")
+        if isinstance(header, dict):
+            pieces = [
+                str(header.get(key) or "").strip() for key in ("title", "subtitle")
+            ]
+            joined = " — ".join(piece for piece in pieces if piece)
+            if joined:
+                parts.append(joined)
+        for section in card.get("sections") or []:
+            if isinstance(section, dict):
+                header_text = str(section.get("header") or "").strip()
+                if header_text:
+                    parts.append(header_text)
+                _collect_widgets(section.get("widgets"))
+    return "\n".join(parts)
+
+
 def _message_text(message: dict[str, Any]) -> str:
-    return str(message.get("text") or message.get("formattedText") or "").strip()
+    text = str(message.get("text") or message.get("formattedText") or "").strip()
+    if text:
+        return text
+    return _card_fallback_text(message).strip()
 
 
 def _member_display_names(client: GoogleChatSyncClient, space_name: str) -> dict[str, str]:
@@ -378,9 +441,12 @@ async def _sync_space(
     space_name = str(space.get("name") or f"spaces/{space_id}")
 
     checkpoint = await _load_checkpoint(pool, space_id)
+    checkpoint_watermark: dt.datetime | None = None
+    if checkpoint and checkpoint.get("watermark_time"):
+        checkpoint_watermark = checkpoint["watermark_time"].astimezone(dt.timezone.utc)
     watermark = explicit_since
-    if watermark is None and checkpoint and checkpoint.get("watermark_time"):
-        watermark = checkpoint["watermark_time"].astimezone(dt.timezone.utc)
+    if watermark is None:
+        watermark = checkpoint_watermark
     effective = watermark
     if effective is not None:
         effective = effective - dt.timedelta(seconds=overlap_seconds)
@@ -425,6 +491,17 @@ async def _sync_space(
         if max_pages and pages >= max_pages:
             break
 
+    # Never let the stored watermark regress past the pre-run checkpoint: an
+    # explicit `since` re-backfill truncated by max_pages would otherwise pull
+    # the checkpoint back into already-synced history (upstream #887 adds the
+    # same guard to the Slack sync watermark). COALESCE in the upsert already
+    # handles the None case; this handles the "older but not None" case.
+    if (
+        successful_watermark is not None
+        and checkpoint_watermark is not None
+        and successful_watermark < checkpoint_watermark
+    ):
+        successful_watermark = checkpoint_watermark
     await _update_checkpoint_success(
         pool,
         space_id=space_id,
