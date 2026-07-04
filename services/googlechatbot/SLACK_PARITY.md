@@ -5,6 +5,9 @@ Audit of `services/googlechatbot` (+ its platform surface) against `services/sla
 (post-merge of paradigmxyz/centaur `main`, 26 commits including the Slack attachment,
 model-override-persistence, and activity-summary work).
 
+**Update 2026-07-04 (`sync/upstream-2026-07-04`, 24 upstream commits):** new
+Slack-touching upstream work and its Chat disposition — see section 3.
+
 Openfort runs both bots in production (centaur-vps), but Google Chat is the primary
 surface. Goal: functionally and internally head-to-head — every difference is either
 fixed, tracked as follow-up, or recorded as a deliberate platform difference.
@@ -77,3 +80,13 @@ domain-wide delegation for `https://www.googleapis.com/auth/chat.messages.create
 `googlechatbot.uploadUser` (chart) / `GOOGLECHATBOT_UPLOAD_USER` (env) to the
 impersonated user. Until then `/api/chat/attachments` fails closed with a 503
 explaining the setup.
+
+## 3. Upstream sync 2026-07-04 (24 commits) — Slack-touching changes
+
+| # | Upstream change | Chat disposition | Status |
+|---|-----------------|------------------|--------|
+| 3.1 | #843 console threads view + slackbotv2 "Open chat in Console" context block (renamed by #889) | `console-session-link.ts` ported: first assistant message carries an `Open chat in Console · MODEL · Harness` card line (textParagraph, HTML link — Chat has no stop-stream context block). Chart mirrors `CENTAUR_CONSOLE_PUBLIC_URL` + `CLAUDE_MODEL`/`CODEX_MODEL` like slackbotv2. First-message detection = empty thread history (bot is stateless). | ✅ |
+| 3.2 | #875 console Slack thread visibility for Slack SSO identities | Chat threads were invisible in the threads view. Added `googlechat_thread_owner_sql`: googlechatbot now records the requester's workspace email (`user_email`, from `sender.email`/envelope `user.email`) in session+message metadata; console matches it against the signed-in (Google SSO) user's email directly — simpler than Slack's identity mapping because console logins ARE Google identities. | ✅ |
+| 3.3 | #882 restore Slack DM context visibility (slack_team_id metadata → iron-control; Slack-DM ETL tables in company_context) | No Chat analogue needed: gchat principals derive wholly from the thread key (space id — `parse_gchat_space`), so no metadata is required to scope them; and there is no Chat DM ETL (DMs are deliberately excluded from the shared corpus, `DEFAULT_INCLUDE_SPACE_TYPES = "SPACE"`). Chat DM ETL with per-user consent (the analogue of upstream's Slack-DM sync subsystem) would be new feature work. | 🟰 / 🔜 (DM ETL) |
+| 3.4 | #887 capture Slack app message content (attachment fallback) + unfreeze busy-channel ETL sync | Ported both applicable halves to `workflows/google_chat/sync.py`: `_message_text` falls back to `cardsV2` widget text (Chat apps post empty `text` + cards — same failure as Slack's attachment-only app posts), and the sync watermark never regresses below the pre-run checkpoint. The head-probe/continuation-job halves are Slack-pagination-specific (oldest-anchored windows); Chat pages `createTime asc` with a token cursor and cannot freeze that way. Backfill job queue remains 🔜 (2.9). | ✅ |
+| 3.5 | #884 gate sandbox API access by capability (tool-side: slack/feedback.py, gsuite/client.py) | Gating lives in shared code (centaur_sdk `save_attachment`, gsuite client — both merged in). The Slack feedback tool has no Chat analogue, and `tools/comms/google_chat` talks to the googlechatbot relay, not the sandbox API server. Nothing to port. | 🟰 |

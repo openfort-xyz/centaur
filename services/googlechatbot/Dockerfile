@@ -18,6 +18,11 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
     pnpm install --filter googlechatbot --prod --frozen-lockfile
 
 COPY services/googlechatbot/ services/googlechatbot/
+# Harness config files: console-session-link.ts imports the baked default
+# models (harness/claude/settings.json, harness/codex/config.toml) so the
+# Chat Console-link line can name the model a harness runs without a
+# hardcoded copy of those values.
+COPY harness/ harness/
 WORKDIR /repo/services/googlechatbot
 
 EXPOSE 3002

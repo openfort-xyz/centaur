@@ -96,6 +96,50 @@ describe('createSession', () => {
     expect(result.status).toBe('')
     expect(result.activeExecution).toBe(false)
   })
+
+  test('records the requester identity in the session metadata', async () => {
+    // The Console grants thread visibility by matching metadata user_email
+    // against the signed-in user's email (Chat analogue of Slack's
+    // slack_user_id ownership) — the create body must carry it.
+    let captured: Record<string, unknown> | undefined
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      captured = JSON.parse(init?.body ?? '{}') as Record<string, unknown>
+      return new Response(JSON.stringify({ status: 'idle' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }) as unknown as typeof fetch
+    await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1', undefined, undefined, {
+      userId: 'users/123',
+      userName: 'Ada Lovelace',
+      userEmail: 'Ada@Openfort.xyz'
+    })
+    expect(captured?.metadata).toMatchObject({
+      source: 'googlechatbot',
+      platform: 'googlechat',
+      user_id: 'users/123',
+      user_name: 'Ada Lovelace',
+      user_email: 'Ada@Openfort.xyz'
+    })
+  })
+
+  test('omits requester fields that are not available', async () => {
+    let captured: Record<string, unknown> | undefined
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      captured = JSON.parse(init?.body ?? '{}') as Record<string, unknown>
+      return new Response(JSON.stringify({ status: 'idle' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }) as unknown as typeof fetch
+    await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1', undefined, undefined, {
+      userId: 'users/123'
+    })
+    const metadata = (captured?.metadata ?? {}) as Record<string, unknown>
+    expect(metadata.user_id).toBe('users/123')
+    expect('user_email' in metadata).toBe(false)
+    expect('user_name' in metadata).toBe(false)
+  })
 })
 
 describe('executeSession', () => {

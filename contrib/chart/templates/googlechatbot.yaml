@@ -69,6 +69,24 @@ spec:
             - name: GOOGLECHATBOT_UPLOAD_USER
               value: {{ .Values.googlechatbot.uploadUser | quote }}
 {{- end }}
+{{- $console := include "centaur.consoleValues" . | fromYaml -}}
+{{- if $console.publicUrl }}
+            # Public origin of the Console UI (matches the Console's own
+            # CENTAUR_CONSOLE_PUBLIC_URL). When set, the first assistant message
+            # in a Chat thread gets an "Open chat in Console" line.
+            - name: CENTAUR_CONSOLE_PUBLIC_URL
+              value: {{ $console.publicUrl | quote }}
+{{- end }}
+{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" }}
+{{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.googlechatbot.extraEnv $name)) }}
+            # Mirror the deployer's harness default-model override
+            # (sandbox.extraEnv) so the Chat Console-link line names the model
+            # sandboxes actually run. googlechatbot.extraEnv wins if it sets the
+            # same variable.
+            - name: {{ $name }}
+              value: {{ index $.Values.sandbox.extraEnv $name | toString | quote }}
+{{- end }}
+{{- end }}
 {{- range $name, $value := .Values.googlechatbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

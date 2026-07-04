@@ -30,6 +30,10 @@ export type NormalizedChatEvent = {
   space_type: ChatSpaceType
   user_id: string
   user_name: string
+  /** Requester email when the sender profile exposes it (same-workspace
+   * humans). The Console matches it against the signed-in user's email to
+   * grant thread visibility (Chat analogue of Slack's slack_user_id, #875). */
+  user_email?: string
   is_mention: boolean
   parts: NormalizedPart[]
   history_messages?: Array<{

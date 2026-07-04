@@ -11,7 +11,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use centaur_api_server::SandboxRuntime;
+use centaur_api_server::{
+    DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig, discover_persona_registry,
+    discover_tool_proxy_fragment,
+};
 use centaur_iron_control::{
     IdentityInput, IronControlClient, IronControlError, RegisterError, RoleSpec, SessionRegistrar,
     register_role,
@@ -34,14 +37,7 @@ use centaur_workflows::WorkflowHostSandboxRuntime;
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{info, warn};
 
-use crate::{
-    ServerError,
-    activity_summary::ActivitySummaryConfig,
-    tool_discovery::{
-        DiscoveredToolProxyFragment, ToolDiscoveryConfig, discover_persona_registry,
-        discover_tool_proxy_fragment,
-    },
-};
+use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 
@@ -110,6 +106,15 @@ impl Args {
     pub(crate) fn activity_summary_config(&self) -> Option<ActivitySummaryConfig> {
         self.activity_summary.config()
     }
+
+    pub(crate) fn shutdown_execution_drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.server.shutdown_execution_drain_timeout_secs)
+    }
+
+    pub(crate) fn execution_adoption_interval(&self) -> Option<Duration> {
+        (self.server.execution_adoption_interval_secs > 0)
+            .then(|| Duration::from_secs(self.server.execution_adoption_interval_secs))
+    }
 }
 
 pub(crate) struct IronControlRuntime {
@@ -143,7 +148,7 @@ struct ActivitySummaryArgs {
     #[arg(
         long = "session-activity-summary-min-interval-secs",
         env = "SESSION_ACTIVITY_SUMMARY_MIN_INTERVAL_SECS",
-        default_value_t = 8,
+        default_value_t = 20,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     min_interval_secs: u64,
@@ -452,6 +457,31 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    /// How long shutdown waits for in-flight executions to finish before
+    /// releasing their stdout-owner leases for adoption by a peer. Keep
+    /// below the pod's terminationGracePeriodSeconds (35s in the chart) so
+    /// the release happens before SIGKILL. 0 releases immediately.
+    #[arg(
+        long = "shutdown-execution-drain-timeout-secs",
+        env = "SHUTDOWN_EXECUTION_DRAIN_TIMEOUT_SECS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(0..=600)
+    )]
+    shutdown_execution_drain_timeout_secs: u64,
+    /// How often to re-run the orphaned-execution adoption scan after the
+    /// startup pass. Executions orphaned while the process is already
+    /// running (e.g. a rolling deploy terminating the previous pod mid-turn
+    /// after this pod's startup scan) are only recovered by these re-scans,
+    /// so the interval bounds how long a handed-off turn stays frozen. A
+    /// steady-state tick is a single SELECT (executions with a live
+    /// stdout-owner lease are skipped before any session or sandbox reads).
+    /// 0 disables re-scans and keeps the startup-only behavior.
+    #[arg(
+        long = "session-execution-adoption-interval-secs",
+        env = "SESSION_EXECUTION_ADOPTION_INTERVAL_SECS",
+        default_value_t = 15
+    )]
+    execution_adoption_interval_secs: u64,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -2069,6 +2099,64 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn execution_adoption_rescans_every_fifteen_seconds_by_default() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.execution_adoption_interval(),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn execution_adoption_interval_zero_disables_rescans() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-execution-adoption-interval-secs",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.execution_adoption_interval(), None);
+    }
+
+    #[test]
+    fn shutdown_drain_defaults_to_twenty_seconds() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.shutdown_execution_drain_timeout(),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_is_configurable() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--shutdown-execution-drain-timeout-secs",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.shutdown_execution_drain_timeout(), Duration::ZERO);
     }
 
     #[test]

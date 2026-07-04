@@ -37,6 +37,9 @@ export type RenderTarget = {
   threadName?: string
   /** Optional deep link rendered as a "View session" button on the final answer. */
   sessionUrl?: string
+  /** Optional "Open chat in Console · MODEL · Harness" trailer widget, set on
+   * the first assistant message of a thread (see console-session-link.ts). */
+  consoleSessionWidget?: GoogleChatCardWidget
   /** Prompt asked for plain text — deliver via the `text` surface, no cards. */
   plainTextOnly?: boolean
 }
@@ -196,6 +199,11 @@ async function deliverFinal(
   const text = finalText(state)
   const rendered = markdownToChatMessage(text)
   const button = sessionButtonWidget(target.sessionUrl)
+  // Trailer widgets appended after the answer: the optional "View session"
+  // button and the first-message "Open chat in Console · …" line.
+  const trailers = [button, target.consoleSessionWidget].filter(
+    (widget): widget is GoogleChatCardWidget => widget !== undefined
+  )
   // Use the card (no `text`) for rich markdown OR when the plain answer would
   // exceed Google Chat's 4096-char `text` cap — the card envelope is ~32 KB, so
   // routing long answers there avoids a 400 (and a silent truncation). Plain:
@@ -208,8 +216,8 @@ async function deliverFinal(
   // 4096-char cap, where the card is the only surface that fits it whole.
   const looksRich = plainOverflows || (!target.plainTextOnly && LOOKS_RICH_RE.test(text))
   const body: Partial<GoogleChatMessage> = looksRich
-    ? { cardsV2: withButton(rendered.cardsV2, button) }
-    : { text: rendered.text, cardsV2: button ? [buttonCard(button)] : [] }
+    ? { cardsV2: withTrailers(rendered.cardsV2, trailers) }
+    : { text: rendered.text, cardsV2: trailers.length ? [trailerCard(trailers)] : [] }
 
   if (target.ackMessageName) {
     try {
@@ -236,21 +244,21 @@ function sessionButtonWidget(sessionUrl?: string): GoogleChatCardWidget | undefi
   return { buttonList: { buttons: [{ text: 'View session', onClick: { openLink: { url: sessionUrl } } }] } }
 }
 
-/** Append the button to the last card's sections, or make a card if there are none. */
-function withButton(
+/** Append trailer widgets to the last card's sections, or make a card if there are none. */
+function withTrailers(
   cards: Array<{ cardId: string; card: GoogleChatCard }> | undefined,
-  button: GoogleChatCardWidget | undefined
+  trailers: GoogleChatCardWidget[]
 ): Array<{ cardId: string; card: GoogleChatCard }> {
-  if (!button) return cards ?? []
-  if (!cards || cards.length === 0) return [buttonCard(button)]
+  if (trailers.length === 0) return cards ?? []
+  if (!cards || cards.length === 0) return [trailerCard(trailers)]
   const last = cards[cards.length - 1]!
-  const sections = [...(last.card.sections ?? []), { widgets: [button] }]
+  const sections = [...(last.card.sections ?? []), { widgets: trailers }]
   const updated = { cardId: last.cardId, card: { ...last.card, sections } }
   return [...cards.slice(0, -1), updated]
 }
 
-function buttonCard(button: GoogleChatCardWidget): { cardId: string; card: GoogleChatCard } {
-  return { cardId: 'actions', card: { sections: [{ widgets: [button] }] } }
+function trailerCard(trailers: GoogleChatCardWidget[]): { cardId: string; card: GoogleChatCard } {
+  return { cardId: 'actions', card: { sections: [{ widgets: trailers }] } }
 }
 
 function finalText(state: RenderState): string {

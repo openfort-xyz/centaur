@@ -8,6 +8,7 @@ import type { GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
 import { extractMessageOverrides } from './overrides'
+import { buildConsoleSessionWidget, defaultModelForHarness } from './console-session-link'
 import { chatReplyLimits } from './constants'
 
 /** Clamp to Google Chat's plain `text` cap so an oversized body can't 400 the send. */
@@ -332,7 +333,12 @@ async function driveSession(
       config,
       threadKey,
       conversationName(event),
-      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
+      {
+        userId: event.user_id,
+        userName: event.user_name,
+        ...(event.user_email ? { userEmail: event.user_email } : {})
+      }
     )
 
     // A run is already in flight for this thread. Starting a second one would
@@ -377,11 +383,33 @@ async function driveSession(
       if (folded) return
       throw error
     }
+    // "Open chat in Console" trailer on the FIRST assistant message in a
+    // thread (no earlier thread history = this event started the thread),
+    // mirroring slackbotv2's console-session-link. Undefined when no Console
+    // base URL is configured. `threadKey` (`chat:spaces:…`) is the exact value
+    // sent to the session API as `thread_key`, which the Console indexes by.
+    const isFirstAssistantMessage = !event.history_messages?.length
+    const effectiveHarnessType =
+      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+    // Without an explicit --model/--opus/... override the harness runs its
+    // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
+    // config); show that instead of dropping the model entirely.
+    const effectiveModel =
+      overrides.model ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
+    const consoleSessionWidget = isFirstAssistantMessage
+      ? buildConsoleSessionWidget({
+          consoleBaseUrl: config.CENTAUR_CONSOLE_PUBLIC_URL,
+          threadKey,
+          harnessType: effectiveHarnessType,
+          model: effectiveModel
+        })
+      : undefined
     const target = {
       spaceName: event.space_name,
       ackMessageName,
       threadName: event.chat.thread_name,
       sessionUrl: sessionUrl(config, threadKey, execution.execution_id),
+      consoleSessionWidget,
       plainTextOnly: isPlainTextOnlyRequest(execute.text)
     }
 
@@ -511,6 +539,15 @@ function isPlainTextOnlyRequest(text: string): boolean {
     || /\bno\s+interactive\s+blocks?\b/.test(normalized)
     || /\bno\s+dashboards?\b/.test(normalized)
   )
+}
+
+/** Deployment defaults for harness models (CLAUDE_MODEL / CODEX_MODEL env,
+ * mirrored from sandbox.extraEnv by the chart), keyed by harness wire value. */
+function harnessDefaultModels(config: AppConfig): Record<string, string> {
+  return {
+    ...(config.CLAUDE_MODEL ? { claudecode: config.CLAUDE_MODEL } : {}),
+    ...(config.CODEX_MODEL ? { codex: config.CODEX_MODEL } : {})
+  }
 }
 
 /** Build the "View session" deep link from the configured template, if any. */

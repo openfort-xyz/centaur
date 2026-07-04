@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from centaur_sdk import (
     current_session_context,
     current_slack_thread,
     reset_tool_context,
+    save_attachment,
     secret,
     set_tool_context,
 )
@@ -110,6 +112,22 @@ def test_current_session_context_fetches_api_context(monkeypatch: pytest.MonkeyP
         reset_tool_context(token)
 
 
+def test_current_session_context_requires_api_server_capability(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        registry,
+        "_backend",
+        MappingBackend({"CENTAUR_SANDBOX_API_SERVER_ENABLED": "false"}),
+    )
+    token = set_tool_context(ToolContext(name="fake-tool", thread_key="slack:C123:123.456"))
+    try:
+        with pytest.raises(RuntimeError, match="API server sandbox capability"):
+            current_session_context()
+    finally:
+        reset_tool_context(token)
+
+
 def test_current_slack_thread_returns_api_slack_destination(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -174,6 +192,53 @@ def test_current_google_chat_space_returns_api_chat_destination(
         reset_tool_context(token)
 
 
+def test_save_attachment_writes_to_sandbox_uploads_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    def fail_urlopen(*_args, **_kwargs):
+        raise AssertionError("save_attachment should not call the API in sandbox mode")
+
+    monkeypatch.setenv("CENTAUR_UPLOADS_DIR", str(tmp_path))
+    monkeypatch.setattr("urllib.request.urlopen", fail_urlopen)
+
+    result = save_attachment(
+        name="../report.txt",
+        data=b"hello",
+        mime_type="text/plain",
+        source_url="https://example.test/report",
+    )
+
+    saved_path = tmp_path / "report.txt"
+    assert saved_path.read_bytes() == b"hello"
+    assert result == {
+        "attachment_id": None,
+        "filename": "report.txt",
+        "mime_type": "text/plain",
+        "download_url": None,
+        "path": str(saved_path),
+        "local_path": str(saved_path),
+        "source_url": "https://example.test/report",
+        "size_bytes": 5,
+    }
+
+
+def test_save_attachment_requires_api_server_capability_without_uploads_dir(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("CENTAUR_UPLOADS_DIR", raising=False)
+    monkeypatch.setattr(
+        registry,
+        "_backend",
+        MappingBackend({"CENTAUR_SANDBOX_API_SERVER_ENABLED": "false"}),
+    )
+    token = set_tool_context(ToolContext(name="fake-tool", thread_key="slack:C123:123.456"))
+    try:
+        with pytest.raises(RuntimeError, match="API server sandbox capability"):
+            save_attachment(name="report.txt", data=b"hello")
+    finally:
+        reset_tool_context(token)
+
+
 def test_current_google_chat_space_rejects_non_chat_threads(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -203,6 +268,23 @@ def test_current_google_chat_space_rejects_non_chat_threads(
             current_google_chat_space()
     finally:
         reset_tool_context(token)
+
+
+def test_save_attachment_uses_unique_local_name_on_collision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setenv("CENTAUR_UPLOADS_DIR", str(tmp_path))
+
+    first = save_attachment(name="same.txt", data=b"first")
+    second = save_attachment(name="same.txt", data=b"second")
+
+    assert first["path"] != second["path"]
+    assert (tmp_path / "same.txt").read_bytes() == b"first"
+    second_path = Path(str(second["path"]))
+    assert second_path.exists()
+    assert second_path.read_bytes() == b"second"
+    assert second_path.name.startswith("same-")
+    assert second_path.suffix == ".txt"
 
 
 @pytest.mark.asyncio

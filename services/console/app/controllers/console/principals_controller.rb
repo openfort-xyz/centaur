@@ -8,12 +8,14 @@ module Console
 
     layout "console"
 
+    before_action :require_admin
     before_action :set_principal
 
     def update_sandbox_access
       @principal.update!(
         sandbox_repo_cache_enabled: ActiveModel::Type::Boolean.new.cast(params[:sandbox_repo_cache_enabled]),
-        sandbox_observability_enabled: ActiveModel::Type::Boolean.new.cast(params[:sandbox_observability_enabled])
+        sandbox_observability_enabled: ActiveModel::Type::Boolean.new.cast(params[:sandbox_observability_enabled]),
+        sandbox_api_server_enabled: ActiveModel::Type::Boolean.new.cast(params[:sandbox_api_server_enabled])
       )
       redirect_to console_principal_path(@principal.oid), notice: "Updated sandbox access."
     rescue ActiveRecord::RecordInvalid => e

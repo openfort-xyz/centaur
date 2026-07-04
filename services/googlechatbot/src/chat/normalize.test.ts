@@ -33,10 +33,35 @@ describe('normalizeChatEnvelope', () => {
     expect(normalized!.message_id).toBe('spaces/AAAA/messages/M1')
     expect(normalized!.user_id).toBe('users/U1')
     expect(normalized!.user_name).toBe('Alice')
+    expect(normalized!.user_email).toBeUndefined()
     expect(normalized!.is_mention).toBe(true)
     expect(normalized!.space_type).toBe('SPACE')
     expect(normalized!.parts).toHaveLength(1)
     expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
+  })
+
+  test('captures the sender email for Console thread attribution', async () => {
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: '<users/bot-account> hello',
+          sender: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(normalized!.user_email).toBe('alice@openfort.xyz')
+  })
+
+  test('falls back to the envelope user email when the sender has none', async () => {
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        user: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' }
+      }),
+      BOT_USER
+    )
+    expect(normalized!.user_email).toBe('alice@openfort.xyz')
   })
 
   test('treats a slash command as a mention and uses argumentText as the prompt', async () => {
