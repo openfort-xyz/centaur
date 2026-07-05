@@ -380,7 +380,13 @@ async function driveSession(
           model: overrides.model,
           provider: overrides.provider,
           reasoning: overrides.reasoning
-        }
+        },
+        // Thread history rides the execute input itself (slackbotv2 parity):
+        // messages appended via /messages are stored for the Console but never
+        // reach the harness, and the harness's own conversation state dies
+        // with its sandbox (pool drain/reap), so without this block any
+        // follow-up after a sandbox swap starts from amnesia.
+        history
       })
     } catch (error) {
       // The activeExecution check above is read-then-act: a run that starts

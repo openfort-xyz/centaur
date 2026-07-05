@@ -260,12 +260,17 @@ export async function executeSession(
   config: AppConfig,
   threadKey: string,
   message: GoogleChatTurnMessage,
-  opts: { idleTimeoutMs?: number; maxDurationMs?: number; overrides?: TurnOverrides } = {}
+  opts: {
+    idleTimeoutMs?: number
+    maxDurationMs?: number
+    overrides?: TurnOverrides
+    history?: GoogleChatTurnMessage[]
+  } = {}
 ): Promise<ExecuteSessionResponse> {
   const body: ExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(threadKey, message, { action: 'execute' }),
-    input_lines: [toCodexInputLine(threadKey, message, opts.overrides)],
+    input_lines: [toCodexInputLine(threadKey, message, opts.overrides, opts.history)],
     ...(opts.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: opts.idleTimeoutMs }),
     ...(opts.maxDurationMs === undefined ? {} : { max_duration_ms: opts.maxDurationMs })
   }
@@ -393,7 +398,8 @@ function sessionMetadata(
 function toCodexInputLine(
   threadKey: string,
   message: GoogleChatTurnMessage,
-  overrides?: TurnOverrides
+  overrides?: TurnOverrides,
+  history?: GoogleChatTurnMessage[]
 ): string {
   return JSON.stringify({
     type: 'user',
@@ -405,7 +411,7 @@ function toCodexInputLine(
     ...(overrides?.reasoning ? { reasoning: overrides.reasoning } : {}),
     message: {
       role: 'user',
-      content: codexInputContent(threadKey, message)
+      content: codexInputContent(threadKey, message, history)
     }
   })
 }
@@ -474,12 +480,72 @@ function requesterIdentityContext(message: GoogleChatTurnMessage): string | unde
   return lines.join('\n')
 }
 
-function codexInputContent(threadKey: string, message: GoogleChatTurnMessage): JsonValue[] {
+/** Newest-biased char budget for the thread-context block. Appended messages
+ * in api-rs never reach the harness input, and the harness conversation state
+ * dies with its sandbox (pool drains, reaps), so this block is the agent's
+ * only durable memory of the thread — mirror slackbotv2's per-turn thread
+ * context rather than relying on sandbox resume. */
+const THREAD_CONTEXT_MAX_CHARS = 24_000
+
+function threadHistoryContext(
+  message: GoogleChatTurnMessage,
+  history: GoogleChatTurnMessage[] | undefined
+): string | undefined {
+  const priorMessages = (history ?? []).filter(
+    item => item.id !== message.id && item.text.trim()
+  )
+  if (priorMessages.length === 0) return undefined
+
+  // Keep the newest messages inside the budget — recency carries the most
+  // context for a reply, matching collectThreadHistory's cap direction.
+  const kept: GoogleChatTurnMessage[] = []
+  let totalChars = 0
+  for (let index = priorMessages.length - 1; index >= 0; index--) {
+    const item = priorMessages[index]
+    if (!item) continue
+    if (kept.length > 0 && totalChars + item.text.length > THREAD_CONTEXT_MAX_CHARS) break
+    kept.unshift(item)
+    totalChars += item.text.length
+  }
+
+  const lines = [
+    '# Google Chat Thread Context',
+    '',
+    'Earlier messages in this Google Chat thread, in chronological order:'
+  ]
+  if (kept.length < priorMessages.length) {
+    lines.push('', `…(${priorMessages.length - kept.length} earlier messages truncated)`)
+  }
+  for (const [index, item] of kept.entries()) {
+    const author =
+      item.role === 'assistant'
+        ? 'assistant (you)'
+        : sanitizeContextValue(item.userName) || 'user'
+    lines.push('', `${index + 1}. ${author}:`, indentChatContext(item.text))
+  }
+  lines.push('', '# Current Request', '', 'The user message follows in the next content block.', '---')
+  return lines.join('\n')
+}
+
+function indentChatContext(text: string): string {
+  return text
+    .split('\n')
+    .map(line => `   ${line}`)
+    .join('\n')
+}
+
+function codexInputContent(
+  threadKey: string,
+  message: GoogleChatTurnMessage,
+  history?: GoogleChatTurnMessage[]
+): JsonValue[] {
   const content: JsonValue[] = []
   const sessionContext = chatSessionContext(message, threadKey)
   if (sessionContext) content.push({ type: 'text', text: sessionContext })
   const requesterContext = requesterIdentityContext(message)
   if (requesterContext) content.push({ type: 'text', text: requesterContext })
+  const threadContext = threadHistoryContext(message, history)
+  if (threadContext) content.push({ type: 'text', text: threadContext })
   if (message.text.trim()) content.push({ type: 'text', text: message.text })
   for (const part of message.parts) {
     if (part.type === 'text') continue
