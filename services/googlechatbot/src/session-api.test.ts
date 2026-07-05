@@ -242,6 +242,123 @@ describe('executeSession', () => {
       'googlechatbot_session_api_operations_total{operation="execute_session",outcome="success"} 1'
     )
   })
+
+  test('rides the thread history in the execute input line', async () => {
+    let captured: string | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ execution_id: 'e1', ok: true, status: 'executing', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+
+    const { execute, history } = turnMessagesFromEvent({
+      ...baseEvent,
+      history_messages: [
+        {
+          message_id: 'spaces/AAAA/messages/M0',
+          role: 'user',
+          parts: [{ type: 'text', text: 'make a company profile of soruka' }],
+          user_id: 'users/U1',
+          metadata: { user_name: 'Alice' }
+        },
+        {
+          message_id: 'spaces/AAAA/messages/M1',
+          role: 'assistant',
+          parts: [{ type: 'text', text: 'Done — profile drafted.' }],
+          user_id: 'users/bot',
+          metadata: { user_name: 'Condor' }
+        },
+        // The current message must not echo into its own context block.
+        {
+          message_id: baseEvent.message_id,
+          role: 'user',
+          parts: [{ type: 'text', text: 'deploy the thing' }],
+          user_id: 'users/U1',
+          metadata: { user_name: 'Alice' }
+        }
+      ]
+    })
+    await executeSession(loadConfig({}), baseEvent.thread_key, execute, { history })
+
+    const body = JSON.parse(captured ?? '{}') as { input_lines: string[] }
+    const line = JSON.parse(body.input_lines[0]!) as {
+      message: { content: Array<{ type: string; text?: string }> }
+    }
+    const context = line.message.content.find(c => c.text?.startsWith('# Google Chat Thread Context'))
+    expect(context?.text).toContain('1. Alice:')
+    expect(context?.text).toContain('make a company profile of soruka')
+    expect(context?.text).toContain('2. assistant (you):')
+    expect(context?.text).toContain('Done — profile drafted.')
+    expect(context?.text).not.toContain('3.')
+    // The context block precedes the user turn, which stays its own block.
+    const contextIndex = line.message.content.findIndex(c => c === context)
+    const promptIndex = line.message.content.findIndex(c => c.text === 'deploy the thing')
+    expect(contextIndex).toBeGreaterThanOrEqual(0)
+    expect(promptIndex).toBe(contextIndex + 1)
+  })
+
+  test('omits the thread context block when there is no prior history', async () => {
+    let captured: string | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ execution_id: 'e1', ok: true, status: 'executing', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+
+    const { execute, history } = turnMessagesFromEvent(baseEvent)
+    await executeSession(loadConfig({}), baseEvent.thread_key, execute, { history })
+
+    const body = JSON.parse(captured ?? '{}') as { input_lines: string[] }
+    const line = JSON.parse(body.input_lines[0]!) as {
+      message: { content: Array<{ text?: string }> }
+    }
+    expect(line.message.content.some(c => c.text?.startsWith('# Google Chat Thread Context'))).toBe(false)
+  })
+
+  test('drops the oldest history when the context exceeds its char budget', async () => {
+    let captured: string | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ execution_id: 'e1', ok: true, status: 'executing', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+
+    const { execute, history } = turnMessagesFromEvent({
+      ...baseEvent,
+      history_messages: [
+        {
+          message_id: 'spaces/AAAA/messages/M0',
+          role: 'user',
+          parts: [{ type: 'text', text: `oldest ${'x'.repeat(20_000)}` }],
+          user_id: 'users/U1',
+          metadata: { user_name: 'Alice' }
+        },
+        {
+          message_id: 'spaces/AAAA/messages/M1',
+          role: 'assistant',
+          parts: [{ type: 'text', text: `newest ${'y'.repeat(20_000)}` }],
+          user_id: 'users/bot',
+          metadata: { user_name: 'Condor' }
+        }
+      ]
+    })
+    await executeSession(loadConfig({}), baseEvent.thread_key, execute, { history })
+
+    const body = JSON.parse(captured ?? '{}') as { input_lines: string[] }
+    const line = JSON.parse(body.input_lines[0]!) as {
+      message: { content: Array<{ text?: string }> }
+    }
+    const context = line.message.content.find(c => c.text?.startsWith('# Google Chat Thread Context'))
+    expect(context?.text).toContain('…(1 earlier messages truncated)')
+    expect(context?.text).toContain('newest')
+    expect(context?.text).not.toContain('oldest')
+  })
 })
 
 describe('openSessionEventStream', () => {
