@@ -55,6 +55,7 @@ class ApplicationController < ActionController::Base
   CONSOLE_SIDEBAR_SLACK_CREDENTIAL_EMAIL_LABEL_KEYS = %w[email slack_email].freeze
   CONSOLE_SIDEBAR_SLACK_TEAM_LABEL = "slack_team_id".freeze
   CONSOLE_SIDEBAR_THREAD_OWNER_METADATA_KEYS = %w[actor_email user_email].freeze
+  CONSOLE_SIDEBAR_GOOGLECHAT_THREAD_OWNER_METADATA_KEYS = %w[user_email actor_email].freeze
   ConsoleSidebarSlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
 
   private
@@ -173,6 +174,7 @@ class ApplicationController < ActionController::Base
     slack_owners = console_sidebar_slack_thread_owners_for_current_user
     conditions = [
       console_sidebar_console_thread_owner_sql,
+      console_sidebar_googlechat_thread_owner_sql,
       (console_sidebar_slack_thread_owner_sql(slack_owners) if slack_owners.any?)
     ].compact
 
@@ -219,6 +221,27 @@ class ApplicationController < ActionController::Base
     end
 
     "(#{console_source}) AND (#{owner_clauses.join(" OR ")})"
+  end
+
+  # Google Chat threads (thread_key `chat:…`) surface in the sidebar for the
+  # user who started them. Mirrors Console::ThreadsController#googlechat_thread_owner_sql
+  # so the sidebar and the main thread pane agree on which chats are visible;
+  # without it, owned Google Chat threads open via a direct link but never
+  # appear in the sidebar list ("No recent chats").
+  def console_sidebar_googlechat_thread_owner_sql
+    email = console_sidebar_normalize_email(current_user&.email)
+    return if email.blank?
+
+    googlechat_source = [
+      "thread_key LIKE 'chat:%'",
+      "metadata ->> 'platform' = 'googlechat'",
+      "metadata ->> 'source' = 'googlechatbot'"
+    ].join(" OR ")
+    owner_clauses = CONSOLE_SIDEBAR_GOOGLECHAT_THREAD_OWNER_METADATA_KEYS.map do |key|
+      "lower(metadata ->> #{console_sidebar_sql_quote(key)}) = #{console_sidebar_sql_quote(email)}"
+    end
+
+    "(#{googlechat_source}) AND (#{owner_clauses.join(" OR ")})"
   end
 
   def console_sidebar_slack_thread_owners_for_current_user

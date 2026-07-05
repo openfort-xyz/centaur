@@ -620,6 +620,21 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_includes sql, "ussoonly"
   end
 
+  test "sidebar thread scope matches Google Chat threads by requester email" do
+    # Regression: the sidebar scope must cover Google Chat threads too, exactly
+    # like Console::ThreadsController#visible_thread_scope. Without the gchat
+    # condition an owned `chat:` thread opens via a direct link but never shows
+    # in the sidebar list ("No recent chats").
+    controller = threads_controller_for(@operator)
+
+    sql = controller.send(:console_sidebar_visible_thread_scope).to_sql
+
+    assert_includes sql, "thread_key LIKE 'chat:%'"
+    assert_includes sql, "metadata ->> 'platform' = 'googlechat'"
+    assert_includes sql, "metadata ->> 'source' = 'googlechatbot'"
+    assert_includes sql, @operator.email.downcase
+  end
+
   test "selected session resolves a directly linked thread only within the owner scope" do
     controller = Console::ThreadsController.new
     owned_thread = SelectedSession.new(thread_key: "slack:C123:1782339173.755169")
