@@ -26,6 +26,15 @@ transforms:
           rules:
             - { host: github.com }
             - { host: api.github.com }
+        # GITHUB_TOKEN is a fine-grained PAT with no Packages permission, so
+        # GitHub Packages gets its own classic read:packages PAT. Consumers
+        # set NODE_AUTH_TOKEN="$GITHUB_PACKAGES_TOKEN" (the api repo's .npmrc
+        # reads that var) for private @openfort-xyz installs.
+        - replace:
+            proxy_value: GITHUB_PACKAGES_TOKEN
+            match_headers: ["Authorization"]
+          rules:
+            - { host: npm.pkg.github.com }
         - replace:
             proxy_value: SLACK_BOT_TOKEN
             match_headers: ["Authorization"]
