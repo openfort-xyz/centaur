@@ -29,9 +29,41 @@ function settledState(answer: string) {
 }
 
 describe('finalizeRender surface selection', () => {
-  test('rich markdown goes to the card surface', async () => {
+  test('markdown answers go to the text surface (cards fragment inline spans)', async () => {
     const capture: { body?: Partial<GoogleChatMessage> } = {}
     const state = settledState(RICH_ANSWER)
+
+    await finalizeRender(stubClient(capture), target(), state)
+
+    // Heading becomes a Chat-markup bold line; list items ride along verbatim.
+    expect(capture.body?.text).toContain('*Result*')
+    expect(capture.body?.text).toContain('- first')
+    expect(capture.body?.cardsV2).toEqual([])
+  })
+
+  test('mid-sentence bold stays inline on the text surface', async () => {
+    const capture: { body?: Partial<GoogleChatMessage> } = {}
+    const state = settledState("The spike was Farao's **coordinated public launch**, not drift.")
+
+    await finalizeRender(stubClient(capture), target(), state)
+
+    expect(capture.body?.text).toContain("Farao's *coordinated public launch*, not drift.")
+    expect(capture.body?.cardsV2).toEqual([])
+  })
+
+  test('standalone image embeds go to the card surface', async () => {
+    const capture: { body?: Partial<GoogleChatMessage> } = {}
+    const state = settledState('Look:\n![diagram](https://example.com/x.png)')
+
+    await finalizeRender(stubClient(capture), target(), state)
+
+    expect(capture.body?.text).toBeUndefined()
+    expect(capture.body?.cardsV2?.length).toBeGreaterThan(0)
+  })
+
+  test('answers over the 4096-char text cap go to the card surface', async () => {
+    const capture: { body?: Partial<GoogleChatMessage> } = {}
+    const state = settledState('word '.repeat(1_500))
 
     await finalizeRender(stubClient(capture), target(), state)
 
