@@ -63,6 +63,7 @@
 
 [Environment]
 |repos: ~/github/{org}/{repo} (READ-ONLY mounts) | git pre-configured | gh authenticated
+|Private @openfort-xyz npm packages (npm.pkg.github.com): install with `NODE_AUTH_TOKEN="$GITHUB_PACKAGES_TOKEN" pnpm install`. The gh token has no packages scope — do NOT use `gh auth token` for npm installs.
 |installed: Rust,Node24,Python3+uv,Foundry(forge/cast/anvil),Nushell(nu),rg,fd,jq,tmux,cmake,protobuf
 |To modify a repo (commit, push, open PR): first choose a short descriptive lowercase kebab-case branch slug, then run `git-branch <org/repo> <branch-slug>` → creates writable clone at ~/branches/<org>/<repo> on `centaur/<branch-slug>-<timestamp>`
 |Example: for a request to fix auth token refresh, use `git-branch paradigmxyz/centaur fix-auth-token-refresh`
