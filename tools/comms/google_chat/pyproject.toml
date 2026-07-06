@@ -36,11 +36,19 @@ hosts = ["chatbot", "chat.googleapis.com"]
 # API — exactly like the Slack tool uploads to slack.com — and iron-proxy injects
 # the token at the edge. But Google's media.upload REJECTS app auth, so the write
 # grant mints a domain-wide-delegation token for a real user (`subject`) with the
-# chat.messages.create scope, injected only on POSTs to /upload and /v1/spaces.
+# chat.messages.create scope, injected on POSTs to chat.googleapis.com.
 # The `subject` is deployment-specific (the Workspace user the service account is
 # authorized to impersonate); ideally a dedicated uploads account.
+# NOTE: the write grant is deliberately NOT narrowed with `paths` (was
+# ["/upload/", "/v1/spaces/"]): the pinned iron-proxy (0.46.0-rc.1) does not
+# implement path rules — a rule carrying `paths` never matches, so the proxy
+# injects nothing and Google returns 401 CREDENTIALS_MISSING (fail closed,
+# verified live 2026-07-06). Host+method scoping is the finest supported
+# granularity; re-add paths only after the proxy image demonstrably matches
+# them. Grant changes here are not auto-synced — re-provision with
+# `centaur-perms roles grant infra --tool google_chat`.
 secrets = [
     {type = "http", name = "CHATBOT_API_KEY", match_headers = ["Authorization"], hosts = ["chatbot"]},
     {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/chat.app.messages.readonly"], http_methods = ["GET"]},
-    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.messages.create"], subject = "jaume@openfort.xyz", http_methods = ["POST"], paths = ["/upload/", "/v1/spaces/"]},
+    {type = "gcp_auth", name = "GOOGLE_SERVICE_ACCOUNT_JSON", hosts = ["chat.googleapis.com"], scopes = ["https://www.googleapis.com/auth/chat.messages.create"], subject = "jaume@openfort.xyz", http_methods = ["POST"]},
 ]
