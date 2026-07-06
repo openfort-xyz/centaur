@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, normalizeCardBreaks, stripInlineMarkdown } from './render'
+import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, normalizeCardBreaks, stripInlineMarkdown, flattenCardProseInline } from './render'
 import { chatReplyLimits } from '../constants'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
@@ -10,14 +10,19 @@ function paragraphs(out: ReturnType<typeof markdownToChatMessage>): TextParagrap
 }
 
 describe('markdownToChatMessage', () => {
-  test('renders body text as MARKDOWN so inline formatting and links survive', () => {
-    const out = markdownToChatMessage('Here is **bold** and a [link](https://example.com).')
+  test('card prose is flattened so Chat cannot fragment inline spans; lists keep markdown', () => {
+    // Cards break EVERY inline span in a top-level paragraph onto its own line
+    // (probe cards posted live, 2026-07-06) — so card prose ships with inline
+    // markup removed. List items are exempt: their spans render correctly.
+    const out = markdownToChatMessage(
+      'Here is **bold** and a [link](https://example.com).\n- item with **bold** leader'
+    )
     const ps = paragraphs(out)
     expect(ps.length).toBeGreaterThan(0)
     expect(ps.every((p) => p.textSyntax === 'MARKDOWN')).toBe(true)
-    // Raw Markdown is preserved verbatim (Google Chat renders it natively).
-    expect(ps[0]!.text).toContain('**bold**')
-    expect(ps[0]!.text).toContain('[link](https://example.com)')
+    const joined = ps.map((p) => p.text).join('\n')
+    expect(joined).toContain('Here is bold and a link (https://example.com).')
+    expect(joined).toContain('- item with **bold** leader')
   })
 
   test('keeps fenced code blocks intact', () => {
@@ -152,6 +157,39 @@ describe('markdownToChatMessage', () => {
   test('toChatTextMarkup leaves image embeds and plain prose untouched', () => {
     expect(toChatTextMarkup('plain prose, no markup')).toBe('plain prose, no markup')
     expect(toChatTextMarkup('![alt](https://img.example/x.png)')).toBe('![alt](https://img.example/x.png)')
+  })
+
+  test('toChatTextMarkup converts headings to bold lines and GFM italics to Chat italics', () => {
+    // `#` has no Chat-markup analog; a bold line is the closest. Inner markers
+    // are stripped so `## **X**` nests to `*X*`, not `***X***`.
+    expect(toChatTextMarkup('## Weekly **summary**\nbody')).toBe('*Weekly summary*\nbody')
+    // GFM `*italic*` must become `_italic_` — a single `*` is BOLD in Chat markup.
+    expect(toChatTextMarkup('High on *what* only')).toBe('High on _what_ only')
+    // Italic conversion must not eat bold runs on the same line.
+    expect(toChatTextMarkup('a *i* and **b** mix')).toBe('a _i_ and *b* mix')
+  })
+
+  test('toChatTextMarkup is fence-aware: code blocks pass through untouched', () => {
+    const md = 'above **bold**\n```py\n# not a heading\nx = 2 ** 3\n```\n# Real heading'
+    expect(toChatTextMarkup(md)).toBe('above *bold*\n```py\n# not a heading\nx = 2 ** 3\n```\n*Real heading*')
+  })
+
+  test('flattenCardProseInline strips prose spans, keeps list items and fences', () => {
+    // Prose: every inline span would fragment onto its own line in a card.
+    expect(flattenCardProseInline("Farao's **launch**, not *drift* — see `source` and [docs](https://x/y)")).toBe(
+      "Farao's launch, not drift — see source and docs (https://x/y)"
+    )
+    // List items render inline spans correctly in cards — keep their markdown.
+    expect(flattenCardProseInline('- **Installs spiked** (vs baseline)')).toBe(
+      '- **Installs spiked** (vs baseline)'
+    )
+    // Whole-line bold (pseudo headings, record-list row titles) already owns its
+    // line, so the bold is kept; heading lines are left for header extraction.
+    expect(flattenCardProseInline('**Product & SDK**')).toBe('**Product & SDK**')
+    expect(flattenCardProseInline('**[demo](https://demo.example/)**')).toBe('**[demo](https://demo.example/)**')
+    expect(flattenCardProseInline('## **Q2** [report](https://x/y)')).toBe('## **Q2** [report](https://x/y)')
+    // Fences are never touched.
+    expect(flattenCardProseInline('```\n**not stripped**\n```')).toBe('```\n**not stripped**\n```')
   })
 
   test('normalizeCardBreaks collapses mashing blank lines but keeps lists and gaps after lists', () => {

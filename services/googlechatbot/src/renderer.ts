@@ -15,19 +15,25 @@ const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 
 // A message with both `text` and `cardsV2` renders the text as a bubble ABOVE
 // the card (Google Chat: "cards are displayed below the plain-text body"), so
-// putting answer content in both shows it twice. We therefore pick ONE surface:
-//   - rich markdown (headers, lists, code, tables, links) → card only. The card
-//     textParagraph (textSyntax: MARKDOWN) is the only surface that renders the
-//     agent's GitHub-flavoured markdown faithfully; the plain `text` field only
-//     supports Chat-flavoured markup (*bold*, <url|text>) and would leak `**`,
-//     `[]()`, `#`, `1.` as literals.
-//   - plain prose (no markdown) → `text` only, no card. It renders fine, stays
-//     searchable/Vault-captured (card text indexing is undocumented), and avoids
-//     card chrome on trivial replies.
+// putting answer content in both shows it twice. We therefore pick ONE surface.
+//
+// The plain `text` field is the DEFAULT surface, cards the exception. Card
+// textParagraphs fragment top-level paragraphs around EVERY inline span —
+// mid-sentence **bold**, *italic*, and `code` each get pushed onto their own
+// line — regardless of markup form (`**b**`, `*b*`, `<b>`, all with textSyntax
+// MARKDOWN and with the default syntax alike; probe cards posted to a live
+// space, 2026-07-06). Only list items render their inline spans correctly.
+// The plain `text` field renders Chat markup (*bold*, _italic_, `code`,
+// ```fences```) inline and intact, so answers read correctly only there;
+// toChatTextMarkup translates the agent's GFM (**bold**, [label](url),
+// # headings) into that markup.
+//
+// Cards remain for what the text surface genuinely cannot carry:
+//   - standalone image embeds (`![alt](https://…)`) → image widgets;
+//   - answers over the 4096-char `text` cap (the card envelope is ~32 KB).
 // Notification preview is not a factor: the answer is delivered by PATCHing the
 // already-posted "thinking" ack, and the ack's create already fired the push.
-const LOOKS_RICH_RE =
-  /(^|\n)\s*#{1,6}\s|```|(^|\n)\s*[-*+]\s|(^|\n)\s*\d+\.\s|\|.*\|/
+const NEEDS_CARD_RE = /(^|\n)\s*!\[[^\]]*\]\(https?:\/\/[^\s)]+\)\s*(?=\n|$)/
 
 export type RenderTarget = {
   spaceName: string
@@ -204,18 +210,20 @@ async function deliverFinal(
   const trailers = [button, target.consoleSessionWidget].filter(
     (widget): widget is GoogleChatCardWidget => widget !== undefined
   )
-  // Use the card (no `text`) for rich markdown OR when the plain answer would
-  // exceed Google Chat's 4096-char `text` cap — the card envelope is ~32 KB, so
-  // routing long answers there avoids a 400 (and a silent truncation). Plain:
-  // the whole answer in `text`, no card (plus a button-only card for the link).
+  // Use the card (no `text`) only when the text surface cannot carry the
+  // answer: image embeds (need image widgets) or overflow past Google Chat's
+  // 4096-char `text` cap — the card envelope is ~32 KB, so routing long answers
+  // there avoids a 400 (and a silent truncation). Everything else goes plain:
+  // the whole answer in `text`, no card (plus a button-only card for the link)
+  // — cards fragment inline formatting (see NEEDS_CARD_RE above).
   // `rendered.text` is clamped to the 4096 cap; hitting it means the plain answer
   // overflowed and must go to the (larger) card to avoid truncation / a 400.
   const plainOverflows = rendered.text.length >= chatReplyLimits.message.maxPlainTextChars
   // A "plain text only" prompt (same phrases slackbotv2 honors) forces the
-  // `text` surface even for rich markdown — unless the answer overflows the
+  // `text` surface even for image embeds — unless the answer overflows the
   // 4096-char cap, where the card is the only surface that fits it whole.
-  const looksRich = plainOverflows || (!target.plainTextOnly && LOOKS_RICH_RE.test(text))
-  const body: Partial<GoogleChatMessage> = looksRich
+  const needsCard = plainOverflows || (!target.plainTextOnly && NEEDS_CARD_RE.test(text))
+  const body: Partial<GoogleChatMessage> = needsCard
     ? { cardsV2: withTrailers(rendered.cardsV2, trailers) }
     : { text: rendered.text, cardsV2: trailers.length ? [trailerCard(trailers)] : [] }
 

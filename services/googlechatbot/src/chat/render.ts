@@ -29,8 +29,10 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   // break but COLLAPSES a blank line (`\n\n`) to nothing, mashing consecutive
   // paragraphs onto one line ("…no new package releases.**Product & SDK**"). The
   // plain `text` field does the opposite (blank line = paragraph break). So
-  // normalise the CARD source only — collapse blank lines to single breaks.
-  const cards = splitMarkdownToCards(normalizeCardBreaks(fenced))
+  // normalise the CARD source only — collapse blank lines to single breaks —
+  // and flatten inline markup in card prose, which cards would otherwise
+  // fragment onto separate lines (see flattenCardProseInline).
+  const cards = splitMarkdownToCards(flattenCardProseInline(normalizeCardBreaks(fenced)))
   const cardsV2 = cards.slice(0, MAX_CARDS).map((card, index) => ({
     cardId: `card-${index}`,
     card: {
@@ -136,18 +138,92 @@ export function stripInlineMarkdown(text: string): string {
 /**
  * Translate the GitHub-flavoured Markdown the agent emits into the Chat-flavoured
  * markup the plain `text` field actually renders. The `text` field does NOT
- * understand `**bold**` or `[label](url)` — it renders `*bold*` and `<url|label>`
- * — so without this they leak as literal asterisks and raw URLs (observed live on
- * a weather answer). Only the card path renders GFM natively (textSyntax MARKDOWN),
- * so this is applied to the plain path only.
+ * understand `**bold**`, `[label](url)`, or `# headings` — it renders `*bold*`,
+ * `<url|label>`, and has no heading concept — so without this they leak as
+ * literal asterisks, raw URLs, and `#` prefixes (observed live on a weather
+ * answer). The plain surface is the primary one: card textParagraphs fragment
+ * every inline span onto its own line (see NEEDS_CARD_RE in renderer.ts), so
+ * answers are only readable here. Fence-aware: lines inside ``` blocks pass
+ * through untouched (Chat renders the fence natively, and a `# comment` inside
+ * code must not become a bold line).
  */
 export function toChatTextMarkup(text: string): string {
-  return text
-    // `[label](url)` → `<url|label>`; skip image embeds (`![alt](url)`).
-    .replace(/(?<!!)\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>')
-    .replace(/\*\*([^*\n]+)\*\*/g, '*$1*') // **bold** → *bold*
-    .replace(/__([^_\n]+)__/g, '*$1*') // __bold__ → *bold*
-    .replace(/~~([^~\n]+)~~/g, '~$1~') // ~~strike~~ → ~strike~
+  const out: string[] = []
+  let inFence = false
+  for (const line of text.split('\n')) {
+    if (line.trimStart().startsWith('```')) {
+      inFence = !inFence
+      out.push(line)
+      continue
+    }
+    if (inFence) {
+      out.push(line)
+      continue
+    }
+    // `# Heading` → a bold line (`*Heading*`), the closest Chat-markup analog.
+    // Inner markers are stripped first so `## **X**` nests to `*X*`, not `***X***`.
+    const heading = line.match(/^#{1,6}\s+(.+)$/)
+    if (heading) {
+      out.push(`*${stripInlineMarkdown(heading[1]!)}*`)
+      continue
+    }
+    out.push(
+      line
+        // `[label](url)` → `<url|label>`; skip image embeds (`![alt](url)`).
+        .replace(/(?<!!)\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>')
+        // GFM `*italic*` → Chat `_italic_` — in Chat markup a single `*` is
+        // BOLD, so leaving it would silently promote italics. Runs before the
+        // `**bold**` conversion; the lookarounds keep it off `**` runs.
+        .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '_$1_')
+        .replace(/\*\*([^*\n]+)\*\*/g, '*$1*') // **bold** → *bold*
+        .replace(/__([^_\n]+)__/g, '*$1*') // __bold__ → *bold*
+        .replace(/~~([^~\n]+)~~/g, '~$1~') // ~~strike~~ → ~strike~
+    )
+  }
+  return out.join('\n')
+}
+
+/**
+ * Flatten inline markup in card PROSE lines so Google Chat cannot fragment it.
+ * Card textParagraphs render every inline span in a top-level paragraph as its
+ * own block — `Farao's **launch**, not` becomes three lines — for every markup
+ * form (`**b**`, `*b*`, `<b>`, backtick code; textSyntax MARKDOWN and default
+ * alike; probe cards, 2026-07-06). Exempt, markdown kept as-is:
+ *  - list items — their inline spans render correctly in cards;
+ *  - `#` heading lines — extracted into section headers downstream;
+ *  - whole-line bold (`**Pseudo heading**`, record-list row titles) — the span
+ *    already owns the line, so "fragmenting" it changes nothing and the bold
+ *    is wanted.
+ * Fences pass through untouched. Links become `label (url)` — an `<a>`/`[]()`
+ * span would fragment too. Card-path only; the plain path renders inline
+ * markup fine via toChatTextMarkup.
+ */
+export function flattenCardProseInline(markdown: string): string {
+  const isListItem = (l: string) => /^\s*([-*+]|\d+\.)\s/.test(l)
+  const isHeading = (l: string) => /^\s*#{1,6}\s/.test(l)
+  const isWholeLineBold = (l: string) => /^\s*\*\*[^*]+\*\*:?\s*$/.test(l)
+  const out: string[] = []
+  let inFence = false
+  for (const line of markdown.split('\n')) {
+    if (line.trimStart().startsWith('```')) {
+      inFence = !inFence
+      out.push(line)
+      continue
+    }
+    if (inFence || isListItem(line) || isHeading(line) || isWholeLineBold(line)) {
+      out.push(line)
+      continue
+    }
+    out.push(
+      line
+        .replace(/(?<!!)\[([^\]]+)\]\(([^)\s]+)\)/g, '$1 ($2)') // [label](url) → label (url)
+        .replace(/(\*\*|__)([^*_\n]+)\1/g, '$2') // **bold** / __bold__ → bold
+        .replace(/(\*|_)([^*_\n]+)\1/g, '$2') // *italic* / _italic_ → italic
+        .replace(/~~([^~\n]+)~~/g, '$1') // ~~strike~~ → strike
+        .replace(/`([^`\n]+)`/g, '$1') // `code` → code
+    )
+  }
+  return out.join('\n')
 }
 
 /**
