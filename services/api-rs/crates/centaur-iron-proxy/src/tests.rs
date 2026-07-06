@@ -35,7 +35,12 @@ fn harness_auth_fragments_are_baked_in() {
         Some("120s")
     );
     let placeholders = placeholder_env(&[infra]);
-    for name in ["AMP_API_KEY", "GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {
+    for name in [
+        "AMP_API_KEY",
+        "GITHUB_TOKEN",
+        "GITHUB_PACKAGES_TOKEN",
+        "SLACK_BOT_TOKEN",
+    ] {
         assert_eq!(placeholders.get(name).map(String::as_str), Some(name));
     }
 }
