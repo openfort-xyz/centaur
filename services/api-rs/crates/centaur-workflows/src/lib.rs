@@ -2747,6 +2747,12 @@ async fn run_python_workflow_host_in_sandbox(
         spec = spec.env("DATABASE_URL", database_url);
     }
     let (sandbox_id, io) = sandbox.runtime.create_running_io(spec).await?;
+    // Shield the host sandbox from the session cleanup worker's orphan reaper
+    // for as long as this run holds it: workflow sandboxes have no session or
+    // warm-pool reference, so without the lease any run outliving two reaper
+    // sweeps (~10 min) was killed mid-flight (2026-07-07 notion_sync incident).
+    let _sandbox_lease =
+        centaur_session_runtime::sandbox_leases::lease_sandbox(sandbox_id.as_str());
     let mut stdin = io.stdin;
     let stderr_task = tokio::spawn(async move {
         let _guard = io.guard;
@@ -3489,9 +3495,8 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
         .and_then(|args| args.get("thread_name"))
         .and_then(Value::as_str);
 
-    let token = env::var("CHATBOT_API_KEY").map_err(|_| {
-        WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned())
-    })?;
+    let token = env::var("CHATBOT_API_KEY")
+        .map_err(|_| WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned()))?;
     let base_url = env::var("CHATBOT_URL")
         .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
     let base_url = base_url.trim_end_matches('/');
