@@ -314,6 +314,20 @@ spec:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
 {{- end }}
+{{- if .Values.googlechatbot.enabled }}
+    # Workflow deliveries: api-rs (centaur-workflows) POSTs digest messages to
+    # the Google Chat bot's local API. Without this rule every scheduled
+    # workflow that delivers to Google Chat exhausts its retries at the
+    # delivery step (2026-07-04 incident: all digests + health sentinel
+    # alerts silently failed for 3 days).
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
+{{- end }}
 {{- if .Values.networkPolicy.otlpEgress.enabled }}
     # OTLP trace export (e.g. Laminar). The collector lives in another
     # namespace; without this rule api-rs's own spans die with
