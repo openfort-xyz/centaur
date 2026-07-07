@@ -22,21 +22,6 @@ def _install_api_stubs() -> None:
         value if value is not None else default
     )
 
-    vm_metrics = types.ModuleType("api.vm_metrics")
-    for name in (
-        "observe_company_context_document_size",
-        "record_company_context_documents_changed",
-        "set_company_context_projection_lag",
-        "set_etl_active_scopes",
-        "set_etl_failed_scopes",
-        "set_etl_scope_sync_freshness_seconds",
-        "record_etl_items_seen",
-        "record_etl_items_upserted",
-        "record_etl_items_failed",
-        "record_slack_etl_rate_limit",
-    ):
-        setattr(vm_metrics, name, lambda *_args, **_kwargs: None)
-
     metrics = types.ModuleType("api.metrics")
     metrics.increment_metric = lambda *_args, **_kwargs: None
     metrics.set_gauge = lambda *_args, **_kwargs: None
@@ -50,12 +35,10 @@ def _install_api_stubs() -> None:
 
     api_module = sys.modules.get("api") or types.ModuleType("api")
     api_module.runtime_control = runtime_control
-    api_module.vm_metrics = vm_metrics
     api_module.metrics = metrics
     api_module.workflow_engine = workflow_engine
     sys.modules["api"] = api_module
     sys.modules["api.runtime_control"] = runtime_control
-    sys.modules["api.vm_metrics"] = vm_metrics
     sys.modules["api.metrics"] = metrics
     sys.modules["api.workflow_engine"] = workflow_engine
     sys.modules["centaur_sdk"] = centaur_sdk
