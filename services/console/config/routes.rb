@@ -86,6 +86,9 @@ Rails.application.routes.draw do
   end
   get "console/credentials/:id", to: "console#credential", as: :console_credential
   get "console/oauth_apps", to: "console#oauth_apps", as: :console_oauth_apps
+  # User-facing list of enabled OAuth apps and their consent start links. Not
+  # admin-gated: any signed-in team member connects integrations from here.
+  get "console/integrations", to: "console/integrations#index", as: :console_integrations
   get "console/etls", to: "console/etls#index", as: :console_etls
   namespace :console do
     post "etls/slack_archive_imports",

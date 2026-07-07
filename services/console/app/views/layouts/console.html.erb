@@ -1248,7 +1248,8 @@
   <% threads_view = request.path.start_with?("/console/threads") %>
   <% workflows_view = request.path.start_with?("/console/workflows") %>
   <%# The Control and Data Sync sections are admin-only (each controller enforces
-      require_admin server-side); non-admins only get the Chats view below. %>
+      require_admin server-side); Integrations is for everyone -- it lists the
+      public consent start links any team member can use. %>
   <% nav_items = [] %>
   <% if acting_admin? %>
     <% control_matches = [ "/console/principals", "/console/roles", "/console/secrets", "/console/credentials", "/console/oauth_apps", "/console/users" ] %>
@@ -1257,6 +1258,7 @@
       { label: "Data Sync", icon: "database", path: console_etls_path, matches: [ "/console/etls" ] }
     ] %>
   <% end %>
+  <% nav_items << { label: "Integrations", icon: "link", path: console_integrations_path, matches: [ "/console/integrations" ] } %>
 
   <body class="h-full overflow-hidden bg-ink-900 text-zinc-300 font-mono antialiased <%= "console-descoped" if descoped? %>">
     <% if descoped? %>
