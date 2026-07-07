@@ -171,13 +171,6 @@ fn orphan_reap_eligible(sandbox: &ObservedSandbox, referenced: &BTreeSet<String>
     if referenced.contains(sandbox.id.as_str()) {
         return false;
     }
-    // Workflow-host sandboxes are referenced by neither `sessions` nor the
-    // warm pool; their runner holds an in-process lease instead. Reaping a
-    // leased sandbox kills a live workflow mid-run (its proxy Service goes
-    // first, so the host dies with a misleading DNS error).
-    if crate::sandbox_leases::is_sandbox_leased(sandbox.id.as_str()) {
-        return false;
-    }
     !matches!(
         sandbox.status,
         SandboxStatus::Created | SandboxStatus::Stopped | SandboxStatus::Gone
