@@ -1586,6 +1586,12 @@ struct IronProxyArgs {
         env = "KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY"
     )]
     image_pull_policy: Option<String>,
+    #[arg(
+        long = "kubernetes-iron-proxy-upstream-deny-cidrs",
+        env = "KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS",
+        value_delimiter = ','
+    )]
+    upstream_deny_cidrs: Vec<String>,
     #[command(flatten)]
     ca: IronProxyCaArgs,
     #[command(flatten)]
@@ -1622,6 +1628,12 @@ impl IronProxyArgs {
         let mut config =
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.image_pull_policy = self.image_pull_policy.clone();
+        config.upstream_deny_cidrs = self
+            .upstream_deny_cidrs
+            .iter()
+            .filter_map(|cidr| non_empty(Some(cidr.as_str())))
+            .map(ToOwned::to_owned)
+            .collect();
         self.source.apply_to_config(&mut config);
         config.fragments = harness_fragments;
         config.env_from_secret_names = self.env_from_secret_names();
@@ -2780,6 +2792,34 @@ mod tests {
         .unwrap();
 
         assert!(!args.sandbox.iron_control_sync_infra_secrets);
+    }
+
+    #[test]
+    fn iron_proxy_upstream_deny_cidrs_are_parsed() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "enabled",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-iron-proxy-upstream-deny-cidrs",
+            "127.0.0.0/8,10.42.0.0/16,10.43.0.0/16",
+        ])
+        .unwrap();
+
+        let config = args.sandbox.iron_proxy.to_config().unwrap().unwrap();
+        assert_eq!(
+            config.upstream_deny_cidrs,
+            vec![
+                "127.0.0.0/8".to_owned(),
+                "10.42.0.0/16".to_owned(),
+                "10.43.0.0/16".to_owned(),
+            ]
+        );
     }
 
     #[test]

@@ -94,7 +94,11 @@
           }
         },
         "secretSource": { "type": "string" },
-        "secretTtl": { "type": "string" }
+        "secretTtl": { "type": "string" },
+        "upstreamDenyCidrs": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
       }
     },
     "toolServer": {
