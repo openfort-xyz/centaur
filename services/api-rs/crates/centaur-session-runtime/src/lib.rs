@@ -1,5 +1,4 @@
 mod cleanup;
-pub mod sandbox_leases;
 mod title_generator;
 
 use std::{
@@ -6363,8 +6362,12 @@ pub fn final_answer_text_from_output_lines(lines: &[String]) -> String {
                 };
                 if let Some(update) = output_line_final_answer_text(&value) {
                     match update {
-                        FinalAnswerTextUpdate::Append(delta) => final_answer_text.push_str(&delta),
-                        FinalAnswerTextUpdate::Replace(canonical) => final_answer_text = canonical,
+                        FinalAnswerTextUpdate::Append(delta) => {
+                            final_answer_text.push_str(&delta)
+                        }
+                        FinalAnswerTextUpdate::Replace(canonical) => {
+                            final_answer_text = canonical
+                        }
                     }
                 }
             }
