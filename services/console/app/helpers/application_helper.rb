@@ -36,10 +36,61 @@ module ApplicationHelper
     when "completed" then "border-centaur-500/30 bg-centaur-500/10 text-centaur-300"
     when "running" then "border-sky-500/40 bg-sky-500/10 text-sky-300"
     when "failed" then "border-red-500/40 bg-red-500/10 text-red-300"
-    when "cancelled" then "border-zinc-600 bg-zinc-700/40 text-zinc-400"
+    when "cancelled" then "border-ink-600 bg-ink-800/80 text-zinc-400"
     when "pending", "sleeping" then "border-amber-500/40 bg-amber-500/10 text-amber-300"
     else "border-ink-600 bg-ink-800/80 text-zinc-400"
     end
+  end
+
+  # Engine names rendered the way the Chats page renders harness types
+  # (Console::ThreadsController#thread_harness_label): known harnesses get
+  # their product names, anything else is capitalized word-wise.
+  def workflow_engine_label(harness_type)
+    case harness_type.to_s
+    when "codex" then "Codex"
+    when "claudecode" then "Claude Code"
+    when "amp" then "Amp"
+    when "" then nil
+    else harness_type.to_s.tr("_-", " ").squish.split.map(&:capitalize).join(" ")
+    end
+  end
+
+  # GitHub URL for a workflow source path reported by the workflow host.
+  # Paths are repo-relative; an overlay-repo prefix ("centaur-tempo/...") maps
+  # to the tempo overlay repo, everything else to the main centaur repo.
+  def workflow_source_url(source_path)
+    path = source_path.to_s
+    return nil if path.blank?
+
+    if path.start_with?("centaur-tempo/")
+      "https://github.com/tempoxyz/centaur-tempo/blob/main/#{path.delete_prefix("centaur-tempo/")}"
+    else
+      "https://github.com/paradigmxyz/centaur/blob/main/#{path}"
+    end
+  end
+
+  # Human label for a workflow schedule from the workflows API, e.g.
+  # "cron */5 * * * *" or "every 5m". The kind is the serde-tagged enum
+  # {"type":"cron","cron":...} | {"type":"interval","interval_seconds":...}.
+  def workflow_schedule_label(schedule)
+    kind = schedule.is_a?(Hash) ? schedule["kind"] : nil
+    return nil unless kind.is_a?(Hash)
+
+    case kind["type"]
+    when "cron"
+      "cron #{kind["cron"]}"
+    when "interval"
+      seconds = kind["interval_seconds"].to_i
+      "every #{seconds % 60 == 0 && seconds >= 60 ? "#{seconds / 60}m" : "#{seconds}s"}"
+    end
+  end
+
+  # Pretty-printed JSON for workflow run payloads (input/result/failure).
+  # Falls back to to_s for values the generator refuses.
+  def workflow_debug_json(value)
+    JSON.pretty_generate(value)
+  rescue JSON::GeneratorError
+    value.to_s
   end
 
   def workflow_duration_label(run)
