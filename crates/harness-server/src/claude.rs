@@ -546,12 +546,17 @@ mod tests {
 
     #[test]
     fn completes_turns_on_result_not_end_turn() {
-        // Claude must NOT complete on the assistant `end_turn` message: it emits a
-        // terminal `result` line every turn (even with stdin held open), and
-        // completing on `end_turn` would leave that `result` unconsumed for the
-        // next turn to read as a stale terminal (follow-up turns then render
-        // empty). The terminal `result` event is what closes a Claude turn.
-        assert!(!ClaudeCodeHarness.finish_turn_on_assistant_end_turn());
+        // Claude must not complete immediately on the assistant `end_turn` stop:
+        // it emits a terminal `result` line every turn (even with stdin held
+        // open), and completing on `end_turn` would leave that `result`
+        // unconsumed for the next turn to read as a stale terminal (follow-up
+        // turns then render empty). Instead it waits out a short settle window
+        // for the native `result` (a non-zero `terminal_assistant_stop_settle`),
+        // and the terminal `result` event is what closes a Claude turn.
+        assert_eq!(
+            ClaudeCodeHarness.terminal_assistant_stop_settle(),
+            Some(std::time::Duration::from_secs(2))
+        );
 
         let mut normalizer = ClaudeEventNormalizer::default();
         let events = normalize(
