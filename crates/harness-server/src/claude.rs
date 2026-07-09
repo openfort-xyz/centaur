@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 use codex_app_server_protocol::UserInput;
 use serde_json::json;
@@ -275,20 +276,28 @@ impl HarnessServer for ClaudeCodeHarness {
         normalizer: &mut Self::EventNormalizer,
         event: Self::Event,
     ) -> Result<Vec<NormalizedEvent>> {
+        // Subagent sidechains (Task tool) interleave their own messages into
+        // the stream, ending with their own `end_turn` while the parent turn
+        // keeps running. Letting them through corrupts the pending-text state
+        // (their message ids clobber the main chain's) and their stop reasons
+        // would settle — and with the stop fallback, terminate — the parent
+        // turn. The subagent's report reaches the turn through the main
+        // chain's Task tool result.
+        if event.is_sidechain() {
+            return Ok(Vec::new());
+        }
         Ok(normalizer.normalize(event))
     }
 
-    // NOTE: ClaudeCodeHarness deliberately does NOT override
-    // `finish_turn_on_assistant_end_turn`. Claude Code emits a terminal
-    // `{"type":"result"}` line at the end of every turn even when stdin is held
-    // open (the persistent-process model), so the turn completes on that `result`
-    // event via `is_terminal()`. Completing earlier on the assistant `end_turn`
-    // message leaves the trailing `result` line unconsumed in the shared stdout;
-    // the NEXT turn then reads that stale `result` first and terminates instantly
-    // with no agent response (its real agentMessage arrives after the turn is
-    // already closed and is dropped) — i.e. follow-up turns render empty. Amp is
-    // different: its streaming process may not emit `result` until stdin closes,
-    // so amp legitimately completes on `end_turn`.
+    /// Claude Code normally ends a turn with a native `result` line, but
+    /// streams have been observed to stop at `message_delta.stop_reason`
+    /// without one (leaving the execution hung as "thinking" forever). Wait a
+    /// short window for the native result before completing on the stop, so
+    /// the trailing `result` is consumed by this turn instead of instantly
+    /// terminating the next one.
+    fn terminal_assistant_stop_settle(&self) -> Option<Duration> {
+        Some(Duration::from_secs(2))
+    }
 }
 
 #[cfg(test)]
