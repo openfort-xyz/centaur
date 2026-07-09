@@ -90,3 +90,48 @@ explaining the setup.
 | 3.3 | #882 restore Slack DM context visibility (slack_team_id metadata → iron-control; Slack-DM ETL tables in company_context) | No Chat analogue needed: gchat principals derive wholly from the thread key (space id — `parse_gchat_space`), so no metadata is required to scope them; and there is no Chat DM ETL (DMs are deliberately excluded from the shared corpus, `DEFAULT_INCLUDE_SPACE_TYPES = "SPACE"`). Chat DM ETL with per-user consent (the analogue of upstream's Slack-DM sync subsystem) would be new feature work. | 🟰 / 🔜 (DM ETL) |
 | 3.4 | #887 capture Slack app message content (attachment fallback) + unfreeze busy-channel ETL sync | Ported both applicable halves to `workflows/google_chat/sync.py`: `_message_text` falls back to `cardsV2` widget text (Chat apps post empty `text` + cards — same failure as Slack's attachment-only app posts), and the sync watermark never regresses below the pre-run checkpoint. The head-probe/continuation-job halves are Slack-pagination-specific (oldest-anchored windows); Chat pages `createTime asc` with a token cursor and cannot freeze that way. Backfill job queue remains 🔜 (2.9). | ✅ |
 | 3.5 | #884 gate sandbox API access by capability (tool-side: slack/feedback.py, gsuite/client.py) | Gating lives in shared code (centaur_sdk `save_attachment`, gsuite client — both merged in). The Slack feedback tool has no Chat analogue, and `tools/comms/google_chat` talks to the googlechatbot relay, not the sandbox API server. Nothing to port. | 🟰 |
+
+## 4. Upstream sync 2026-07-09 (65 commits) — Slack-touching changes
+
+Structural note for this window: upstream's new Slack read/write tooling (#961/#1001)
+routes history and files through an **api-rs Slack proxy** (`slack_proxy.rs`) gated by
+per-channel JWT capabilities (#971/#973). The Chat side deliberately has **no api-rs
+chat proxy** — `tools/comms/google_chat` reads/uploads **directly against
+`chat.googleapis.com`** and lets iron-proxy MITM-inject the SA credential at the edge
+(`client.py` `list_messages` / `upload_attachment`). So Slack's history (`list_messages`)
+and upload (`upload`, from 1.16) parity already exists via a different transport, and the
+proxy + JWT-capability machinery has no Chat analogue by design.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 4.1 | #942 Add Meta model support (`--meta` → `{provider:'responses',harnessType:'codex'}` in slackbotv2 `overrides.ts`; shared `args.rs` `META_AI_API_KEY`, iron-proxy `meta-ai` fragment, `harness/codex/config.toml` all merged) | Ported the one-line `meta` entry to `googlechatbot/src/overrides.ts` `PROVIDER_FLAGS` + doc + tests. `session-api.ts` already forwards `provider` on the execute line (same path `--bedrock` uses), so no api-rs/chart change — only the `META_AI_API_KEY` secret must be provisioned on centaur-vps. | ✅ port |
+| 4.2 | #900 handle newline after model override (new `MODEL_VALUE_SEPARATOR`/`FLAG_VALUE_BOUNDARY` regexes + newline/`<br>`-stripping `stripMatch` in slackbotv2 `overrides.ts`) | Ported verbatim to `googlechatbot/src/overrides.ts` (its parser mirrored the pre-#900 form and mis-stripped `--model x⏎prompt`). `<br>` clause is inert on Chat (normalize emits `\n`) but kept for byte-parity. Tests added. | ✅ port |
+| 4.3 | #1001 proxy Slack history and files (`slack_proxy.rs` + `channel-proxy`/`upload-proxy`/`download-proxy` CLI) | History (`list_messages`) and upload (`upload`) parity already exist via direct `chat.googleapis.com` + edge injection (deliberate transport difference). Only gap: a `download` command for a Chat attachment by resource name — inbound attachments already reach the agent via session context (1.1/1.11). | 🟰 / 🔜 (attachment download cmd) |
+| 4.4 | #961 add Slack file proxy API · #1002 proxy sandbox api traffic · #973 slack client jwt on healthz · #971 API server JWTs for sandbox proxy sync | api-rs Slack proxy + JWT-capability machinery: no Chat analogue by design (Chat uses no held token / no api-rs chat proxy). #1002 sandbox-networking is shared infra, applies to both. | 🟰 |
+| 4.5 | #981 resolve user IDs/@usernames to DM channels in Slack read paths | Slack-specific (`conversations.open`); Chat `list_messages` takes a space resource name directly and app-auth can't read DM spaces. No analogue. | 🟰 |
+| 4.6 | #986 index private Slack channels behind flag (`SLACK_SYNC_INDEX_PRIVATE_CHANNELS`, migration `0038→0040`) | Chat ETL already gates space inclusion by type (`GOOGLE_CHAT_INCLUDE_SPACE_TYPES`, default `SPACE`); the private-channel concept maps to space types, already configurable. RLS test merged to keep google_chat coverage + adopt the public/private `visible_rows` model. | 🟰 |
+| 4.7 | #911 / #915 / #970 interrupt process through slackbot stop + stop-command detection | harness-server interrupt primitive is shared/merged; Chat has no stop-command handler wired (parity 1.8). Now a real divergence — portable (detect "stop" in mention text, call the interrupt route). | 🔜 (Chat stop/interrupt) |
+| 4.8 | #920 release session event stream connections after terminal events · #916 gauge open stream connections | Server-side runtime fix (`centaur-session-runtime`) is shared/merged and benefits Chat; bot-side SSE release + open-stream gauge could be mirrored in `googlechatbot/session-api.ts`. | 🟰 (runtime) / 🔜 (bot mirror) |
+| 4.9 | #931 / #935 retry retryable handoff failures in-process | Tied to Slack's redelivery model; Chat already does post-ACK background processing (parity 1.7). Console snapshot half is shared/merged. | 🟰 / 🔜 (resilience) |
+| 4.10 | #924 preserve paragraph breaks in Slack plain-text extraction (`@chat-adapter/slack` patch) | Slack-adapter-specific; Chat has its own `normalize.ts` and does not use `@chat-adapter/slack`. | 🟰 |
+| 4.11 | #982 wire slack bot token into api-rs chart · #983+#985 scoped slack search proxy (added+reverted) | Chart token wiring feeds the api-rs Slack proxy (Chat uses edge injection, no held token). #983 reverted by #985 — nothing lands. | 🟰 |
+| 4.12 | #994 granola MCP backend · #956 GitHub client/githubbot · #955/#957 allium MCP rename · #932/#937/#938/#941/#964/#965/#966 console Integrations + OAuth (Granola/Linear/Attio) | Cross-surface tools/services and console/infra, not a Slack↔Chat parity axis; usable from either bot's sandboxes unchanged. Console OAuth broker stays 🟰 (2.12 — Chat uses a service account). | 🟰 (N/A) |
+
+### Merge-mechanics note (not a parity item)
+
+Migrations collided: the fork's already-applied `0036_google_chat_sync_tables` /
+`0037_google_chat_context_rls` (prod `_sqlx_migrations` has 36/37 as google_chat) vs
+upstream's new `0036`/`0037`/`0038`. Resolution: renumber the **incoming upstream**
+migrations to `0038_readonly_all_workflow_queues` / `0039_session_sandbox_repo_cache_access`
+/ `0040_slack_private_channels` (never the fork's applied ones, which would break checksum
+reconciliation). Harness completion: adopted upstream's `terminal_assistant_stop_settle`
+(2s) settle-window over the fork's result-only stance (fixes hung turns without
+reintroducing empty follow-ups), preserving the fork's `accumulate_turn_usage`.
+
+### Follow-up queue additions (this sync)
+
+6. **Chat stop/interrupt controls** (4.7) — wire a "stop" mention detector + the shared
+   harness-server interrupt route into googlechatbot; updates parity 1.8.
+7. **Attachment `download` tool command** (4.3) — fetch a Chat attachment by resource name
+   via edge-injected direct API.
+8. **Bot-side SSE release + open-stream gauge** (4.8) — mirror in `googlechatbot/session-api.ts`.
