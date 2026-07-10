@@ -19,6 +19,8 @@ use crate::{
 
 const DEFAULT_SLACK_API_URL: &str = "https://slack.com/api";
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_SLACK_FILES_LIST_LIMIT: u16 = 100;
+const MAX_SLACK_FILES_LIST_LIMIT: u16 = 200;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -35,6 +37,7 @@ fn http_client() -> &'static reqwest::Client {
 
 pub(crate) fn slack_proxy_router() -> Router<AppState> {
     Router::new()
+        .route("/api/slack/files", get(get_slack_files))
         .route(
             "/api/slack/files/upload",
             post(upload_slack_file).layer(DefaultBodyLimit::disable()),
@@ -75,6 +78,16 @@ struct SlackFileUploadQuery {
 #[derive(Debug, Deserialize)]
 struct SlackFileDownloadQuery {
     channel_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackFilesListQuery {
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    page: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +135,16 @@ struct SlackChannelsResponse {
     ok: bool,
     channels: Vec<SlackChannelItem>,
     count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SlackFilesListResponse {
+    ok: bool,
+    files: Vec<Value>,
+    count: usize,
+    page: u32,
+    paging: Option<Value>,
+    has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +289,55 @@ async fn download_slack_file(
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
     Ok(response)
+}
+
+async fn get_slack_files(
+    headers: HeaderMap,
+    Query(query): Query<SlackFilesListQuery>,
+) -> Result<Json<SlackFilesListResponse>, ApiError> {
+    let claims = authorize_slack_file_proxy(&headers)?;
+    validate_slack_files_list_query(&query)?;
+    let channel_id = query
+        .channel_id
+        .as_deref()
+        .expect("validate_slack_files_list_query requires channel_id");
+    ensure_download_channel_allowed(&claims, channel_id)?;
+    let effective_page = slack_files_list_page(&query);
+
+    let config = slack_proxy_config()?;
+    let client = http_client();
+    let mut value = slack_files_list(client, config, channel_id, &query).await?;
+    let mut files = Vec::new();
+    let mut seen_file_ids = BTreeSet::new();
+    let paging = value.get("paging").cloned();
+    let has_more = slack_files_list_has_more(&value);
+    let file_values = value
+        .get_mut("files")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    for file in file_values {
+        let Some(file_id) = file.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        if seen_file_ids.insert(file_id) {
+            files.push(file);
+        }
+    }
+    files.sort_by(|left, right| {
+        slack_file_created(right)
+            .cmp(&slack_file_created(left))
+            .then_with(|| slack_file_id(left).cmp(slack_file_id(right)))
+    });
+
+    Ok(Json(SlackFilesListResponse {
+        ok: true,
+        count: files.len(),
+        files,
+        page: effective_page,
+        paging,
+        has_more,
+    }))
 }
 
 async fn get_slack_channels(headers: HeaderMap) -> Result<Json<SlackChannelsResponse>, ApiError> {
@@ -536,6 +608,27 @@ async fn slack_thread_replies(
     slack_api_post_form(client, config, "conversations.replies", &form).await
 }
 
+async fn slack_files_list(
+    client: &reqwest::Client,
+    config: &SlackFileProxyConfig,
+    channel_id: &str,
+    query: &SlackFilesListQuery,
+) -> Result<Value, ApiError> {
+    let form = slack_files_list_form(channel_id, query);
+    slack_api_post_form(client, config, "files.list", &form).await
+}
+
+fn slack_files_list_form(
+    channel_id: &str,
+    query: &SlackFilesListQuery,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("channel", channel_id.to_owned()),
+        ("count", slack_files_list_limit(query).to_string()),
+        ("page", slack_files_list_page(query).to_string()),
+    ]
+}
+
 fn slack_channel_history_form(
     channel_id: &str,
     query: &SlackChannelHistoryQuery,
@@ -579,6 +672,34 @@ fn slack_thread_replies_form(
     let mut form = slack_channel_history_form(channel_id, query);
     form.push(("ts", thread_ts.to_owned()));
     form
+}
+
+fn slack_files_list_limit(query: &SlackFilesListQuery) -> u16 {
+    query.limit.unwrap_or(DEFAULT_SLACK_FILES_LIST_LIMIT)
+}
+
+fn slack_files_list_page(query: &SlackFilesListQuery) -> u32 {
+    query.page.unwrap_or(1)
+}
+
+fn slack_files_list_has_more(value: &Value) -> bool {
+    value
+        .get("paging")
+        .is_some_and(|paging| slack_paging_page(paging) < slack_paging_pages(paging))
+}
+
+fn slack_paging_page(paging: &Value) -> u64 {
+    paging
+        .get("page")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn slack_paging_pages(paging: &Value) -> u64 {
+    paging
+        .get("pages")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
 }
 
 async fn slack_api_post_form(
@@ -661,14 +782,21 @@ fn ensure_channel_allowed(
 }
 
 fn slack_channel_ids_from_claims(claims: &SlackFileProxyClaims) -> Result<Vec<String>, ApiError> {
-    let mut channel_ids = BTreeSet::new();
-    for channel_id in claims
-        .slack
-        .upload_channels
-        .iter()
-        .chain(claims.slack.download_channels.iter())
-        .chain(claims.slack.history_channels.iter())
-    {
+    validated_channel_ids(
+        claims
+            .slack
+            .upload_channels
+            .iter()
+            .chain(claims.slack.download_channels.iter())
+            .chain(claims.slack.history_channels.iter()),
+    )
+}
+
+fn validated_channel_ids<'a>(
+    raw_channel_ids: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<String>, ApiError> {
+    let mut channel_ids: BTreeSet<String> = BTreeSet::new();
+    for channel_id in raw_channel_ids {
         validate_slack_channel_id(channel_id)?;
         channel_ids.insert(channel_id.to_owned());
     }
@@ -754,6 +882,16 @@ fn slack_file_channel_ids(file: &Value) -> BTreeSet<String> {
     channels
 }
 
+fn slack_file_created(file: &Value) -> u64 {
+    file.get("created")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn slack_file_id(file: &Value) -> &str {
+    file.get("id").and_then(Value::as_str).unwrap_or_default()
+}
+
 fn required_slack_string(value: &Value, field: &str) -> Result<String, ApiError> {
     value
         .get(field)
@@ -824,6 +962,30 @@ fn validate_slack_channel_history_query(query: &SlackChannelHistoryQuery) -> Res
     }
     if let Some(cursor) = query.cursor.as_deref() {
         validate_slack_cursor(cursor)?;
+    }
+    Ok(())
+}
+
+fn validate_slack_files_list_query(query: &SlackFilesListQuery) -> Result<(), ApiError> {
+    if let Some(limit) = query.limit
+        && !(1..=MAX_SLACK_FILES_LIST_LIMIT).contains(&limit)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "Slack files.list limit must be between 1 and {MAX_SLACK_FILES_LIST_LIMIT}"
+        )));
+    }
+    let Some(channel_id) = query.channel_id.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "Slack files.list channel_id is required".to_owned(),
+        ));
+    };
+    validate_slack_channel_id(channel_id)?;
+    if let Some(page) = query.page
+        && page == 0
+    {
+        return Err(ApiError::BadRequest(
+            "Slack files.list page must be greater than 0".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1012,6 +1174,90 @@ mod tests {
                 ("include_num_members", "true".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn files_list_form_maps_proxy_query_to_slack_params() {
+        let query = SlackFilesListQuery {
+            channel_id: Some("C123456789".to_owned()),
+            limit: Some(20),
+            page: Some(3),
+        };
+
+        assert_eq!(
+            slack_files_list_form("C123456789", &query),
+            vec![
+                ("channel", "C123456789".to_owned()),
+                ("count", "20".to_owned()),
+                ("page", "3".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn files_list_form_defaults_to_capped_first_page() {
+        let query = SlackFilesListQuery {
+            channel_id: Some("C123456789".to_owned()),
+            limit: None,
+            page: None,
+        };
+
+        assert_eq!(
+            slack_files_list_form("C123456789", &query),
+            vec![
+                ("channel", "C123456789".to_owned()),
+                ("count", DEFAULT_SLACK_FILES_LIST_LIMIT.to_string()),
+                ("page", "1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn files_list_has_more_reads_legacy_paging() {
+        assert!(slack_files_list_has_more(&json!({
+            "paging": {"page": 1, "pages": 2}
+        })));
+        assert!(!slack_files_list_has_more(&json!({
+            "paging": {"page": 2, "pages": 2}
+        })));
+    }
+
+    #[test]
+    fn validates_files_list_query() {
+        validate_slack_files_list_query(&SlackFilesListQuery {
+            channel_id: Some("C123456789".to_owned()),
+            limit: Some(200),
+            page: Some(1),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            validate_slack_files_list_query(&SlackFilesListQuery {
+                channel_id: None,
+                limit: Some(20),
+                page: None,
+            })
+            .unwrap_err(),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            validate_slack_files_list_query(&SlackFilesListQuery {
+                channel_id: Some("C123456789".to_owned()),
+                limit: Some(201),
+                page: None,
+            })
+            .unwrap_err(),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            validate_slack_files_list_query(&SlackFilesListQuery {
+                channel_id: Some("C123456789".to_owned()),
+                limit: Some(20),
+                page: Some(0),
+            })
+            .unwrap_err(),
+            ApiError::BadRequest(_)
+        ));
     }
 
     #[test]
