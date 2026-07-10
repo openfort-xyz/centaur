@@ -28,9 +28,11 @@ import {
   classifyExecuteConflict,
   createSession,
   executeSession,
+  interruptSessionExecution,
   openSessionEventStream,
   turnMessagesFromEvent
 } from './session-api'
+import { isChatStopCommand } from './stop-command'
 
 type Variables = Record<string, never>
 
@@ -293,6 +295,14 @@ async function processChatEvent(
   const followUp = config.GOOGLECHATBOT_FOLLOW_UP_THREADS && isThreadReply(normalized)
   if (!normalized.is_mention && !followUp) return
 
+  // A bare "stop"/"kill"/"cancel" interrupts the thread's active run instead
+  // of becoming a new turn (slackbotv2 parity, #911/#915). Checked before the
+  // ack so a stop never posts a stranded "thinking…" placeholder.
+  if (isChatStopCommand(normalizedEventText(normalized))) {
+    await handleStopCommand(config, client, normalized)
+    return
+  }
+
   // Post the "_Condor is thinking…_" ack IMMEDIATELY, before touching api-rs.
   // Google Chat shows a "<bot> not responding" placeholder if no bot message
   // appears within ~5s, and spinning up a sandbox takes longer than that. The
@@ -469,6 +479,43 @@ async function driveSession(
     incr('centaur_session_delivery_total', { delivery_status: 'failed' })
     logError('googlechatbot_session_drive_failed', error)
     await deliverDriveError(client, event, ackMessageName, error)
+  }
+}
+
+function normalizedEventText(event: NormalizedChatEvent): string {
+  return event.parts
+    .map(part => (part.type === 'text' ? part.text : ''))
+    .filter(Boolean)
+    .join('\n')
+}
+
+async function handleStopCommand(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  event: NormalizedChatEvent
+): Promise<void> {
+  const threadKey = event.thread_key
+  const requester = event.user_name || event.user_id || 'unknown user'
+  const reason = `Interrupted from Google Chat by ${requester}`
+  let text: string
+  try {
+    const response = await interruptSessionExecution(config, threadKey, reason)
+    incr('googlechatbot_stop_commands_total', {
+      outcome: response.interrupted ? 'interrupted' : 'no_active_run'
+    })
+    text = response.interrupted
+      ? '⏹️ Stopped the current run.'
+      : 'There is no active run in this thread to stop.'
+  } catch (error) {
+    incr('googlechatbot_stop_commands_total', { outcome: 'failed' })
+    logError('googlechatbot_stop_command_failed', error)
+    const detail = error instanceof Error ? error.message : String(error)
+    text = clampPlainText(`⚠️ Couldn't stop the run: ${detail}`)
+  }
+  try {
+    await client.createMessage(event.space_name, { text }, { threadName: event.chat.thread_name })
+  } catch (deliverError) {
+    logError('googlechatbot_stop_reply_failed', deliverError)
   }
 }
 

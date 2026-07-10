@@ -284,6 +284,31 @@ export async function executeSession(
   return (await response.json()) as ExecuteSessionResponse
 }
 
+export type InterruptSessionResponse = {
+  execution_id?: string | null
+  interrupted: boolean
+  ok: boolean
+  thread_key: string
+}
+
+/** POST /api/session/{thread_key}/interrupt — asks api-rs to interrupt the
+ * thread's active run (slackbotv2's stop-command analog). `interrupted: false`
+ * means there was nothing running; api-rs does not treat that as an error. */
+export async function interruptSessionExecution(
+  config: AppConfig,
+  threadKey: string,
+  reason: string
+): Promise<InterruptSessionResponse> {
+  const response = await sessionApiRequest('interrupt_session', 'interrupt session', () =>
+    fetch(apiSessionUrl(config, threadKey, 'interrupt'), {
+      method: 'POST',
+      headers: apiHeaders(config),
+      body: JSON.stringify({ reason })
+    })
+  )
+  return (await response.json()) as InterruptSessionResponse
+}
+
 export async function openSessionEventStream(
   config: AppConfig,
   threadKey: string,
@@ -320,6 +345,7 @@ type SessionApiOperation =
   | 'create_session'
   | 'append_messages'
   | 'execute_session'
+  | 'interrupt_session'
   | 'open_event_stream'
 
 async function sessionApiRequest(
@@ -585,7 +611,7 @@ function codexInputContent(
 function apiSessionUrl(
   config: AppConfig,
   threadKey: string,
-  suffix?: 'messages' | 'execute' | 'events'
+  suffix?: 'messages' | 'execute' | 'events' | 'interrupt'
 ): string {
   const path = `/api/session/${encodeURIComponent(threadKey)}${suffix ? `/${suffix}` : ''}`
   return new URL(path, ensureTrailingSlash(config.CENTAUR_API_URL)).toString()
