@@ -5,7 +5,10 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta charset="utf-8">
     <%= csrf_meta_tags %>
+    <%= tag.link rel: "manifest", href: pwa_manifest_path(format: :json) %>
+    <meta name="theme-color" content="#050506">
     <link rel="icon" href="/icon-dark.svg" type="image/svg+xml" data-console-favicon>
+    <link rel="apple-touch-icon" href="/pwa-icon-192.png">
     <script>
       (() => {
         const storageKey = "centaur-console-theme";
@@ -704,6 +707,13 @@
         color: #f4f4f5;
       }
 
+      /* The install item is hidden until beforeinstallprompt fires; the
+         explicit rule is needed because display: flex above would otherwise
+         override the hidden attribute. */
+      .console-account-menu-button[hidden] {
+        display: none;
+      }
+
       .console-main {
         display: flex;
         height: 100%;
@@ -1392,6 +1402,22 @@
               <div class="console-account-menu-line" title="<%= current_user.email %>"><%= current_user.email %></div>
               <div class="console-account-menu-line console-account-menu-muted">Centaur Console</div>
               <div class="console-account-menu-separator"></div>
+              <%# PWA install entry point. Hidden unless the browser reports
+                  the console is installable (beforeinstallprompt); installing
+                  keeps the standalone window plus the manifest's file_handlers
+                  registration. %>
+              <button type="button"
+                      class="console-account-menu-button"
+                      data-controller="pwa-install"
+                      data-pwa-install-target="banner"
+                      data-action="pwa-install#install"
+                      hidden
+                      role="menuitem"
+                      title="Install Centaur Console as a standalone app"
+                      aria-label="Install app">
+                <%= console_icon("computer", classes: "size-4") %>
+                <span>Install app</span>
+              </button>
               <button type="button"
                       class="console-account-menu-button"
                       data-console-theme-toggle

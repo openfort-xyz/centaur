@@ -5,9 +5,15 @@ Rails.application.routes.draw do
   # Can be used by load balancers and uptime monitors to verify that the app is live.
   get "up" => "rails/health#show", as: :rails_health_check
 
-  # Render dynamic PWA files from app/views/pwa/* (remember to link manifest in application.html.erb)
-  # get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
-  # get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
+  # PWA manifest + service worker, rendered from app/views/pwa/*. Served by
+  # Rails::PwaController (framework controller, no console session required) so
+  # the browser can fetch them outside an authenticated page load. Both layouts
+  # link the manifest and register the worker.
+  get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
+  get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker
+  # Target of the manifest's web+centaur:// protocol handler: maps the
+  # custom-scheme URL in ?target= onto an in-app path and redirects.
+  get "launch", to: "launch#show", as: :launch
 
   # Operator console session login (cookie-based, separate from the API key auth).
   get "login", to: "sessions#new", as: :login
@@ -65,6 +71,7 @@ Rails.application.routes.draw do
   namespace :console do
     delete "principals/:id",                  to: "principals#destroy", as: :delete_principal
     patch  "principals/:id/sandbox_access",   to: "principals#update_sandbox_access", as: :principal_sandbox_access
+    patch  "principals/:id/slack_channel_permissions", to: "principals#update_slack_channel_permissions", as: :principal_slack_channel_permissions
     post   "principals/:id/roles",            to: "principals#assign_role",   as: :principal_assign_role
     delete "principals/:id/roles/:role_id",   to: "principals#unassign_role", as: :principal_unassign_role
     post   "principals/:id/grants",           to: "principals#grant_secret",  as: :principal_grant_secret
@@ -171,6 +178,7 @@ Rails.application.routes.draw do
         end
         member do
           get "effective_config"
+          post "slack_channel_permissions", action: :upsert_slack_channel_permission
         end
         # Role assignments for a principal. :id is the role's oid.
         resources :roles, only: %i[index create destroy], controller: :principal_roles

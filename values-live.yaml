@@ -1,0 +1,188 @@
+# Managed in git: openfort-xyz/centaur-vps deploy/values.yaml
+# Secrets live in deploy/values.secrets.yaml (VPS-only, gitignored).
+secretManager:
+  existingSecretName: centaur-infra-env
+  envPrefix: ''
+firewall:
+  existingCaSecretName: centaur-firewall-ca
+  existingCaKeySecretName: centaur-firewall-ca-key
+networkPolicy:
+  enabled: true
+  # Bots/api-rs accept in-namespace callers (api-rs delivers chat posts by
+  # calling the bot services in-cluster). Sandboxes remain blocked by their own
+  # api-rs-managed per-sandbox egress policies. Host-local traffic (cloudflared
+  # -> bot services) is allowed by the k3s netpol controller; canary-verified
+  # 2026-07-04.
+  ingressSourceNamespaces:
+    - centaur
+  # api-rs exports its own spans to the in-cluster OTLP forwarder (see
+  # otlpForwarder below); its egress policy only admits in-cluster collectors.
+  otlpEgress:
+    enabled: true
+    namespace: laminar
+    port: 8000
+  # Chart-managed replacement for the previously hand-applied
+  # centaur-sandbox-observability-egress manifest (sandboxes labeled
+  # centaur.ai/observability-enabled=true -> laminar OTLP). Losing that policy
+  # wedges every follow-up agent turn (2026-07-02 incident).
+  observabilityEgress:
+    enabled: true
+    destinations:
+      - namespace: laminar
+        ports:
+          - port: 8000
+            protocol: TCP
+postgres:
+  enabled: true
+  auth:
+    existingSecretName: centaur-infra-env
+    existingSecretKey: POSTGRES_PASSWORD
+ironProxy:
+  image:
+    pullPolicy: IfNotPresent
+  secretSource: onepassword
+apiRs:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+  runMigrations: true
+  opVault: centaur
+  sandboxWarmPoolSize: 1
+  # Cap concurrent sandboxes (chart default 0 = unlimited) and shrink their max
+  # lifetime from 3d to 12h. Unbounded sandboxes + no per-pod memory limit on an
+  # 8GB node caused an OOM/swap-thrash boot-storm (2026-07-08): a cold boot
+  # reconciled every retained Sandbox CR at once and exhausted RAM. See the
+  # LimitRange in manifests/ and the Sandbox-CR reap in host/centaur-k8s-gc.sh.
+  sandboxRunningLimit: 3
+  sandboxMaxLifetimeSecs: 43200
+  extraEnv:
+    OTEL_TRACES_EXPORTER: otlp
+    # In-cluster OTLP forwarder (relays to the off-cluster Laminar on the
+    # host); the api-rs egress NetworkPolicy only admits in-cluster collectors.
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otlp.laminar.svc:8000/v1/traces
+    GOOGLE_CHAT_ETL_ENABLED: '1'
+    SESSION_SANDBOX_PASSTHROUGH_ENV: GOOGLE_CHAT_ETL_ENABLED,GOOGLE_CHAT_SPACE_IDS,NOTION_ETL_ENABLED,GOOGLE_CHAT_ETL_RETENTION_DAYS
+    GOOGLE_CHAT_SPACE_IDS: AAQA42QLdws,AAQAOs-sTGA
+    NOTION_ETL_ENABLED: '1'
+    GOOGLE_CHAT_ETL_RETENTION_DAYS: '90'
+sandbox:
+  image:
+    pullPolicy: IfNotPresent
+  codexAuthMode: api_key
+  claudeCodeAuthMode: access_token
+  harnessEngine: claudecode
+  extraEnv:
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otlp.laminar.svc:8000/v1/traces
+    LAMINAR_BASE_URL: http://otlp.laminar.svc:8000
+    LAMINAR_EXTERNAL_URL: http://localhost:5667
+    LAMINAR_PROJECT_ID: fdf9a748-3e89-4a1a-b274-7e7c4db2fffa
+    POSTHOG_HOST: eu.posthog.com
+    GRAFANA_URL: https://grafana.openfort.io
+    TOOL_BLOCKLIST: linear,slack,discord,telegram,twitter,vlogs,vmetrics
+    GCP_LOGS_DEFAULT_PROJECT_ID: openfort
+    GOOGLE_CHAT_ETL_ENABLED: '1'
+    AGENTCASH_ADDRESS: '0x01d4Db3A969a9603ed6e31253ddDF02941579554'
+slackbotv2:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+  extraEnv:
+    SESSION_MAX_DURATION_MS: '1800000'
+discordbot:
+  enabled: false
+console:
+  # Google SSO for operator console sign-in (client creds in centaur-infra-env).
+  googleOauth:
+    enabled: true
+  enabled: true
+  publicUrl: https://centaur-dash.fort.dev
+  image:
+    pullPolicy: IfNotPresent
+  worker:
+    enabled: true
+googlechatbot:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+  allowedDomain: openfort.xyz,openfort.io
+  eventsPath: /api/chat/events
+  uploadUser: jaume@openfort.xyz
+  extraEnv:
+    SESSION_MAX_DURATION_MS: '1800000'
+laminar:
+  enabled: true
+toolServer:
+  enabled: true
+  repo: openfort-xyz/centaur
+  subdir: tools
+# Pinned overlay sources (chart default rides `main` for both, which lets
+# tools/workflows/prompt changes reach production on every repo-cache sync with
+# no deploy gate, review point, or rollback). Helm replaces the array wholesale,
+# so both sources are restated in full here.
+#
+# - The fork source is force-set to the deployed SHA by deploy.sh
+#   (overlays.sources[0].ref=$SHA), keeping the tool tree in lockstep with the
+#   running images; the ref below is only the fallback for manual helm runs.
+# - Bump the overlay pin deliberately: update the SHA, then re-run deploy.sh
+#   with the currently deployed --sha (images unchanged; the chart change rolls
+#   repo-cache). Rollback = revert the bump commit and redeploy.
+overlays:
+  sources:
+    - repo: openfort-xyz/centaur
+      ref: de558d47a826a56e329019a0808c3ed766930cc2
+    - repo: openfort-xyz/centaur-overlay
+      # 2026-07-09 "pulse: drop the Google Sheets scan; keep Openfort+Farao" (#40)
+      ref: 1fe3b677ada05da539e57c2ebfb26b795d5160ad
+      promptPath: services/sandbox/SYSTEM_PROMPT.md
+repoCache:
+  githubToken:
+    existingSecretName: centaur-infra-env
+    secretKey: GITHUB_TOKEN
+  repositories:
+  - openfort-xyz/www
+  - openfort-xyz/api
+  - openfort-xyz/openfort-js
+  - openfort-xyz/openfort-node
+  - openfort-xyz/iframe
+  - openfort-xyz/shield
+  - openfort-xyz/shield-js
+  - openfort-xyz/pigeon
+  - openfort-xyz/buffers
+  - openfort-xyz/crypto-js
+  - openfort-xyz/ecosystem-js
+  - openfort-xyz/book
+  - openfort-xyz/ecosystem-sample
+  - openfort-xyz/sentinel
+  - openfort-xyz/gazer
+  - openfort-xyz/sentinel-sdk-go
+  - openfort-xyz/react-native
+  - openfort-xyz/ecosystem-wallet-expo-example
+  - openfort-xyz/blocks
+  - openfort-xyz/openfort-react
+  - openfort-xyz/castle
+  - openfort-xyz/ecosystem-sample-safe-passkeys
+  - openfort-xyz/dash
+  - openfort-xyz/documentation
+  - openfort-xyz/embedded-wallet-benchmark
+  - openfort-xyz/ecosystem-sample-commerce
+  - openfort-xyz/opensigner
+  - openfort-xyz/claude-skills
+  - openfort-xyz/canigo
+  - openfort-xyz/agent-skills
+  - openfort-xyz/farao
+  - openfort-xyz/demo-directory
+  - openfort-xyz/cli
+  - openfort-xyz/agentic-supplements
+  - openfort-xyz/backend-wallet-benchmark
+  - openfort-xyz/embedded-wallet-bench
+  - openfort-xyz/kora
+  - openfort-xyz/condor
+  - openfort-xyz/agent-fs
+  - openfort-xyz/agent-condor
+  - openfort-xyz/epistoma
+otlpForwarder:
+  enabled: true
+  namespace: laminar
+  service: otlp
+  port: 8000
+  target: 10.42.0.1:8000

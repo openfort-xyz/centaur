@@ -40,6 +40,7 @@ COMPANY_CONTEXT_SOURCE_TYPES = {
     "google_calendar": ("calendar_event",),
     "google_chat": ("google_chat_thread",),
     "linear": ("linear_issue",),
+    "attio": ("attio_meeting",),
 }
 COMPANY_CONTEXT_DOCUMENT_ACTIONS = ("inserted", "updated", "deleted", "noop")
 ETL_CHECKPOINT_TABLES = {
@@ -47,6 +48,7 @@ ETL_CHECKPOINT_TABLES = {
     "google_calendar": "google_calendar_sync_checkpoints",
     "google_chat": "google_chat_sync_checkpoints",
     "linear": "linear_sync_checkpoints",
+    "attio": "attio_sync_checkpoints",
 }
 
 
@@ -89,6 +91,7 @@ SCHEDULE = {
             or _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
             or _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
             or _env_flag_enabled("LINEAR_ETL_ENABLED")
+            or _env_flag_enabled("ATTIO_ETL_ENABLED")
         )
         and _env_flag_enabled("COMPANY_CONTEXT_DOCUMENTS_ENABLED", default=True)
     ),
@@ -229,6 +232,7 @@ def _source_enabled() -> bool:
         or _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
         or _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
         or _env_flag_enabled("LINEAR_ETL_ENABLED")
+        or _env_flag_enabled("ATTIO_ETL_ENABLED")
     )
 
 
@@ -593,6 +597,43 @@ async def _load_changed_linear_issues(
         "max_updated_at": max(max_updated_candidates)
         if max_updated_candidates
         else None,
+    }
+
+
+async def _load_changed_attio_meetings(
+    pool,
+    since: dt.datetime | None,
+    until: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Find Attio meetings whose synced content changed."""
+    where_sql, args = _updated_at_where(
+        "updated_at",
+        since,
+        until,
+        base_clauses=("last_error = ''",),
+    )
+
+    rows = await pool.fetch(
+        "SELECT meeting_id, title, description, url, linked_records, participants, "
+        "organizer_id, organizer_name, organizer_email, call_recording_ids, "
+        "transcript_text, transcript_payload, content_text, content_hash, started_at, "
+        "ended_at, source_created_at, source_updated_at, raw_payload, updated_at "
+        f"FROM attio_sync_meetings {where_sql} "
+        "ORDER BY source_updated_at NULLS LAST, started_at NULLS LAST, meeting_id",
+        *args,
+    )
+    stats = await pool.fetchrow(
+        f"SELECT COUNT(*) AS changed_meetings, MAX(updated_at) AS max_updated_at "
+        f"FROM attio_sync_meetings {where_sql}",
+        *args,
+    )
+    max_updated_at = stats["max_updated_at"] if stats else None
+    if isinstance(max_updated_at, dt.datetime):
+        max_updated_at = max_updated_at.astimezone(dt.timezone.utc)
+    return {
+        "meetings": list(rows),
+        "changed_meetings": int(stats["changed_meetings"] or 0) if stats else 0,
+        "max_updated_at": max_updated_at,
     }
 
 
@@ -1276,6 +1317,94 @@ def _linear_issue_document(row: Any, comments: list[Any]) -> dict[str, Any] | No
     }
 
 
+def _named_entries(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or entry.get("email") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _attio_meeting_document(row: Any) -> dict[str, Any] | None:
+    """Render one synced Attio meeting into a context document."""
+    meeting_id = str(row["meeting_id"] or "").strip()
+    if not meeting_id:
+        return None
+
+    title = str(row["title"] or "Untitled Attio meeting").strip()
+    description = str(row["description"] or "").strip()
+    transcript = str(row["transcript_text"] or "").strip()
+    url = str(row["url"] or "").strip()
+    participants = _jsonb_value(row, "participants", [])
+    participant_names = _named_entries(participants)
+    linked_records = _jsonb_value(row, "linked_records", [])
+    call_recording_ids = _jsonb_value(row, "call_recording_ids", [])
+    raw_payload = _jsonb_value(row, "raw_payload", {})
+    started_at = row["started_at"]
+    ended_at = row["ended_at"]
+    source_created_at = row["source_created_at"]
+    source_updated_at = row["source_updated_at"] or row["updated_at"]
+    organizer_name = str(row["organizer_name"] or row["organizer_email"] or "").strip()
+
+    lines = [
+        f"# {title}",
+        "",
+        "- Source: Attio",
+    ]
+    if organizer_name:
+        lines.append(f"- Organizer: {organizer_name}")
+    if participant_names:
+        lines.append(f"- Participants: {', '.join(participant_names)}")
+    if started_at:
+        lines.append(f"- Started: {_format_time(started_at)}")
+    if ended_at:
+        lines.append(f"- Ended: {_format_time(ended_at)}")
+    if url:
+        lines.append(f"- URL: {url}")
+    if description:
+        lines.extend(["", "---", "", "## Description", "", description])
+    if transcript:
+        lines.extend(["", "## Transcript", "", transcript])
+    body = "\n".join(lines).strip()
+    metadata = {
+        "meeting_id": meeting_id,
+        "linked_records": linked_records if isinstance(linked_records, list) else [],
+        "participants": participants if isinstance(participants, list) else [],
+        "organizer_id": str(row["organizer_id"] or ""),
+        "organizer_name": str(row["organizer_name"] or ""),
+        "organizer_email": str(row["organizer_email"] or ""),
+        "call_recording_ids": (
+            call_recording_ids if isinstance(call_recording_ids, list) else []
+        ),
+        "has_description": bool(description),
+        "has_transcript": bool(transcript),
+        "raw_payload": raw_payload if isinstance(raw_payload, dict) else {},
+    }
+    return {
+        "document_id": f"attio:meeting:{meeting_id}",
+        "source": "attio",
+        "source_type": "attio_meeting",
+        "source_document_id": meeting_id,
+        "source_chunk_id": "",
+        "parent_document_id": None,
+        "title": title,
+        "body": body,
+        "url": url,
+        "author_id": str(row["organizer_id"] or ""),
+        "author_name": organizer_name,
+        "access_scope": "company",
+        "occurred_at": started_at or source_created_at or source_updated_at,
+        "source_updated_at": source_updated_at,
+        "content_hash": _content_hash(title, body, url, metadata),
+        "metadata": metadata,
+    }
+
+
 def _calendar_event_document_id(row: Any) -> str:
     calendar_id = str(row["calendar_id"] or "")
     event_id = str(row["event_id"] or "")
@@ -1521,6 +1650,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     google_calendar_enabled = _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
     google_chat_enabled = _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
     linear_enabled = _env_flag_enabled("LINEAR_ETL_ENABLED")
+    attio_enabled = _env_flag_enabled("ATTIO_ETL_ENABLED")
     enabled_sources = [
         source
         for source, enabled in (
@@ -1529,6 +1659,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             ("google_calendar", google_calendar_enabled),
             ("google_chat", google_chat_enabled),
             ("linear", linear_enabled),
+            ("attio", attio_enabled),
         )
         if enabled
     ]
@@ -1576,6 +1707,15 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     }
     if linear_enabled:
         linear_changed = await _load_changed_linear_issues(
+            ctx._pool, since, batch_until
+        )
+    attio_changed = {
+        "meetings": [],
+        "changed_meetings": 0,
+        "max_updated_at": None,
+    }
+    if attio_enabled:
+        attio_changed = await _load_changed_attio_meetings(
             ctx._pool, since, batch_until
         )
 
@@ -1768,6 +1908,24 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         if action in {"inserted", "updated"}:
             documents_upserted += 1
 
+    for row in attio_changed["meetings"]:
+        document = _attio_meeting_document(row)
+        if document is None:
+            continue
+        observe_company_context_document_size(
+            "attio",
+            str(document["source_type"]),
+            len(str(document["body"] or "")),
+        )
+        action = await _upsert_document(ctx._pool, document)
+        record_company_context_documents_changed(
+            "attio",
+            str(document["source_type"]),
+            action,
+        )
+        if action in {"inserted", "updated"}:
+            documents_upserted += 1
+
     if batch_until is not None:
         watermark = batch_until
     else:
@@ -1779,6 +1937,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                 calendar_changed["max_updated_at"],
                 chat_changed["max_updated_at"],
                 linear_changed["max_updated_at"],
+                attio_changed["max_updated_at"],
                 last_watermark,
             )
             if value is not None
@@ -1800,6 +1959,9 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "linear": watermark
         if batch_until is not None
         else linear_changed["max_updated_at"] or last_watermark,
+        "attio": watermark
+        if batch_until is not None
+        else attio_changed["max_updated_at"] or last_watermark,
     }
     remaining_lag_seconds = (
         max((now - watermark).total_seconds(), 0.0) if watermark is not None else None
@@ -1815,6 +1977,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "changed_calendar_events": calendar_changed["changed_events"],
         "changed_chat_messages": chat_changed["changed_messages"],
         "changed_linear_issues": linear_changed["changed_issues"],
+        "changed_attio_meetings": attio_changed["changed_meetings"],
         "channel_day_documents": len(changed["channel_days"]),
         "thread_candidates": len(changed["threads"]),
         "slack_attachment_documents": len(changed["attachments"]),
@@ -1822,6 +1985,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "calendar_event_documents": len(calendar_changed["events"]),
         "chat_thread_documents": len(chat_changed["threads"]),
         "linear_issue_documents": len(linear_changed["issues"]),
+        "attio_meeting_documents": len(attio_changed["meetings"]),
         "documents_upserted": documents_upserted,
         "documents_deleted": documents_deleted,
         "since": since.isoformat() if since else None,

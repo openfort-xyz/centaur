@@ -43,6 +43,13 @@ module Console
       redirect_to console_principal_path(@principal.oid), alert: e.record.errors.full_messages.to_sentence
     end
 
+    def update_slack_channel_permissions
+      @principal.update!(slack_channel_permission_params)
+      redirect_to console_principal_path(@principal.oid), notice: "Updated Slack channel permissions."
+    rescue ActiveRecord::RecordInvalid => e
+      redirect_to console_principal_path(@principal.oid), alert: e.record.errors.full_messages.to_sentence
+    end
+
     def assign_role
       role = Role.find_by_oid!(params[:role_id])
       @principal.principal_roles.find_or_create_by!(role: role)
@@ -96,6 +103,20 @@ module Console
 
     def principal_params
       params.fetch(:principal, ActionController::Parameters.new)
+    end
+
+    def slack_channel_permission_params
+      params.require(:principal).permit(
+        slack_channel_permissions_attributes: %i[
+          id
+          channel_id
+          channel_name
+          upload_enabled
+          download_enabled
+          history_enabled
+          _destroy
+        ]
+      )
     end
 
     # Parse the "<kind>:<oid>" value from the grant dropdown into a secret record.
