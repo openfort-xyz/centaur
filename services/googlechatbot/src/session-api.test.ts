@@ -5,6 +5,7 @@ import {
   turnMessagesFromEvent,
   createSession,
   executeSession,
+  interruptSessionExecution,
   openSessionEventStream
 } from './session-api'
 import { parseChatBody } from './index'
@@ -465,5 +466,55 @@ describe('classifyExecuteConflict', () => {
   test('non-SessionApiError values are unrelated', () => {
     expect(classifyExecuteConflict(new Error('boom'))).toBe('unrelated')
     expect(classifyExecuteConflict(undefined)).toBe('unrelated')
+  })
+})
+
+describe('interruptSessionExecution', () => {
+  const realFetch = globalThis.fetch
+  beforeEach(() => {
+    resetMetrics()
+  })
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  test('posts the reason to the interrupt route and counts the operation', async () => {
+    let capturedUrl: string | undefined
+    let capturedBody: string | undefined
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      capturedUrl = String(url)
+      capturedBody = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ ok: true, interrupted: true, execution_id: 'e1', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+
+    const response = await interruptSessionExecution(
+      loadConfig({}),
+      baseEvent.thread_key,
+      'Interrupted from Google Chat by Alice'
+    )
+
+    expect(capturedUrl).toContain(`/api/session/${encodeURIComponent(baseEvent.thread_key)}/interrupt`)
+    expect(JSON.parse(capturedBody ?? '{}')).toEqual({
+      reason: 'Interrupted from Google Chat by Alice'
+    })
+    expect(response.interrupted).toBe(true)
+    expect(response.execution_id).toBe('e1')
+    expect(renderMetrics()).toContain(
+      'googlechatbot_session_api_operations_total{operation="interrupt_session",outcome="success"} 1'
+    )
+  })
+
+  test('reports interrupted=false when no run is active', async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({ ok: true, interrupted: false, execution_id: null, thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )) as unknown as typeof fetch
+
+    const response = await interruptSessionExecution(loadConfig({}), baseEvent.thread_key, 'x')
+    expect(response.interrupted).toBe(false)
   })
 })
