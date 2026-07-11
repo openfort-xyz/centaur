@@ -13,7 +13,7 @@ const SLACK_DM_CONTEXT_DOCUMENTS_SQL: &str =
 const SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL: &str =
     include_str!("../migrations/0029_slack_dm_conversation_context_documents.sql");
 const READONLY_DM_RLS_SQL: &str =
-    include_str!("../migrations/0042_centaur_readonly_slack_dm_rls.sql");
+    include_str!("../migrations/0043_centaur_readonly_slack_dm_rls.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_dm_sync_conversations",
