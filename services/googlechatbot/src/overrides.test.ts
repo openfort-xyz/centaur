@@ -39,6 +39,10 @@ describe('extractMessageOverrides', () => {
     expect(out.cleanedText).toBe('fix the bug')
   })
 
+  test('-rsn accepts the GPT-5.6 max effort', () => {
+    expect(extractMessageOverrides('-rsn max fix it').reasoning).toBe('max')
+  })
+
   test('stops the -rsn value at a trailing newline', () => {
     const out = extractMessageOverrides('-rsn high\nthink hard about this')
     expect(out.reasoning).toBe('high')

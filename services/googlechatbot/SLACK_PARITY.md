@@ -135,3 +135,21 @@ reintroducing empty follow-ups), preserving the fork's `accumulate_turn_usage`.
 7. **Attachment `download` tool command** (4.3) — fetch a Chat attachment by resource name
    via edge-injected direct API.
 8. **Bot-side SSE release + open-stream gauge** (4.8) — mirror in `googlechatbot/session-api.ts`.
+
+## 5. Upstream sync 2026-07-11 (27 commits, `503aa4cd..38f10c3`) — Slack-touching dispositions
+
+| # | Upstream change | Chat surface | Status |
+|---|-----------------|--------------|--------|
+| 5.1 | #1027 `--rsn max` (GPT-5.6 max Codex reasoning) + harness support | Ported: `max: 'max'` in `googlechatbot/src/overrides.ts` + test (pattern parity with slackbotv2). | ✅ |
+| 5.2 | #1009 / #1023 / #1025 / #1029 Slack file/thread/channel/member tools default to api-rs proxy routes | Slack transport family: Chat tools go direct to `chat.googleapis.com` with iron-proxy edge injection (parity 4.4). No held-token problem to solve on Chat. | 🟰 |
+| 5.3 | #1010 / #1011 / #1013 / #1017 / #1022 / #1032 Slack identity → principal/DM permission chain | Slack-SSO/identity plumbing in api-rs+console. Chat records `user_email` in session metadata for Console visibility (parity §875 analogue); a Chat-identity permission chain would be its own feature, not a port. | 🟰 |
+| 5.4 | #987 Granola sync · #4c0b8e7/#1031 Attio sync (migrations 0040-0042 upstream → 0041-0043 fork) | Platform workflows, surface-agnostic; inert until GRANOLA/ATTIO credentials exist in the vault. Migration renumber per fork convention. | 🟰 |
+| 5.5 | #1020 grace executions awaiting sandbox assignment · #1012 stale api-rs build artifacts · #1015 drop nonexistent co-author · #944 Datadog proxy headers | Shared runtime/build/sandbox fixes; benefit both surfaces on merge, nothing bot-side to port. | 🟰 (shared) |
+| 5.6 | #1005 / #1016 Codex default → `gpt-5.6-sol` | Harness config, shared; Chat `--codex` runs pick it up automatically. | 🟰 (shared) |
+| 5.7 | #980 / #1026 console PWA · #1006 / #1007 MPP discovery | Console/platform features, no bot surface. | 🟰 |
+
+Merge mechanics: 3 conflicts (Justfile / publish-images.yml service-list unions
+keeping googlechatbot alongside new githubbot+linearbot; AGENTS.md rewritten
+upstream — taken wholesale, the fork's one-line google_chat_sync table entry had
+no surviving home). Incoming migrations renumbered 0041-0043 (fork's applied
+0040_slack_private_channels keeps its slot).
