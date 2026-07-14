@@ -28,13 +28,15 @@ describe('verifyGoogleSignedJwt', () => {
   test('rejects a token minted for a different audience', async () => {
     const token = await signJwt({ privateKey: pair.privateKey, kid: KID, claims: claims({ aud: 'someone-else' }) })
     const out = await verifyGoogleSignedJwt({ token, audiences: [AUD], nowSeconds: NOW, resolveKey })
-    expect(out).toEqual({ ok: false, reason: 'audience_mismatch' })
+    expect(out.ok).toBe(false)
+    if (!out.ok) expect(out.reason).toMatch(/^audience_mismatch\(aud=someone-else\)$/)
   })
 
   test('rejects a token from the wrong issuer', async () => {
     const token = await signJwt({ privateKey: pair.privateKey, kid: KID, claims: claims({ iss: 'attacker@evil.example' }) })
     const out = await verifyGoogleSignedJwt({ token, audiences: [AUD], nowSeconds: NOW, resolveKey })
-    expect(out).toEqual({ ok: false, reason: 'issuer_mismatch' })
+    expect(out.ok).toBe(false)
+    if (!out.ok) expect(out.reason).toMatch(/^issuer_mismatch\(iss=attacker@evil\.example\)$/)
   })
 
   test('rejects an expired token', async () => {

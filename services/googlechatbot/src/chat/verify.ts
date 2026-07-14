@@ -11,7 +11,7 @@ export type ChatVerification =
 export function chatRequestAudiences(config: AppConfig): string[] {
   const audiences: string[] = []
   if (config.GOOGLECHATBOT_PROJECT_NUMBER) audiences.push(config.GOOGLECHATBOT_PROJECT_NUMBER)
-  if (config.GOOGLECHATBOT_AUDIENCE) audiences.push(config.GOOGLECHATBOT_AUDIENCE)
+  if (config.GOOGLECHATBOT_WEBHOOK_AUDIENCE) audiences.push(config.GOOGLECHATBOT_WEBHOOK_AUDIENCE)
   return audiences
 }
 

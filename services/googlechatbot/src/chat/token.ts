@@ -86,10 +86,16 @@ export async function verifyGoogleSignedJwt(opts: {
   if (!valid) return { ok: false, reason: 'bad_signature' }
 
   const issuer = opts.issuer ?? GOOGLE_CHAT_ISSUER
-  if (payload.iss !== issuer) return { ok: false, reason: 'issuer_mismatch' }
+  if (payload.iss !== issuer) {
+    // Include the observed issuer so a misconfigured rollout is diagnosable from
+    // logs (iss is Google's SA email, not secret).
+    return { ok: false, reason: `issuer_mismatch(iss=${String(payload.iss)})` }
+  }
 
   if (typeof payload.aud !== 'string' || !opts.audiences.includes(payload.aud)) {
-    return { ok: false, reason: 'audience_mismatch' }
+    // Surface the observed audience so a wrong PROJECT_NUMBER/WEBHOOK_AUDIENCE is
+    // obvious in logs when enforcement rejects a real event (aud is not secret).
+    return { ok: false, reason: `audience_mismatch(aud=${String(payload.aud)})` }
   }
 
   const now = opts.nowSeconds ?? Math.floor(Date.now() / 1000)

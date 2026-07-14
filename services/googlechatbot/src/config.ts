@@ -71,7 +71,7 @@ const EnvSchema = z.object({
   // audience depending on the app config; set whichever the app uses (both may
   // be set — a token matching either is accepted).
   GOOGLECHATBOT_PROJECT_NUMBER: z.string().optional(),
-  GOOGLECHATBOT_AUDIENCE: z.string().optional(),
+  GOOGLECHATBOT_WEBHOOK_AUDIENCE: z.string().optional(),
 
   // Optional per-run guards forwarded to api-rs.
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),

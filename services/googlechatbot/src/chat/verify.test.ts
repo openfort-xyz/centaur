@@ -122,7 +122,7 @@ describe('verifyChatRequestToken', () => {
   })
 
   test('fails closed when enforcement is on but no audience is configured', async () => {
-    const config = configWith({ GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: '1', GOOGLECHATBOT_PROJECT_NUMBER: '', GOOGLECHATBOT_AUDIENCE: '' })
+    const config = configWith({ GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: '1', GOOGLECHATBOT_PROJECT_NUMBER: '', GOOGLECHATBOT_WEBHOOK_AUDIENCE: '' })
     const out = await verifyChatRequestToken({ config, authorization: await bearer(), resolveKey, nowSeconds: NOW })
     expect(out).toEqual({ ok: false, status: 401, reason: 'audience_not_configured' })
   })
@@ -147,14 +147,18 @@ describe('verifyChatRequestToken', () => {
       resolveKey,
       nowSeconds: NOW
     })
-    expect(out).toEqual({ ok: false, status: 401, reason: 'audience_mismatch' })
+    expect(out.ok).toBe(false)
+    if (!out.ok) {
+      expect(out.status).toBe(401)
+      expect(out.reason).toMatch(/^audience_mismatch\(aud=not-our-project\)$/)
+    }
   })
 
   test('accepts the URL audience model', async () => {
     const url = 'https://chat-centaur.fort.dev/api/chat/events'
     const config = configWith({
       GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: 'true',
-      GOOGLECHATBOT_AUDIENCE: url
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: url
     })
     const out = await verifyChatRequestToken({
       config,
