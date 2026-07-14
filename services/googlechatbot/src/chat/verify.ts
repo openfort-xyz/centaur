@@ -1,5 +1,5 @@
 import type { AppConfig } from '../config'
-import { GOOGLE_CHAT_ISSUER, verifyGoogleSignedJwt, type KeyResolver } from './token'
+import { GOOGLE_REQUEST_ISSUERS, verifyGoogleSignedJwt, type KeyResolver } from './token'
 import type { GoogleChatEnvelope } from './types'
 
 export type ChatVerification =
@@ -47,7 +47,7 @@ export async function verifyChatRequestToken(opts: {
     result = await verifyGoogleSignedJwt({
       token,
       audiences,
-      issuer: GOOGLE_CHAT_ISSUER,
+      allowedIssuers: GOOGLE_REQUEST_ISSUERS,
       nowSeconds: opts.nowSeconds,
       resolveKey: opts.resolveKey
     })
