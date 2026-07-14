@@ -4,7 +4,7 @@ import { ChatEdgeClient } from './chat/client'
 import { EventDeduper, chatDedupKey } from './chat/dedup'
 import { collectThreadHistory, isThreadReply, normalizeChatEnvelope } from './chat/normalize'
 import { verifyChatRequest, verifyChatRequestToken } from './chat/verify'
-import { googleChatKeyResolver } from './chat/token'
+import { googleRequestKeyResolver } from './chat/token'
 import type { GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
@@ -59,7 +59,7 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
   const client = new ChatEdgeClient(config)
   const deduper = new EventDeduper(config.CHAT_EVENT_DEDUP_TTL_MS)
   // Resolver for Google Chat's request-signing public keys (cached JWK set).
-  const resolveChatKey = googleChatKeyResolver()
+  const resolveChatKey = googleRequestKeyResolver()
 
   const app = new Hono<{ Variables: Variables }>()
 
