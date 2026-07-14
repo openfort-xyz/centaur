@@ -3,7 +3,8 @@ import type { AppConfig } from './config'
 import { ChatEdgeClient } from './chat/client'
 import { EventDeduper, chatDedupKey } from './chat/dedup'
 import { collectThreadHistory, isThreadReply, normalizeChatEnvelope } from './chat/normalize'
-import { verifyChatRequest } from './chat/verify'
+import { verifyChatRequest, verifyChatRequestToken } from './chat/verify'
+import { googleChatKeyResolver } from './chat/token'
 import type { GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
@@ -57,6 +58,8 @@ export type Googlechatbot = {
 export function createGooglechatbot(config: AppConfig): Googlechatbot {
   const client = new ChatEdgeClient(config)
   const deduper = new EventDeduper(config.CHAT_EVENT_DEDUP_TTL_MS)
+  // Resolver for Google Chat's request-signing public keys (cached JWK set).
+  const resolveChatKey = googleChatKeyResolver()
 
   const app = new Hono<{ Variables: Variables }>()
 
@@ -76,6 +79,19 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     const body = await c.req.raw.text()
     const envelope = parseChatBody(body)
     if (!envelope) return c.json({}, 400)
+
+    // Authenticate the request itself (Google-signed bearer JWT) before we
+    // trust anything in the body. No-op unless GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS.
+    const tokenCheck = await verifyChatRequestToken({
+      config,
+      authorization: c.req.header('Authorization'),
+      resolveKey: resolveChatKey
+    })
+    if (!tokenCheck.ok) {
+      incr('googlechatbot_events_total', { outcome: 'rejected' })
+      logWarn('googlechatbot_event_rejected', { reason: tokenCheck.reason })
+      return c.json({}, tokenCheck.status)
+    }
 
     const verification = verifyChatRequest({ config, envelope })
     if (!verification.ok) {

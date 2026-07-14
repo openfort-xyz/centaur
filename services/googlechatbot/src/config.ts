@@ -44,6 +44,9 @@ const EnvSchema = z.object({
 
   // Comma/space-separated email-domain allowlist for inbound events. The bot is
   // OPEN to all domains until set; set it (e.g. "openfort.xyz") to fail closed.
+  // NOTE: this is a coarse filter on the (attacker-controllable) event body, not
+  // an authentication control — enable GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS for
+  // that.
   GOOGLECHATBOT_ALLOWED_DOMAIN: z
     .string()
     .default('')
@@ -53,6 +56,22 @@ const EnvSchema = z.object({
         .map(part => part.trim())
         .filter(Boolean)
     ),
+
+  // Authenticate inbound webhook requests by verifying Google Chat's signed
+  // bearer JWT (issuer chat@system.gserviceaccount.com). OFF by default so the
+  // rollout can gate the code independently of the edge; flip to `true`/`1` to
+  // fail closed. Requires at least one audience below or every request 401s.
+  GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: z
+    .string()
+    .default('false')
+    .transform(value => value === 'true' || value === '1'),
+
+  // Accepted `aud` claim(s) for the signed request token. Google Chat mints the
+  // token with either the app's Cloud project number or the endpoint URL as the
+  // audience depending on the app config; set whichever the app uses (both may
+  // be set — a token matching either is accepted).
+  GOOGLECHATBOT_PROJECT_NUMBER: z.string().optional(),
+  GOOGLECHATBOT_WEBHOOK_AUDIENCE: z.string().optional(),
 
   // Optional per-run guards forwarded to api-rs.
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
