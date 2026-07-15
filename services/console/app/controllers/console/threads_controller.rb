@@ -411,13 +411,11 @@ class Console::ThreadsController < ApplicationController
     line.to_json
   end
 
-  # Resolve the signed-in human through the same Slack profile custom-field
-  # path as slackbotv2, falling back to their Console display name/email. Keep
-  # this separate from the persisted prompt: it is harness execution context.
+  # Prefer the signed-in human's connected GitHub account, then use the same
+  # Slack profile custom-field path as slackbotv2. Keep this separate from the
+  # persisted prompt: it is harness execution context.
   def console_requester_context
-    github_identity = SlackRequesterIdentity.resolve(
-      user_ids: slack_thread_owners_for_current_user.map(&:user_id)
-    )
+    github_identity = console_requester_identity
     prompted_by = github_identity.handle.presence ||
       (current_user&.name.to_s.strip.presence || current_user&.email.to_s)
     github_status = github_identity.handle.present? ?
@@ -459,12 +457,27 @@ class Console::ThreadsController < ApplicationController
 
   def console_actor_metadata
     email = current_user&.email.to_s
-    {
+    metadata = {
       platform: "console",
       source: "console",
       user_email: email,
       actor_email: email
     }
+    github_handle = console_requester_identity.handle.presence
+    metadata[:github_handle] = github_handle if github_handle
+    metadata
+  end
+
+  def console_requester_identity
+    @console_requester_identity ||= begin
+      identity = GithubRequesterIdentity.resolve(user: current_user)
+      if identity.handle.blank?
+        identity = SlackRequesterIdentity.resolve(
+          user_ids: slack_thread_owners_for_current_user.map(&:user_id)
+        )
+      end
+      identity
+    end
   end
 
   def load_threads
