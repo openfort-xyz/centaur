@@ -461,7 +461,32 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await
+            .await?;
+        // Reclaim the proxy: a paused sandbox has no pod for it to serve, and the
+        // ownerReference cascade only fires when the Sandbox CR is *deleted*, so
+        // without this the proxy pod stays Running until max-lifetime reaping —
+        // hours later. On a small node those retained proxies accumulate until new
+        // sandboxes cannot be scheduled at all.
+        //
+        // Nothing depends on them surviving the pause. resume() rebuilds the set
+        // from scratch (create_iron_proxy_resources starts by deleting whatever is
+        // there), and assign/ensure_proxy_resources_for_principal recreate on
+        // demand when has_usable_iron_proxy_resources reports them missing. The
+        // principal needed to rebind lives in a CR annotation, not in these
+        // resources, so it still survives.
+        //
+        // Best-effort: the sandbox IS paused once the patch above lands, so a
+        // failure here must not fail the pause. The resources remain owned by the
+        // CR and are still reclaimed by cascade deletion at stop()/max-lifetime,
+        // which is exactly the old behaviour.
+        if let Err(error) = self.delete_iron_proxy_resources(id).await {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to delete iron-proxy resources on pause; they will be reclaimed when the sandbox is deleted"
+            );
+        }
+        Ok(())
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
