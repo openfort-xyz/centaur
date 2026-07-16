@@ -42,8 +42,6 @@ class Console::ThreadsController < ApplicationController
     tool_use
     functioncall
     function_call
-    filechange
-    file_change
   ].freeze
   TOOL_TRACE_ITEM_TYPES = %w[
     commandExecution
@@ -56,8 +54,6 @@ class Console::ThreadsController < ApplicationController
     tool_use
     functionCall
     function_call
-    fileChange
-    file_change
   ].freeze
   # Messages and thinking precede the terminal event for a same-timestamp tie.
   TRANSCRIPT_SOURCE_ORDER = { message: 0, thinking: 1, event: 2 }.freeze
@@ -1183,7 +1179,6 @@ class Console::ThreadsController < ApplicationController
   end
 
   def generic_tool_item_trace(item)
-    label = trace_label_for_item(item)
     name = first_present(item["name"], item["tool"], item["toolName"], item["tool_name"])
     input = item["input"] || item["arguments"] || item["args"]
     output = item["output"] || item["result"]
@@ -1197,7 +1192,7 @@ class Console::ThreadsController < ApplicationController
     text = sections.compact.join("\n\n").strip
     return nil if text.blank?
 
-    { label: label, text: text }
+    { label: "Tool call", text: text }
   end
 
   def claude_tool_use_trace(value)
@@ -1251,14 +1246,6 @@ class Console::ThreadsController < ApplicationController
   def message_content(value)
     message = value["message"]
     message.is_a?(Hash) ? message["content"] : value["content"]
-  end
-
-  def trace_label_for_item(item)
-    case item["type"].to_s
-    when "fileChange", "file_change" then "File change"
-    when "mcpToolCall", "mcp_tool_call" then "Tool call"
-    else "Tool call"
-    end
   end
 
   def markdown_code_block(value, language: nil)
