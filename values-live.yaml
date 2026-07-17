@@ -86,8 +86,6 @@ slackbotv2:
   enabled: true
   image:
     pullPolicy: IfNotPresent
-  extraEnv:
-    SESSION_MAX_DURATION_MS: '1800000'
 discordbot:
   enabled: false
 console:
@@ -107,8 +105,6 @@ googlechatbot:
   allowedDomain: openfort.xyz,openfort.io
   eventsPath: /api/chat/events
   uploadUser: jaume@openfort.xyz
-  extraEnv:
-    SESSION_MAX_DURATION_MS: '1800000'
 laminar:
   enabled: true
 toolServer:
