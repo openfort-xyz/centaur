@@ -276,7 +276,15 @@ impl AgentSandboxBackend {
         let Some(principal_id) = principal_id else {
             return Ok(None);
         };
-        let pg = self.resolved_pg();
+        // Reuse the client user/password baked into the sandbox's sticky
+        // CENTAUR_POSTGRES_DSN (set once via set_missing_env at create) rather
+        // than minting a fresh random pair. Resume recreates the proxy pod, so
+        // a new random user would land in IRON_PROXY_PG_CLIENT_USER while the
+        // sandbox keeps presenting its original DSN user — the proxy then
+        // rejects it with `FATAL: unknown user`. Read-back (falling back to a
+        // fresh pair only when the sandbox has no DSN yet) keeps the two in
+        // sync, exactly as the proxy-repair path already does.
+        let pg = self.resolved_pg_for_repair(Some(&sandbox));
         let replace_placeholders = self.effective_replace_placeholders(&principal_id).await?;
         let observability_enabled = sandbox_observability_enabled(&sandbox, &self.config.container_name)
             .unwrap_or_else(|| {
@@ -2310,6 +2318,41 @@ mod tests {
     fn pg_repair_ignores_unparseable_sandbox_dsn() {
         assert!(pg_from_sandbox_dsn("not-a-postgres-dsn", "0.0.0.0:5432", 5432).is_none());
         assert!(pg_from_sandbox_dsn("postgresql://@host:5432", "0.0.0.0:5432", 5432).is_none());
+    }
+
+    fn sandbox_with_pg_dsn(container: &str, dsn: Option<&str>) -> crate::crd::Sandbox {
+        let env = dsn.map(|dsn| serde_json::json!([{ "name": CENTAUR_POSTGRES_DSN_ENV, "value": dsn }]));
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1alpha1",
+            "kind": "Sandbox",
+            "metadata": { "name": "asbx-test" },
+            "spec": { "podTemplate": { "spec": { "containers": [{ "name": container, "env": env }] } } },
+        }))
+        .expect("construct test sandbox")
+    }
+
+    // Guards the resume path: a resumed proxy must reuse the client credentials
+    // baked into the sandbox's sticky CENTAUR_POSTGRES_DSN, or it rejects the
+    // sandbox's connection with `FATAL: unknown user`.
+    #[test]
+    fn pg_from_sandbox_env_reuses_sticky_dsn_credentials() {
+        let sandbox = sandbox_with_pg_dsn(
+            "agent",
+            Some("postgresql://pg-user-original:pg-password-original@asbx-test-iron-proxy:5432"),
+        );
+
+        let pg = pg_from_sandbox_env(&sandbox, "agent", "0.0.0.0:5432", 5432).unwrap();
+
+        assert_eq!(pg.user, "pg-user-original");
+        assert_eq!(pg.password, "pg-password-original");
+        assert_eq!(pg.listen, "0.0.0.0:5432");
+        assert_eq!(pg.port, 5432);
+    }
+
+    #[test]
+    fn pg_from_sandbox_env_absent_when_sandbox_has_no_dsn() {
+        let sandbox = sandbox_with_pg_dsn("agent", None);
+        assert!(pg_from_sandbox_env(&sandbox, "agent", "0.0.0.0:5432", 5432).is_none());
     }
 
     #[test]
