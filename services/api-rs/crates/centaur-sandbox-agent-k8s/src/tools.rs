@@ -82,8 +82,9 @@ pub struct ToolsConfig {
     /// Whether running sandboxes should watch repo-cache checkouts and refresh
     /// local tool shims when commits change.
     pub auto_reload: bool,
-    /// Additional tool sources copied after the base tree. Duplicate tool names
-    /// are skipped by the copy helper.
+    /// Additional tool sources copied after the base tree. On a duplicate tool
+    /// name the later source replaces the earlier one (base tree first, then
+    /// each extra source in order), so overlay sources shadow the base tree.
     pub extra_sources: Vec<ToolSource>,
 }
 

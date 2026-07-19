@@ -14,7 +14,7 @@ import install_tool_shims
 
 
 class CopyPublishedToolsTest(unittest.TestCase):
-    def test_copies_tool_dirs_and_skips_duplicate_names(self) -> None:
+    def test_copies_tool_dirs_and_later_source_replaces_duplicate_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             published = root / "published"
@@ -40,13 +40,13 @@ class CopyPublishedToolsTest(unittest.TestCase):
                 (target / "research" / "sensortower" / "pyproject.toml").read_text(),
                 "base\n",
             )
-            self.assertIn("skipping duplicate tool websearch", stderr.getvalue())
+            self.assertIn("overriding tool websearch", stderr.getvalue())
             self.assertEqual(
                 (target / "research" / "websearch" / "pyproject.toml").read_text(),
-                "old project\n",
+                "new project\n",
             )
-            self.assertEqual((target / "research" / "websearch" / "old.py").read_text(), "old\n")
-            self.assertFalse((target / "research" / "websearch" / "new.py").exists())
+            self.assertEqual((target / "research" / "websearch" / "new.py").read_text(), "new\n")
+            self.assertFalse((target / "research" / "websearch" / "old.py").exists())
             self.assertEqual((target / "research" / "company" / "pyproject.toml").read_text(), "company\n")
 
     def test_tool_allowlist_restricts_installed_tools(self) -> None:

@@ -155,14 +155,20 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
             continue
         if tool_name in blocklist:
             continue
-        if tool_name in existing:
-            print(
-                f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
-                file=sys.stderr,
-            )
-            continue
         relative_package_dir = package_dir.relative_to(published)
         target = tool_dir / relative_package_dir
+        previous = existing.get(tool_name)
+        if previous is not None:
+            # Later sources shadow earlier ones by tool name (base tree first,
+            # then each overlay source in order). Remove the earlier install if
+            # it lives elsewhere so it doesn't linger alongside the replacement
+            # with a duplicate [project.scripts] shim name.
+            print(
+                f"overriding tool {tool_name}: {package_dir} replaces {previous}",
+                file=sys.stderr,
+            )
+            if previous != target:
+                _remove_path(previous)
         if target.exists() or target.is_symlink():
             _remove_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
