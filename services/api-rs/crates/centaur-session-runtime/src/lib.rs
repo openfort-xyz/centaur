@@ -2986,17 +2986,31 @@ impl SessionRuntime {
         let mut failed = 0_usize;
         let mut skipped = 0_usize;
         let mut own = 0_usize;
+        let mut hung = 0_usize;
         let mut deferred = HashSet::new();
         for candidate in executions {
             let execution_id = candidate.execution.execution_id.clone();
             // Advisory fast path: a live lease means the execution has an
-            // active pump somewhere. Skip our own executions silently and
-            // defer peers' without touching the session row or the sandbox
-            // backend — the conditional claim below stays the sole authority
-            // on ownership.
+            // active pump somewhere. Defer peers' without touching the
+            // session row or the sandbox backend — the conditional claim
+            // below stays the sole authority on ownership. Our own
+            // executions still get a direct sandbox-health check: a live
+            // lease only proves this process is still polling for output,
+            // not that the sandbox producing it is still alive. A sandbox
+            // can die mid-turn (OOM, node eviction, manual kill) without
+            // ever breaking lease renewal, which otherwise wedges the
+            // thread forever behind the one-active-execution-per-thread
+            // constraint.
             if candidate.stdout_owner_lease_active {
                 if candidate.stdout_owner_id.as_deref() == Some(self.stdout_owner_id.as_str()) {
-                    own += 1;
+                    if self
+                        .fail_if_owned_execution_sandbox_dead(&candidate.execution)
+                        .await
+                    {
+                        hung += 1;
+                    } else {
+                        own += 1;
+                    }
                     continue;
                 }
                 if !state.deferred.contains(&execution_id) {
@@ -3034,16 +3048,17 @@ impl SessionRuntime {
             }
         }
         state.deferred = deferred;
-        if adopted > 0 || failed > 0 {
+        if adopted > 0 || failed > 0 || hung > 0 {
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "execution_adoption_scan",
                 adopted,
                 failed,
+                hung,
                 deferred = state.deferred.len(),
                 skipped,
                 own,
-                "adopted executions orphaned by a previous control plane process"
+                "adopted executions orphaned by a previous control plane process, or failed owned executions whose sandbox died"
             );
         } else {
             debug!(
@@ -3051,12 +3066,94 @@ impl SessionRuntime {
                 event = "execution_adoption_scan",
                 adopted,
                 failed,
+                hung,
                 deferred = state.deferred.len(),
                 skipped,
                 own,
                 "orphan adoption scan found nothing adoptable"
             );
         }
+    }
+
+    /// A live stdout-owner lease only proves this process is still the one
+    /// polling for output -- not that the sandbox behind it is still alive.
+    /// Check the sandbox directly and fail the execution if it can no longer
+    /// serve I/O, using the same completion pipeline (and so the same
+    /// events/metrics/notifications) as every other terminal-output path.
+    /// Returns true if the execution was failed.
+    async fn fail_if_owned_execution_sandbox_dead(&self, execution: &SessionExecution) -> bool {
+        let thread_key = &execution.thread_key;
+        let execution_id = execution.execution_id.as_str();
+        let session = match self.store.get_session(thread_key).await {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "owned_execution_health_check_failed",
+                    thread_key = %thread_key,
+                    execution_id,
+                    %error,
+                    "failed to load session while checking owned execution's sandbox health"
+                );
+                return false;
+            }
+        };
+        let Some(sandbox_id) = session.sandbox_id.as_deref() else {
+            return false;
+        };
+        let id = SandboxId::new(sandbox_id);
+        let status = match self.sandbox_runtime.manager.status(&id).await {
+            Ok(status) => status,
+            Err(SandboxError::NotFound(_)) => SandboxStatus::Gone,
+            // Transient status failures must not fail a possibly live
+            // execution; surface nothing and retry on the next tick.
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "owned_execution_health_check_failed",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    %error,
+                    "failed to read sandbox status while checking owned execution's health"
+                );
+                return false;
+            }
+        };
+        if status.can_open_io() {
+            return false;
+        }
+        let error = format!("sandbox no longer accepts io (status {status:?})");
+        if let Err(record_error) = record_terminal_output(
+            &self.context(),
+            thread_key,
+            sandbox_id,
+            execution_id,
+            TerminalOutput::Failed { error },
+        )
+        .await
+        {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "owned_execution_health_check_record_failed",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                error = %record_error,
+                "failed to record owned execution as failed after its sandbox died"
+            );
+            return false;
+        }
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "owned_execution_sandbox_dead",
+            thread_key = %thread_key,
+            execution_id,
+            sandbox_id,
+            status = ?status,
+            "failed an owned execution whose sandbox died without breaking the stdout-owner lease"
+        );
+        true
     }
 
     async fn record_adoption_deferral(&self, execution: &SessionExecution) {
@@ -9419,6 +9516,63 @@ mod adoption_tests {
             "expected status detail: {error}"
         );
         assert_eq!(backend.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_scan_fails_owned_execution_when_sandbox_dies() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:owned-dead-sandbox-{}", uuid::Uuid::new_v4()))
+                .unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Stopped, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60)
+                )
+                .await
+                .expect("claim as this control plane")
+        );
+
+        // The lease is live and owned by this exact process -- the advisory
+        // fast path alone would skip it forever. The sandbox behind it is
+        // already dead, so the scan must still fail it instead of leaving
+        // the thread wedged behind the one-active-execution-per-thread
+        // constraint.
+        let mut state = OrphanAdoptionState::default();
+        runtime
+            .run_orphan_adoption_scan(&mut state, Some(PRE_SANDBOX_ORPHAN_GRACE))
+            .await;
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        let error = failed.payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("sandbox no longer accepts io"),
+            "unexpected error: {error}"
+        );
+
+        let execution = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("latest execution")
+            .expect("execution exists");
+        assert_eq!(execution.status, ExecutionStatus::Failed);
+
+        let session = store.get_session(&thread_key).await.expect("get session");
+        assert_eq!(session.status, SessionStatus::Failed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
