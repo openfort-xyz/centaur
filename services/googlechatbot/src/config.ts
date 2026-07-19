@@ -100,7 +100,29 @@ const EnvSchema = z.object({
   GOOGLECHATBOT_FOLLOW_UP_THREADS: z
     .string()
     .default('false')
-    .transform(value => value === 'true' || value === '1')
+    .transform(value => value === 'true' || value === '1'),
+
+  // How inline harness/model/provider/reasoning overrides are resolved from a
+  // message: "flags" (default) parses literal --flags; "llm" additionally asks
+  // an OpenAI model to interpret natural-language requests ("use max effort
+  // and the sol model"), matching slackbotv2's SLACKBOTV2_MESSAGE_OVERRIDES_STRATEGY.
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY: z
+    .enum(['flags', 'llm'])
+    .default('flags'),
+  // Falls back to OPENAI_API_KEY when unset, same as slackbotv2. Required for
+  // the "llm" strategy; the strategy no-ops (no overrides) if neither is set.
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL: z.string().optional(),
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL: z.string().default('gpt-5.4-nano'),
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().optional(),
+
+  // Per-space default harness/model/provider/reasoning, JSON keyed by Google
+  // Chat space id. Mirrors slackbotv2's SLACKBOTV2_CHANNEL_DEFAULTS. See
+  // space-defaults.ts for the shape and precedence (per-thread flag, then
+  // space default, then GOOGLECHATBOT_DEFAULT_HARNESS).
+  GOOGLECHATBOT_SPACE_DEFAULTS: z.string().optional()
 })
 
 export type AppConfig = z.infer<typeof EnvSchema>

@@ -154,3 +154,47 @@ keeping googlechatbot alongside new githubbot+linearbot; AGENTS.md rewritten
 upstream — taken wholesale, the fork's one-line google_chat_sync table entry had
 no surviving home). Incoming migrations renumbered 0041-0043 (fork's applied
 0040_slack_private_channels keeps its slot).
+
+## 6. Upstream sync 2026-07-18 (63 commits, `origin/main..upstream/main`) — Slack-touching dispositions
+
+This was a full merge (all 63 commits), not a scoped cherry-pick: one merge-blocking gap
+found and fixed, plus every Slack-only feature in the range ported to Chat so the fork
+does not regress parity by merging.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 6.1 | #704 Make the chat agent platform-aware (Slack/Discord/Linear/Github) — adds `ChatDestination` (api-rs `centaur-session-core`), platform-tagged session context, and free-function removal in `centaur-api-server`/`centaur-session-runtime` | **Not conflict-flagged** — the file merged cleanly with zero Google Chat awareness (upstream added Discord/Linear/GitHub variants but never a Chat one, since Chat doesn't exist upstream). Would have silently dropped Chat's platform/session-context block on merge. Added `ChatDestination::GoogleChat { space_name, thread_name }`, its `platform()`/`context_line()`/`chat_destination()` arms, and a parsing test in `centaur-session-core`; threaded through `centaur-api-server` (`SessionContextResponse.google_chat` field, 5-tuple match) and `centaur-session-runtime` (`session_context_for_thread` match arm, test). This is the merge-blocking item flagged before scoping this PR. | ✅ |
+| 6.2 | #1096 Add LLM message override strategy (slackbotv2 `message-overrides-strategy.ts`: OpenAI-backed natural-language flag extraction, `GOOGLECHATBOT`-equivalent config, `flags`/`llm` strategy switch) | Ported as `googlechatbot/src/message-overrides-strategy.ts` (`createFlagMessageOverridesStrategy`/`createOpenAiMessageOverridesStrategy`/`messageOverridesStrategyFromConfig`, memoized) + `GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY`/`_OPENAI_API_KEY`/`_OPENAI_BASE_URL`/`_MODEL`/`_TIMEOUT_MS`/`_MAX_OUTPUT_TOKENS` config. `overrides.ts` refactored (`MessageOverrides` → `HarnessOverrides` + `cleanedText`) so both the flag-parser and LLM paths share one shape. 7 tests (`message-overrides-strategy.test.ts`). | ✅ port |
+| 6.3 | #1075 Default model and reasoning effort per Slack channel (`slackbotv2` channel-defaults: per-channel `harness`/`model`/`provider`/`reasoning` below the deployment default, above per-message overrides) | Ported as `googlechatbot/src/space-defaults.ts` (`parseSpaceDefaults`/`spaceIdFromThreadId`/`resolveSpaceDefault`/`spaceDefaultsFromConfig`) + `GOOGLECHATBOT_SPACE_DEFAULTS` config (JSON keyed by space id, parsed from `chat:spaces:<id>:...` thread keys). `index.ts`'s `driveSession` now resolves `overrides ?? spaceDefault ?? config default` for harness/model/provider/reasoning, same precedence chain as Slack's channel defaults. 10 tests (`space-defaults.test.ts`). Note (1.4 still applies): this precedence is per-turn from static config, not the sticky-in-Postgres persistence Slack has — that gap is unchanged by this port. | ✅ port |
+| 6.4 | #1110 Dispatch Slack Block Kit actions (`slackbotv2` `chat.onAction` → lease-deduped `POST /api/workflows/events` as `slack.block_action.<action_id>`) | Ported best-effort as Google Chat `CARD_CLICKED` dispatch: `googlechatbot/src/index.ts` now special-cases `envelope.type === 'CARD_CLICKED'` **before** `normalizeChatEnvelope` (which deliberately nulls out that type — no command-aware workflow path exists yet, see its inline comment) and calls `emitWorkflowEvent(config, 'google_chat.card_click.<invokedFunction>', payload)` via the new `googleChatCardClickPayload()`/`handleCardClick()`. No separate per-click lease was added (unlike Slack's `state.setIfNotExists`): the existing top-level `EventDeduper`/`chatDedupKey` (keyed on `eventTime`+`spaceName`+`messageName`) already runs on every inbound webhook before dispatch, which covers redelivery the same way. **⚠️ Unverified**: the `event.common.invokedFunction`/`event.common.parameters` wire shape for `CARD_CLICKED` (added to `GoogleChatEnvelope.common`) is taken from Google's REST reference docs, not exercised against a live Chat backend anywhere in this codebase — nothing in `googlechatbot` currently sends a `cardsV2` button whose `onClick.action.function` would trigger this path, so there is no existing card in production to click. **Needs a manual smoke test against a real Google Chat card button before this is relied upon** (post-deploy: post a message with a button card, click it, confirm `google_chat.card_click.*` lands in workflow events with the expected fields). | ✅ port (best-effort, unverified) |
+| 6.5 | #1051 scoped trigger bot IDs · #1043 resolve trigger bot identities · #1048 trigger on rich message mentions · #1061 fall back to direct Slack threads · #1088 non-rotating Slack OAuth tokens · #1079 ingest private Slack channels from OAuth | All Slack-transport-specific: trigger-bot allowlisting and rich-mention detection are text/event-shape quirks of the Slack Events API that Chat's envelope-typed `normalizeChatEnvelope` doesn't share (1.9); OAuth-token rotation and private-channel-via-OAuth ingestion are Slack App OAuth concepts with no Chat analogue (Chat bot auth is a service account, 2.12; space-type inclusion already covers the private/public axis, 4.6). No functional gap on the Chat side. | 🟰 |
+| 6.6 | #1093 label Slack principal kinds · #1092 label Slack DM principals with email | Cosmetic principal-display fixes in Slack's admin/console surfaces. Chat DM principals already carry `user_email` in session metadata (3.2); no equivalent display gap identified. | 🟰 |
+| 6.7 | #1085 show Codex effort/speed in slackbotv2 · #1095 hide Codex effort/speed (slackbotv2 Block Kit UI toggle) | Slack-specific Block Kit rendering of harness metadata. Chat's card renderer has no equivalent status line for effort/speed today — a real but low-priority gap, not part of the 3 features scoped for this sync. | 🔜 |
+| 6.8 | #984/#1047/#1054/#1102 console chat composer + attribution/discovery fixes · #1027/#1005/#1016/#1009/#1023/#1025/#1029/#1010/#1011/#1013/#1017/#1022/#1032/#1101/#1100/#1097/#1094/#1090/#1074/#1072/#1076/#1078/#1083/#1084/#1036/#1039/#1062/#1058/#1059/#1060/#1063/#1073/#1077/#1099/#1106/#1109/#1118/#1119/#1124/#1125/#1126 platform/console/harness/infra work | Platform-agnostic (console, api-rs runtime, sandbox, CI, chart, Airtable/Granola integrations) or Slack-proxy-transport work already dispositioned as 🟰 by the `slack_proxy.rs`-vs-edge-injection note in section 4. Benefits both bots (or console-only) on merge; nothing bot-side to port. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+Widest merge to date: 63 commits touching `api-rs` (5 crates), `workflows/`,
+`contrib/chart`, and `services/console` Ruby tests, on top of the 3 Chat-only ports
+above. Notable conflict resolutions: sqlx migrations renumbered (`0044`-`0046`,
+fork's `0043_centaur_readonly_slack_dm_rls` kept in its applied slot); `contrib/chart/templates/networkpolicy.yaml`
+kept the fork's googlechatbot+otlpEgress block verbatim (upstream's side was empty);
+`workflows/company_context_documents.py` took upstream's new scope-claiming
+`handler()` architecture wholesale, then had the Google Chat ETL scope
+(`google_chat_thread`) added to it explicitly — the auto-merge produced a version
+that would `raise ValueError`/silently no-op for Chat's projection scope if left
+unfixed, since upstream's rewrite had no knowledge of that scope either (same class
+of gap as 6.1: upstream code that merges clean but is blind to a fork-only surface).
+`services/console/test/controllers/console/threads_controller_test.rb` conflict
+resolved by keeping both sides' new tests and correctly dropping (not restoring) a
+test whose target private method upstream had removed in a console refactor
+(coverage already existed via a separate integration test).
+
+### Follow-up queue additions (this sync)
+
+9. **Smoke-test the Card-click port against a live Google Chat backend** (6.4) —
+   the `event.common.invokedFunction`/`event.common.parameters` shape is unverified;
+   confirm before any workflow depends on `google_chat.card_click.*` events firing.
+10. **Codex effort/speed status line for Chat** (6.7) — cosmetic parity gap, low
+    priority.
+

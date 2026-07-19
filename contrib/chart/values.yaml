@@ -625,6 +625,25 @@ googlechatbot:
   # domain-wide-delegation grant of chat.messages.create to the SA's client ID.
   # Empty = the /api/chat/attachments route fails closed.
   uploadUser: ""
+  # How inline harness/model/provider/reasoning overrides are resolved from a
+  # message. "flags" (default) parses literal --flags; "llm" additionally asks
+  # an OpenAI model to interpret natural-language requests. Mirrors
+  # slackbotv2.messageOverridesStrategy.
+  # Per-space default harness/model/provider/reasoning, keyed by Google Chat
+  # space id (the AAAA in spaces/AAAA). Each value is an object of optional
+  # harness / model / provider / reasoning fields, using the same vocabulary as
+  # the inline flags. Applied below an explicit per-thread flag and above the
+  # deployment default. Mirrors slackbotv2.channelDefaults. Example:
+  #   spaceDefaults:
+  #     AAAAeng: { harness: claude, model: opus, reasoning: high }
+  #     AAAAtriage: { reasoning: low }
+  spaceDefaults: {}
+  messageOverridesStrategy:
+    mode: flags
+    model: gpt-5.4-nano
+    openaiBaseUrl: https://api.openai.com/v1
+    timeoutMs: 1500
+    maxOutputTokens: 300
   # Public ingress for the webhook. Separate from the slackbotv2 ingress (which owns "/").
   ingress:
     enabled: false
