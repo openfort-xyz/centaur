@@ -20,7 +20,12 @@ jobs:
   release:
     permissions:
       contents: write
-    runs-on: depot-ubuntu-24.04-16
+    # ubuntu-latest, not depot-ubuntu-24.04-16: every step here is a lightweight
+    # checkout/lint/publish (no compilation), and this job has queued for the
+    # full 24h GitHub Actions timeout and been auto-cancelled on every run for
+    # the last three weeks without ever picking up a depot runner -- so the
+    # chart version-bump check and chart-releaser publish silently never ran.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
