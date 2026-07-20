@@ -44,6 +44,23 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 
+  test('strips one or many trailing slashes from a configured base URL', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1///',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await strategy('deploy the thing')
+
+    const [calledUrl] = fetchFn.mock.calls[0] as unknown as [string, unknown]
+    expect(calledUrl).toBe('https://example.test/v1/responses')
+  })
+
   test('drops the whole bundle when the model output fails validation', async () => {
     const fetchFn = fakeResponsesApi(
       JSON.stringify({ harness: 'not-a-harness', model: null, provider: null, reasoning: null })

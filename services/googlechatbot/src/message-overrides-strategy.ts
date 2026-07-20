@@ -97,10 +97,18 @@ export function createFlagMessageOverridesStrategy(): MessageOverridesStrategy {
   return async text => extractMessageOverrides(text)
 }
 
+/** Strip trailing slashes without a `/+$/`-style regex, which CodeQL (rightly)
+ * flags as quadratic-time on a long run of slashes. */
+function stripTrailingSlashes(value: string): string {
+  let end = value.length
+  while (end > 0 && value[end - 1] === '/') end -= 1
+  return value.slice(0, end)
+}
+
 export function createOpenAiMessageOverridesStrategy(
   options: OpenAiMessageOverridesStrategyOptions
 ): MessageOverridesStrategy {
-  const responsesUrl = `${(options.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')}/responses`
+  const responsesUrl = `${stripTrailingSlashes(options.baseUrl ?? 'https://api.openai.com/v1')}/responses`
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
   const fetchFn = options.fetch ?? fetch

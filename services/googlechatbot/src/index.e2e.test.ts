@@ -29,7 +29,7 @@ function installMockFetch(): { calls: MockCall[]; restore: () => void } {
     }
     calls.push({ url, method, body })
 
-    if (url.includes('chat.googleapis.com')) {
+    if (new URL(url).hostname === 'chat.googleapis.com') {
       return new Response(JSON.stringify({ name: 'spaces/AAAA/messages/ACK1' }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
