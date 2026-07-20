@@ -5,10 +5,11 @@ import { EventDeduper, chatDedupKey } from './chat/dedup'
 import { collectThreadHistory, isThreadReply, normalizeChatEnvelope } from './chat/normalize'
 import { verifyChatRequest, verifyChatRequestToken } from './chat/verify'
 import { googleRequestKeyResolver } from './chat/token'
-import type { GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
+import type { GoogleChatCardClickPayload, GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
-import { extractMessageOverrides } from './overrides'
+import { messageOverridesStrategyFromConfig } from './message-overrides-strategy'
+import { resolveSpaceDefault, spaceDefaultsFromConfig } from './space-defaults'
 import { buildConsoleSessionWidget, defaultModelForHarness } from './console-session-link'
 import { chatReplyLimits } from './constants'
 
@@ -28,6 +29,7 @@ import {
   appendSessionMessages,
   classifyExecuteConflict,
   createSession,
+  emitWorkflowEvent,
   executeSession,
   interruptSessionExecution,
   openSessionEventStream,
@@ -292,6 +294,17 @@ async function processChatEvent(
   client: ChatEdgeClient,
   envelope: GoogleChatEnvelope
 ): Promise<void> {
+  // CARD_CLICKED is handled independently of normalizeChatEnvelope: that
+  // normalizer deliberately returns null for it (no command-aware workflow
+  // path to hand a "message" event to), so a click's context is read straight
+  // off the raw envelope rather than a normalized one. Best-effort port of
+  // slackbotv2's chat.onAction -- see SLACK_PARITY.md 6.4 for the caveat that
+  // this wire shape is unverified against a live Google Chat backend.
+  if (envelope.type === 'CARD_CLICKED') {
+    await handleCardClick(config, envelope)
+    return
+  }
+
   const botUser = botResourceName(config)
   const normalized = await normalizeChatEnvelope(envelope, botUser, client)
   if (!normalized) return
@@ -353,6 +366,49 @@ async function processChatEvent(
   await driveSession(config, client, normalized, ackMessageName)
 }
 
+export function googleChatCardClickPayload(envelope: GoogleChatEnvelope): GoogleChatCardClickPayload | null {
+  const spaceName = envelope.space?.name
+  const invokedFunction = envelope.common?.invokedFunction
+  if (!spaceName || !invokedFunction) return null
+
+  const threadName = envelope.message?.thread?.name ?? envelope.thread?.name
+  return {
+    invoked_function: invokedFunction,
+    ...(envelope.message?.name ? { message_name: envelope.message.name } : {}),
+    ...(envelope.common?.parameters ? { parameters: envelope.common.parameters } : {}),
+    space_name: spaceName,
+    ...(threadName ? { thread_name: threadName } : {}),
+    ...(envelope.user?.email ? { user_email: envelope.user.email } : {}),
+    ...(envelope.user?.name ? { user_id: envelope.user.name } : {}),
+    ...(envelope.user?.displayName ? { user_name: envelope.user.displayName } : {})
+  }
+}
+
+async function handleCardClick(config: AppConfig, envelope: GoogleChatEnvelope): Promise<void> {
+  const payload = googleChatCardClickPayload(envelope)
+  if (!payload) {
+    logWarn('googlechatbot_card_click_missing_context', {
+      has_space_name: Boolean(envelope.space?.name),
+      has_invoked_function: Boolean(envelope.common?.invokedFunction)
+    })
+    return
+  }
+
+  // Card-click dedup is already covered by the top-level EventDeduper keyed on
+  // (eventTime, spaceName, messageName) in the webhook handler above -- unlike
+  // slackbotv2's block actions, no separate per-click lease is needed here.
+  try {
+    await emitWorkflowEvent(config, `google_chat.card_click.${payload.invoked_function}`, payload)
+    incr('googlechatbot_card_clicks_total', { outcome: 'dispatched' })
+  } catch (error) {
+    incr('googlechatbot_card_clicks_total', { outcome: 'failed' })
+    logError('googlechatbot_card_click_dispatch_failed', error, {
+      invoked_function: payload.invoked_function,
+      space_name: payload.space_name
+    })
+  }
+}
+
 async function driveSession(
   config: AppConfig,
   client: ChatEdgeClient,
@@ -363,15 +419,25 @@ async function driveSession(
   const { execute, history } = turnMessagesFromEvent(event)
   // Inline directives (--model, -rsn, --bedrock, --claude, ...) are stripped from
   // the prompt and applied to the harness/turn, matching the Slack integration.
-  const overrides = extractMessageOverrides(execute.text)
+  // GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY=llm swaps the literal-flag parser
+  // for an LLM that also understands natural-language requests.
+  const overrides = await messageOverridesStrategyFromConfig(config)(execute.text)
   execute.text = overrides.cleanedText
+  // Space default: below a per-thread flag, above the deployment default.
+  // Unlike slackbotv2's channel default, there is no sticky-thread tier in
+  // between -- this bot keeps no cross-turn state (parity tracked separately).
+  const spaceDefault = resolveSpaceDefault(spaceDefaultsFromConfig(config), threadKey)
+  const resolvedHarnessType = overrides.harnessType ?? spaceDefault?.harnessType
+  const resolvedModel = overrides.model ?? spaceDefault?.model
+  const resolvedProvider = overrides.provider ?? spaceDefault?.provider
+  const resolvedReasoning = overrides.reasoning ?? spaceDefault?.reasoning
   incr('googlechatbot_runs_total', { outcome: 'started' })
   try {
     const session = await createSession(
       config,
       threadKey,
       conversationName(event),
-      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
+      resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
       {
         userId: event.user_id,
         userName: event.user_name,
@@ -403,9 +469,9 @@ async function driveSession(
         idleTimeoutMs: config.SESSION_IDLE_TIMEOUT_MS,
         maxDurationMs: config.SESSION_MAX_DURATION_MS,
         overrides: {
-          model: overrides.model,
-          provider: overrides.provider,
-          reasoning: overrides.reasoning
+          model: resolvedModel,
+          provider: resolvedProvider,
+          reasoning: resolvedReasoning
         },
         // Thread history rides the execute input itself (slackbotv2 parity):
         // messages appended via /messages are stored for the Console but never
@@ -422,7 +488,7 @@ async function driveSession(
       // live run instead of erroring into the thread.
       const folded = await foldIntoActiveRun(config, client, threadKey, execute, ackMessageName, error, {
         conversationName: conversationName(event),
-        harnessType: overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+        harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
       })
       if (folded) return
       throw error
@@ -434,12 +500,12 @@ async function driveSession(
     // sent to the session API as `thread_key`, which the Console indexes by.
     const isFirstAssistantMessage = !event.history_messages?.length
     const effectiveHarnessType =
-      overrides.harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+      resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
     // Without an explicit --model/--opus/... override the harness runs its
     // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
     // config); show that instead of dropping the model entirely.
     const effectiveModel =
-      overrides.model ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
+      resolvedModel ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
     const consoleSessionWidget = isFirstAssistantMessage
       ? buildConsoleSessionWidget({
           consoleBaseUrl: config.CENTAUR_CONSOLE_PUBLIC_URL,

@@ -69,6 +69,32 @@ spec:
             - name: GOOGLECHATBOT_UPLOAD_USER
               value: {{ .Values.googlechatbot.uploadUser | quote }}
 {{- end }}
+{{- if .Values.googlechatbot.spaceDefaults }}
+            # Per-space default harness / model / provider / reasoning, keyed by
+            # Google Chat space id. Applied below an explicit per-thread flag and
+            # above the deployment/baked default, and forwarded onto the harness
+            # input line so it takes effect. Mirrors slackbotv2's channelDefaults.
+            - name: GOOGLECHATBOT_SPACE_DEFAULTS
+              value: {{ .Values.googlechatbot.spaceDefaults | toJson | quote }}
+{{- end }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.mode | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.model | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.openaiBaseUrl | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.timeoutMs | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.maxOutputTokens | quote }}
+            # Shared with slackbotv2: same OPENAI_API_KEY secret key, optional so
+            # a deployment without it still starts (llm mode then no-ops).
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sOPENAI_API_KEY" .Values.secretManager.envPrefix }}
+                  optional: true
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- if $console.publicUrl }}
             # Public origin of the Console UI (matches the Console's own

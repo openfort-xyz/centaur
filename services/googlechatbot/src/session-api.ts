@@ -284,6 +284,25 @@ export async function executeSession(
   return (await response.json()) as ExecuteSessionResponse
 }
 
+/** POST /api/workflows/events -- forwards a card-click (or any other
+ * out-of-band UI action) to the workflows engine as a named event, mirroring
+ * slackbotv2's dispatchSlackBlockAction. Not thread-scoped: this hits the same
+ * api-rs route slackbotv2 uses, so `payload` carries whatever thread/space
+ * context the caller wants the workflow to see. */
+export async function emitWorkflowEvent(
+  config: AppConfig,
+  eventName: string,
+  payload: Record<string, unknown>
+): Promise<void> {
+  await sessionApiRequest('emit_workflow_event', `emit workflow event ${eventName}`, () =>
+    fetch(new URL('/api/workflows/events', ensureTrailingSlash(config.CENTAUR_API_URL)).toString(), {
+      method: 'POST',
+      headers: apiHeaders(config),
+      body: JSON.stringify({ event_name: eventName, payload })
+    })
+  )
+}
+
 export type InterruptSessionResponse = {
   execution_id?: string | null
   interrupted: boolean
@@ -347,6 +366,7 @@ type SessionApiOperation =
   | 'execute_session'
   | 'interrupt_session'
   | 'open_event_stream'
+  | 'emit_workflow_event'
 
 async function sessionApiRequest(
   operation: SessionApiOperation,

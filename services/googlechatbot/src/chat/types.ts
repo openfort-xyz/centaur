@@ -108,6 +108,32 @@ export type GoogleChatEnvelope = {
     appCommandType?: string
   }
   configCompleteRedirectUrl?: string
+  // CARD_CLICKED events: the invoked cardsV2 button (onClick.action.function)
+  // and its parameters come back under `common`, per the modern Chat API
+  // (event.common.invokedFunction / event.common.parameters). NOTE: this
+  // shape is not exercised against a live Google Chat backend anywhere in
+  // this codebase yet -- verify it against a real CARD_CLICKED payload before
+  // relying on it in production (see SLACK_PARITY.md 6.4).
+  common?: {
+    invokedFunction?: string
+    parameters?: Record<string, string>
+    hostApp?: string
+  }
+}
+
+// Payload dispatched to api-rs as a `google_chat.card_click.<invokedFunction>`
+// workflow event (parity with slackbotv2's SlackbotV2BlockActionPayload /
+// `slack.block_action.<action_id>`). See SLACK_PARITY.md 6.4 for the same
+// unverified-wire-format caveat as GoogleChatEnvelope.common above.
+export type GoogleChatCardClickPayload = {
+  invoked_function: string
+  message_name?: string
+  parameters?: Record<string, string>
+  space_name: string
+  thread_name?: string
+  user_email?: string
+  user_id?: string
+  user_name?: string
 }
 
 // Inbound message shape returned by spaces.messages.list / spaces.messages.get.

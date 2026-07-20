@@ -25,7 +25,6 @@ def _load_projection_module():
 
     company_context_metrics = types.ModuleType("workflows.company_context_metrics")
     for name in (
-        "observe_company_context_document_size",
         "record_company_context_documents_changed",
         "set_company_context_projection_lag",
     ):
@@ -112,9 +111,14 @@ class FakeWorkflowContext:
         self.run_id = "run_123"
         self._pool = object()
         self.logs: list[tuple[str, dict]] = []
+        self.children: list[tuple[str, dict, str | None]] = []
 
     def log(self, message, **fields):
         self.logs.append((message, fields))
+
+    async def start_workflow(self, workflow_name, input, *, idempotency_key=None):
+        self.children.append((workflow_name, input, idempotency_key))
+        return {"task_id": f"task_{len(self.children)}", "created": True}
 
 
 def test_latest_successful_watermark_reads_absurd_etl_queue():
@@ -159,26 +163,19 @@ def test_load_changed_message_keys_applies_upper_batch_bound():
         assert args == (since, until)
 
 
-def test_handler_advances_empty_bounded_window(monkeypatch):
+def test_coordinator_starts_one_child_per_enabled_scope(monkeypatch):
     last_watermark = dt.datetime(2026, 6, 18, 22, 59, 36, tzinfo=dt.UTC)
-    seen_bounds: dict[str, dt.datetime | None] = {}
+    claimed_scopes: list[str] = []
 
     async def latest_watermark(_pool, _run_id):
         return last_watermark
 
-    async def load_slack_lookup_maps(_pool):
-        return {}, {}
-
-    async def load_changed_message_keys(_pool, since, until=None):
-        seen_bounds["since"] = since
-        seen_bounds["until"] = until
+    async def claim_scope(_pool, *, scope, **_kwargs):
+        claimed_scopes.append(scope)
         return {
-            "channel_days": [],
-            "threads": [],
-            "attachments": [],
-            "changed_messages": 0,
-            "changed_attachments": 0,
-            "max_updated_at": None,
+            "scope": scope,
+            "lease_token": f"lease_{scope}",
+            "window_end": dt.datetime(2026, 6, 18, 23, 58, 36, tzinfo=dt.UTC),
         }
 
     async def noop_async(*_args, **_kwargs):
@@ -190,17 +187,8 @@ def test_handler_advances_empty_bounded_window(monkeypatch):
     monkeypatch.setenv("LINEAR_ETL_ENABLED", "false")
     monkeypatch.setenv("COMPANY_CONTEXT_DOCUMENTS_ENABLED", "true")
     monkeypatch.setattr(projection, "_latest_successful_watermark", latest_watermark)
-    monkeypatch.setattr(projection, "_load_slack_lookup_maps", load_slack_lookup_maps)
-    monkeypatch.setattr(
-        projection,
-        "_load_changed_message_keys",
-        load_changed_message_keys,
-    )
-    monkeypatch.setattr(
-        projection,
-        "_emit_company_context_document_size_snapshot",
-        noop_async,
-    )
+    monkeypatch.setattr(projection, "_claim_scope", claim_scope)
+    monkeypatch.setattr(projection, "_emit_projection_lag_from_checkpoints", noop_async)
     monkeypatch.setattr(projection, "_emit_etl_scope_metrics", noop_async)
 
     ctx = FakeWorkflowContext()
@@ -211,14 +199,155 @@ def test_handler_advances_empty_bounded_window(monkeypatch):
         )
     )
 
-    expected_since = dt.datetime(2026, 6, 18, 22, 58, 36, tzinfo=dt.UTC)
-    expected_until = dt.datetime(2026, 6, 18, 23, 58, 36, tzinfo=dt.UTC)
-    assert seen_bounds == {"since": expected_since, "until": expected_until}
-    assert result["changed_messages"] == 0
-    assert result["batch_until"] == expected_until.isoformat()
-    assert result["watermark"] == expected_until.isoformat()
-    assert result["remaining_lag_seconds"] is not None
-    assert ctx.logs[-1][0] == "company_context_documents_completed"
+    assert claimed_scopes == ["slack_channel_day", "slack_thread", "slack_attachment"]
+    assert [child[1]["scope"] for child in ctx.children] == claimed_scopes
+    assert all(child[0] == "company_context_documents" for child in ctx.children)
+    assert all("company-context:slack_" in str(child[2]) for child in ctx.children)
+    assert result["started_scopes"]
+    assert result["batch_size"] == projection.DEFAULT_BATCH_SIZE
+    assert ctx.logs[-1][0] == "company_context_documents_coordinator_completed"
+
+
+def test_coordinator_claims_google_chat_thread_scope_when_enabled(monkeypatch):
+    last_watermark = dt.datetime(2026, 6, 18, 22, 59, 36, tzinfo=dt.UTC)
+    claimed_scopes: list[str] = []
+
+    async def latest_watermark(_pool, _run_id):
+        return last_watermark
+
+    async def claim_scope(_pool, *, scope, **_kwargs):
+        claimed_scopes.append(scope)
+        return {
+            "scope": scope,
+            "lease_token": f"lease_{scope}",
+            "window_end": dt.datetime(2026, 6, 18, 23, 58, 36, tzinfo=dt.UTC),
+        }
+
+    async def noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setenv("SLACK_ETL_ENABLED", "false")
+    monkeypatch.setenv("GOOGLE_DRIVE_ETL_ENABLED", "false")
+    monkeypatch.setenv("GOOGLE_CALENDAR_ETL_ENABLED", "false")
+    monkeypatch.setenv("GOOGLE_CHAT_ETL_ENABLED", "true")
+    monkeypatch.setenv("LINEAR_ETL_ENABLED", "false")
+    monkeypatch.setenv("COMPANY_CONTEXT_DOCUMENTS_ENABLED", "true")
+    monkeypatch.setattr(projection, "_latest_successful_watermark", latest_watermark)
+    monkeypatch.setattr(projection, "_claim_scope", claim_scope)
+    monkeypatch.setattr(projection, "_emit_projection_lag_from_checkpoints", noop_async)
+    monkeypatch.setattr(projection, "_emit_etl_scope_metrics", noop_async)
+
+    ctx = FakeWorkflowContext()
+    result = asyncio.run(
+        projection.handler(
+            projection.Input(max_window_seconds=3600),
+            ctx,
+        )
+    )
+
+    assert claimed_scopes == ["google_chat_thread"]
+    assert [child[1]["scope"] for child in ctx.children] == ["google_chat_thread"]
+    assert result["started_scopes"]
+
+
+class FakeGoogleChatThreadPool:
+    """Fake pool for _project_scope_page's google_chat_thread branch: serves
+    thread messages via fetch() and records upserts via fetchval()/execute()
+    without a real content-hash match, so every document inserts."""
+
+    def __init__(self, messages: list[dict]) -> None:
+        self.messages = messages
+        self.executed: list[tuple[str, tuple]] = []
+
+    async def fetch(self, _query, *_args):
+        return self.messages
+
+    async def fetchval(self, _query, *_args):
+        return None
+
+    async def execute(self, query, *args):
+        self.executed.append((query, args))
+        return "UPDATE 1" if "DELETE" in query else "INSERT 0 1"
+
+
+def test_project_scope_page_dispatches_google_chat_thread():
+    updated_at = dt.datetime(2026, 7, 18, 12, 0, 0, tzinfo=dt.UTC)
+    create_time = dt.datetime(2026, 7, 18, 11, 59, 0, tzinfo=dt.UTC)
+    message_row = {
+        "space_id": "AAAA",
+        "thread_id": "BBBB",
+        "message_id": "CCCC",
+    }
+    thread_message = {
+        "space_id": "AAAA",
+        "space_display_name": "Engineering",
+        "space_type": "SPACE",
+        "message_id": "CCCC",
+        "message_name": "spaces/AAAA/messages/CCCC",
+        "thread_id": "BBBB",
+        "sender_id": "users/1",
+        "sender_name": "Ada Lovelace",
+        "sender_type": "HUMAN",
+        "text_content": "Ship it.",
+        "source_create_time": create_time,
+        "updated_at": updated_at,
+    }
+    pool = FakeGoogleChatThreadPool([thread_message])
+
+    upserted, deleted = asyncio.run(
+        projection._project_scope_page(pool, "google_chat_thread", [message_row])
+    )
+
+    assert (upserted, deleted) == (1, 0)
+    insert_calls = [call for call in pool.executed if "INSERT INTO" in call[0]]
+    assert len(insert_calls) == 1
+    assert insert_calls[0][1][0] == "google_chat:thread:AAAA:BBBB"
+
+
+def test_scope_batch_advances_cursor_before_starting_one_continuation(monkeypatch):
+    window_end = dt.datetime(2026, 6, 18, 23, 58, 36, tzinfo=dt.UTC)
+    cursor_at = dt.datetime(2026, 6, 18, 23, 0, tzinfo=dt.UTC)
+    advanced: list[tuple] = []
+
+    async def read_owned_scope(_pool, _scope, _lease_token):
+        return {
+            "window_start": dt.datetime(2026, 6, 18, 22, 58, 36, tzinfo=dt.UTC),
+            "window_end": window_end,
+            "cursor_updated_at": None,
+            "cursor_key": "",
+        }
+
+    async def load_scope_page(*_args, **_kwargs):
+        return [
+            {"projection_updated_at": cursor_at, "projection_key": "doc_a"},
+            {"projection_updated_at": cursor_at, "projection_key": "doc_b"},
+        ]
+
+    async def project_scope_page(*_args, **_kwargs):
+        return 2, 0
+
+    async def advance_scope_cursor(*args):
+        advanced.append(args)
+
+    monkeypatch.setattr(projection, "_read_owned_scope", read_owned_scope)
+    monkeypatch.setattr(projection, "_load_scope_page", load_scope_page)
+    monkeypatch.setattr(projection, "_project_scope_page", project_scope_page)
+    monkeypatch.setattr(projection, "_advance_scope_cursor", advance_scope_cursor)
+    monkeypatch.setattr(projection, "_batch_size", lambda _value=None: 2)
+
+    ctx = FakeWorkflowContext()
+    result = asyncio.run(
+        projection._run_scope_batch(
+            projection.Input(scope="google_doc", lease_token="lease_1", batch_size=2),
+            ctx,
+            "google_doc",
+        )
+    )
+
+    assert advanced == [(ctx._pool, "google_doc", "lease_1", cursor_at, "doc_b")]
+    assert ctx.children[0][1]["scope"] == "google_doc"
+    assert ctx.children[0][1]["lease_token"] == "lease_1"
+    assert result["continuation"]["created"] is True
 
 
 def test_etl_scope_metrics_no_longer_emit_slack_scope_gauges(monkeypatch):

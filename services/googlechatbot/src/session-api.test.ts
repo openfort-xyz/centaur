@@ -4,6 +4,7 @@ import {
   classifyExecuteConflict,
   turnMessagesFromEvent,
   createSession,
+  emitWorkflowEvent,
   executeSession,
   interruptSessionExecution,
   openSessionEventStream
@@ -516,5 +517,45 @@ describe('interruptSessionExecution', () => {
 
     const response = await interruptSessionExecution(loadConfig({}), baseEvent.thread_key, 'x')
     expect(response.interrupted).toBe(false)
+  })
+})
+
+describe('emitWorkflowEvent', () => {
+  const realFetch = globalThis.fetch
+  beforeEach(() => {
+    resetMetrics()
+  })
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  test('posts the event name and payload to the workflow events route', async () => {
+    let capturedUrl: string | undefined
+    let capturedBody: string | undefined
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      capturedUrl = String(url)
+      capturedBody = String(init?.body ?? '')
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    await emitWorkflowEvent(loadConfig({}), 'google_chat.card_click.approve', {
+      space_name: 'spaces/AAAA',
+      invoked_function: 'approve'
+    })
+
+    expect(capturedUrl).toContain('/api/workflows/events')
+    expect(JSON.parse(capturedBody ?? '{}')).toEqual({
+      event_name: 'google_chat.card_click.approve',
+      payload: { space_name: 'spaces/AAAA', invoked_function: 'approve' }
+    })
+  })
+
+  test('throws when the API rejects the event', async () => {
+    globalThis.fetch = (async () =>
+      new Response('{"error":"bad"}', { status: 500 })) as unknown as typeof fetch
+
+    await expect(
+      emitWorkflowEvent(loadConfig({}), 'google_chat.card_click.approve', {})
+    ).rejects.toThrow()
   })
 })

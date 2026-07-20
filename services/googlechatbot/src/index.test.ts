@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { parseChatBody, createGooglechatbot } from './index'
+import { googleChatCardClickPayload, parseChatBody, createGooglechatbot } from './index'
 import { loadConfig } from './config'
 
 describe('outbound /api/chat/messages', () => {
@@ -104,5 +104,57 @@ describe('parseChatBody', () => {
     const env = parseChatBody(body)
     expect(env?.type).toBe('MESSAGE')
     expect(env?.space?.name).toBe('spaces/AAAA')
+  })
+})
+
+describe('googleChatCardClickPayload', () => {
+  test('extracts invoked function, parameters, thread and user context', () => {
+    const payload = googleChatCardClickPayload({
+      type: 'CARD_CLICKED',
+      space: { name: 'spaces/AAAA', type: 'SPACE' },
+      message: { name: 'spaces/AAAA/messages/M1', thread: { name: 'spaces/AAAA/threads/T1' } },
+      thread: { name: 'spaces/AAAA/threads/T1' },
+      user: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' },
+      common: { invokedFunction: 'approve', parameters: { request_id: 'r1' } }
+    })
+
+    expect(payload).toEqual({
+      invoked_function: 'approve',
+      message_name: 'spaces/AAAA/messages/M1',
+      parameters: { request_id: 'r1' },
+      space_name: 'spaces/AAAA',
+      thread_name: 'spaces/AAAA/threads/T1',
+      user_email: 'alice@openfort.xyz',
+      user_id: 'users/U1',
+      user_name: 'Alice'
+    })
+  })
+
+  test('falls back to the top-level thread when the message omits one', () => {
+    const payload = googleChatCardClickPayload({
+      type: 'CARD_CLICKED',
+      space: { name: 'spaces/AAAA', type: 'SPACE' },
+      thread: { name: 'spaces/AAAA/threads/T1' },
+      common: { invokedFunction: 'reject' }
+    })
+
+    expect(payload?.thread_name).toBe('spaces/AAAA/threads/T1')
+    expect(payload?.parameters).toBeUndefined()
+  })
+
+  test('returns null without a space name', () => {
+    const payload = googleChatCardClickPayload({
+      type: 'CARD_CLICKED',
+      common: { invokedFunction: 'approve' }
+    })
+    expect(payload).toBeNull()
+  })
+
+  test('returns null without an invoked function', () => {
+    const payload = googleChatCardClickPayload({
+      type: 'CARD_CLICKED',
+      space: { name: 'spaces/AAAA', type: 'SPACE' }
+    })
+    expect(payload).toBeNull()
   })
 })
