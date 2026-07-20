@@ -6787,12 +6787,8 @@ pub fn final_answer_text_from_output_lines(lines: &[String]) -> String {
                 };
                 if let Some(update) = output_line_final_answer_text(&value) {
                     match update {
-                        FinalAnswerTextUpdate::Append(delta) => {
-                            final_answer_text.push_str(&delta)
-                        }
-                        FinalAnswerTextUpdate::Replace(canonical) => {
-                            final_answer_text = canonical
-                        }
+                        FinalAnswerTextUpdate::Append(delta) => final_answer_text.push_str(&delta),
+                        FinalAnswerTextUpdate::Replace(canonical) => final_answer_text = canonical,
                     }
                 }
             }
@@ -8293,6 +8289,7 @@ mod adoption_tests {
     };
 
     use centaur_sandbox_core::{ObservedSandbox, SandboxHandle, SandboxIo, SandboxResult};
+    use centaur_session_core::SessionStatus;
     use tokio::io::{AsyncWriteExt, DuplexStream};
 
     use super::*;
@@ -9704,8 +9701,7 @@ mod adoption_tests {
         };
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
-            ThreadKey::parse(format!("test:owned-dead-sandbox-{}", uuid::Uuid::new_v4()))
-                .unwrap();
+            ThreadKey::parse(format!("test:owned-dead-sandbox-{}", uuid::Uuid::new_v4())).unwrap();
         let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-mock"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Stopped, Vec::new()));

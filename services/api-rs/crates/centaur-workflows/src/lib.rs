@@ -3868,9 +3868,8 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
         .and_then(|args| args.get("thread_name"))
         .and_then(Value::as_str);
 
-    let token = env::var("CHATBOT_API_KEY").map_err(|_| {
-        WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned())
-    })?;
+    let token = env::var("CHATBOT_API_KEY")
+        .map_err(|_| WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned()))?;
     let base_url = env::var("CHATBOT_URL")
         .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
     let base_url = base_url.trim_end_matches('/');
