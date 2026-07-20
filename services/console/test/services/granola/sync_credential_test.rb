@@ -1,4 +1,5 @@
 require "test_helper"
+require "timeout"
 
 module Granola
   class SyncCredentialTest < ActiveSupport::TestCase
@@ -113,6 +114,45 @@ module Granola
       assert_equal "failed", failed[:run][:status]
       assert_equal "oauth:#{credential.oid}", failed[:run][:scope_id]
       assert_includes failed[:run][:error_text], "rate limited"
+    end
+
+    test "parse_meetings extracts every well-formed meeting block, in order" do
+      instance = SyncCredential.new(credential, api_client: FakeApiClient.new, mcp_http: ->(*) { })
+      xml = <<~XML
+        <meeting id="meeting-1" title="Planning" date="Jul 8, 2026 5:30 PM GMT+2">
+          <known_participants>Ada (note creator) &lt;ada@example.com&gt;</known_participants>
+          <summary>First meeting.</summary>
+        </meeting>
+        <meeting id="meeting-2" title="Retro" date="Jul 9, 2026 5:30 PM GMT+2">
+          <known_participants>Bob (note creator) &lt;bob@example.com&gt;</known_participants>
+          <summary>Second meeting.</summary>
+        </meeting>
+      XML
+
+      meetings = instance.send(:parse_meetings, xml)
+
+      assert_equal [ "meeting-1", "meeting-2" ], meetings.map { |m| m["id"] }
+      assert_equal "First meeting.", meetings[0]["summary_markdown"]
+      assert_equal "Second meeting.", meetings[1]["summary_markdown"]
+    end
+
+    test "parse_meetings returns nothing for an unclosed meeting tag, without hanging" do
+      instance = SyncCredential.new(credential, api_client: FakeApiClient.new, mcp_http: ->(*) { })
+      # A meeting header with no closing </meeting> anywhere in the document --
+      # this is exactly the shape that made the old `.*?`-based MEETING_RE
+      # quadratic (CodeQL: "may run slow on strings starting with '<meeting
+      # id=\"!\" title=\"\" date=\"\">' and with many repetitions of '<meeting
+      # id=\"!\" title=\"\" date=\"\">a'"). 2000 repetitions keeps the test itself
+      # fast while still being large enough that the old quadratic behavior
+      # would be very noticeably slow (the timeout is the regression guard).
+      unclosed = ('<meeting id="!" title="" date="">' + "a") * 2000
+
+      meetings = nil
+      assert_nothing_raised do
+        Timeout.timeout(5) { meetings = instance.send(:parse_meetings, unclosed) }
+      end
+
+      assert_empty meetings
     end
 
     private

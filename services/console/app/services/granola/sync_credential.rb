@@ -19,7 +19,14 @@ module Granola
     DEFAULT_MAX_NOTES = 50
     WATERMARK_OVERLAP_SECONDS = 5 * 60
 
-    MEETING_RE = /<meeting\s+id="(?<id>[^"]+)"\s+title="(?<title>[^"]*)"\s+date="(?<date>[^"]*)">(?<body>.*?)<\/meeting>/m
+    # Only the header is matched by regex; the body is sliced out via a plain
+    # substring search for the closing tag (see #scan_meetings) rather than a
+    # `.*?` lazy quantifier, which is quadratic-time here: with no
+    # `</meeting>` closing an open tag, `.scan` would retry the lazy body
+    # match at every subsequent `<meeting ...>`-shaped position in the
+    # remaining text, each retry re-scanning to the end of the string.
+    MEETING_HEADER_RE = /<meeting\s+id="(?<id>[^"]+)"\s+title="(?<title>[^"]*)"\s+date="(?<date>[^"]*)">/
+    MEETING_CLOSE_TAG = "</meeting>"
     PARTICIPANTS_RE = /<known_participants>(?<participants>.*?)<\/known_participants>/m
     SUMMARY_RE = /<summary>(?<summary>.*?)<\/summary>/m
     PARTICIPANT_RE = /(?<name>[^,<]+?)\s*<(?<email>[^>]+)>/
@@ -216,7 +223,7 @@ module Granola
     end
 
     def parse_meetings(text)
-      text.to_s.scan(MEETING_RE).filter_map do |id, title, date, body|
+      scan_meetings(text).filter_map do |id, title, date, body|
         participants = participant_list(body)
         owner = participants.find { |participant| participant["name"].include?("(note creator)") } || participants.first || {}
         owner = owner.merge(
@@ -232,6 +239,31 @@ module Granola
           "summary_markdown" => CGI.unescapeHTML(summary_match&.[](:summary).to_s.strip)
         }
       end
+    end
+
+    # Equivalent to `text.scan(MEETING_HEADER_RE + body + MEETING_CLOSE_TAG)`
+    # but without the ReDoS shape: the header regex has no unbounded
+    # backtracking (fixed literals and negated-character-class groups only),
+    # and finding the closing tag is a plain linear `String#index` scan
+    # rather than a lazy-quantifier regex retried at every header-shaped
+    # position. `pos` only ever advances, so total work across the whole
+    # input is linear.
+    def scan_meetings(text)
+      text = text.to_s
+      results = []
+      pos = 0
+      while (match = MEETING_HEADER_RE.match(text, pos))
+        header_end = match.end(0)
+        close_index = text.index(MEETING_CLOSE_TAG, header_end)
+        unless close_index
+          pos = header_end
+          next
+        end
+        body = text[header_end...close_index]
+        results << [ match[:id], match[:title], match[:date], body ]
+        pos = close_index + MEETING_CLOSE_TAG.length
+      end
+      results
     end
 
     def participant_list(body)
