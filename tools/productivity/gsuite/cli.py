@@ -554,10 +554,23 @@ def drive_download(
 def drive_upload(
     file_path: str = typer.Argument(..., help="Local file path"),
     channel: str = typer.Option(
-        ..., "--channel", "-c", help="Slack channel to share with (shares with all members)"
+        None, "--channel", "-c", help="Slack channel to share with (shares with all members)"
     ),
     requester_slack_id: str = typer.Option(
-        ..., "--requester", "-r", help="Slack user ID to transfer ownership to (e.g., U123ABC)"
+        None, "--requester", "-r", help="Slack user ID to transfer ownership to (e.g., U123ABC)"
+    ),
+    share_email: list[str] = typer.Option(
+        None,
+        "--share-email",
+        "-e",
+        help="Email(s) to share the file with directly. Works on any surface "
+        "(Google Chat, Discord, CLI) with no Slack CLI. Repeatable.",
+    ),
+    role: str = typer.Option(
+        "reader", "--role", help="Role for --share-email grants: reader, writer, or commenter"
+    ),
+    notify: bool = typer.Option(
+        False, "--notify", help="Send an email notification for --share-email grants"
     ),
     name: str = typer.Option(None, "--name", "-n", help="File name in Drive"),
     folder: str = typer.Option(None, "--folder", "-f", help="Parent folder ID"),
@@ -565,20 +578,31 @@ def drive_upload(
         False, "--sheets", "-s", help="Convert CSV to Google Sheets (opens directly in Sheets)"
     ),
 ):
-    """Upload a file to Google Drive with Slack channel permissions.
+    """Upload a file to Google Drive and share it.
 
-    Uploads the file, shares with all channel members, and transfers ownership
-    to the requester.
+    Two ways to share, both optional and combinable:
+      * --share-email/-e: share directly with one or more emails. Surface-agnostic
+        (Google Chat, Discord, CLI) — needs no Slack CLI.
+      * --channel/-c + --requester/-r: Slack path — share with all channel members
+        and transfer ownership to the requester. Requires the `slack` CLI.
+
+    With none of these, the file is uploaded to the bot's Drive unshared and the
+    web link is printed (useful when you'll share it in a later step).
 
     Examples:
+        gsuite drive upload report.pdf -e user@example.com
+        gsuite drive upload report.pdf -e a@x.com -e b@x.com --role writer --notify
         gsuite drive upload report.pdf -c general -r U123ABC
-        gsuite drive upload report.pdf -c general -r U123ABC -n "Q4 Report.pdf"
-        gsuite drive upload data.csv -c general -r U123ABC --sheets
+        gsuite drive upload data.csv -e user@example.com --sheets
     """
     import base64
     import subprocess
     import json
-    from .client import drive_upload as upload, drive_setup_channel_permissions
+    from .client import (
+        drive_upload as upload,
+        drive_setup_channel_permissions,
+        drive_share,
+    )
 
     def get_channel_member_emails_via_cli(channel_name: str) -> list[str]:
         """Get channel member emails via slack CLI subprocess."""
@@ -628,19 +652,32 @@ def drive_upload(
             console.print("[red]Error: Could not get file ID from upload result[/]")
             raise typer.Exit(1)
 
-        # Get channel member emails (optional - sharing will be skipped if none found)
-        member_emails = get_channel_member_emails_via_cli(channel)
-        if not member_emails:
-            console.print(
-                f"[yellow]Warning: No members with emails found in channel {channel}, skipping sharing[/]"
-            )
+        # Direct email sharing — surface-agnostic, no Slack CLI required.
+        for email in share_email or []:
+            try:
+                drive_share(file_id, email, role=role, send_notification=notify)
+                console.print(f"[green]✓ Shared with {email} as {role}[/]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: could not share with {email}: {e}[/]")
 
-        # Get requester email from Slack user ID (optional - ownership transfer will be skipped if not found)
-        requester_email = get_user_email_via_cli(requester_slack_id)
-        if not requester_email:
-            console.print(
-                f"[yellow]Warning: Could not get email for Slack user {requester_slack_id}, skipping ownership transfer[/]"
-            )
+        # Slack path: resolve emails from the channel/requester only when asked for.
+        # Skipped entirely on non-Slack surfaces (no channel/requester given).
+        member_emails: list[str] = []
+        requester_email: str | None = None
+
+        if channel:
+            member_emails = get_channel_member_emails_via_cli(channel)
+            if not member_emails:
+                console.print(
+                    f"[yellow]Warning: No members with emails found in channel {channel}, skipping sharing[/]"
+                )
+
+        if requester_slack_id:
+            requester_email = get_user_email_via_cli(requester_slack_id)
+            if not requester_email:
+                console.print(
+                    f"[yellow]Warning: Could not get email for Slack user {requester_slack_id}, skipping ownership transfer[/]"
+                )
 
         # Set up permissions (only if there's something to do)
         if member_emails or requester_email:
