@@ -43,6 +43,56 @@ def _space_id(space_name: str) -> str:
     return space_name[len("spaces/") :] if space_name.startswith("spaces/") else space_name
 
 
+# A Google Chat deep link: ``chat.google.com/room/<space>/<thread>[/<message>]``.
+# The path segments after ``room/`` are the space id then (optionally) the thread
+# id — pasting such a link is how a user points at a specific thread.
+_CHAT_LINK_RE = re.compile(
+    r"chat\.google(?:apis)?\.com/room/(?P<space>[^/?#]+)(?:/(?P<thread>[^/?#]+))?"
+)
+
+
+def parse_chat_link(value: str | None) -> tuple[str | None, str | None]:
+    """Return ``(space_id, thread_id)`` parsed from a Chat room URL, else
+    ``(None, None)`` when ``value`` is not such a link."""
+    match = _CHAT_LINK_RE.search(value or "")
+    if not match:
+        return None, None
+    return match.group("space"), match.group("thread")
+
+
+def resolve_space_and_thread(
+    space_name: str, thread: str | None = None
+) -> tuple[str, str | None]:
+    """Resolve a ``(space_id, thread_name | None)`` pair from CLI inputs.
+
+    ``space_name`` may be a space resource name (``spaces/S``), a bare space id,
+    or a ``chat.google.com/room/<space>/<thread>`` deep link. ``thread``, when
+    given, may be a full thread resource name (``spaces/S/threads/T``), a bare
+    thread id, or the same kind of link. A link in either argument supplies both
+    the space and the thread — this is what makes pasting a Chat thread URL Just
+    Work, instead of forcing the caller to hand-build a ``thread.name`` filter.
+    An explicit ``thread`` wins over a thread id embedded in ``space_name``.
+    """
+    link_space, link_thread = parse_chat_link(space_name)
+    if link_space:
+        space_id, thread_id = link_space, link_thread
+    else:
+        space_id, thread_id = _space_id(space_name), None
+
+    if thread:
+        if thread.startswith("spaces/"):
+            return space_id, thread
+        t_space, t_thread = parse_chat_link(thread)
+        if t_thread:
+            resolved = t_space or space_id
+            return resolved, f"spaces/{resolved}/threads/{t_thread}"
+        return space_id, f"spaces/{space_id}/threads/{thread}"
+
+    if thread_id:
+        return space_id, f"spaces/{space_id}/threads/{thread_id}"
+    return space_id, None
+
+
 def _base_url() -> str:
     """Resolve CHATBOT_URL and guarantee an http(s) scheme.
 
@@ -101,6 +151,7 @@ class GoogleChatClient:
         *,
         page_size: int = 20,
         filter: str | None = None,
+        page_token: str | None = None,
     ) -> dict[str, Any]:
         """List messages in a space, reading the real Chat API directly.
 
@@ -113,6 +164,7 @@ class GoogleChatClient:
 
         Returns the Chat API `{messages, nextPageToken}` shape unchanged.
         `filter` scopes to a thread, e.g. ``thread.name="spaces/S/threads/T"``.
+        `page_token` is a prior response's ``nextPageToken`` for the next page.
         """
         import httpx
 
@@ -120,6 +172,8 @@ class GoogleChatClient:
         params: dict[str, Any] = {"pageSize": page_size}
         if filter:
             params["filter"] = filter
+        if page_token:
+            params["pageToken"] = page_token
         response = httpx.get(
             f"{_GOOGLE_CHAT_API_BASE}/v1/spaces/{space_id}/messages",
             params=params,

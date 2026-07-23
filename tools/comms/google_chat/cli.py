@@ -35,30 +35,59 @@ def send_message(
 
 @app.command()
 def list_messages(
-    space_name: str = typer.Argument(..., help="Google Chat space resource name"),
+    space_name: str = typer.Argument(
+        ...,
+        help="Space resource name, bare id, or a chat.google.com link (a link scopes to its thread)",
+    ),
+    thread: str | None = typer.Option(
+        None,
+        "--thread",
+        "-t",
+        help="Scope to one thread: resource name, bare thread id, or chat.google.com link",
+    ),
     page_size: int = typer.Option(20, "--page-size", "-n", help="Number of messages per page"),
+    page_token: str | None = typer.Option(
+        None, "--page-token", help="nextPageToken from a prior call, to fetch the next page"
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
-    """List messages in a Google Chat space."""
-    from .client import _client
+    """List messages in a Google Chat space, or a single thread within it.
+
+    Examples:
+        google-chat list-messages spaces/AAAA
+        google-chat list-messages spaces/AAAA -t spaces/AAAA/threads/TTTT
+        google-chat list-messages "https://chat.google.com/room/AAAA/TTTT/TTTT"
+    """
+    from .client import _client, resolve_space_and_thread
+
+    space_id, thread_name = resolve_space_and_thread(space_name, thread)
+    filter_expr = f'thread.name = "{thread_name}"' if thread_name else None
 
     client = _client()
-    result = client.list_messages(space_name, page_size=page_size)
+    result = client.list_messages(
+        space_id, page_size=page_size, filter=filter_expr, page_token=page_token
+    )
 
     if json_output:
         print(json.dumps(result, indent=2))
         return
 
     messages = result.get("messages", [])
-    table = Table(title=f"Messages in {space_name}")
-    table.add_column("Name", style="cyan")
+    table = Table(title=f"Messages in {thread_name or f'spaces/{space_id}'}")
+    table.add_column("Time", style="dim")
+    table.add_column("Sender", style="green")
     table.add_column("Text", style="white")
-    for msg in messages[:20]:
+    for msg in messages:
         table.add_row(
-            msg.get("name", "unknown")[:50],
+            (msg.get("createTime", "") or "")[:19],
+            (msg.get("sender", {}).get("displayName", "") or "")[:20],
             (msg.get("text", "") or "")[:100],
         )
     console.print(table)
+
+    next_token = result.get("nextPageToken")
+    if next_token:
+        console.print(f"[dim]more: --page-token {next_token}[/dim]")
 
 
 @app.command()

@@ -162,6 +162,54 @@ def test_list_messages_reads_chat_api_directly(monkeypatch) -> None:
     assert "Authorization" not in call["headers"]
 
 
+def test_list_messages_forwards_page_token(monkeypatch) -> None:
+    fake = _patch_httpx(monkeypatch, {"upload": {}, "default": {"messages": []}})
+
+    _client().list_messages("spaces/AAAA", page_token="TOK123")
+
+    assert fake.calls[0]["params"] == {"pageSize": 20, "pageToken": "TOK123"}
+
+
+def test_parse_chat_link_extracts_space_and_thread() -> None:
+    space, thread = gc.parse_chat_link(
+        "https://chat.google.com/room/AAQA42QLdws/2yHD6g35vtw/2yHD6g35vtw?cls=10"
+    )
+    assert (space, thread) == ("AAQA42QLdws", "2yHD6g35vtw")
+
+    # Room-only link (no thread segment) and a non-link both degrade gracefully.
+    assert gc.parse_chat_link("https://chat.google.com/room/AAQA42QLdws") == ("AAQA42QLdws", None)
+    assert gc.parse_chat_link("spaces/AAAA") == (None, None)
+
+
+def test_resolve_space_and_thread_from_pasted_link() -> None:
+    # The reported bug: pasting the thread URL should scope to that thread with
+    # no hand-built filter and no separate space argument.
+    space_id, thread_name = gc.resolve_space_and_thread(
+        "https://chat.google.com/room/AAQA42QLdws/2yHD6g35vtw/2yHD6g35vtw?cls=10"
+    )
+    assert space_id == "AAQA42QLdws"
+    assert thread_name == "spaces/AAQA42QLdws/threads/2yHD6g35vtw"
+
+
+def test_resolve_space_and_thread_variants() -> None:
+    # Bare space, no thread.
+    assert gc.resolve_space_and_thread("spaces/AAAA") == ("AAAA", None)
+    # Bare thread id resolves against the given space.
+    assert gc.resolve_space_and_thread("spaces/AAAA", "TTTT") == (
+        "AAAA",
+        "spaces/AAAA/threads/TTTT",
+    )
+    # Full thread resource name passes through unchanged.
+    assert gc.resolve_space_and_thread("AAAA", "spaces/AAAA/threads/TTTT") == (
+        "AAAA",
+        "spaces/AAAA/threads/TTTT",
+    )
+    # An explicit --thread link wins and carries its own space.
+    assert gc.resolve_space_and_thread(
+        "spaces/IGNORED", "https://chat.google.com/room/BBBB/TTTT/TTTT"
+    ) == ("BBBB", "spaces/BBBB/threads/TTTT")
+
+
 def test_health_probes_chat_api_with_configured_space(monkeypatch) -> None:
     fake = _patch_httpx(monkeypatch, {"upload": {}, "default": {"messages": []}})
     monkeypatch.setenv("GOOGLE_CHAT_SPACE_IDS", "AAQA42QLdws,AAQAOs")
