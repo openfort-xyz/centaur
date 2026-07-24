@@ -198,3 +198,34 @@ test whose target private method upstream had removed in a console refactor
 10. **Codex effort/speed status line for Chat** (6.7) — cosmetic parity gap, low
     priority.
 
+## 7. Upstream sync 2026-07-24 (23 commits, `origin/main..upstream/main`) — Slack-touching dispositions
+
+Full merge (all 23 commits). Three real conflicts, resolved in the merge commit;
+Slack-touching feature work ported to Chat below so the fork does not regress parity.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 7.1 | #1130 native Nanocodex harness — new `harness-server` harness (`nanocodex.rs`, `nanocodex_subagents.rs`) + `packages/rendering/nanocodex.ts`, plus slackbotv2 wiring to select it (`--nanocodex`, LLM strategy allowed value, "explicit flags first" short-circuit). The harness-server/rendering pieces are surface-agnostic and merged as-is. | Ported the slackbotv2 wiring to `googlechatbot/src/overrides.ts` (`nanocodex` in `HARNESS_FLAGS` + `STRATEGY_HARNESSES`, doc comment) and `message-overrides-strategy.ts` (allowed-harness in `SYSTEM_PROMPT` + schema enum; explicit flags resolved before the OpenAI call so a strict schema/model failure can't discard the selection and flags never leak into the harness prompt — adapted to Chat's flat `MessageOverrides` return shape). 3 tests (`--nanocodex` parse, explicit-flag-before-strategy, LLM-selects-nanocodex). | ✅ port |
+| 7.2 | #1133 clarify slackbot claude model selection — adds `claude-opus-4-7`, clarifies the bare-`--claude`→opus / `--claude --model=fable`→fable prompt wording, raises the override timeout 1500ms→2000ms | Ported to `googlechatbot`: `claude-opus-4-7` in `overrides.ts` `STRATEGY_MODEL_HARNESSES` and `message-overrides-strategy.ts` `MODEL_VALUES` + prompt alias; the clarity lines adapted for the Chat surface ("In this Chat bot"); timeout raised to 2000ms. 1 test (strategy selects `claude-opus-4-7`). | ✅ port |
+| 7.3 | #1135 preserve pinned thread harness (slackbotv2 `index.ts`: once a thread is pinned via `--claude/--amp/--codex/--nanocodex`, only another explicit flag may move it — a false-positive LLM harness/model/provider inference must not replace it) | Not portable as written: it reads/writes `SlackbotV2ThreadState` — the sticky per-thread harness state persisted in Postgres (#831) that googlechatbot deliberately does not have (stateless bot; harness is sticky only via session creation). Tracked under the existing state-store follow-up (§1.4/1.6). The explicit-flags-first short-circuit ported in 7.1 gives Chat the *deterministic-flag* half of this fix (flags always win over the LLM strategy per turn); only the cross-turn *pinning* half waits on the state store. | 🔜 (state store) |
+| 7.4 | #1136 make Nanocodex commentary/subagents explicit · #1137 render Nanocodex commentary as Slack progress | Shared `packages/rendering/nanocodex.ts` changes are surface-agnostic (merged); the Slack-facing half renders Nanocodex commentary as incremental Slack progress updates, which is Slack-streaming specific. Chat is single-write (one ack PATCHed once, no streaming primitive — §1.5), so there is no per-step progress surface to feed. | 🟰 (§1.5) |
+| 7.5 | #1157/#1150/#1143 Twitter/X (response handling, quote+retweet lookups, search pagination) · #1142 gsuite full-text Drive search · #1121 surface Granola MCP tool errors · #1141/#1164 per-proxy labels · #1158 proxy labels in pg dsn · #1163 python workflow event waits · #1161 append mounted overlay system prompts · #1165 client-credentials broker refresh · #1162 Codex instruction limit 128 KiB · #1131/#1134 console system-theme option · #1132 redaction word-boundary · #1166/#1168/#1170 dependabot config + dep bumps | Platform-agnostic: tool plugins (`twitter`, `gsuite`, `granola`), api-rs runtime/proxy/broker/workflows, console UI, and dependency/CI hygiene. Benefits both bots (or is console-/tool-only) on merge; nothing bot-side to port. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+Three conflicts, all resolved in the merge commit:
+- `.github/workflows/ci.yml` — kept the fork's `googlechatbot-tests` allowed-skip
+  alongside upstream's new `sandbox-tests` (union).
+- `centaur-session-runtime` redaction — the fork and upstream #1132 independently
+  fixed the same "redaction mangles `sk-` glued inside a slug like `metamask-`" bug.
+  Took upstream's `should_redact_prefixed_token` (more complete: boundary-before +
+  token validation + `sk-` length gate), dropping the fork's `is_slug_word_char`
+  word-boundary approach. **Behavior delta adopted:** upstream treats `=`/`:`/`/`/`.`
+  as token-internal, so a prefixed secret glued directly after a URL-query separator
+  (`?key=sk-ant-...`) is no longer redacted by that path — only the env-key path
+  catches it when the key name is sensitive. The fork's retained regression test was
+  updated to reflect this (comment added), keeping its slug-sparing + bare-token
+  assertions.
+- `granola/sync_credential_test.rb` — kept both the fork's `parse_meetings` tests
+  and upstream #1121's MCP-tool-error test (additive).
+
