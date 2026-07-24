@@ -44,6 +44,22 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 
+  test('selects claude-opus-4-7 and implies the claudecode harness', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: 'claude-opus-4-7', provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use claude opus 4.7')
+
+    expect(out.model).toBe('claude-opus-4-7')
+    expect(out.harnessType).toBe('claudecode')
+  })
+
   test('strips one or many trailing slashes from a configured base URL', async () => {
     const fetchFn = fakeResponsesApi(
       JSON.stringify({ harness: null, model: null, provider: null, reasoning: null })
@@ -88,6 +104,39 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     const out = await strategy('some message')
 
     expect(out).toEqual({ cleanedText: 'some message' })
+  })
+
+  test('handles --nanocodex deterministically before the OpenAI strategy', async () => {
+    const fetchFn = mock(async () => {
+      throw new Error('the explicit flag must not call the strategy model')
+    })
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('--nanocodex review this')
+
+    expect(out.harnessType).toBe('nanocodex')
+    expect(out.cleanedText).toBe('review this')
+    expect(fetchFn).toHaveBeenCalledTimes(0)
+  })
+
+  test('allows the OpenAI strategy to select nanocodex from natural language', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'nanocodex', model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use nanocodex for this')
+
+    expect(out.harnessType).toBe('nanocodex')
+    expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 })
 

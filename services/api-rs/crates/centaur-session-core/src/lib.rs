@@ -3,7 +3,7 @@
 //! A session is the public control-plane object for one ongoing agent
 //! conversation. `thread_key` is the canonical identifier.
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
@@ -390,6 +390,7 @@ pub enum HarnessType {
     Codex,
     Amp,
     ClaudeCode,
+    Nanocodex,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
@@ -491,6 +492,10 @@ pub struct Session {
     /// iron-control principal OID this session's egress proxy binds to,
     /// captured at registration so a resumed session can recreate its sandbox.
     pub iron_control_principal: Option<String>,
+    /// Per-proxy labels captured at session creation and applied whenever this
+    /// session's egress proxy is created, repaired, or rebound.
+    #[serde(default)]
+    pub proxy_labels: BTreeMap<String, String>,
     /// Last meaningful activity for the currently assigned sandbox. This is
     /// the eviction signal for capacity pressure and intentionally separate
     /// from `updated_at`, which also changes for metadata/status writes.
@@ -910,6 +915,10 @@ mod tests {
     fn harness_type_accepts_supported_values() {
         assert_eq!(HarnessType::from_str("codex").unwrap(), HarnessType::Codex);
         assert_eq!(HarnessType::from_str("amp").unwrap(), HarnessType::Amp);
+        assert_eq!(
+            HarnessType::from_str("nanocodex").unwrap(),
+            HarnessType::Nanocodex
+        );
         assert_eq!(
             HarnessType::from_str("claudecode").unwrap(),
             HarnessType::ClaudeCode

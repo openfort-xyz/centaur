@@ -15,6 +15,12 @@ describe('extractMessageOverrides', () => {
     expect(out.cleanedText).toBe('refactor this')
   })
 
+  test('recognizes --nanocodex as a harness flag', () => {
+    const out = extractMessageOverrides('--nanocodex review this')
+    expect(out.harnessType).toBe('nanocodex')
+    expect(out.cleanedText).toBe('review this')
+  })
+
   test('extracts -rsn reasoning effort', () => {
     const out = extractMessageOverrides('think hard -rsn high')
     expect(out.reasoning).toBe('high')
