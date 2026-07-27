@@ -10,7 +10,11 @@ import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
 import { messageOverridesStrategyFromConfig } from './message-overrides-strategy'
 import { resolveSpaceDefault, spaceDefaultsFromConfig } from './space-defaults'
-import { buildConsoleSessionWidget, defaultModelForHarness } from './console-session-link'
+import {
+  buildConsoleSessionWidget,
+  defaultModelForHarness,
+  effectiveReasoningForHarness
+} from './console-session-link'
 import { chatReplyLimits } from './constants'
 
 /** Clamp to Google Chat's plain `text` cap so an oversized body can't 400 the send. */
@@ -478,7 +482,13 @@ async function driveSession(
         // reach the harness, and the harness's own conversation state dies
         // with its sandbox (pool drain/reap), so without this block any
         // follow-up after a sandbox swap starts from amnesia.
-        history
+        history,
+        // A/B provenance for the harness api-rs actually persisted, so the
+        // execution metadata records the cohort (upstream #1178 parity).
+        ...(session.harnessType ? { harnessType: session.harnessType } : {}),
+        ...(session.harnessAssignment
+          ? { harnessAssignment: session.harnessAssignment }
+          : {})
       })
     } catch (error) {
       // The activeExecution check above is read-then-act: a run that starts
@@ -499,19 +509,32 @@ async function driveSession(
     // base URL is configured. `threadKey` (`chat:spaces:…`) is the exact value
     // sent to the session API as `thread_key`, which the Console indexes by.
     const isFirstAssistantMessage = !event.history_messages?.length
+    // api-rs may route a Codex request onto Nanocodex (thread-key-hashed A/B
+    // split, upstream #1178), so the harness that actually runs is the one the
+    // create-session response reports -- not the one this turn asked for.
+    // Showing the requested harness here would mislabel the cohort (#1179).
     const effectiveHarnessType =
-      resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+      session.harnessType ?? resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
     // Without an explicit --model/--opus/... override the harness runs its
     // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
     // config); show that instead of dropping the model entirely.
     const effectiveModel =
       resolvedModel ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
+    // Codex/Nanocodex run an effort level even when this turn asked for none;
+    // show the one the harness actually applies (Nanocodex folds Minimal into
+    // Low). Undefined for the Claude/Amp harnesses, which drop the segment.
+    const effectiveReasoning = effectiveReasoningForHarness(
+      effectiveHarnessType,
+      resolvedReasoning,
+      harnessDefaultReasoning(config)
+    )
     const consoleSessionWidget = isFirstAssistantMessage
       ? buildConsoleSessionWidget({
           consoleBaseUrl: config.CENTAUR_CONSOLE_PUBLIC_URL,
           threadKey,
           harnessType: effectiveHarnessType,
-          model: effectiveModel
+          model: effectiveModel,
+          reasoning: effectiveReasoning
         })
       : undefined
     const target = {
@@ -693,8 +716,17 @@ function isPlainTextOnlyRequest(text: string): boolean {
 function harnessDefaultModels(config: AppConfig): Record<string, string> {
   return {
     ...(config.CLAUDE_MODEL ? { claudecode: config.CLAUDE_MODEL } : {}),
-    ...(config.CODEX_MODEL ? { codex: config.CODEX_MODEL } : {})
+    // Nanocodex runs off the same CODEX_MODEL deployment override as Codex.
+    ...(config.CODEX_MODEL
+      ? { codex: config.CODEX_MODEL, nanocodex: config.CODEX_MODEL }
+      : {})
   }
+}
+
+/** Deployment default effort per harness, mirroring harnessDefaultModels. */
+function harnessDefaultReasoning(config: AppConfig): Record<string, string> {
+  const effort = config.CODEX_MODEL_REASONING_EFFORT
+  return effort ? { codex: effort, nanocodex: effort } : {}
 }
 
 /** Build the "View session" deep link from the configured template, if any. */

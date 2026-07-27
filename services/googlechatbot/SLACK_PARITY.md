@@ -229,3 +229,48 @@ Three conflicts, all resolved in the merge commit:
 - `granola/sync_credential_test.rb` — kept both the fork's `parse_meetings` tests
   and upstream #1121's MCP-tool-error test (additive).
 
+
+## 8. Upstream sync 2026-07-27 (7 commits, `origin/main..upstream/main`) — Slack-touching dispositions
+
+Full merge (all 7 commits). Three conflicts, resolved in the merge commit;
+Slack-touching feature work ported to Chat below so the fork does not regress parity.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 8.1 | #1177 add Claude Opus 5 model and Fast effort — adds `claude-opus-5` / `claude-opus-5-fast` to slackbotv2's `MODEL_VALUES` + `STRATEGY_MODEL_HARNESSES` and the prompt alias map (plus a console `threads_controller` option, which is shared). | Ported to `googlechatbot`: both models added to `overrides.ts` `STRATEGY_MODEL_HARNESSES` and `message-overrides-strategy.ts` `MODEL_VALUES` + prompt alias list. Without the `MODEL_VALUES` entry the strict schema rejects the selection and the turn silently falls back to the default harness. 1 test (strategy selects both Opus 5 ids → `claudecode`). Note: as on Slack, `--model claude-opus-5` alone does **not** imply the harness — only bare alias flags (`--opus`) do; that is pre-existing, deliberate behavior on both surfaces. | ✅ port |
+| 8.2 | #1178 A/B test Codex and Nanocodex — api-rs `create_or_get_session` may route a **Codex** request onto **Nanocodex**, chosen by a hash of the thread key (`codex_nanocodex_ab`, `--codex-nanocodex-rollout-percent`, default 0). The response now carries `harness_type` + `harness_assignment`; slackbotv2 reads them back, records them in the execute metadata, and shows the effective reasoning in the footer. | The rollout is **surface-agnostic** — it hashes `ThreadKey`, so Chat threads requesting Codex are split exactly like Slack ones. Ported to `googlechatbot`: `createSession` now parses `harness_type`/`harness_assignment` off the response (`GoogleChatHarnessAssignment`, malformed payloads ignored), `executeSession` records `harness_type` + `harness_assignment` in the execute metadata, and `console-session-link.ts` gained the `nanocodex` display name, the shared baked Codex default model, `BAKED_DEFAULT_REASONING` + `defaultReasoningForHarness`/`effectiveReasoningForHarness`, and an effort segment on the widget. Config/chart gained `CODEX_MODEL_REASONING_EFFORT` (mirrored like `CODEX_MODEL`), and `harnessDefaultModels` now maps `CODEX_MODEL` onto `nanocodex` too. 12 tests. | ✅ port |
+| 8.3 | #1179 show resolved harness in footer — slackbotv2 renders the harness api-rs persisted rather than the one the turn requested. | Same latent bug existed on Chat and is fixed by the same means: `index.ts` now derives `effectiveHarnessType` from `session.harnessType` (the create-session response) before falling back to the requested harness / deployment default. Without this the Chat trailer would label a Nanocodex-cohort thread "Codex" whenever the rollout is non-zero. | ✅ port |
+| 8.4 | #1181 company context reader RLS role — new `centaur_company_context_reader` role + `0048_company_context_reader_role.sql`, `tool_discovery` scoping, and a rewritten `etl_context_rls.rs` (creates a real test database and runs the full migrator instead of hand-applying selected migrations). | Platform-shared; no bot-side port. The migration was **renumbered to `0049`** (see mechanics below) and the fork's Google Chat RLS coverage was re-applied onto upstream's rewritten test harness — the `google_chat_sync_*` fixtures/assertions and the `google_chat_space_id` argument to `visible_rows` survive, and the four `centaur_readonly_google_chat_sync_*_select` policies are now asserted **explicitly** because upstream deleted the generic `RLS_TABLES` loop that used to cover them. | 🟰 (shared) + coverage preserved |
+| 8.5 | #1183 Linear project milestone support · #1167/#1169 dependabot dep bumps (docs, harness-server) | Platform-agnostic: the `linear` tool plugin and dependency hygiene. Benefits both bots on merge; nothing bot-side to port. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+Three conflicts, all resolved in the merge commit:
+- `crates/harness-server/src/server.rs` — additive collision only: the fork's
+  `accumulate_turn_usage` helper landed exactly where upstream added
+  `#[allow(clippy::too_many_arguments)]` to `export_harness_usage_if_available`.
+  Kept both (union); upstream's side of this commit is purely new clippy
+  attributes, no behavior change.
+- `services/api-rs/crates/centaur-api-server/src/routes.rs` — import-list union:
+  kept the fork's `GoogleChatThreadContext` alongside upstream's new
+  `HarnessAssignment`.
+- `services/api-rs/crates/centaur-session-sqlx/tests/etl_context_rls.rs` — upstream
+  rewrote the harness (real per-test database + full `sqlx::migrate!` run, replacing
+  the hand-created minimal tables and hand-picked migration list) and dropped the
+  `RLS_TABLES` constant. Took upstream's file wholesale, then re-applied the fork's
+  Google Chat coverage on top. Two consequences of the rewrite worth noting:
+  the fork no longer needs to `include_str!` `0037_google_chat_context_rls.sql` or
+  hand-create `google_chat_sync_*` tables (the migrator does it), so the fixtures now
+  run against the **real** schema — `google_chat_sync_runs.status` is `not null` with
+  no default and had to be supplied, matching upstream's own `status` additions to the
+  drive/calendar/linear run fixtures.
+
+### Migration renumbering (recurring fork tax)
+
+The fork sits exactly **+1** on sqlx migration numbers (it inserted
+`0043_centaur_readonly_slack_dm_rls`). Upstream's new
+`0048_company_context_reader_role` collided with the fork's already-applied
+`0048_session_proxy_labels`, so it was renumbered to **`0049`** — keeping the fork
+monotonic and exactly +1 from upstream. `check-migration-order.sh` passes; nothing
+references the file by name. This is the same tax paid in the 2026-07-24 sync and
+should be expected on every sync that brings a new sqlx migration.

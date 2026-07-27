@@ -3,6 +3,8 @@ import {
   buildConsoleSessionWidget,
   consoleSessionUrl,
   defaultModelForHarness,
+  defaultReasoningForHarness,
+  effectiveReasoningForHarness,
   harnessDisplayName
 } from './console-session-link'
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -136,5 +138,80 @@ describe('buildConsoleSessionWidget', () => {
         model: 'gpt-5.2'
       })
     ).toBeUndefined()
+  })
+})
+
+// Upstream #1178/#1179 parity: api-rs may route a Codex request onto Nanocodex,
+// so the trailer has to name the harness that actually runs and the effort it
+// applies. See SLACK_PARITY.md §8.
+describe('nanocodex harness parity', () => {
+  const bakedCodexModel = (codexConfig as { model: string }).model
+  const bakedCodexEffort = (codexConfig as { model_reasoning_effort?: string })
+    .model_reasoning_effort
+
+  test('nanocodex renders as a first-class harness name', () => {
+    expect(harnessDisplayName('nanocodex')).toBe('Nanocodex')
+  })
+
+  test('nanocodex shares the baked Codex default model', () => {
+    expect(defaultModelForHarness('nanocodex')).toBe(bakedCodexModel)
+  })
+
+  test('nanocodex shares the CODEX_MODEL deployment override', () => {
+    expect(defaultModelForHarness('nanocodex', { nanocodex: 'gpt-override' })).toBe(
+      'gpt-override'
+    )
+  })
+
+  test('defaults to the baked Codex effort for both Codex-family harnesses', () => {
+    expect(bakedCodexEffort).toBeTruthy()
+    expect(defaultReasoningForHarness('codex')).toBe(bakedCodexEffort)
+    expect(defaultReasoningForHarness('nanocodex')).toBe(bakedCodexEffort)
+  })
+})
+
+describe('effectiveReasoningForHarness', () => {
+  test('prefers the requested effort over the configured default', () => {
+    expect(effectiveReasoningForHarness('codex', 'high', { codex: 'medium' })).toBe('high')
+  })
+
+  test('falls back to the configured default, then the baked one', () => {
+    expect(effectiveReasoningForHarness('codex', undefined, { codex: 'xhigh' })).toBe('xhigh')
+    expect(effectiveReasoningForHarness('codex', '   ', { codex: 'xhigh' })).toBe('xhigh')
+  })
+
+  test('folds Minimal into Low for nanocodex, which has no Minimal level', () => {
+    expect(effectiveReasoningForHarness('nanocodex', 'minimal')).toBe('low')
+    expect(effectiveReasoningForHarness('codex', 'minimal')).toBe('minimal')
+  })
+
+  test('returns undefined for harnesses without a reasoning knob', () => {
+    expect(effectiveReasoningForHarness('claudecode', 'high')).toBeUndefined()
+    expect(effectiveReasoningForHarness('amp', 'high')).toBeUndefined()
+    expect(effectiveReasoningForHarness(undefined, 'high')).toBeUndefined()
+  })
+})
+
+describe('buildConsoleSessionWidget effort segment', () => {
+  test('appends the effort after the harness, middot separated', () => {
+    const widget = buildConsoleSessionWidget({
+      consoleBaseUrl: 'https://console.centaur.dev',
+      threadKey: 'chat:spaces:A:1',
+      harnessType: 'nanocodex',
+      model: 'gpt-5.2',
+      reasoning: 'xhigh'
+    })
+    expect(widget?.textParagraph.text).toContain('GPT-5.2 · Nanocodex · XHigh')
+  })
+
+  test('omits the segment when no effort applies', () => {
+    const widget = buildConsoleSessionWidget({
+      consoleBaseUrl: 'https://console.centaur.dev',
+      threadKey: 'chat:spaces:A:1',
+      harnessType: 'claudecode',
+      model: 'claude-opus-5'
+    })
+    expect(widget?.textParagraph.text).toContain('CLAUDE-OPUS-5 · Claude Code')
+    expect(widget?.textParagraph.text).not.toContain('·  ·')
   })
 })

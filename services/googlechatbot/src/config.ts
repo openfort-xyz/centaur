@@ -93,6 +93,9 @@ const EnvSchema = z.object({
   // sandboxes actually run instead of the repo-baked default.
   CLAUDE_MODEL: z.string().optional(),
   CODEX_MODEL: z.string().optional(),
+  // Deployment default effort for the Codex-family harnesses (Nanocodex shares
+  // Codex's policy), so the Console-link line names the effort that actually runs.
+  CODEX_MODEL_REASONING_EFFORT: z.string().optional(),
 
   // Opt-in: continue a thread on a plain reply (no re-@mention), like Slack's
   // subscribed-thread mode. OFF by default — only enable when the app is
