@@ -60,6 +60,27 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     expect(out.harnessType).toBe('claudecode')
   })
 
+  // Upstream #1177 parity: the Opus 5 pair has to survive schema validation and
+  // imply claudecode, otherwise the selection is discarded and the turn silently
+  // falls back to the default harness. See SLACK_PARITY.md §8.
+  test('selects the Opus 5 models and implies the claudecode harness', async () => {
+    for (const model of ['claude-opus-5', 'claude-opus-5-fast']) {
+      const fetchFn = fakeResponsesApi(
+        JSON.stringify({ harness: null, model, provider: null, reasoning: null })
+      )
+      const strategy = createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        fetch: fetchFn as unknown as typeof fetch,
+        model: 'gpt-5.4-nano'
+      })
+
+      const out = await strategy(`use ${model}`)
+
+      expect(out.model).toBe(model)
+      expect(out.harnessType).toBe('claudecode')
+    }
+  })
+
   test('strips one or many trailing slashes from a configured base URL', async () => {
     const fetchFn = fakeResponsesApi(
       JSON.stringify({ harness: null, model: null, provider: null, reasoning: null })

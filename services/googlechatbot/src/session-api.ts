@@ -93,6 +93,42 @@ type CreateSessionResponse = {
   // false (so execute-vs-execute conflicts 500'd instead of folding).
   status?: string
   session?: { status?: string }
+  harness_type?: string
+  harness_assignment?: unknown
+}
+
+/**
+ * A/B provenance for the harness api-rs actually persisted (upstream #1178).
+ * api-rs may route a Codex request onto Nanocodex by thread-key hash, so the
+ * requested harness is not necessarily the one that runs.
+ */
+export type GoogleChatHarnessAssignment = {
+  experiment: string
+  requestedHarness: string
+  cohort: string
+  rolloutPercent: number
+}
+
+function harnessAssignmentFromResponse(
+  value: unknown
+): GoogleChatHarnessAssignment | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = value as Record<string, unknown>
+  const experiment = typeof raw.experiment === 'string' ? raw.experiment : undefined
+  const requestedHarness =
+    typeof raw.requested_harness === 'string' ? raw.requested_harness : undefined
+  const cohort = typeof raw.cohort === 'string' ? raw.cohort : undefined
+  const rolloutPercent = raw.rollout_percent
+  if (
+    !experiment ||
+    !requestedHarness ||
+    !cohort ||
+    typeof rolloutPercent !== 'number' ||
+    !Number.isFinite(rolloutPercent)
+  ) {
+    return undefined
+  }
+  return { experiment, requestedHarness, cohort, rolloutPercent }
 }
 
 export type CreateSessionResult = {
@@ -102,6 +138,11 @@ export type CreateSessionResult = {
    * `/execute` would collide with the `one active execution per thread` index
    * and 500, so the caller should append-and-fold instead of executing. */
   activeExecution: boolean
+  /** The harness persisted by api-rs after applying control-plane policy
+   * (the Codex/Nanocodex A/B split), which may differ from the requested one. */
+  harnessType?: string
+  /** The experiment/cohort used to select the persisted harness. */
+  harnessAssignment?: GoogleChatHarnessAssignment
 }
 
 export class SessionApiError extends Error {
@@ -224,7 +265,14 @@ export async function createSession(
   )
   const payload = (await response.json().catch(() => ({}))) as CreateSessionResponse
   const status = payload.status ?? payload.session?.status ?? ''
-  return { status, activeExecution: status === ACTIVE_SESSION_STATUS }
+  const resolvedHarness = payload.harness_type?.trim()
+  const harnessAssignment = harnessAssignmentFromResponse(payload.harness_assignment)
+  return {
+    status,
+    activeExecution: status === ACTIVE_SESSION_STATUS,
+    ...(resolvedHarness ? { harnessType: resolvedHarness } : {}),
+    ...(harnessAssignment ? { harnessAssignment } : {})
+  }
 }
 
 export async function appendSessionMessages(
@@ -265,11 +313,27 @@ export async function executeSession(
     maxDurationMs?: number
     overrides?: TurnOverrides
     history?: GoogleChatTurnMessage[]
+    /** Harness api-rs persisted for this thread (see CreateSessionResult). */
+    harnessType?: string
+    harnessAssignment?: GoogleChatHarnessAssignment
   } = {}
 ): Promise<ExecuteSessionResponse> {
   const body: ExecuteSessionRequest = {
     idempotency_key: message.id,
-    metadata: sessionMetadata(threadKey, message, { action: 'execute' }),
+    metadata: sessionMetadata(threadKey, message, {
+      action: 'execute',
+      ...(opts.harnessType ? { harness_type: opts.harnessType } : {}),
+      ...(opts.harnessAssignment
+        ? {
+            harness_assignment: {
+              experiment: opts.harnessAssignment.experiment,
+              requested_harness: opts.harnessAssignment.requestedHarness,
+              cohort: opts.harnessAssignment.cohort,
+              rollout_percent: opts.harnessAssignment.rolloutPercent
+            }
+          }
+        : {})
+    }),
     input_lines: [toCodexInputLine(threadKey, message, opts.overrides, opts.history)],
     ...(opts.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: opts.idleTimeoutMs }),
     ...(opts.maxDurationMs === undefined ? {} : { max_duration_ms: opts.maxDurationMs })

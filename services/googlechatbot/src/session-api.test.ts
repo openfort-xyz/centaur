@@ -99,6 +99,51 @@ describe('createSession', () => {
     expect(result.activeExecution).toBe(false)
   })
 
+  // Upstream #1178 parity: api-rs may persist a different harness than the one
+  // requested (Codex/Nanocodex A/B split, hashed by thread key). The bot has to
+  // read the resolved harness back so the trailer doesn't mislabel the cohort.
+  test('surfaces the harness api-rs actually persisted', async () => {
+    stubFetch({ status: 'idle', harness_type: 'nanocodex' })
+    const result = await createSession(
+      loadConfig({}),
+      'chat:spaces:AAAA:threads:T1',
+      undefined,
+      'codex'
+    )
+    expect(result.harnessType).toBe('nanocodex')
+  })
+
+  test('surfaces the A/B assignment provenance', async () => {
+    stubFetch({
+      status: 'idle',
+      harness_type: 'nanocodex',
+      harness_assignment: {
+        experiment: 'codex_nanocodex_ab',
+        requested_harness: 'codex',
+        cohort: 'nanocodex',
+        rollout_percent: 50
+      }
+    })
+    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(result.harnessAssignment).toEqual({
+      experiment: 'codex_nanocodex_ab',
+      requestedHarness: 'codex',
+      cohort: 'nanocodex',
+      rolloutPercent: 50
+    })
+  })
+
+  test('ignores a malformed or absent assignment instead of throwing', async () => {
+    stubFetch({ status: 'idle', harness_assignment: { experiment: 'codex_nanocodex_ab' } })
+    const partial = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(partial.harnessAssignment).toBeUndefined()
+
+    stubFetch({ status: 'idle' })
+    const missing = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(missing.harnessAssignment).toBeUndefined()
+    expect(missing.harnessType).toBeUndefined()
+  })
+
   test('records the requester identity in the session metadata', async () => {
     // The Console grants thread visibility by matching metadata user_email
     // against the signed-in user's email (Chat analogue of Slack's
