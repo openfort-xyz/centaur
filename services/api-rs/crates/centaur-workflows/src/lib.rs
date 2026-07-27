@@ -3400,6 +3400,12 @@ async fn handle_python_context_request(
             Ok(value) => Ok(value),
             Err(error) => Err(error.to_string()),
         },
+        Some("ctx.post_to_google_chat_attachment") => {
+            match post_google_chat_attachment(message).await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.to_string()),
+            }
+        }
         other => Err(format!("unsupported context request type {other:?}")),
     };
     Ok(match result {
@@ -3956,6 +3962,72 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
     if !status.is_success() {
         return Err(WorkflowRuntimeError::Upstream(format!(
             "google chat send failed: {status} {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Upload a file to a Google Chat space via the chatbot's attachments route.
+///
+/// Mirrors [`post_google_chat_message`]: api-rs is the trusted host that holds
+/// `CHATBOT_API_KEY` and reaches the bot in-cluster, so the workflow host never
+/// handles the credential. `content_base64` is produced by the workflow host
+/// (charts and PDFs are rendered there), not by an agent sandbox.
+async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let required = |key: &str| -> Result<String, WorkflowRuntimeError> {
+        message
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(format!(
+                    "ctx.post_to_google_chat_attachment requires {key}"
+                ))
+            })
+    };
+    let space_name = required("space_name")?;
+    let filename = required("filename")?;
+    let content_base64 = required("content_base64")?;
+    let arg = |key: &str| {
+        message
+            .get("args")
+            .and_then(|args| args.get(key))
+            .and_then(Value::as_str)
+    };
+
+    let token = env::var("CHATBOT_API_KEY")
+        .map_err(|_| WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned()))?;
+    let base_url = env::var("CHATBOT_URL")
+        .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
+    let base_url = base_url.trim_end_matches('/');
+
+    let mut body = json!({
+        "space_name": space_name,
+        "filename": filename,
+        "content_base64": content_base64,
+    });
+    for key in ["mime_type", "text", "thread_name"] {
+        if let Some(value) = arg(key) {
+            body[key] = json!(value);
+        }
+    }
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/api/chat/attachments"))
+        .bearer_auth(&token)
+        .json(&body)
+        // Uploads are larger than text posts, so allow more than the 30s a
+        // message send gets — but still bound it so a stuck bot can't hang
+        // the workflow run.
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "google chat attachment upload failed: {status} {value}"
         )));
     }
     Ok(value)

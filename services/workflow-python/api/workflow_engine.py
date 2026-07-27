@@ -181,6 +181,26 @@ class WorkflowContext:
             }
         )
 
+    async def post_to_google_chat_attachment(
+        self,
+        space_name: str,
+        filename: str,
+        content_base64: str,
+        **kwargs: Any,
+    ) -> Any:
+        # Same trust model as post_to_google_chat: api-rs holds CHATBOT_API_KEY
+        # and posts to the googlechatbot attachments route. Optional kwargs:
+        # mime_type, text, thread_name.
+        return await self._rpc.request(
+            {
+                "type": "ctx.post_to_google_chat_attachment",
+                "space_name": space_name,
+                "filename": filename,
+                "content_base64": content_base64,
+                "args": kwargs,
+            }
+        )
+
 
 def duration_seconds(value: dt.timedelta | int | float) -> float:
     if isinstance(value, dt.timedelta):
