@@ -71,6 +71,62 @@ describe('createSession', () => {
       })) as unknown as typeof fetch
   }
 
+  // api-rs derives the session principal's identity from this metadata. A
+  // Google Chat principal keys on the space, so it may only adopt the
+  // requester's identity when the space holds exactly one human and the event
+  // was provably Google's.
+  const captureSessionBody = async (requester: Parameters<typeof createSession>[4]) => {
+    let captured: Record<string, unknown> = {}
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body)) as Record<string, unknown>
+      return new Response(JSON.stringify({ status: 'idle' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }) as unknown as typeof fetch
+    await createSession(
+      loadConfig({}),
+      'chat:spaces:AAAA:threads:T1',
+      undefined,
+      'codex',
+      requester
+    )
+    return captured.metadata as Record<string, unknown>
+  }
+
+  test('sends the space type and verification status for a verified DM', async () => {
+    const metadata = await captureSessionBody({
+      userId: 'users/U1',
+      userEmail: 'alice@openfort.xyz',
+      spaceType: 'DIRECT_MESSAGE',
+      requestVerified: true
+    })
+    expect(metadata.googlechat_space_type).toBe('DIRECT_MESSAGE')
+    expect(metadata.googlechat_request_verified).toBe(true)
+    expect(metadata.user_email).toBe('alice@openfort.xyz')
+  })
+
+  test('omits the verification claim when signed requests are not enforced', async () => {
+    const metadata = await captureSessionBody({
+      userId: 'users/U1',
+      userEmail: 'alice@openfort.xyz',
+      spaceType: 'DIRECT_MESSAGE',
+      requestVerified: false
+    })
+    expect(metadata.googlechat_request_verified).toBeUndefined()
+    expect(metadata.googlechat_space_type).toBe('DIRECT_MESSAGE')
+  })
+
+  test('carries the group space type so api-rs withholds the identity', async () => {
+    const metadata = await captureSessionBody({
+      userId: 'users/U1',
+      userEmail: 'alice@openfort.xyz',
+      spaceType: 'GROUP_CHAT',
+      requestVerified: true
+    })
+    expect(metadata.googlechat_space_type).toBe('GROUP_CHAT')
+  })
+
   test('reports an active execution when api-rs says the session is executing', async () => {
     // api-rs returns the session fields flat on the response body — mirror the
     // real shape here so the stub can't drift from production again.

@@ -3,7 +3,7 @@ import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
 import { logWarn } from './logging'
 import { incr } from './metrics'
-import type { NormalizedChatEvent, NormalizedPart } from './chat/types'
+import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
 
 // ---------------------------------------------------------------------------
 // api-rs session contract
@@ -230,6 +230,16 @@ export type SessionRequester = {
   userId?: string
   userName?: string
   userEmail?: string
+  /** Space type for the conversation. api-rs binds the requester's identity to
+   *  the session principal only for a 1:1 DIRECT_MESSAGE — a space principal is
+   *  shared by every member, so a GROUP_CHAT or SPACE must not adopt one
+   *  person's identity. */
+  spaceType?: ChatSpaceType
+  /** Whether this event arrived on a request we authenticated against Google's
+   *  signed JWT. The event body (including the sender's email) is
+   *  attacker-controllable without it, so api-rs refuses to derive an identity
+   *  from an unverified event. */
+  requestVerified?: boolean
 }
 
 export async function createSession(
@@ -252,6 +262,11 @@ export async function createSession(
       ...(requester?.userId ? { user_id: requester.userId } : {}),
       ...(requester?.userName ? { user_name: requester.userName } : {}),
       ...(requester?.userEmail ? { user_email: requester.userEmail } : {}),
+      // Gates api-rs's identity labelling of the session principal: the email
+      // above only names the requester when the space is 1:1 and the event was
+      // provably Google's (see SessionRequester).
+      ...(requester?.spaceType ? { googlechat_space_type: requester.spaceType } : {}),
+      ...(requester?.requestVerified ? { googlechat_request_verified: true } : {}),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }

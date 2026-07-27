@@ -14,7 +14,8 @@ use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
 use crate::models::{Principal, SlackChannelPermissionInput};
 use crate::principal::{
-    derive_principal_with_slack_team, is_direct_message, slack_conversation_id,
+    GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND, KIND_LABEL,
+    derive_principal_with_slack_team, is_direct_message, parse_gchat_space, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -23,6 +24,16 @@ struct SessionPrincipalMetadata<'a> {
     slack_team_id: Option<&'a str>,
     slack_user_email: Option<&'a str>,
     conversation_name: Option<&'a str>,
+    /// The requester's address as the ingress reported it. Google Chat carries
+    /// it on the event; ``slack_user_email`` stays separate because the
+    /// slackbot resolves that one out of band (see
+    /// [`apply_gchat_identity_labels`]).
+    user_email: Option<&'a str>,
+    /// Google Chat ``SpaceType`` for the conversation this session runs in.
+    space_type: Option<&'a str>,
+    /// Whether the googlechatbot authenticated the inbound webhook against
+    /// Google's signed request JWT before handing us this event.
+    request_verified: bool,
 }
 
 impl<'a> SessionPrincipalMetadata<'a> {
@@ -41,9 +52,18 @@ impl<'a> SessionPrincipalMetadata<'a> {
             conversation_name: metadata
                 .get("slack_conversation_name")
                 .or_else(|| metadata.get("discord_conversation_name"))
+                .or_else(|| metadata.get("googlechat_conversation_name"))
                 .or_else(|| metadata.get("linear_conversation_name"))
                 .or_else(|| metadata.get("teams_conversation_name"))
                 .and_then(Value::as_str),
+            user_email: metadata.get("user_email").and_then(Value::as_str),
+            space_type: metadata
+                .get("googlechat_space_type")
+                .and_then(Value::as_str),
+            request_verified: metadata
+                .get("googlechat_request_verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 }
@@ -97,6 +117,7 @@ impl SessionRegistrar {
         );
         let mut input = principal.to_identity_input(&self.namespace);
         apply_slack_dm_email_label(thread_key, metadata.slack_user_email, &mut input.labels);
+        apply_gchat_identity_labels(thread_key, &metadata, &mut input.labels);
         let existing = match self
             .client
             .get_principal(&self.namespace, &input.foreign_id)
@@ -177,6 +198,65 @@ fn apply_slack_dm_email_label(
     if is_direct_message(Some(conversation_id)) && labels.contains_key("slack_user_id") {
         labels.insert("slack_email".to_owned(), email.to_owned());
     }
+}
+
+/// Label a Google Chat principal with its space kind and, for a 1:1 DM, the
+/// requester's email.
+///
+/// Google Chat principals key on the space, so the thread key alone cannot say
+/// whether the conversation is 1:1 the way a Slack ``D`` conversation id can.
+/// The space type answers it: Google documents ``DIRECT_MESSAGE`` as "1:1
+/// messages between two humans or a human and a Chat app", so a space our bot
+/// sees with that type has exactly one human in it and the requester's address
+/// identifies them. ``GROUP_CHAT`` and ``SPACE`` hold more people and never get
+/// an identity label — console's credential reconciliation grants a principal
+/// the secrets of whoever its labels name, and in a shared space that would
+/// hand every member one person's credentials.
+///
+/// The email rides the Chat event body, which is attacker-controllable on its
+/// own: only the Google-signed request JWT proves an event came from Google.
+/// The ingress reports whether it verified that token, and without it we leave
+/// the principal unlabelled rather than let a forged event mint an identity
+/// that reconciliation will attach real credentials to. Slack needs no such
+/// gate because the slackbot reads the address from ``users.info`` rather than
+/// from the event payload.
+///
+/// A missing space type means the ingress predates this contract; we label
+/// nothing rather than guess, which leaves the principal exactly as it is today.
+fn apply_gchat_identity_labels(
+    thread_key: &str,
+    metadata: &SessionPrincipalMetadata<'_>,
+    labels: &mut BTreeMap<String, String>,
+) {
+    if parse_gchat_space(thread_key).is_none() {
+        return;
+    }
+    let Some(space_type) = metadata
+        .space_type
+        .map(str::trim)
+        .filter(|space_type| !space_type.is_empty())
+    else {
+        return;
+    };
+    let is_dm = space_type.eq_ignore_ascii_case(GCHAT_DIRECT_MESSAGE_SPACE_TYPE);
+    let kind = if is_dm {
+        GCHAT_DM_KIND
+    } else {
+        GCHAT_SPACE_KIND
+    };
+    labels.insert(KIND_LABEL.to_owned(), kind.to_owned());
+
+    if !is_dm || !metadata.request_verified {
+        return;
+    }
+    let Some(email) = metadata
+        .user_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    else {
+        return;
+    };
+    labels.insert("google_email".to_owned(), email.to_owned());
 }
 
 fn slack_permission(
@@ -426,6 +506,149 @@ mod tests {
             "existing DM principals must not have manually removed roles restored"
         );
         server.abort();
+    }
+
+    const GCHAT_DM_THREAD: &str = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
+
+    fn gchat_labels(metadata: Value) -> BTreeMap<String, String> {
+        let mut labels = BTreeMap::new();
+        apply_gchat_identity_labels(
+            GCHAT_DM_THREAD,
+            &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
+            &mut labels,
+        );
+        labels
+    }
+
+    #[test]
+    fn session_principal_metadata_accepts_googlechat_name() {
+        assert_eq!(
+            SessionPrincipalMetadata::from_session_metadata(Some(&json!({
+                "googlechat_conversation_name": "Ada Lovelace"
+            })))
+            .conversation_name,
+            Some("Ada Lovelace")
+        );
+    }
+
+    #[test]
+    fn session_principal_metadata_carries_googlechat_space_fields() {
+        let raw = json!({
+            "user_email": "ada@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        });
+        let metadata = SessionPrincipalMetadata::from_session_metadata(Some(&raw));
+        assert_eq!(metadata.user_email, Some("ada@example.com"));
+        assert_eq!(metadata.space_type, Some("DIRECT_MESSAGE"));
+        assert!(metadata.request_verified);
+    }
+
+    #[test]
+    fn gchat_dm_labels_carry_the_verified_requester_email() {
+        let labels = gchat_labels(json!({
+            "user_email": " ada@example.com ",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        }));
+        assert_eq!(labels.get("kind").map(String::as_str), Some("gchat_dm"));
+        assert_eq!(
+            labels.get("google_email").map(String::as_str),
+            Some("ada@example.com")
+        );
+    }
+
+    #[test]
+    fn gchat_group_spaces_never_carry_an_email() {
+        for space_type in ["GROUP_CHAT", "SPACE"] {
+            let labels = gchat_labels(json!({
+                "user_email": "ada@example.com",
+                "googlechat_space_type": space_type,
+                "googlechat_request_verified": true
+            }));
+            assert_eq!(
+                labels.get("kind").map(String::as_str),
+                Some("gchat_space"),
+                "{space_type} must not be treated as a 1:1 conversation"
+            );
+            assert_eq!(
+                labels.get("google_email"),
+                None,
+                "{space_type} must not adopt one member's identity"
+            );
+        }
+    }
+
+    #[test]
+    fn gchat_dm_email_requires_a_verified_request() {
+        // An unverified event body is attacker-controllable, so its email must
+        // not become an identity reconciliation will grant credentials to.
+        let labels = gchat_labels(json!({
+            "user_email": "attacker@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE"
+        }));
+        assert_eq!(labels.get("kind").map(String::as_str), Some("gchat_dm"));
+        assert_eq!(labels.get("google_email"), None);
+    }
+
+    #[test]
+    fn gchat_labels_are_skipped_without_a_space_type() {
+        // An ingress that predates the space-type contract leaves the principal
+        // exactly as it is today rather than being guessed into a kind.
+        assert!(
+            gchat_labels(json!({
+                "user_email": "ada@example.com",
+                "googlechat_request_verified": true
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn gchat_identity_labels_ignore_non_gchat_threads() {
+        // The Slack-compatible `chat:C…` adapter key is not Google Chat.
+        let mut labels = BTreeMap::new();
+        let metadata = json!({
+            "user_email": "ada@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        });
+        for thread_key in ["chat:C123:1780000000.000000", "slack:T123:D123:1780.1"] {
+            apply_gchat_identity_labels(
+                thread_key,
+                &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
+                &mut labels,
+            );
+        }
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn slack_dm_labels_are_unchanged_by_googlechat_metadata() {
+        // Slack keeps sourcing its address from `slack_user_email`; a stray
+        // `user_email` must not leak into a Slack principal.
+        let mut labels = BTreeMap::new();
+        labels.insert("slack_user_id".to_owned(), "U123".to_owned());
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_user_email": "ada@example.com",
+            "user_email": "someone-else@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        });
+        let parsed = SessionPrincipalMetadata::from_session_metadata(Some(&metadata));
+        apply_slack_dm_email_label(
+            "slack:T123:D123:1780.1",
+            parsed.slack_user_email,
+            &mut labels,
+        );
+        apply_gchat_identity_labels("slack:T123:D123:1780.1", &parsed, &mut labels);
+        assert_eq!(
+            labels.get("slack_email").map(String::as_str),
+            Some("ada@example.com")
+        );
+        assert_eq!(labels.get("google_email"), None);
+        assert_eq!(labels.get("kind"), None);
     }
 
     #[test]
