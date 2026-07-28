@@ -18,10 +18,29 @@ module Oauth
       # carries an id_token identifying the Google account.
       IDENTITY_SCOPES = %w[openid https://www.googleapis.com/auth/userinfo.email].freeze
       # Hosts a minted access token may be sent to, as request-rule host patterns.
-      # Every Google API is served under *.googleapis.com; accounts.google.com is
-      # auth-only and intentionally excluded. Drives the rules on the static secret
-      # auto-created alongside a minted credential.
-      API_HOSTS = %w[*.googleapis.com].freeze
+      # Drives the rules on the static secret auto-created alongside a minted
+      # credential. accounts.google.com is auth-only and intentionally excluded.
+      #
+      # Enumerated rather than wildcarded on purpose. Host matching is
+      # wildcard-aware, so a `*.googleapis.com` rule overlaps every googleapis
+      # host, and cross-type conflict resolution (Principal#served_credentials)
+      # suppresses a whole lower-priority credential on any overlap -- a personal
+      # Google credential with that pattern silently disabled unrelated infra
+      # credentials on chat/searchconsole/logging.googleapis.com.
+      #
+      # This is deliberately the same set the shared gsuite OauthTokenSecret
+      # carries, so per-user and shared credentials collide on exactly the same
+      # hosts and grant priority decides deterministically. www.googleapis.com is
+      # where Drive lives and is required.
+      API_HOSTS = %w[
+        gmail.googleapis.com
+        calendar.googleapis.com
+        docs.googleapis.com
+        sheets.googleapis.com
+        slides.googleapis.com
+        www.googleapis.com
+        analyticsdata.googleapis.com
+      ].freeze
       # The issuers Google stamps into the id_token; both forms are accepted per
       # Google's OIDC discovery document.
       VALID_ISSUERS = %w[https://accounts.google.com accounts.google.com].freeze

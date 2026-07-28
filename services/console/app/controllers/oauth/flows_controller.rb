@@ -28,6 +28,10 @@ module Oauth
     FLOW_TTL = 10.minutes
     FLOW_COOKIE = :oauth_flow
 
+    # How the static secret wrapping a minted credential presents the token, for
+    # providers that do not declare their own shape (see ensure_wrapping_secret).
+    DEFAULT_WRAPPER_INJECT_CONFIG = { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }.freeze
+
     # Tests swap in an AuthorizationCodeClient built around an http double,
     # mirroring BrokerCredential#refresh_client.
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }
@@ -248,10 +252,16 @@ module Oauth
 
     # Wraps a minted credential in a grantable static secret, so an operator can
     # grant the integration's token to a principal straight from the console (a
-    # broker credential is not grantable on its own). The secret injects the live
-    # access token as `Authorization: Bearer <token>` through a token_broker source
-    # pointing at the credential, scoped to the provider's API hosts. The token
-    # stays fresh because the source resolves the credential live at sync time.
+    # broker credential is not grantable on its own). By default the secret injects
+    # the live access token as `Authorization: Bearer <token>` through a
+    # token_broker source pointing at the credential, scoped to the provider's API
+    # hosts. The token stays fresh because the source resolves the credential live
+    # at sync time.
+    #
+    # A strategy that answers #wrapper_replace_config overrides that with a replace
+    # transform instead -- for clients that send the token under their own scheme,
+    # where injecting a Bearer header is simply the wrong shape. StaticSecret
+    # validates that exactly one of inject_config/replace_config is set.
     #
     # Created once per credential (keyed on the broker_credential association, which
     # a unique index enforces) and left untouched on re-consent, so any operator
@@ -265,13 +275,24 @@ module Oauth
 
       secret.namespace = credential.namespace
       secret.name = "#{credential.name} token"
-      secret.inject_config = { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }
+      apply_wrapping_transform(secret)
       secret.source = SecretSource.new(source_type: "token_broker", config: { "credential_id" => credential.oid })
       secret.rules = Array(@provider.api_hosts).each_with_index.map do |host, position|
         RequestRule.new(host: host, http_methods: [], paths: [], position: position)
       end
       secret.save!
       secret
+    end
+
+    # Sets the one transform the wrapping secret carries: the provider's replace
+    # config when it declares one, otherwise the default Bearer header injection.
+    def apply_wrapping_transform(secret)
+      replace_config = @provider.wrapper_replace_config if @provider.respond_to?(:wrapper_replace_config)
+      if replace_config.present?
+        secret.replace_config = replace_config
+      else
+        secret.inject_config = DEFAULT_WRAPPER_INJECT_CONFIG
+      end
     end
 
     def read_and_clear_flow_cookie

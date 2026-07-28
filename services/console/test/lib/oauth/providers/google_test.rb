@@ -75,6 +75,21 @@ module Oauth
         assert_equal "https://oauth2.googleapis.com/token", strategy.token_endpoint
         assert_equal({ "access_type" => "offline", "prompt" => "consent" }, strategy.extra_authorization_params)
       end
+
+      test "api hosts enumerate the gsuite APIs rather than wildcarding googleapis" do
+        assert_equal %w[
+          gmail.googleapis.com calendar.googleapis.com docs.googleapis.com
+          sheets.googleapis.com slides.googleapis.com www.googleapis.com
+          analyticsdata.googleapis.com
+        ], strategy.api_hosts
+        # A wildcard here overlaps every googleapis host, and cross-type conflict
+        # resolution suppresses the whole lower-priority credential on overlap.
+        assert_empty strategy.api_hosts.select { |host| host.include?("*") }
+      end
+
+      test "does not override the default wrapping-secret transform" do
+        refute_respond_to strategy, :wrapper_replace_config
+      end
     end
   end
 end

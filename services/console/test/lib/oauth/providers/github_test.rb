@@ -37,9 +37,18 @@ module Oauth
         assert_equal "https://github.com/login/oauth/authorize", strategy.authorization_endpoint
         assert_equal "https://github.com/login/oauth/access_token", strategy.token_endpoint
         assert_equal [], strategy.identity_scopes
+        assert_equal %w[api.github.com github.com], strategy.api_hosts
         assert_equal "scope", strategy.authorization_scope_param
         assert_equal " ", strategy.scope_separator
         refute strategy.refreshable?
+      end
+
+      test "declares a replace transform for its wrapping secret" do
+        # gh sends `Authorization: token <value>` and git-over-HTTPS sends
+        # `Authorization: Basic <base64>`; replace is scheme-agnostic where a
+        # Bearer injection would be wrong for both.
+        assert_equal({ "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
+                     Github.new.wrapper_replace_config)
       end
     end
   end
