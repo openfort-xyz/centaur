@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeAll } from 'bun:test'
-import { verifyChatRequest, verifyChatRequestToken } from './verify'
+import { resolveIdentityEmission, verifyChatRequest, verifyChatRequestToken } from './verify'
 import { GOOGLE_CHAT_ISSUER } from './token'
 import { generateRsaKeyPair, signJwt, staticKeyResolver } from './test-jwt'
 import { loadConfig, type AppConfig } from '../config'
@@ -169,5 +169,65 @@ describe('verifyChatRequestToken', () => {
       nowSeconds: NOW
     })
     expect(out).toEqual({ ok: true, verified: true })
+  })
+})
+
+describe('resolveIdentityEmission', () => {
+  const verifiedClaim = (email: string | undefined, env: Record<string, string> = {}) =>
+    resolveIdentityEmission({
+      config: configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz,other.example', ...env }),
+      verified: true,
+      userEmail: email
+    })
+
+  test('allows a verified sender on an allowlisted domain', () => {
+    expect(verifiedClaim('Ada@Openfort.xyz')).toEqual({ emit: true, userEmail: 'Ada@Openfort.xyz' })
+    expect(verifiedClaim('bob@other.example').emit).toBe(true)
+  })
+
+  // An unverified request's body is attacker-controllable: anyone able to POST
+  // the webhook could claim any colleague's email.
+  test('suppresses an unverified request even from an allowlisted domain', () => {
+    const out = resolveIdentityEmission({
+      config: configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }),
+      verified: false,
+      userEmail: 'ada@openfort.xyz'
+    })
+    expect(out).toEqual({ emit: false, reason: 'unverified' })
+  })
+
+  test('suppresses a domain outside the allowlist', () => {
+    expect(verifiedClaim('mallory@evil.example')).toEqual({
+      emit: false,
+      reason: 'domain_not_allowlisted'
+    })
+  })
+
+  // GOOGLECHATBOT_ALLOWED_DOMAIN defaults to '' — that is "no domain may claim
+  // an identity", not "every domain may".
+  test('suppresses everything while the allowlist is empty', () => {
+    expect(verifiedClaim('ada@openfort.xyz', { GOOGLECHATBOT_ALLOWED_DOMAIN: '' })).toEqual({
+      emit: false,
+      reason: 'allowlist_empty'
+    })
+  })
+
+  test('suppresses a missing or malformed sender email', () => {
+    expect(verifiedClaim(undefined).emit).toBe(false)
+    expect(verifiedClaim('')).toEqual({ emit: false, reason: 'no_email' })
+    expect(verifiedClaim('   ')).toEqual({ emit: false, reason: 'no_email' })
+    expect(verifiedClaim('ada')).toEqual({ emit: false, reason: 'no_email' })
+    expect(verifiedClaim('@openfort.xyz')).toEqual({ emit: false, reason: 'no_email' })
+    // Multiple '@' is not an address we grant credentials from, even though the
+    // 403 path's looser split() would read a domain out of it.
+    expect(verifiedClaim('ada@evil.example@openfort.xyz')).toEqual({
+      emit: false,
+      reason: 'no_email'
+    })
+  })
+
+  test('matches the domain case-insensitively on both sides', () => {
+    expect(verifiedClaim('ada@OPENFORT.XYZ', { GOOGLECHATBOT_ALLOWED_DOMAIN: 'Openfort.XYZ' }).emit)
+      .toBe(true)
   })
 })

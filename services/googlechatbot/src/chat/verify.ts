@@ -106,3 +106,60 @@ export function verifyChatRequest(opts: {
 
   return { ok: true }
 }
+
+/** Why a session was created without identity metadata. Every suppression is
+ * reported with one of these so "my credential did not attach" is answerable
+ * from the logs. */
+export type IdentitySuppressionReason =
+  | 'unverified'
+  | 'no_email'
+  | 'allowlist_empty'
+  | 'domain_not_allowlisted'
+
+export type IdentityEmission =
+  | { emit: true; userEmail: string }
+  | { emit: false; reason: IdentitySuppressionReason }
+
+/**
+ * Decide whether an event may claim a human identity for the session it starts.
+ *
+ * Downstream, centaur labels the DM principal from that identity and
+ * auto-grants the named person's OAuth credentials (Gmail, GitHub, …) to every
+ * session in the room, so this gate is a credential-grant decision, not a
+ * display concern. It fails closed for credentials only — the caller still
+ * processes the chat event normally when identity is suppressed.
+ *
+ * Both conditions must hold:
+ *  - the request carried a valid Google signature (`verified`), and
+ *  - the email the identity is actually derived from sits in a non-empty
+ *    GOOGLECHATBOT_ALLOWED_DOMAIN.
+ *
+ * An empty allowlist is a suppression reason, never a wildcard: the default is
+ * '' (off), and "unset" must not mean "any domain may claim any identity".
+ *
+ * Note this validates the SENDER email the identity is built from, which is not
+ * necessarily the `envelope.user.email` verifyChatRequest hard-rejects on — the
+ * two fields differ, and only this one reaches the session metadata.
+ */
+export function resolveIdentityEmission(opts: {
+  config: AppConfig
+  verified: boolean
+  userEmail: string | undefined
+}): IdentityEmission {
+  if (!opts.verified) return { emit: false, reason: 'unverified' }
+
+  const email = (opts.userEmail ?? '').trim()
+  // Stricter than the 403 path's `split('@')[1]`: an address that is not
+  // exactly local@domain is not something to grant credentials from.
+  const parts = email.split('@')
+  const domain = parts.length === 2 ? (parts[1] ?? '').toLowerCase() : ''
+  if (!parts[0] || !domain) return { emit: false, reason: 'no_email' }
+
+  const allowedDomains = opts.config.GOOGLECHATBOT_ALLOWED_DOMAIN
+  if (allowedDomains.length === 0) return { emit: false, reason: 'allowlist_empty' }
+  if (!allowedDomains.some(allowed => allowed.toLowerCase() === domain)) {
+    return { emit: false, reason: 'domain_not_allowlisted' }
+  }
+
+  return { emit: true, userEmail: email }
+}
