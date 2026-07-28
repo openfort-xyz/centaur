@@ -106,10 +106,12 @@ describe('verifyChatRequestToken', () => {
     return `Bearer ${token}`
   }
 
+  // The skip path is processable but NOT verified: nothing was authenticated,
+  // so it must never source identity metadata.
   test('is a no-op when signed requests are not required (legacy / rollback)', async () => {
     const config = configWith({ GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: 'false' })
     const out = await verifyChatRequestToken({ config, authorization: undefined, resolveKey, nowSeconds: NOW })
-    expect(out.ok).toBe(true)
+    expect(out).toEqual({ ok: true, verified: false })
   })
 
   test('rejects a missing bearer token when required', async () => {
@@ -133,7 +135,7 @@ describe('verifyChatRequestToken', () => {
       GOOGLECHATBOT_PROJECT_NUMBER: AUD
     })
     const out = await verifyChatRequestToken({ config, authorization: await bearer(), resolveKey, nowSeconds: NOW })
-    expect(out.ok).toBe(true)
+    expect(out).toEqual({ ok: true, verified: true })
   })
 
   test('rejects a valid signature carrying the wrong audience', async () => {
@@ -166,6 +168,6 @@ describe('verifyChatRequestToken', () => {
       resolveKey,
       nowSeconds: NOW
     })
-    expect(out.ok).toBe(true)
+    expect(out).toEqual({ ok: true, verified: true })
   })
 })

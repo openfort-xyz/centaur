@@ -2,9 +2,27 @@ import type { AppConfig } from '../config'
 import { GOOGLE_REQUEST_ISSUERS, verifyGoogleSignedJwt, type KeyResolver } from './token'
 import type { GoogleChatEnvelope } from './types'
 
-export type ChatVerification =
-  | { ok: true }
-  | { ok: false; status: 400 | 401 | 403; reason: string }
+type ChatVerificationFailure = { ok: false; status: 400 | 401 | 403; reason: string }
+
+/**
+ * Outcome of authenticating an inbound request.
+ *
+ * `ok` only says the request may be PROCESSED. `verified` says a Google
+ * signature was actually checked — the two differ on every request while
+ * GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS is off, where the check is skipped
+ * entirely. Anything that grants trust from the request body (identity
+ * metadata, and through it the requester's OAuth credentials) MUST read
+ * `verified`; deriving trust from `ok` treats a skipped check as a passed one.
+ */
+export type ChatVerification = { ok: true; verified: boolean } | ChatVerificationFailure
+
+/**
+ * Outcome of the envelope-shape checks (domain allowlist, event freshness).
+ * These say nothing about authenticity — the envelope is attacker-controllable
+ * without a signature — so this result deliberately carries no `verified` field
+ * that could be mistaken for one.
+ */
+export type ChatEnvelopeCheck = { ok: true } | ChatVerificationFailure
 
 /** Audiences a signed request token's `aud` claim may match (project number
  *  and/or endpoint URL, whichever the app is configured with). */
@@ -29,7 +47,9 @@ export async function verifyChatRequestToken(opts: {
   nowSeconds?: number
 }): Promise<ChatVerification> {
   const { config } = opts
-  if (!config.GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS) return { ok: true }
+  // Skipped, not passed: the request is processed but nothing about it was
+  // authenticated, so it can never source identity metadata.
+  if (!config.GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS) return { ok: true, verified: false }
 
   const audiences = chatRequestAudiences(config)
   if (audiences.length === 0) {
@@ -55,14 +75,14 @@ export async function verifyChatRequestToken(opts: {
     return { ok: false, status: 401, reason: 'key_resolution_failed' }
   }
   if (!result.ok) return { ok: false, status: 401, reason: result.reason }
-  return { ok: true }
+  return { ok: true, verified: true }
 }
 
 export function verifyChatRequest(opts: {
   config: AppConfig
   envelope: GoogleChatEnvelope
   nowSeconds?: number
-}): ChatVerification {
+}): ChatEnvelopeCheck {
   const allowedDomains = opts.config.GOOGLECHATBOT_ALLOWED_DOMAIN
   if (allowedDomains.length > 0 && opts.envelope.user?.email) {
     const domain = opts.envelope.user.email.split('@')[1]
