@@ -118,7 +118,9 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     }
 
     incr('googlechatbot_events_total', { outcome: 'accepted' })
-    runInBackground(c, processChatEvent(config, client, envelope))
+    // `tokenCheck.verified` — NOT `tokenCheck.ok`: with signed requests off the
+    // check is skipped, and a skipped check must not source identity metadata.
+    runInBackground(c, processChatEvent(config, client, envelope, tokenCheck.verified))
     return c.json({})
   }
 
@@ -296,7 +298,10 @@ function botResourceName(config: AppConfig): string | undefined {
 async function processChatEvent(
   config: AppConfig,
   client: ChatEdgeClient,
-  envelope: GoogleChatEnvelope
+  envelope: GoogleChatEnvelope,
+  /** Whether this event's request carried a valid Google signature. Gates the
+   * identity metadata on the session it creates — nothing else. */
+  verified: boolean
 ): Promise<void> {
   // CARD_CLICKED is handled independently of normalizeChatEnvelope: that
   // normalizer deliberately returns null for it (no command-aware workflow
@@ -367,7 +372,7 @@ async function processChatEvent(
   const [ackMessageName, historyMessages] = await Promise.all([ackPromise, historyPromise])
   if (historyMessages.length) normalized.history_messages = historyMessages
 
-  await driveSession(config, client, normalized, ackMessageName)
+  await driveSession(config, client, normalized, ackMessageName, verified)
 }
 
 export function googleChatCardClickPayload(envelope: GoogleChatEnvelope): GoogleChatCardClickPayload | null {
@@ -417,7 +422,8 @@ async function driveSession(
   config: AppConfig,
   client: ChatEdgeClient,
   event: NormalizedChatEvent,
-  ackMessageName: string
+  ackMessageName: string,
+  verified: boolean
 ): Promise<void> {
   const threadKey = event.thread_key
   const { execute, history } = turnMessagesFromEvent(event)
@@ -445,13 +451,12 @@ async function driveSession(
       {
         userId: event.user_id,
         userName: event.user_name,
-        ...(event.user_email ? { userEmail: event.user_email } : {}),
-        spaceType: event.space_type,
-        // Only an event we authenticated against Google's signed JWT may name
-        // the human behind the session principal. When the enforcement switch
-        // is off any caller can forge `user.email`, so we withhold the claim
-        // rather than let it reach credential reconciliation.
-        requestVerified: config.GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS
+        identity: {
+          verified,
+          ...(event.user_email ? { userEmail: event.user_email } : {}),
+          spaceType: event.space_type,
+          singleUserBotDm: event.single_user_bot_dm
+        }
       }
     )
 

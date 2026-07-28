@@ -4,6 +4,7 @@ import { centaurApiKey } from './config'
 import { logWarn } from './logging'
 import { incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
+import { resolveIdentityEmission, type IdentityEmission } from './chat/verify'
 
 // ---------------------------------------------------------------------------
 // api-rs session contract
@@ -226,20 +227,26 @@ export function turnMessagesFromEvent(event: NormalizedChatEvent): {
   return { execute, history }
 }
 
+/** The identity an inbound event claims, paired with whether that event was
+ * actually authenticated. `verified` is required so a caller cannot supply a
+ * claim without stating its provenance. */
+export type RequesterIdentityClaim = {
+  /** True ONLY when the request carried a valid Google signature — never
+   * derived from a verification result's `ok`. */
+  verified: boolean
+  /** Sender email the identity would be built from (message.sender.email, or
+   * the envelope user's as a fallback). */
+  userEmail?: string
+  spaceType: ChatSpaceType
+  singleUserBotDm: boolean
+}
+
 export type SessionRequester = {
   userId?: string
   userName?: string
-  userEmail?: string
-  /** Space type for the conversation. api-rs binds the requester's identity to
-   *  the session principal only for a 1:1 DIRECT_MESSAGE — a space principal is
-   *  shared by every member, so a GROUP_CHAT or SPACE must not adopt one
-   *  person's identity. */
-  spaceType?: ChatSpaceType
-  /** Whether this event arrived on a request we authenticated against Google's
-   *  signed JWT. The event body (including the sender's email) is
-   *  attacker-controllable without it, so api-rs refuses to derive an identity
-   *  from an unverified event. */
-  requestVerified?: boolean
+  /** Omit entirely for calls that are not starting a turn on someone's behalf
+   * (e.g. the idempotent re-check in the fold path). */
+  identity?: RequesterIdentityClaim
 }
 
 export async function createSession(
@@ -250,6 +257,24 @@ export async function createSession(
   requester?: SessionRequester
 ): Promise<CreateSessionResult> {
   const name = conversationName?.trim()
+  const claim = requester?.identity
+  const identity = claim
+    ? resolveIdentityEmission({ config, verified: claim.verified, userEmail: claim.userEmail })
+    : undefined
+  if (identity && !identity.emit) {
+    // Never silent: centaur attaches a person's OAuth credentials off these
+    // keys, so their absence has to be explainable after the fact.
+    incr('googlechatbot_session_identity_total', {
+      outcome: 'suppressed',
+      reason: identity.reason
+    })
+    logWarn('googlechatbot_session_identity_suppressed', {
+      thread_key: threadKey,
+      reason: identity.reason
+    })
+  } else if (identity) {
+    incr('googlechatbot_session_identity_total', { outcome: 'emitted', reason: 'none' })
+  }
   const body: CreateSessionRequest = {
     harness_type: harnessType ?? 'codex',
     metadata: {
@@ -261,12 +286,12 @@ export async function createSession(
       // signed-in user's email to grant thread visibility (#875 analogue).
       ...(requester?.userId ? { user_id: requester.userId } : {}),
       ...(requester?.userName ? { user_name: requester.userName } : {}),
-      ...(requester?.userEmail ? { user_email: requester.userEmail } : {}),
-      // Gates api-rs's identity labelling of the session principal: the email
-      // above only names the requester when the space is 1:1 and the event was
-      // provably Google's (see SessionRequester).
-      ...(requester?.spaceType ? { googlechat_space_type: requester.spaceType } : {}),
-      ...(requester?.requestVerified ? { googlechat_request_verified: true } : {}),
+      // Identity keys. centaur labels the DM principal from these and
+      // auto-grants that person's OAuth credentials to every session in the
+      // room, so they ship ONLY for a signature-verified request from an
+      // allowlisted domain. An absent key means "no label" — there is
+      // deliberately no fallback value to fall back to.
+      ...identityMetadata(identity, claim),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }
@@ -287,6 +312,19 @@ export async function createSession(
     activeExecution: status === ACTIVE_SESSION_STATUS,
     ...(resolvedHarness ? { harnessType: resolvedHarness } : {}),
     ...(harnessAssignment ? { harnessAssignment } : {})
+  }
+}
+
+/** The identity half of the create-session metadata: all three keys or none. */
+function identityMetadata(
+  identity: IdentityEmission | undefined,
+  claim: RequesterIdentityClaim | undefined
+): JsonObject {
+  if (!identity?.emit || !claim) return {}
+  return {
+    user_email: identity.userEmail,
+    space_type: claim.spaceType,
+    single_user_bot_dm: claim.singleUserBotDm
   }
 }
 

@@ -7,7 +7,9 @@ import {
   emitWorkflowEvent,
   executeSession,
   interruptSessionExecution,
-  openSessionEventStream
+  openSessionEventStream,
+  type RequesterIdentityClaim,
+  type SessionRequester
 } from './session-api'
 import { parseChatBody } from './index'
 import { loadConfig } from './config'
@@ -201,32 +203,6 @@ describe('createSession', () => {
     expect(missing.harnessType).toBeUndefined()
   })
 
-  test('records the requester identity in the session metadata', async () => {
-    // The Console grants thread visibility by matching metadata user_email
-    // against the signed-in user's email (Chat analogue of Slack's
-    // slack_user_id ownership) — the create body must carry it.
-    let captured: Record<string, unknown> | undefined
-    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
-      captured = JSON.parse(init?.body ?? '{}') as Record<string, unknown>
-      return new Response(JSON.stringify({ status: 'idle' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' }
-      })
-    }) as unknown as typeof fetch
-    await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1', undefined, undefined, {
-      userId: 'users/123',
-      userName: 'Ada Lovelace',
-      userEmail: 'Ada@Openfort.xyz'
-    })
-    expect(captured?.metadata).toMatchObject({
-      source: 'googlechatbot',
-      platform: 'googlechat',
-      user_id: 'users/123',
-      user_name: 'Ada Lovelace',
-      user_email: 'Ada@Openfort.xyz'
-    })
-  })
-
   test('omits requester fields that are not available', async () => {
     let captured: Record<string, unknown> | undefined
     globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
@@ -243,6 +219,127 @@ describe('createSession', () => {
     expect(metadata.user_id).toBe('users/123')
     expect('user_email' in metadata).toBe(false)
     expect('user_name' in metadata).toBe(false)
+  })
+})
+
+// centaur labels the DM principal from these metadata keys and auto-grants that
+// person's OAuth credentials to every session in the room, so emitting them for
+// an unauthenticated (or off-domain) event hands one person's live credentials
+// to whoever else is in the space. The three keys ship together or not at all.
+describe('createSession identity metadata', () => {
+  const realFetch = globalThis.fetch
+  const ALLOWLISTED = { GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }
+
+  beforeEach(() => {
+    resetMetrics()
+  })
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  /** Runs createSession against a capturing stub and returns the metadata the
+   * bot would have sent to api-rs. */
+  const metadataFor = async (
+    env: Record<string, string>,
+    requester: SessionRequester
+  ): Promise<Record<string, unknown>> => {
+    let captured: Record<string, unknown> | undefined
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      captured = JSON.parse(init?.body ?? '{}') as Record<string, unknown>
+      return new Response(JSON.stringify({ status: 'idle' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }) as unknown as typeof fetch
+    await createSession(
+      loadConfig({ ...env }),
+      'chat:spaces:AAAA:threads:T1',
+      undefined,
+      undefined,
+      requester
+    )
+    return (captured?.metadata ?? {}) as Record<string, unknown>
+  }
+
+  const claim = (overrides: Partial<RequesterIdentityClaim> = {}): SessionRequester => ({
+    userId: 'users/123',
+    userName: 'Ada Lovelace',
+    identity: {
+      verified: true,
+      userEmail: 'Ada@Openfort.xyz',
+      spaceType: 'DIRECT_MESSAGE',
+      singleUserBotDm: true,
+      ...overrides
+    }
+  })
+
+  const expectSuppressed = (metadata: Record<string, unknown>, reason: string): void => {
+    expect('user_email' in metadata).toBe(false)
+    expect('space_type' in metadata).toBe(false)
+    expect('single_user_bot_dm' in metadata).toBe(false)
+    // user_id is not an identity key — it stays unconditional.
+    expect(metadata.user_id).toBe('users/123')
+    expect(renderMetrics()).toContain(
+      `googlechatbot_session_identity_total{outcome="suppressed",reason="${reason}"} 1`
+    )
+  }
+
+  test('records the requester identity for a verified, allowlisted sender', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, claim())
+    expect(metadata).toMatchObject({
+      source: 'googlechatbot',
+      platform: 'googlechat',
+      user_id: 'users/123',
+      user_name: 'Ada Lovelace',
+      user_email: 'Ada@Openfort.xyz',
+      space_type: 'DIRECT_MESSAGE',
+      single_user_bot_dm: true
+    })
+    expect(renderMetrics()).toContain(
+      'googlechatbot_session_identity_total{outcome="emitted",reason="none"} 1'
+    )
+  })
+
+  // The bot forwards the space shape verbatim; filtering shared rooms out is the
+  // consumer's call, and doing it here too would hide the room from the audit.
+  test.each(['DIRECT_MESSAGE', 'GROUP_CHAT', 'SPACE'] as const)(
+    'forwards space_type %s verbatim',
+    async spaceType => {
+      const metadata = await metadataFor(
+        ALLOWLISTED,
+        claim({ spaceType, singleUserBotDm: spaceType === 'DIRECT_MESSAGE' })
+      )
+      expect(metadata.space_type).toBe(spaceType)
+      expect(metadata.single_user_bot_dm).toBe(spaceType === 'DIRECT_MESSAGE')
+    }
+  )
+
+  test('suppresses identity when the request was not signature-verified', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, claim({ verified: false }))
+    expectSuppressed(metadata, 'unverified')
+  })
+
+  test('suppresses identity when the sender domain is not allowlisted', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, claim({ userEmail: 'mallory@evil.example' }))
+    expectSuppressed(metadata, 'domain_not_allowlisted')
+  })
+
+  // Default is '' (allowlist off). "Unset" must never mean "any domain may
+  // claim any identity".
+  test('suppresses identity when the allowlist is empty', async () => {
+    const metadata = await metadataFor({ GOOGLECHATBOT_ALLOWED_DOMAIN: '' }, claim())
+    expectSuppressed(metadata, 'allowlist_empty')
+  })
+
+  test('suppresses identity when the sender carries no usable email', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, claim({ userEmail: undefined }))
+    expectSuppressed(metadata, 'no_email')
+  })
+
+  test('emits no identity telemetry for a call that claims no requester', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, { userId: 'users/123' })
+    expect('user_email' in metadata).toBe(false)
+    expect(renderMetrics()).toContain('googlechatbot_session_identity_total 0')
   })
 })
 

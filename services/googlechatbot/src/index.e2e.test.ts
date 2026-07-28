@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createGooglechatbot } from './index'
 import { loadConfig } from './config'
-import { resetMetrics } from './metrics'
+import { renderMetrics, resetMetrics } from './metrics'
 
 const CHATBOT_ENV = { CHAT_EVENTS_PATH: '/api/chat/events' }
 const NOW_ISO = new Date().toISOString()
@@ -151,6 +151,83 @@ describe('googlechatbot webhook e2e', () => {
       c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url)
     )
     expect(createSessionCall).toBeTruthy()
+  })
+
+  // GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS defaults to off, so every event the
+  // deployed bot sees today is unverified: it must still run, just without an
+  // identity anyone's credentials could be attached to.
+  test('an unverified event is processed but creates the session without identity keys', async () => {
+    const res = await app({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }).request(
+      '/api/chat/events',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'MESSAGE',
+          eventTime: NOW_ISO,
+          space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true },
+          message: {
+            name: 'spaces/AAAA/messages/M9',
+            text: 'deploy the thing',
+            sender: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' }
+          },
+          user: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' }
+        })
+      }
+    )
+    expect(res.status).toBe(200)
+
+    await waitFor(() =>
+      mock.calls.some(c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url))
+    )
+    const create = mock.calls.find(
+      c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url)
+    )
+    const metadata = ((create?.body as { metadata?: Record<string, unknown> })?.metadata
+      ?? {}) as Record<string, unknown>
+    expect(metadata.user_id).toBe('users/U1')
+    expect('user_email' in metadata).toBe(false)
+    expect('space_type' in metadata).toBe(false)
+    expect('single_user_bot_dm' in metadata).toBe(false)
+    expect(renderMetrics()).toContain(
+      'googlechatbot_session_identity_total{outcome="suppressed",reason="unverified"} 1'
+    )
+  })
+
+  // The 403 allowlist check reads envelope.user.email; the identity is built
+  // from message.sender.email. An event that carries only the latter sails past
+  // the hard reject, so the identity path has to gate on it separately.
+  test('an off-domain sender that passes the 403 check still gets no identity', async () => {
+    const res = await app({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }).request(
+      '/api/chat/events',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'MESSAGE',
+          eventTime: NOW_ISO,
+          space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true },
+          message: {
+            name: 'spaces/AAAA/messages/M10',
+            text: 'deploy the thing',
+            sender: { name: 'users/U2', displayName: 'Mallory', email: 'mallory@evil.example' }
+          }
+        })
+      }
+    )
+    // Processed, not rejected: failing closed means closed for credentials.
+    expect(res.status).toBe(200)
+
+    await waitFor(() =>
+      mock.calls.some(c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url))
+    )
+    const create = mock.calls.find(
+      c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url)
+    )
+    const metadata = ((create?.body as { metadata?: Record<string, unknown> })?.metadata
+      ?? {}) as Record<string, unknown>
+    expect('user_email' in metadata).toBe(false)
+    expect(metadata.user_id).toBe('users/U2')
   })
 
   test('CARD_CLICKED dispatches a workflow event with the invoked function and space', async () => {
