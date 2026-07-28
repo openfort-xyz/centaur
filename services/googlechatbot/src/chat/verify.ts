@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config'
+import type { SpaceDmConfirmation } from './space-verify'
 import { GOOGLE_REQUEST_ISSUERS, verifyGoogleSignedJwt, type KeyResolver } from './token'
-import type { GoogleChatEnvelope } from './types'
+import type { ChatSpaceType, GoogleChatEnvelope } from './types'
 
 type ChatVerificationFailure = { ok: false; status: 400 | 401 | 403; reason: string }
 
@@ -115,6 +116,11 @@ export type IdentitySuppressionReason =
   | 'no_email'
   | 'allowlist_empty'
   | 'domain_not_allowlisted'
+  /** Google was asked about the space and did not answer "1:1 DM" — or the
+   * request body did not even claim one, so Google was never asked. */
+  | 'space_not_dm'
+  /** Google could not be asked at all (Chat API error, non-200, timeout). */
+  | 'space_unverified'
 
 export type IdentityEmission =
   | { emit: true; userEmail: string }
@@ -162,4 +168,65 @@ export function resolveIdentityEmission(opts: {
   }
 
   return { emit: true, userEmail: email }
+}
+
+/** An emission that additionally carries the space as GOOGLE described it. The
+ * space values are Google's, never the envelope's — the envelope's exist only
+ * as a pre-filter. */
+export type ConfirmedIdentityEmission =
+  | { emit: true; userEmail: string; spaceType: ChatSpaceType; singleUserBotDm: boolean }
+  | { emit: false; reason: IdentitySuppressionReason }
+
+/**
+ * resolveIdentityEmission plus the one thing the request body cannot be trusted
+ * for: that the space really is a 1:1 DM.
+ *
+ * Google's signed request token verifies iss/aud/exp/signature but binds
+ * NOTHING in the body, so a valid token can carry an envelope that names a
+ * shared room while claiming `spaceType: DIRECT_MESSAGE` and a colleague's
+ * address. Labelling that room's principal with that person would hand their
+ * live OAuth credentials to everyone in it. So the DM-ness is re-asked of
+ * Google, and only Google's answer counts.
+ *
+ * Order is deliberate and cost-ordered:
+ *  1. the existing local checks (signature, sender domain) — free, and their
+ *     reasons keep precedence so an unsigned request still reports `unverified`;
+ *  2. the envelope's own `spaceType` as a pre-filter — a body that does not even
+ *     claim a DM is suppressed without spending a Chat API call. Necessary,
+ *     never sufficient;
+ *  3. Google's answer, which is the only one that can grant emission.
+ *
+ * Fails closed for credentials, open for chat: a Chat API failure suppresses
+ * identity and is reported, but never throws at the caller, whose turn proceeds.
+ */
+export async function resolveConfirmedIdentityEmission(opts: {
+  config: AppConfig
+  verified: boolean
+  userEmail: string | undefined
+  /** spaceType AS CLAIMED BY THE REQUEST BODY. Attacker-controllable; used only
+   * to skip the API call for events that are obviously not DMs. */
+  claimedSpaceType: ChatSpaceType
+  confirmSpace: () => Promise<SpaceDmConfirmation>
+}): Promise<ConfirmedIdentityEmission> {
+  const local = resolveIdentityEmission(opts)
+  if (!local.emit) return local
+
+  if (opts.claimedSpaceType !== 'DIRECT_MESSAGE') return { emit: false, reason: 'space_not_dm' }
+
+  let confirmation: SpaceDmConfirmation
+  try {
+    confirmation = await opts.confirmSpace()
+  } catch {
+    // The verifier already fails closed on its own; this is the belt-and-braces
+    // case where it (or a future one) throws anyway.
+    return { emit: false, reason: 'space_unverified' }
+  }
+  if (!confirmation.confirmed) return { emit: false, reason: confirmation.reason }
+
+  return {
+    emit: true,
+    userEmail: local.userEmail,
+    spaceType: confirmation.spaceType,
+    singleUserBotDm: confirmation.singleUserBotDm
+  }
 }

@@ -23,6 +23,24 @@ export type NormalizedPart = NormalizedTextPart | NormalizedBinaryPart
 // See: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space.FIELDS.type
 export type ChatSpaceType = 'SPACE' | 'DIRECT_MESSAGE' | 'GROUP_CHAT'
 
+/**
+ * A Space as GOOGLE describes it (spaces.get response), not as the request body
+ * claims it. Every field is `unknown` because this is the input to a credential
+ * decision: the classifier must be able to reject a `singleUserBotDm` or a
+ * `joinedDirectHumanUserCount` that arrives as null, a boolean or a string,
+ * which a typed `number`/`boolean` here would quietly launder into a pass.
+ * https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space
+ */
+export type ChatSpaceResource = {
+  name?: string
+  /** Modern discriminator (SPACE | GROUP_CHAT | DIRECT_MESSAGE). Deliberately
+   * NOT the deprecated `type` field, which cannot express GROUP_CHAT. */
+  spaceType?: unknown
+  singleUserBotDm?: unknown
+  membershipCount?: { joinedDirectHumanUserCount?: unknown } | null
+  displayName?: string
+}
+
 export type NormalizedChatEvent = {
   thread_key: string
   message_id: string
@@ -34,10 +52,11 @@ export type NormalizedChatEvent = {
    * humans). The Console matches it against the signed-in user's email to
    * grant thread visibility (Chat analogue of Slack's slack_user_id, #875). */
   user_email?: string
-  /** True when the space is the bot's 1:1 DM with a single human (Google's
-   * `space.singleUserBotDm`). Carried on the event rather than re-read off the
-   * envelope at each use site, so the session metadata can record the shape of
-   * the room an identity claim came from. */
+  /** The envelope's `space.singleUserBotDm` claim: "this is the bot's 1:1 DM
+   * with a single human". UNVERIFIED — a signed Chat request binds nothing in
+   * its body, so this is what the sender said, not what Google says. The
+   * session metadata deliberately does NOT source `single_user_bot_dm` from
+   * here; it uses the spaces.get confirmation (see chat/space-verify.ts). */
   single_user_bot_dm: boolean
   is_mention: boolean
   parts: NormalizedPart[]

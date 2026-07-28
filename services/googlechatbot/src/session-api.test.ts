@@ -14,7 +14,8 @@ import {
 import { parseChatBody } from './index'
 import { loadConfig } from './config'
 import { renderMetrics, resetMetrics } from './metrics'
-import type { NormalizedChatEvent } from './chat/types'
+import { SpaceDmVerifier, type SpaceDmConfirmation } from './chat/space-verify'
+import type { ChatSpaceResource, NormalizedChatEvent } from './chat/types'
 
 const baseEvent: NormalizedChatEvent = {
   thread_key: 'chat:spaces:AAAA:spaces:AAAA:messages:M2',
@@ -261,14 +262,40 @@ describe('createSession identity metadata', () => {
     return (captured?.metadata ?? {}) as Record<string, unknown>
   }
 
-  const claim = (overrides: Partial<RequesterIdentityClaim> = {}): SessionRequester => ({
+  /** What Google returns for a real 1:1 DM (shape confirmed against three prod
+   * DMs: DIRECT_MESSAGE, singleUserBotDm, exactly one joined human). */
+  const CONFIRMED_DM: ChatSpaceResource = {
+    name: 'spaces/AAAA',
+    spaceType: 'DIRECT_MESSAGE',
+    singleUserBotDm: true,
+    membershipCount: { joinedDirectHumanUserCount: 1 }
+  }
+
+  /** A stubbed Chat API that records every space it was asked about, so a test
+   * can assert an API call was — or crucially was not — spent. */
+  type SpaceStub = { lookups: string[]; confirmSpace: () => Promise<SpaceDmConfirmation> }
+
+  const googleReturns = (answer: ChatSpaceResource | Error): SpaceStub => {
+    const lookups: string[] = []
+    const verifier = new SpaceDmVerifier(async spaceName => {
+      lookups.push(spaceName)
+      if (answer instanceof Error) throw answer
+      return answer
+    })
+    return { lookups, confirmSpace: () => verifier.confirm('spaces/AAAA') }
+  }
+
+  const claim = (
+    overrides: Partial<RequesterIdentityClaim> = {},
+    space: SpaceStub = googleReturns(CONFIRMED_DM)
+  ): SessionRequester => ({
     userId: 'users/123',
     userName: 'Ada Lovelace',
     identity: {
       verified: true,
       userEmail: 'Ada@Openfort.xyz',
       spaceType: 'DIRECT_MESSAGE',
-      singleUserBotDm: true,
+      confirmSpace: space.confirmSpace,
       ...overrides
     }
   })
@@ -300,23 +327,109 @@ describe('createSession identity metadata', () => {
     )
   })
 
-  // The bot forwards the space shape verbatim; filtering shared rooms out is the
-  // consumer's call, and doing it here too would hide the room from the audit.
-  test.each(['DIRECT_MESSAGE', 'GROUP_CHAT', 'SPACE'] as const)(
-    'forwards space_type %s verbatim',
+  // ==========================================================================
+  // THE THREAT THIS GATE EXISTS FOR.
+  //
+  // Google Chat's signed request token binds iss/aud/exp/signature but NOTHING
+  // in the body (see chat/token.ts). So for the lifetime of one token, anyone
+  // holding it can POST an envelope that names a SHARED ROOM's space id while
+  // claiming `spaceType: DIRECT_MESSAGE` and a colleague's email address.
+  //
+  // If the body's claim were believed, that room's principal would be labelled
+  // with the colleague's identity and centaur would auto-grant their live
+  // Gmail/GitHub OAuth credentials to every other member of the room. Two rooms
+  // in production have 6 and 3+ human members.
+  //
+  // The body's claim is therefore never sufficient: only Google's own answer
+  // about the space can emit identity.
+  // ==========================================================================
+  test.each(['GROUP_CHAT', 'SPACE'] as const)(
+    'suppresses identity when the body claims DIRECT_MESSAGE but Google says %s',
     async spaceType => {
       const metadata = await metadataFor(
         ALLOWLISTED,
-        claim({ spaceType, singleUserBotDm: spaceType === 'DIRECT_MESSAGE' })
+        // The body claims a DM (spaceType: 'DIRECT_MESSAGE' in claim()) and the
+        // room even has a single joined human — Google's spaceType still rules.
+        claim({}, googleReturns({ spaceType, membershipCount: { joinedDirectHumanUserCount: 1 } }))
       )
-      expect(metadata.space_type).toBe(spaceType)
-      expect(metadata.single_user_bot_dm).toBe(spaceType === 'DIRECT_MESSAGE')
+      expectSuppressed(metadata, 'space_not_dm')
     }
   )
 
+  // A DIRECT_MESSAGE with a membership count that is not exactly one human is
+  // not something to grant credentials from either: confirmation is conjunctive.
+  test.each([['no', 0], ['two', 2], ['six', 6]] as const)(
+    'suppresses identity when Google reports %s joined humans in the DM',
+    async (_label, joinedDirectHumanUserCount) => {
+      const metadata = await metadataFor(
+        ALLOWLISTED,
+        claim(
+          {},
+          googleReturns({ spaceType: 'DIRECT_MESSAGE', membershipCount: { joinedDirectHumanUserCount } })
+        )
+      )
+      expectSuppressed(metadata, 'space_not_dm')
+    }
+  )
+
+  // `Number(true) === 1`, so a coercing read of the count would manufacture a
+  // pass out of a field that never stated a number of humans.
+  test.each([
+    ['absent', {} as ChatSpaceResource['membershipCount']],
+    ['null', null],
+    ['a boolean', { joinedDirectHumanUserCount: true }],
+    ['a numeric string', { joinedDirectHumanUserCount: '1' }]
+  ])('suppresses identity when the joined-human count is %s', async (_label, membershipCount) => {
+    const metadata = await metadataFor(
+      ALLOWLISTED,
+      claim({}, googleReturns({ spaceType: 'DIRECT_MESSAGE', membershipCount }))
+    )
+    expectSuppressed(metadata, 'space_not_dm')
+  })
+
+  // A body that does not even claim a DM cannot be one, so it is suppressed
+  // without spending a Chat API call on the turn's hot path.
+  test('suppresses a non-DM body without asking Google at all', async () => {
+    const space = googleReturns(CONFIRMED_DM)
+    const metadata = await metadataFor(ALLOWLISTED, claim({ spaceType: 'GROUP_CHAT' }, space))
+    expectSuppressed(metadata, 'space_not_dm')
+    expect(space.lookups).toEqual([])
+  })
+
+  // Fail closed for credentials, open for chat: the caller still runs the turn.
+  test('suppresses identity when the Chat API cannot answer', async () => {
+    const metadata = await metadataFor(
+      ALLOWLISTED,
+      claim({}, googleReturns(new Error('Chat API GET spaces/AAAA failed: 503 unavailable')))
+    )
+    expectSuppressed(metadata, 'space_unverified')
+  })
+
+  // Downstream keeps its own defence-in-depth guards; they should be checking a
+  // fact from Google, not an echo of the attacker-supplied envelope.
+  test("emits Google's space values rather than the envelope's claims", async () => {
+    const metadata = await metadataFor(
+      ALLOWLISTED,
+      claim(
+        {},
+        googleReturns({
+          spaceType: 'DIRECT_MESSAGE',
+          singleUserBotDm: false,
+          membershipCount: { joinedDirectHumanUserCount: 1 }
+        })
+      )
+    )
+    expect(metadata.space_type).toBe('DIRECT_MESSAGE')
+    expect(metadata.single_user_bot_dm).toBe(false)
+  })
+
   test('suppresses identity when the request was not signature-verified', async () => {
-    const metadata = await metadataFor(ALLOWLISTED, claim({ verified: false }))
+    const space = googleReturns(CONFIRMED_DM)
+    const metadata = await metadataFor(ALLOWLISTED, claim({ verified: false }, space))
     expectSuppressed(metadata, 'unverified')
+    // The local checks run first, so an unsigned request — every request today,
+    // with GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS off — costs no Chat API call.
+    expect(space.lookups).toEqual([])
   })
 
   test('suppresses identity when the sender domain is not allowlisted', async () => {

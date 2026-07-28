@@ -1,9 +1,15 @@
 import { test, expect, describe, beforeAll } from 'bun:test'
-import { resolveIdentityEmission, verifyChatRequest, verifyChatRequestToken } from './verify'
+import {
+  resolveConfirmedIdentityEmission,
+  resolveIdentityEmission,
+  verifyChatRequest,
+  verifyChatRequestToken
+} from './verify'
 import { GOOGLE_CHAT_ISSUER } from './token'
 import { generateRsaKeyPair, signJwt, staticKeyResolver } from './test-jwt'
 import { loadConfig, type AppConfig } from '../config'
-import type { GoogleChatEnvelope } from './types'
+import type { SpaceDmConfirmation } from './space-verify'
+import type { ChatSpaceType, GoogleChatEnvelope } from './types'
 
 function configWith(overrides: Record<string, string>): AppConfig {
   return loadConfig({ ...process.env, ...overrides })
@@ -229,5 +235,99 @@ describe('resolveIdentityEmission', () => {
   test('matches the domain case-insensitively on both sides', () => {
     expect(verifiedClaim('ada@OPENFORT.XYZ', { GOOGLECHATBOT_ALLOWED_DOMAIN: 'Openfort.XYZ' }).emit)
       .toBe(true)
+  })
+})
+
+describe('resolveConfirmedIdentityEmission', () => {
+  const ALLOWLISTED = { GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }
+
+  const resolve = async (
+    opts: {
+      claimedSpaceType?: ChatSpaceType
+      confirmSpace?: () => Promise<SpaceDmConfirmation>
+      env?: Record<string, string>
+      userEmail?: string
+      verified?: boolean
+    } = {}
+  ) =>
+    resolveConfirmedIdentityEmission({
+      config: configWith({ ...ALLOWLISTED, ...opts.env }),
+      verified: opts.verified ?? true,
+      userEmail: opts.userEmail ?? 'ada@openfort.xyz',
+      claimedSpaceType: opts.claimedSpaceType ?? 'DIRECT_MESSAGE',
+      confirmSpace:
+        opts.confirmSpace
+        ?? (async () => ({ confirmed: true, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true }))
+    })
+
+  test('emits the identity and Google’s space values for a confirmed DM', async () => {
+    expect(await resolve()).toEqual({
+      emit: true,
+      userEmail: 'ada@openfort.xyz',
+      spaceType: 'DIRECT_MESSAGE',
+      singleUserBotDm: true
+    })
+  })
+
+  // The whole point of the gate: the request body's spaceType claim is not
+  // signature-bound, so Google's contradicting answer wins outright.
+  test('suppresses when Google contradicts the body’s DIRECT_MESSAGE claim', async () => {
+    expect(
+      await resolve({ confirmSpace: async () => ({ confirmed: false, reason: 'space_not_dm' }) })
+    ).toEqual({ emit: false, reason: 'space_not_dm' })
+  })
+
+  test('suppresses when Google could not be asked', async () => {
+    expect(
+      await resolve({
+        confirmSpace: async () => ({ confirmed: false, reason: 'space_unverified' })
+      })
+    ).toEqual({ emit: false, reason: 'space_unverified' })
+  })
+
+  // Fail closed, and never let a Chat API failure escape into the turn.
+  test('suppresses rather than throwing when the confirmation itself throws', async () => {
+    expect(
+      await resolve({
+        confirmSpace: async () => {
+          throw new Error('Chat API GET spaces/AAAA failed: 500 internal')
+        }
+      })
+    ).toEqual({ emit: false, reason: 'space_unverified' })
+  })
+
+  test.each(['GROUP_CHAT', 'SPACE'] as const)(
+    'short-circuits a %s body without asking Google',
+    async claimedSpaceType => {
+      let asked = false
+      const out = await resolve({
+        claimedSpaceType,
+        confirmSpace: async () => {
+          asked = true
+          return { confirmed: true, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true }
+        }
+      })
+      expect(out).toEqual({ emit: false, reason: 'space_not_dm' })
+      expect(asked).toBe(false)
+    }
+  )
+
+  // The pre-existing local reasons keep precedence, and cost no API call.
+  test.each([
+    ['unverified', { verified: false }],
+    ['no_email', { userEmail: '' }],
+    ['domain_not_allowlisted', { userEmail: 'mallory@evil.example' }],
+    ['allowlist_empty', { env: { GOOGLECHATBOT_ALLOWED_DOMAIN: '' } }]
+  ] as const)('still reports %s before any space lookup', async (reason, opts) => {
+    let asked = false
+    const out = await resolve({
+      ...opts,
+      confirmSpace: async () => {
+        asked = true
+        return { confirmed: true, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true }
+      }
+    })
+    expect(out).toEqual({ emit: false, reason })
+    expect(asked).toBe(false)
   })
 })

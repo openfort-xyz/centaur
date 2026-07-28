@@ -4,7 +4,8 @@ import { centaurApiKey } from './config'
 import { logWarn } from './logging'
 import { incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
-import { resolveIdentityEmission, type IdentityEmission } from './chat/verify'
+import type { SpaceDmConfirmation } from './chat/space-verify'
+import { resolveConfirmedIdentityEmission, type ConfirmedIdentityEmission } from './chat/verify'
 
 // ---------------------------------------------------------------------------
 // api-rs session contract
@@ -237,8 +238,13 @@ export type RequesterIdentityClaim = {
   /** Sender email the identity would be built from (message.sender.email, or
    * the envelope user's as a fallback). */
   userEmail?: string
+  /** The space type THE BODY CLAIMS. A signed Chat request does not bind its
+   * body, so this is only a pre-filter that saves an API call; what actually
+   * reaches the metadata is `confirmSpace`'s answer. */
   spaceType: ChatSpaceType
-  singleUserBotDm: boolean
+  /** Asks Google what the space is. Required — a caller must not be able to
+   * assert a DM without one. */
+  confirmSpace: () => Promise<SpaceDmConfirmation>
 }
 
 export type SessionRequester = {
@@ -259,7 +265,13 @@ export async function createSession(
   const name = conversationName?.trim()
   const claim = requester?.identity
   const identity = claim
-    ? resolveIdentityEmission({ config, verified: claim.verified, userEmail: claim.userEmail })
+    ? await resolveConfirmedIdentityEmission({
+        config,
+        verified: claim.verified,
+        userEmail: claim.userEmail,
+        claimedSpaceType: claim.spaceType,
+        confirmSpace: claim.confirmSpace
+      })
     : undefined
   if (identity && !identity.emit) {
     // Never silent: centaur attaches a person's OAuth credentials off these
@@ -289,9 +301,9 @@ export async function createSession(
       // Identity keys. centaur labels the DM principal from these and
       // auto-grants that person's OAuth credentials to every session in the
       // room, so they ship ONLY for a signature-verified request from an
-      // allowlisted domain. An absent key means "no label" — there is
-      // deliberately no fallback value to fall back to.
-      ...identityMetadata(identity, claim),
+      // allowlisted domain in a space GOOGLE confirmed is a 1:1 DM. An absent
+      // key means "no label" — there is deliberately no fallback to fall to.
+      ...identityMetadata(identity),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }
@@ -315,16 +327,19 @@ export async function createSession(
   }
 }
 
-/** The identity half of the create-session metadata: all three keys or none. */
-function identityMetadata(
-  identity: IdentityEmission | undefined,
-  claim: RequesterIdentityClaim | undefined
-): JsonObject {
-  if (!identity?.emit || !claim) return {}
+/**
+ * The identity half of the create-session metadata: all three keys or none.
+ *
+ * `space_type` and `single_user_bot_dm` are Google's own values from the
+ * spaces.get confirmation, not the envelope's claims — downstream keeps its
+ * defence-in-depth guards, and they should be checking a fact, not an echo.
+ */
+function identityMetadata(identity: ConfirmedIdentityEmission | undefined): JsonObject {
+  if (!identity?.emit) return {}
   return {
     user_email: identity.userEmail,
-    space_type: claim.spaceType,
-    single_user_bot_dm: claim.singleUserBotDm
+    space_type: identity.spaceType,
+    single_user_bot_dm: identity.singleUserBotDm
   }
 }
 

@@ -4,6 +4,7 @@ import { ChatEdgeClient } from './chat/client'
 import { EventDeduper, chatDedupKey } from './chat/dedup'
 import { collectThreadHistory, isThreadReply, normalizeChatEnvelope } from './chat/normalize'
 import { verifyChatRequest, verifyChatRequestToken } from './chat/verify'
+import { SpaceDmVerifier, type SpaceDmConfirmation } from './chat/space-verify'
 import { googleRequestKeyResolver } from './chat/token'
 import type { GoogleChatCardClickPayload, GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
 import { logError, logWarn } from './logging'
@@ -48,6 +49,23 @@ type WaitUntilContext = { waitUntil(promise: Promise<unknown>): void }
 /** Bounded re-opens of a dropped SSE stream before we give up and deliver. */
 const MAX_RESUME_ATTEMPTS = 3
 
+/**
+ * Everything the identity gate needs about a request: whether GOOGLE signed it,
+ * and how to ask GOOGLE what the space is. Neither can be read off the body —
+ * the signed request token binds no body — and both must hold before a session
+ * may claim a person's identity (and with it their OAuth credentials).
+ */
+type IdentityContext = {
+  verified: boolean
+  confirmSpace: (spaceName: string) => Promise<SpaceDmConfirmation>
+}
+
+/** Ceiling on the spaces.get identity lookup. Far below
+ * GOOGLECHATBOT_CHAT_API_TIMEOUT_MS (30s) because this call gates a live turn:
+ * a hung Chat backend must cost the turn ~3s and suppress identity, not stall
+ * it. The result is cached, so the cost is paid once per space. */
+const SPACE_LOOKUP_TIMEOUT_MS = 3_000
+
 // Outbound upload ceiling — matches slackbotv2's inline file cap; the Chat API
 // itself accepts up to 200MB per attachment.
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -66,6 +84,11 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
   const deduper = new EventDeduper(config.CHAT_EVENT_DEDUP_TTL_MS)
   // Resolver for Google Chat's request-signing public keys (cached JWK set).
   const resolveChatKey = googleRequestKeyResolver()
+  // Asks Google (once per space, then cached) whether a space really is a 1:1
+  // DM. The request body cannot answer that: Chat's signed token binds no body.
+  const spaceVerifier = new SpaceDmVerifier(spaceName =>
+    client.getSpace(spaceName, { timeoutMs: SPACE_LOOKUP_TIMEOUT_MS })
+  )
 
   const app = new Hono<{ Variables: Variables }>()
 
@@ -120,7 +143,13 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     incr('googlechatbot_events_total', { outcome: 'accepted' })
     // `tokenCheck.verified` — NOT `tokenCheck.ok`: with signed requests off the
     // check is skipped, and a skipped check must not source identity metadata.
-    runInBackground(c, processChatEvent(config, client, envelope, tokenCheck.verified))
+    runInBackground(
+      c,
+      processChatEvent(config, client, envelope, {
+        verified: tokenCheck.verified,
+        confirmSpace: spaceName => spaceVerifier.confirm(spaceName)
+      })
+    )
     return c.json({})
   }
 
@@ -299,9 +328,7 @@ async function processChatEvent(
   config: AppConfig,
   client: ChatEdgeClient,
   envelope: GoogleChatEnvelope,
-  /** Whether this event's request carried a valid Google signature. Gates the
-   * identity metadata on the session it creates — nothing else. */
-  verified: boolean
+  identity: IdentityContext
 ): Promise<void> {
   // CARD_CLICKED is handled independently of normalizeChatEnvelope: that
   // normalizer deliberately returns null for it (no command-aware workflow
@@ -372,7 +399,7 @@ async function processChatEvent(
   const [ackMessageName, historyMessages] = await Promise.all([ackPromise, historyPromise])
   if (historyMessages.length) normalized.history_messages = historyMessages
 
-  await driveSession(config, client, normalized, ackMessageName, verified)
+  await driveSession(config, client, normalized, ackMessageName, identity)
 }
 
 export function googleChatCardClickPayload(envelope: GoogleChatEnvelope): GoogleChatCardClickPayload | null {
@@ -423,7 +450,7 @@ async function driveSession(
   client: ChatEdgeClient,
   event: NormalizedChatEvent,
   ackMessageName: string,
-  verified: boolean
+  identity: IdentityContext
 ): Promise<void> {
   const threadKey = event.thread_key
   const { execute, history } = turnMessagesFromEvent(event)
@@ -452,10 +479,10 @@ async function driveSession(
         userId: event.user_id,
         userName: event.user_name,
         identity: {
-          verified,
+          verified: identity.verified,
           ...(event.user_email ? { userEmail: event.user_email } : {}),
           spaceType: event.space_type,
-          singleUserBotDm: event.single_user_bot_dm
+          confirmSpace: () => identity.confirmSpace(event.space_name)
         }
       }
     )
