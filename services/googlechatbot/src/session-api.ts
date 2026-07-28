@@ -539,6 +539,20 @@ function sessionMessageParts(message: GoogleChatTurnMessage): JsonValue[] {
   return parts.length > 0 ? parts : [{ type: 'text', text: '' }]
 }
 
+/**
+ * Per-message metadata for the /messages and /execute payloads.
+ *
+ * WARNING: the `user_email` below is of UNVERIFIED provenance. It is copied
+ * straight off the inbound envelope and is deliberately NOT gated by
+ * resolveIdentityEmission — an unsigned request can put any address here. It
+ * exists for Console display/attribution only and must never be used to source
+ * principal labels, DM-principal identity, or credential grants.
+ *
+ * Today api-rs registers principals only from the session metadata (see
+ * createSession), which IS gated, so there is no bypass. Anyone wiring api-rs
+ * to read identity out of message metadata must route through that verified
+ * session path instead of reading this.
+ */
 function sessionMetadata(
   threadKey: string,
   message: GoogleChatTurnMessage,
