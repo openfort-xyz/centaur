@@ -23,6 +23,23 @@ export type NormalizedPart = NormalizedTextPart | NormalizedBinaryPart
 // See: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space.FIELDS.type
 export type ChatSpaceType = 'SPACE' | 'DIRECT_MESSAGE' | 'GROUP_CHAT'
 
+/**
+ * A Space as GOOGLE describes it (spaces.get response), not as the request body
+ * claims it. The classified fields are `unknown` because this is the input to a
+ * credential decision: the classifier must be able to reject a `spaceType` or a
+ * `joinedDirectHumanUserCount` that arrives as null, a boolean or a string,
+ * which a typed `string`/`number` here would quietly launder into a pass.
+ * https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space
+ */
+export type ChatSpaceResource = {
+  name?: string
+  /** Modern discriminator (SPACE | GROUP_CHAT | DIRECT_MESSAGE). Deliberately
+   * NOT the deprecated `type` field, which cannot express GROUP_CHAT. */
+  spaceType?: unknown
+  membershipCount?: { joinedDirectHumanUserCount?: unknown } | null
+  displayName?: string
+}
+
 export type NormalizedChatEvent = {
   thread_key: string
   message_id: string

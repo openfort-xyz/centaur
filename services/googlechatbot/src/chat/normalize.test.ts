@@ -40,6 +40,40 @@ describe('normalizeChatEnvelope', () => {
     expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
   })
 
+  // The envelope's singleUserBotDm no longer reaches the session metadata (that
+  // now carries Google's spaces.get answer instead), but it still decides one
+  // thing: in the bot's 1:1 DM every message is addressed to it, so a plain
+  // message with no @ still starts a run.
+  test('treats any message in a 1:1 bot DM as a mention', async () => {
+    const dm = await normalizeChatEnvelope(
+      messageEnvelope({
+        space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'deploy the thing',
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(dm!.is_mention).toBe(true)
+    expect(dm!.space_type).toBe('DIRECT_MESSAGE')
+
+    // Same message in a shared room, where an @ IS required.
+    const room = await normalizeChatEnvelope(
+      messageEnvelope({
+        space: { name: 'spaces/AAAA', type: 'SPACE' },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'deploy the thing',
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(room!.is_mention).toBe(false)
+  })
+
   test('captures the sender email for Console thread attribution', async () => {
     const normalized = await normalizeChatEnvelope(
       messageEnvelope({

@@ -1,5 +1,10 @@
 import type { AppConfig } from '../config'
-import type { ChatListMessage, GoogleChatMessage, UploadAttachmentResponse } from './types'
+import type {
+  ChatListMessage,
+  ChatSpaceResource,
+  GoogleChatMessage,
+  UploadAttachmentResponse
+} from './types'
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1'
 const CHAT_UPLOAD_BASE = 'https://chat.googleapis.com/upload/v1'
@@ -171,11 +176,10 @@ export class ChatEdgeClient {
     method: string,
     path: string,
     body?: unknown,
-    baseUrl = CHAT_API_BASE,
-    tokenOverride?: string | null
+    opts: { baseUrl?: string; token?: string | null; timeoutMs?: number } = {}
   ): Promise<T> {
-    const url = `${baseUrl}/${path.replace(/^\//, '')}`
-    const token = tokenOverride ?? (await this.getAccessToken())
+    const url = `${opts.baseUrl ?? CHAT_API_BASE}/${path.replace(/^\//, '')}`
+    const token = opts.token ?? (await this.getAccessToken())
     const response = await fetch(url, {
       method,
       headers: {
@@ -183,7 +187,7 @@ export class ChatEdgeClient {
         ...(token ? { Authorization: `Bearer ${token}` } : {})
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(this.apiTimeoutMs)
+      signal: AbortSignal.timeout(opts.timeoutMs ?? this.apiTimeoutMs)
     })
 
     if (!response.ok) {
@@ -299,7 +303,7 @@ export class ChatEdgeClient {
       if (!this.isAppAuthDmError(error) || !opts.impersonateSubject) throw error
       const userToken = await this.getUserReadToken(opts.impersonateSubject)
       if (!userToken) throw error
-      return await this.request('GET', path, undefined, CHAT_API_BASE, userToken)
+      return await this.request('GET', path, undefined, { token: userToken })
     }
   }
 
@@ -342,14 +346,26 @@ export class ChatEdgeClient {
 
   /**
    * Get a space by name.
-   * Path: GET /v1/{space.name}
+   * Path: GET /v1/spaces/{space}
+   *
+   * This is the only statement about a space that comes from GOOGLE rather than
+   * from the (attacker-controllable, signature-unbound) request body, so it is
+   * what the identity gate classifies a DM from. App auth is accepted here
+   * including on DM spaces — the 400 "DMs are not supported for methods
+   * requiring app authentication" refusal is specific to spaces.messages.list,
+   * not spaces.get.
+   *
+   * Fields stay `unknown` on purpose: the caller must reject a
+   * joinedDirectHumanUserCount that is absent, null, boolean or a string rather
+   * than coerce it into a passing "1".
+   *
+   * `timeoutMs` overrides GOOGLECHATBOT_CHAT_API_TIMEOUT_MS because this call
+   * can sit in front of a turn; a hung Chat backend must cost the turn seconds,
+   * not the deployment-wide 30s ceiling.
    */
-  async getSpace(spaceName: string): Promise<{
-    name?: string
-    type?: string
-    displayName?: string
-  }> {
-    return this.request('GET', spaceName)
+  async getSpace(spaceName: string, opts: { timeoutMs?: number } = {}): Promise<ChatSpaceResource> {
+    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    return this.request('GET', `spaces/${encodeURIComponent(id)}`, undefined, opts)
   }
 
   /**

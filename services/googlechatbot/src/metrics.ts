@@ -16,6 +16,10 @@ const COUNTERS: CounterSpec[] = [
   { name: 'googlechatbot_render_resumes_total', help: 'Resumed SSE render passes after a stream drop.' },
   { name: 'googlechatbot_stop_commands_total', help: 'Stop-command mentions by outcome.' },
   {
+    name: 'googlechatbot_session_identity_total',
+    help: 'Session-metadata identity claims by outcome and suppression reason.'
+  },
+  {
     name: 'googlechatbot_session_api_operations_total',
     help: 'api-rs session API calls by operation and outcome.'
   },

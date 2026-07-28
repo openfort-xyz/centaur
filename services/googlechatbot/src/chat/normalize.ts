@@ -101,11 +101,12 @@ export async function normalizeChatEnvelope(
 
   // Determine if the bot was @mentioned.
   // In Google Chat, mentions use <users/{botUserId}> syntax in message text.
+  // In the bot's 1:1 DM every message is addressed to it, so no @ is needed.
   const isMention =
     isSlashCommand ||
     Boolean(botUserName && (message.text ?? '').includes(botUserName)) ||
     Boolean(botUserName && (message.text ?? '').includes('@')) ||
-    envelope.space?.singleUserBotDm === true
+    envelope.space.singleUserBotDm === true
 
   const parts: NormalizedPart[] = []
   const textPart = [formattedText, text].filter(Boolean).join('\n').trim()

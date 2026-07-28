@@ -4,6 +4,8 @@ import { centaurApiKey } from './config'
 import { logWarn } from './logging'
 import { incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
+import type { SpaceDmConfirmation } from './chat/space-verify'
+import { resolveSessionIdentity, type ResolvedSessionIdentity } from './chat/verify'
 
 // ---------------------------------------------------------------------------
 // api-rs session contract
@@ -226,20 +228,31 @@ export function turnMessagesFromEvent(event: NormalizedChatEvent): {
   return { execute, history }
 }
 
+/** The identity an inbound event claims, paired with whether that event was
+ * actually authenticated. `verified` is required so a caller cannot supply a
+ * claim without stating its provenance. */
+export type RequesterIdentityClaim = {
+  /** True ONLY when the request carried a valid Google signature — never
+   * derived from a verification result's `ok`. */
+  verified: boolean
+  /** Sender email the identity would be built from (message.sender.email, or
+   * the envelope user's as a fallback). */
+  userEmail?: string
+  /** The space type THE BODY CLAIMS. A signed Chat request does not bind its
+   * body, so this is only a pre-filter that saves an API call; what actually
+   * reaches the metadata is `confirmSpace`'s answer. */
+  spaceType: ChatSpaceType
+  /** Asks Google what the space is. Required — a caller must not be able to
+   * assert a DM without one. */
+  confirmSpace: () => Promise<SpaceDmConfirmation>
+}
+
 export type SessionRequester = {
   userId?: string
   userName?: string
-  userEmail?: string
-  /** Space type for the conversation. api-rs binds the requester's identity to
-   *  the session principal only for a 1:1 DIRECT_MESSAGE — a space principal is
-   *  shared by every member, so a GROUP_CHAT or SPACE must not adopt one
-   *  person's identity. */
-  spaceType?: ChatSpaceType
-  /** Whether this event arrived on a request we authenticated against Google's
-   *  signed JWT. The event body (including the sender's email) is
-   *  attacker-controllable without it, so api-rs refuses to derive an identity
-   *  from an unverified event. */
-  requestVerified?: boolean
+  /** Omit entirely for calls that are not starting a turn on someone's behalf
+   * (e.g. the idempotent re-check in the fold path). */
+  identity?: RequesterIdentityClaim
 }
 
 export async function createSession(
@@ -250,6 +263,30 @@ export async function createSession(
   requester?: SessionRequester
 ): Promise<CreateSessionResult> {
   const name = conversationName?.trim()
+  const claim = requester?.identity
+  const identity = claim
+    ? await resolveSessionIdentity({
+        config,
+        verified: claim.verified,
+        userEmail: claim.userEmail,
+        claimedSpaceType: claim.spaceType,
+        confirmSpace: claim.confirmSpace
+      })
+    : undefined
+  if (identity && !identity.email.emit) {
+    // Never silent: centaur attaches a person's OAuth credentials off this key,
+    // so its absence has to be explainable after the fact.
+    incr('googlechatbot_session_identity_total', {
+      outcome: 'suppressed',
+      reason: identity.email.reason
+    })
+    logWarn('googlechatbot_session_identity_suppressed', {
+      thread_key: threadKey,
+      reason: identity.email.reason
+    })
+  } else if (identity) {
+    incr('googlechatbot_session_identity_total', { outcome: 'emitted', reason: 'none' })
+  }
   const body: CreateSessionRequest = {
     harness_type: harnessType ?? 'codex',
     metadata: {
@@ -261,12 +298,10 @@ export async function createSession(
       // signed-in user's email to grant thread visibility (#875 analogue).
       ...(requester?.userId ? { user_id: requester.userId } : {}),
       ...(requester?.userName ? { user_name: requester.userName } : {}),
-      ...(requester?.userEmail ? { user_email: requester.userEmail } : {}),
-      // Gates api-rs's identity labelling of the session principal: the email
-      // above only names the requester when the space is 1:1 and the event was
-      // provably Google's (see SessionRequester).
-      ...(requester?.spaceType ? { googlechat_space_type: requester.spaceType } : {}),
-      ...(requester?.requestVerified ? { googlechat_request_verified: true } : {}),
+      // Identity keys api-rs gates its DM-principal labelling on. Only
+      // `user_email` is credential-bearing, and only it is withheld when the
+      // gate fails; the other two describe the request and always ship.
+      ...identityMetadata(identity),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }
@@ -287,6 +322,34 @@ export async function createSession(
     activeExecution: status === ACTIVE_SESSION_STATUS,
     ...(resolvedHarness ? { harnessType: resolvedHarness } : {}),
     ...(harnessAssignment ? { harnessAssignment } : {})
+  }
+}
+
+/**
+ * The identity half of the create-session metadata.
+ *
+ * Two layers gate the same decision. api-rs labels a session principal with the
+ * requester's identity — and auto-grants that person's OAuth credentials to
+ * every session in the room — only when `googlechat_space_type` is
+ * DIRECT_MESSAGE AND `googlechat_request_verified` is true AND there is a
+ * `user_email` to name. This side withholds the email unless the request was
+ * signature-verified, the sender's domain is allowlisted, and GOOGLE itself
+ * confirmed the space is a 1:1 DM. Either layer alone is sufficient to deny.
+ *
+ * The two gate inputs ship unconditionally so a room stays observable — neither
+ * names anybody, and api-rs cannot label without the email. The space type is
+ * Google's confirmed value where one was obtained and the envelope's claim
+ * otherwise, so it is a gate input, never a trust signal in itself.
+ *
+ * `single_user_bot_dm` is deliberately not emitted: the confirmation already
+ * requires exactly one joined human, so the key would restate the check.
+ */
+function identityMetadata(identity: ResolvedSessionIdentity | undefined): JsonObject {
+  if (!identity) return {}
+  return {
+    googlechat_space_type: identity.spaceType,
+    googlechat_request_verified: identity.verified,
+    ...(identity.email.emit ? { user_email: identity.email.userEmail } : {})
   }
 }
 
@@ -501,6 +564,20 @@ function sessionMessageParts(message: GoogleChatTurnMessage): JsonValue[] {
   return parts.length > 0 ? parts : [{ type: 'text', text: '' }]
 }
 
+/**
+ * Per-message metadata for the /messages and /execute payloads.
+ *
+ * WARNING: the `user_email` below is of UNVERIFIED provenance. It is copied
+ * straight off the inbound envelope and is deliberately NOT gated by
+ * resolveIdentityEmission — an unsigned request can put any address here. It
+ * exists for Console display/attribution only and must never be used to source
+ * principal labels, DM-principal identity, or credential grants.
+ *
+ * Today api-rs registers principals only from the session metadata (see
+ * createSession), which IS gated, so there is no bypass. Anyone wiring api-rs
+ * to read identity out of message metadata must route through that verified
+ * session path instead of reading this.
+ */
 function sessionMetadata(
   threadKey: string,
   message: GoogleChatTurnMessage,

@@ -1,9 +1,15 @@
 import { test, expect, describe, beforeAll } from 'bun:test'
-import { verifyChatRequest, verifyChatRequestToken } from './verify'
+import {
+  resolveIdentityEmission,
+  resolveSessionIdentity,
+  verifyChatRequest,
+  verifyChatRequestToken
+} from './verify'
 import { GOOGLE_CHAT_ISSUER } from './token'
 import { generateRsaKeyPair, signJwt, staticKeyResolver } from './test-jwt'
 import { loadConfig, type AppConfig } from '../config'
-import type { GoogleChatEnvelope } from './types'
+import type { SpaceDmConfirmation } from './space-verify'
+import type { ChatSpaceType, GoogleChatEnvelope } from './types'
 
 function configWith(overrides: Record<string, string>): AppConfig {
   return loadConfig({ ...process.env, ...overrides })
@@ -106,10 +112,12 @@ describe('verifyChatRequestToken', () => {
     return `Bearer ${token}`
   }
 
+  // The skip path is processable but NOT verified: nothing was authenticated,
+  // so it must never source identity metadata.
   test('is a no-op when signed requests are not required (legacy / rollback)', async () => {
     const config = configWith({ GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: 'false' })
     const out = await verifyChatRequestToken({ config, authorization: undefined, resolveKey, nowSeconds: NOW })
-    expect(out.ok).toBe(true)
+    expect(out).toEqual({ ok: true, verified: false })
   })
 
   test('rejects a missing bearer token when required', async () => {
@@ -133,7 +141,7 @@ describe('verifyChatRequestToken', () => {
       GOOGLECHATBOT_PROJECT_NUMBER: AUD
     })
     const out = await verifyChatRequestToken({ config, authorization: await bearer(), resolveKey, nowSeconds: NOW })
-    expect(out.ok).toBe(true)
+    expect(out).toEqual({ ok: true, verified: true })
   })
 
   test('rejects a valid signature carrying the wrong audience', async () => {
@@ -166,6 +174,195 @@ describe('verifyChatRequestToken', () => {
       resolveKey,
       nowSeconds: NOW
     })
-    expect(out.ok).toBe(true)
+    expect(out).toEqual({ ok: true, verified: true })
+  })
+})
+
+describe('resolveIdentityEmission', () => {
+  const verifiedClaim = (email: string | undefined, env: Record<string, string> = {}) =>
+    resolveIdentityEmission({
+      config: configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz,other.example', ...env }),
+      verified: true,
+      userEmail: email
+    })
+
+  test('allows a verified sender on an allowlisted domain', () => {
+    expect(verifiedClaim('Ada@Openfort.xyz')).toEqual({ emit: true, userEmail: 'Ada@Openfort.xyz' })
+    expect(verifiedClaim('bob@other.example').emit).toBe(true)
+  })
+
+  // An unverified request's body is attacker-controllable: anyone able to POST
+  // the webhook could claim any colleague's email.
+  test('suppresses an unverified request even from an allowlisted domain', () => {
+    const out = resolveIdentityEmission({
+      config: configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }),
+      verified: false,
+      userEmail: 'ada@openfort.xyz'
+    })
+    expect(out).toEqual({ emit: false, reason: 'unverified' })
+  })
+
+  test('suppresses a domain outside the allowlist', () => {
+    expect(verifiedClaim('mallory@evil.example')).toEqual({
+      emit: false,
+      reason: 'domain_not_allowlisted'
+    })
+  })
+
+  // GOOGLECHATBOT_ALLOWED_DOMAIN defaults to '' — that is "no domain may claim
+  // an identity", not "every domain may".
+  test('suppresses everything while the allowlist is empty', () => {
+    expect(verifiedClaim('ada@openfort.xyz', { GOOGLECHATBOT_ALLOWED_DOMAIN: '' })).toEqual({
+      emit: false,
+      reason: 'allowlist_empty'
+    })
+  })
+
+  test('suppresses a missing or malformed sender email', () => {
+    expect(verifiedClaim(undefined).emit).toBe(false)
+    expect(verifiedClaim('')).toEqual({ emit: false, reason: 'no_email' })
+    expect(verifiedClaim('   ')).toEqual({ emit: false, reason: 'no_email' })
+    expect(verifiedClaim('ada')).toEqual({ emit: false, reason: 'no_email' })
+    expect(verifiedClaim('@openfort.xyz')).toEqual({ emit: false, reason: 'no_email' })
+    // Multiple '@' is not an address we grant credentials from, even though the
+    // 403 path's looser split() would read a domain out of it.
+    expect(verifiedClaim('ada@evil.example@openfort.xyz')).toEqual({
+      emit: false,
+      reason: 'no_email'
+    })
+  })
+
+  test('matches the domain case-insensitively on both sides', () => {
+    expect(verifiedClaim('ada@OPENFORT.XYZ', { GOOGLECHATBOT_ALLOWED_DOMAIN: 'Openfort.XYZ' }).emit)
+      .toBe(true)
+  })
+})
+
+describe('resolveSessionIdentity', () => {
+  const ALLOWLISTED = { GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }
+
+  const CONFIRMED: SpaceDmConfirmation = { confirmed: true, spaceType: 'DIRECT_MESSAGE' }
+
+  const resolve = async (
+    opts: {
+      claimedSpaceType?: ChatSpaceType
+      confirmSpace?: () => Promise<SpaceDmConfirmation>
+      env?: Record<string, string>
+      userEmail?: string
+      verified?: boolean
+    } = {}
+  ) =>
+    resolveSessionIdentity({
+      config: configWith({ ...ALLOWLISTED, ...opts.env }),
+      verified: opts.verified ?? true,
+      userEmail: opts.userEmail ?? 'ada@openfort.xyz',
+      claimedSpaceType: opts.claimedSpaceType ?? 'DIRECT_MESSAGE',
+      confirmSpace: opts.confirmSpace ?? (async () => CONFIRMED)
+    })
+
+  test('releases the email and Google’s space type for a confirmed DM', async () => {
+    expect(await resolve()).toEqual({
+      verified: true,
+      spaceType: 'DIRECT_MESSAGE',
+      email: { emit: true, userEmail: 'ada@openfort.xyz' }
+    })
+  })
+
+  // The whole point of the gate: the request body's spaceType claim is not
+  // signature-bound, so Google's contradicting answer wins outright — and it is
+  // Google's answer, not the disbelieved claim, that gets reported.
+  test('withholds the email when Google contradicts the body’s DM claim', async () => {
+    expect(
+      await resolve({
+        confirmSpace: async () => ({ confirmed: false, reason: 'space_not_dm', spaceType: 'SPACE' })
+      })
+    ).toEqual({
+      verified: true,
+      spaceType: 'SPACE',
+      email: { emit: false, reason: 'space_not_dm' }
+    })
+  })
+
+  // Google said "not a DM" but named no usable type, so there is nothing better
+  // than the body's claim to report. Harmless: api-rs cannot label without the
+  // email, which is withheld.
+  test('falls back to the body’s claim when Google names no usable space type', async () => {
+    expect(
+      await resolve({ confirmSpace: async () => ({ confirmed: false, reason: 'space_not_dm' }) })
+    ).toEqual({
+      verified: true,
+      spaceType: 'DIRECT_MESSAGE',
+      email: { emit: false, reason: 'space_not_dm' }
+    })
+  })
+
+  test('withholds the email when Google could not be asked', async () => {
+    expect(
+      await resolve({
+        confirmSpace: async () => ({ confirmed: false, reason: 'space_unverified' })
+      })
+    ).toMatchObject({ email: { emit: false, reason: 'space_unverified' } })
+  })
+
+  // Fail closed, and never let a Chat API failure escape into the turn.
+  test('withholds rather than throwing when the confirmation itself throws', async () => {
+    expect(
+      await resolve({
+        confirmSpace: async () => {
+          throw new Error('Chat API GET spaces/AAAA failed: 500 internal')
+        }
+      })
+    ).toMatchObject({ email: { emit: false, reason: 'space_unverified' } })
+  })
+
+  test.each(['GROUP_CHAT', 'SPACE'] as const)(
+    'short-circuits a %s body without asking Google',
+    async claimedSpaceType => {
+      let asked = false
+      const out = await resolve({
+        claimedSpaceType,
+        confirmSpace: async () => {
+          asked = true
+          return CONFIRMED
+        }
+      })
+      // No lookup was made, so the body's own claim is what gets reported — it
+      // is a gate input for api-rs, which cannot label without an email anyway.
+      expect(out).toEqual({
+        verified: true,
+        spaceType: claimedSpaceType,
+        email: { emit: false, reason: 'space_not_dm' }
+      })
+      expect(asked).toBe(false)
+    }
+  )
+
+  // The pre-existing local reasons keep precedence, and cost no API call.
+  test.each([
+    ['unverified', { verified: false }],
+    ['no_email', { userEmail: '' }],
+    ['domain_not_allowlisted', { userEmail: 'mallory@evil.example' }],
+    ['allowlist_empty', { env: { GOOGLECHATBOT_ALLOWED_DOMAIN: '' } }]
+  ] as const)('still reports %s before any space lookup', async (reason, opts) => {
+    let asked = false
+    const out = await resolve({
+      ...opts,
+      confirmSpace: async () => {
+        asked = true
+        return CONFIRMED
+      }
+    })
+    expect(out.email).toEqual({ emit: false, reason })
+    expect(asked).toBe(false)
+  })
+
+  // `verified` reports what actually happened rather than what was allowed —
+  // an unsigned request says so in the metadata instead of going unmentioned.
+  test('reports the real verification state even when the email is withheld', async () => {
+    expect(await resolve({ verified: false })).toEqual({
+      verified: false,
+      spaceType: 'DIRECT_MESSAGE',
+      email: { emit: false, reason: 'unverified' }
+    })
   })
 })
