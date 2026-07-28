@@ -36,8 +36,38 @@ describe('normalizeChatEnvelope', () => {
     expect(normalized!.user_email).toBeUndefined()
     expect(normalized!.is_mention).toBe(true)
     expect(normalized!.space_type).toBe('SPACE')
+    expect(normalized!.single_user_bot_dm).toBe(false)
     expect(normalized!.parts).toHaveLength(1)
     expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
+  })
+
+  // Carried on the event because the session metadata records the shape of the
+  // room an identity came from — a 1:1 DM is not a 3-person shared room.
+  test('carries singleUserBotDm through to the normalized event', async () => {
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true }
+      }),
+      BOT_USER
+    )
+    expect(normalized!.single_user_bot_dm).toBe(true)
+    expect(normalized!.space_type).toBe('DIRECT_MESSAGE')
+  })
+
+  test('populates single_user_bot_dm on the added-to-space event too', async () => {
+    const dm = await normalizeChatEnvelope({
+      type: 'ADDED_TO_SPACE',
+      eventTime: '2026-01-01T00:00:00Z',
+      space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true }
+    })
+    expect(dm!.single_user_bot_dm).toBe(true)
+
+    const room = await normalizeChatEnvelope({
+      type: 'ADDED_TO_SPACE',
+      eventTime: '2026-01-01T00:00:00Z',
+      space: { name: 'spaces/AAAA', type: 'SPACE' }
+    })
+    expect(room!.single_user_bot_dm).toBe(false)
   })
 
   test('captures the sender email for Console thread attribution', async () => {

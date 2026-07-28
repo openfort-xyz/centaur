@@ -34,6 +34,11 @@ export type NormalizedChatEvent = {
    * humans). The Console matches it against the signed-in user's email to
    * grant thread visibility (Chat analogue of Slack's slack_user_id, #875). */
   user_email?: string
+  /** True when the space is the bot's 1:1 DM with a single human (Google's
+   * `space.singleUserBotDm`). Carried on the event rather than re-read off the
+   * envelope at each use site, so the session metadata can record the shape of
+   * the room an identity claim came from. */
+  single_user_bot_dm: boolean
   is_mention: boolean
   parts: NormalizedPart[]
   history_messages?: Array<{
