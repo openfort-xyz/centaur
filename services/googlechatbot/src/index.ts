@@ -445,7 +445,13 @@ async function driveSession(
       {
         userId: event.user_id,
         userName: event.user_name,
-        ...(event.user_email ? { userEmail: event.user_email } : {})
+        ...(event.user_email ? { userEmail: event.user_email } : {}),
+        spaceType: event.space_type,
+        // Only an event we authenticated against Google's signed JWT may name
+        // the human behind the session principal. When the enforcement switch
+        // is off any caller can forge `user.email`, so we withhold the claim
+        // rather than let it reach credential reconciliation.
+        requestVerified: config.GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS
       }
     )
 

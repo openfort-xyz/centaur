@@ -26,9 +26,20 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crate::models::IdentityInput;
 use crate::util::{managed_labels, slugify};
 
-const KIND_LABEL: &str = "kind";
+pub(crate) const KIND_LABEL: &str = "kind";
 const SLACK_DM_KIND: &str = "slack_dm";
 const SLACK_CHANNEL_KIND: &str = "slack_channel";
+/// Google Chat principals key on the space, so — unlike Slack, where a ``D``
+/// conversation id marks a DM — the thread key alone cannot say whether the
+/// conversation is 1:1. The ingress supplies the space type instead; see
+/// [`crate::session`].
+pub(crate) const GCHAT_DM_KIND: &str = "gchat_dm";
+pub(crate) const GCHAT_SPACE_KIND: &str = "gchat_space";
+/// The Google Chat ``SpaceType`` for a 1:1 conversation. Google documents it as
+/// "1:1 messages between two humans or a human and a Chat app", so a space our
+/// bot sees with this type has exactly one human in it. ``GROUP_CHAT`` (3 or
+/// more) and ``SPACE`` do not.
+pub(crate) const GCHAT_DIRECT_MESSAGE_SPACE_TYPE: &str = "DIRECT_MESSAGE";
 
 /// The principal a session resolves to, as a stable upsert key plus a label.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -324,7 +335,7 @@ fn parse_teams_adapter_segments(thread_key: &str) -> Option<(String, String, Opt
 /// right after the leading ``chat:spaces:``. Keying on it groups every thread
 /// and message in a space onto one principal. The Slack-compatible ``chat:C…``
 /// adapter format is left untouched — only ``chat:spaces:`` matches here.
-fn parse_gchat_space(thread_key: &str) -> Option<&str> {
+pub(crate) fn parse_gchat_space(thread_key: &str) -> Option<&str> {
     thread_key
         .strip_prefix("chat:spaces:")?
         .split(':')
