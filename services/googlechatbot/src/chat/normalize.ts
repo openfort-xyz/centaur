@@ -60,10 +60,8 @@ export async function normalizeChatEnvelope(
 
   const eventTime = envelope.eventTime
 
-  const singleUserBotDm = envelope.space.singleUserBotDm === true
-
   if (envelope.type === 'ADDED_TO_SPACE') {
-    return buildAddedToSpaceEvent(spaceName, spaceType, singleUserBotDm, eventTime)
+    return buildAddedToSpaceEvent(spaceName, spaceType, eventTime)
   }
 
   if (envelope.type === 'REMOVED_FROM_SPACE') {
@@ -103,11 +101,12 @@ export async function normalizeChatEnvelope(
 
   // Determine if the bot was @mentioned.
   // In Google Chat, mentions use <users/{botUserId}> syntax in message text.
+  // In the bot's 1:1 DM every message is addressed to it, so no @ is needed.
   const isMention =
     isSlashCommand ||
     Boolean(botUserName && (message.text ?? '').includes(botUserName)) ||
     Boolean(botUserName && (message.text ?? '').includes('@')) ||
-    singleUserBotDm
+    envelope.space.singleUserBotDm === true
 
   const parts: NormalizedPart[] = []
   const textPart = [formattedText, text].filter(Boolean).join('\n').trim()
@@ -138,7 +137,6 @@ export async function normalizeChatEnvelope(
     user_id: senderName,
     user_name: displayName,
     ...(userEmail ? { user_email: userEmail } : {}),
-    single_user_bot_dm: singleUserBotDm,
     is_mention: isMention,
     parts,
     chat: {
@@ -335,7 +333,6 @@ function isAckOrEmpty(message: ChatListMessage): boolean {
 function buildAddedToSpaceEvent(
   spaceName: string,
   spaceType: ChatSpaceType,
-  singleUserBotDm: boolean,
   eventTime?: string
 ): NormalizedChatEvent {
   return {
@@ -345,7 +342,6 @@ function buildAddedToSpaceEvent(
     space_type: spaceType,
     user_id: 'system',
     user_name: 'System',
-    single_user_bot_dm: singleUserBotDm,
     is_mention: true,
     parts: [{ type: 'text', text: 'ADDED_TO_SPACE' }],
     chat: { event_time: eventTime }

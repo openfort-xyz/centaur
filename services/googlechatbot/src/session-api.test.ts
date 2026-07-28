@@ -24,7 +24,6 @@ const baseEvent: NormalizedChatEvent = {
   space_type: 'SPACE',
   user_id: 'users/U1',
   user_name: 'Alice',
-  single_user_bot_dm: false,
   is_mention: true,
   parts: [{ type: 'text', text: 'deploy the thing' }],
   chat: { event_time: '2026-06-22T00:00:00Z', message_name: 'spaces/AAAA/messages/M2' }

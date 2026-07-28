@@ -36,38 +36,42 @@ describe('normalizeChatEnvelope', () => {
     expect(normalized!.user_email).toBeUndefined()
     expect(normalized!.is_mention).toBe(true)
     expect(normalized!.space_type).toBe('SPACE')
-    expect(normalized!.single_user_bot_dm).toBe(false)
     expect(normalized!.parts).toHaveLength(1)
     expect(normalized!.parts[0]).toMatchObject({ type: 'text' })
   })
 
-  // Carried on the event because the session metadata records the shape of the
-  // room an identity came from — a 1:1 DM is not a 3-person shared room.
-  test('carries singleUserBotDm through to the normalized event', async () => {
-    const normalized = await normalizeChatEnvelope(
+  // The envelope's singleUserBotDm no longer reaches the session metadata (that
+  // now carries Google's spaces.get answer instead), but it still decides one
+  // thing: in the bot's 1:1 DM every message is addressed to it, so a plain
+  // message with no @ still starts a run.
+  test('treats any message in a 1:1 bot DM as a mention', async () => {
+    const dm = await normalizeChatEnvelope(
       messageEnvelope({
-        space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true }
+        space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'deploy the thing',
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
       }),
       BOT_USER
     )
-    expect(normalized!.single_user_bot_dm).toBe(true)
-    expect(normalized!.space_type).toBe('DIRECT_MESSAGE')
-  })
+    expect(dm!.is_mention).toBe(true)
+    expect(dm!.space_type).toBe('DIRECT_MESSAGE')
 
-  test('populates single_user_bot_dm on the added-to-space event too', async () => {
-    const dm = await normalizeChatEnvelope({
-      type: 'ADDED_TO_SPACE',
-      eventTime: '2026-01-01T00:00:00Z',
-      space: { name: 'spaces/AAAA', type: 'DIRECT_MESSAGE', singleUserBotDm: true }
-    })
-    expect(dm!.single_user_bot_dm).toBe(true)
-
-    const room = await normalizeChatEnvelope({
-      type: 'ADDED_TO_SPACE',
-      eventTime: '2026-01-01T00:00:00Z',
-      space: { name: 'spaces/AAAA', type: 'SPACE' }
-    })
-    expect(room!.single_user_bot_dm).toBe(false)
+    // Same message in a shared room, where an @ IS required.
+    const room = await normalizeChatEnvelope(
+      messageEnvelope({
+        space: { name: 'spaces/AAAA', type: 'SPACE' },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'deploy the thing',
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(room!.is_mention).toBe(false)
   })
 
   test('captures the sender email for Console thread attribution', async () => {

@@ -52,12 +52,6 @@ export type NormalizedChatEvent = {
    * humans). The Console matches it against the signed-in user's email to
    * grant thread visibility (Chat analogue of Slack's slack_user_id, #875). */
   user_email?: string
-  /** The envelope's `space.singleUserBotDm` claim: "this is the bot's 1:1 DM
-   * with a single human". UNVERIFIED — a signed Chat request binds nothing in
-   * its body, so this is what the sender said, not what Google says. The
-   * session metadata deliberately does NOT source `single_user_bot_dm` from
-   * here; it uses the spaces.get confirmation (see chat/space-verify.ts). */
-  single_user_bot_dm: boolean
   is_mention: boolean
   parts: NormalizedPart[]
   history_messages?: Array<{
