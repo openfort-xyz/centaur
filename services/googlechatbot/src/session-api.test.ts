@@ -74,62 +74,6 @@ describe('createSession', () => {
       })) as unknown as typeof fetch
   }
 
-  // api-rs derives the session principal's identity from this metadata. A
-  // Google Chat principal keys on the space, so it may only adopt the
-  // requester's identity when the space holds exactly one human and the event
-  // was provably Google's.
-  const captureSessionBody = async (requester: Parameters<typeof createSession>[4]) => {
-    let captured: Record<string, unknown> = {}
-    globalThis.fetch = (async (_url: string, init: RequestInit) => {
-      captured = JSON.parse(String(init.body)) as Record<string, unknown>
-      return new Response(JSON.stringify({ status: 'idle' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' }
-      })
-    }) as unknown as typeof fetch
-    await createSession(
-      loadConfig({}),
-      'chat:spaces:AAAA:threads:T1',
-      undefined,
-      'codex',
-      requester
-    )
-    return captured.metadata as Record<string, unknown>
-  }
-
-  test('sends the space type and verification status for a verified DM', async () => {
-    const metadata = await captureSessionBody({
-      userId: 'users/U1',
-      userEmail: 'alice@openfort.xyz',
-      spaceType: 'DIRECT_MESSAGE',
-      requestVerified: true
-    })
-    expect(metadata.googlechat_space_type).toBe('DIRECT_MESSAGE')
-    expect(metadata.googlechat_request_verified).toBe(true)
-    expect(metadata.user_email).toBe('alice@openfort.xyz')
-  })
-
-  test('omits the verification claim when signed requests are not enforced', async () => {
-    const metadata = await captureSessionBody({
-      userId: 'users/U1',
-      userEmail: 'alice@openfort.xyz',
-      spaceType: 'DIRECT_MESSAGE',
-      requestVerified: false
-    })
-    expect(metadata.googlechat_request_verified).toBeUndefined()
-    expect(metadata.googlechat_space_type).toBe('DIRECT_MESSAGE')
-  })
-
-  test('carries the group space type so api-rs withholds the identity', async () => {
-    const metadata = await captureSessionBody({
-      userId: 'users/U1',
-      userEmail: 'alice@openfort.xyz',
-      spaceType: 'GROUP_CHAT',
-      requestVerified: true
-    })
-    expect(metadata.googlechat_space_type).toBe('GROUP_CHAT')
-  })
-
   test('reports an active execution when api-rs says the session is executing', async () => {
     // api-rs returns the session fields flat on the response body — mirror the
     // real shape here so the stub can't drift from production again.
@@ -222,10 +166,17 @@ describe('createSession', () => {
   })
 })
 
-// centaur labels the DM principal from these metadata keys and auto-grants that
-// person's OAuth credentials to every session in the room, so emitting them for
-// an unauthenticated (or off-domain) event hands one person's live credentials
-// to whoever else is in the space. The three keys ship together or not at all.
+// api-rs labels the DM principal from these metadata keys and auto-grants that
+// person's OAuth credentials to every session in the room, so naming someone in
+// an unauthenticated (or off-domain, or non-DM) event hands one person's live
+// credentials to whoever else is in the space.
+//
+// Two independent layers deny that. api-rs will not label unless
+// googlechat_space_type is DIRECT_MESSAGE AND googlechat_request_verified is
+// true AND a user_email is present; this side withholds user_email unless the
+// request was signature-verified, the sender's domain is allowlisted, and
+// GOOGLE confirmed the space is a 1:1 DM. The two gate inputs always ship —
+// they name nobody, and a room reporting SPACE is signal worth having.
 describe('createSession identity metadata', () => {
   const realFetch = globalThis.fetch
   const ALLOWLISTED = { GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }
@@ -262,11 +213,10 @@ describe('createSession identity metadata', () => {
   }
 
   /** What Google returns for a real 1:1 DM (shape confirmed against three prod
-   * DMs: DIRECT_MESSAGE, singleUserBotDm, exactly one joined human). */
+   * DMs: DIRECT_MESSAGE with exactly one joined human). */
   const CONFIRMED_DM: ChatSpaceResource = {
     name: 'spaces/AAAA',
     spaceType: 'DIRECT_MESSAGE',
-    singleUserBotDm: true,
     membershipCount: { joinedDirectHumanUserCount: 1 }
   }
 
@@ -299,10 +249,23 @@ describe('createSession identity metadata', () => {
     }
   })
 
-  const expectSuppressed = (metadata: Record<string, unknown>, reason: string): void => {
+  /**
+   * The email — the only credential-bearing key — was withheld for `reason`.
+   *
+   * The two gate inputs are still asserted, because "suppressed" must not
+   * quietly become "emitted nothing": api-rs needs them, and a test that only
+   * checked for absence would pass just as well if the bot had stopped sending
+   * metadata at all.
+   */
+  const expectSuppressed = (
+    metadata: Record<string, unknown>,
+    reason: string,
+    gate: { spaceType?: string; verified?: boolean } = {}
+  ): void => {
     expect('user_email' in metadata).toBe(false)
-    expect('space_type' in metadata).toBe(false)
     expect('single_user_bot_dm' in metadata).toBe(false)
+    expect(metadata.googlechat_space_type).toBe(gate.spaceType ?? 'DIRECT_MESSAGE')
+    expect(metadata.googlechat_request_verified).toBe(gate.verified ?? true)
     // user_id is not an identity key — it stays unconditional.
     expect(metadata.user_id).toBe('users/123')
     expect(renderMetrics()).toContain(
@@ -318,12 +281,19 @@ describe('createSession identity metadata', () => {
       user_id: 'users/123',
       user_name: 'Ada Lovelace',
       user_email: 'Ada@Openfort.xyz',
-      space_type: 'DIRECT_MESSAGE',
-      single_user_bot_dm: true
+      googlechat_space_type: 'DIRECT_MESSAGE',
+      googlechat_request_verified: true
     })
     expect(renderMetrics()).toContain(
       'googlechatbot_session_identity_total{outcome="emitted",reason="none"} 1'
     )
+  })
+
+  // Google already had to report exactly one joined human before the email was
+  // released, so a single_user_bot_dm key would only restate that check.
+  test('does not restate the DM shape with a single_user_bot_dm key', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, claim())
+    expect('single_user_bot_dm' in metadata).toBe(false)
   })
 
   // ==========================================================================
@@ -351,7 +321,9 @@ describe('createSession identity metadata', () => {
         // room even has a single joined human — Google's spaceType still rules.
         claim({}, googleReturns({ spaceType, membershipCount: { joinedDirectHumanUserCount: 1 } }))
       )
-      expectSuppressed(metadata, 'space_not_dm')
+      // The forged DIRECT_MESSAGE claim does not survive into the metadata
+      // either: what ships is what Google said the room is.
+      expectSuppressed(metadata, 'space_not_dm', { spaceType })
     }
   )
 
@@ -391,7 +363,7 @@ describe('createSession identity metadata', () => {
   test('suppresses a non-DM body without asking Google at all', async () => {
     const space = googleReturns(CONFIRMED_DM)
     const metadata = await metadataFor(ALLOWLISTED, claim({ spaceType: 'GROUP_CHAT' }, space))
-    expectSuppressed(metadata, 'space_not_dm')
+    expectSuppressed(metadata, 'space_not_dm', { spaceType: 'GROUP_CHAT' })
     expect(space.lookups).toEqual([])
   })
 
@@ -404,28 +376,33 @@ describe('createSession identity metadata', () => {
     expectSuppressed(metadata, 'space_unverified')
   })
 
-  // Downstream keeps its own defence-in-depth guards; they should be checking a
-  // fact from Google, not an echo of the attacker-supplied envelope.
-  test("emits Google's space values rather than the envelope's claims", async () => {
+  // api-rs keeps its own defence-in-depth gate on googlechat_space_type; it
+  // should be checking a fact from Google, not an echo of the envelope.
+  test("carries Google's space type rather than the envelope's claim", async () => {
     const metadata = await metadataFor(
       ALLOWLISTED,
       claim(
-        {},
-        googleReturns({
-          spaceType: 'DIRECT_MESSAGE',
-          singleUserBotDm: false,
-          membershipCount: { joinedDirectHumanUserCount: 1 }
-        })
+        { spaceType: 'DIRECT_MESSAGE' },
+        googleReturns({ spaceType: 'SPACE', membershipCount: { joinedDirectHumanUserCount: 1 } })
       )
     )
-    expect(metadata.space_type).toBe('DIRECT_MESSAGE')
-    expect(metadata.single_user_bot_dm).toBe(false)
+    expect(metadata.googlechat_space_type).toBe('SPACE')
+  })
+
+  // A room that never claimed to be a DM is still reported as a room, so the
+  // shape of every conversation stays visible in the session metadata even
+  // though no lookup was spent on it.
+  test('reports the body’s space type on the paths that never ask Google', async () => {
+    const metadata = await metadataFor(ALLOWLISTED, claim({ spaceType: 'SPACE' }))
+    expect(metadata.googlechat_space_type).toBe('SPACE')
   })
 
   test('suppresses identity when the request was not signature-verified', async () => {
     const space = googleReturns(CONFIRMED_DM)
     const metadata = await metadataFor(ALLOWLISTED, claim({ verified: false }, space))
-    expectSuppressed(metadata, 'unverified')
+    // Reported as false rather than omitted: api-rs gets the real state, and a
+    // skipped check can never read as a passed one.
+    expectSuppressed(metadata, 'unverified', { verified: false })
     // The local checks run first, so an unsigned request — every request today,
     // with GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS off — costs no Chat API call.
     expect(space.lookups).toEqual([])
@@ -448,9 +425,14 @@ describe('createSession identity metadata', () => {
     expectSuppressed(metadata, 'no_email')
   })
 
-  test('emits no identity telemetry for a call that claims no requester', async () => {
+  // The fold-path re-check is not starting a turn on anyone's behalf, so it
+  // makes no claim at all — and must not report a verification state it never
+  // established.
+  test('emits no identity keys or telemetry for a call that claims no requester', async () => {
     const metadata = await metadataFor(ALLOWLISTED, { userId: 'users/123' })
     expect('user_email' in metadata).toBe(false)
+    expect('googlechat_space_type' in metadata).toBe(false)
+    expect('googlechat_request_verified' in metadata).toBe(false)
     expect(renderMetrics()).toContain('googlechatbot_session_identity_total 0')
   })
 })

@@ -5,7 +5,7 @@ import { logWarn } from './logging'
 import { incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
 import type { SpaceDmConfirmation } from './chat/space-verify'
-import { resolveConfirmedIdentityEmission, type ConfirmedIdentityEmission } from './chat/verify'
+import { resolveSessionIdentity, type ResolvedSessionIdentity } from './chat/verify'
 
 // ---------------------------------------------------------------------------
 // api-rs session contract
@@ -265,7 +265,7 @@ export async function createSession(
   const name = conversationName?.trim()
   const claim = requester?.identity
   const identity = claim
-    ? await resolveConfirmedIdentityEmission({
+    ? await resolveSessionIdentity({
         config,
         verified: claim.verified,
         userEmail: claim.userEmail,
@@ -273,16 +273,16 @@ export async function createSession(
         confirmSpace: claim.confirmSpace
       })
     : undefined
-  if (identity && !identity.emit) {
-    // Never silent: centaur attaches a person's OAuth credentials off these
-    // keys, so their absence has to be explainable after the fact.
+  if (identity && !identity.email.emit) {
+    // Never silent: centaur attaches a person's OAuth credentials off this key,
+    // so its absence has to be explainable after the fact.
     incr('googlechatbot_session_identity_total', {
       outcome: 'suppressed',
-      reason: identity.reason
+      reason: identity.email.reason
     })
     logWarn('googlechatbot_session_identity_suppressed', {
       thread_key: threadKey,
-      reason: identity.reason
+      reason: identity.email.reason
     })
   } else if (identity) {
     incr('googlechatbot_session_identity_total', { outcome: 'emitted', reason: 'none' })
@@ -298,11 +298,9 @@ export async function createSession(
       // signed-in user's email to grant thread visibility (#875 analogue).
       ...(requester?.userId ? { user_id: requester.userId } : {}),
       ...(requester?.userName ? { user_name: requester.userName } : {}),
-      // Identity keys. centaur labels the DM principal from these and
-      // auto-grants that person's OAuth credentials to every session in the
-      // room, so they ship ONLY for a signature-verified request from an
-      // allowlisted domain in a space GOOGLE confirmed is a 1:1 DM. An absent
-      // key means "no label" — there is deliberately no fallback to fall to.
+      // Identity keys api-rs gates its DM-principal labelling on. Only
+      // `user_email` is credential-bearing, and only it is withheld when the
+      // gate fails; the other two describe the request and always ship.
       ...identityMetadata(identity),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
@@ -328,18 +326,30 @@ export async function createSession(
 }
 
 /**
- * The identity half of the create-session metadata: all three keys or none.
+ * The identity half of the create-session metadata.
  *
- * `space_type` and `single_user_bot_dm` are Google's own values from the
- * spaces.get confirmation, not the envelope's claims — downstream keeps its
- * defence-in-depth guards, and they should be checking a fact, not an echo.
+ * Two layers gate the same decision. api-rs labels a session principal with the
+ * requester's identity — and auto-grants that person's OAuth credentials to
+ * every session in the room — only when `googlechat_space_type` is
+ * DIRECT_MESSAGE AND `googlechat_request_verified` is true AND there is a
+ * `user_email` to name. This side withholds the email unless the request was
+ * signature-verified, the sender's domain is allowlisted, and GOOGLE itself
+ * confirmed the space is a 1:1 DM. Either layer alone is sufficient to deny.
+ *
+ * The two gate inputs ship unconditionally so a room stays observable — neither
+ * names anybody, and api-rs cannot label without the email. The space type is
+ * Google's confirmed value where one was obtained and the envelope's claim
+ * otherwise, so it is a gate input, never a trust signal in itself.
+ *
+ * `single_user_bot_dm` is deliberately not emitted: the confirmation already
+ * requires exactly one joined human, so the key would restate the check.
  */
-function identityMetadata(identity: ConfirmedIdentityEmission | undefined): JsonObject {
-  if (!identity?.emit) return {}
+function identityMetadata(identity: ResolvedSessionIdentity | undefined): JsonObject {
+  if (!identity) return {}
   return {
-    user_email: identity.userEmail,
-    space_type: identity.spaceType,
-    single_user_bot_dm: identity.singleUserBotDm
+    googlechat_space_type: identity.spaceType,
+    googlechat_request_verified: identity.verified,
+    ...(identity.email.emit ? { user_email: identity.email.userEmail } : {})
   }
 }
 

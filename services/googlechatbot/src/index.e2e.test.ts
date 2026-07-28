@@ -187,8 +187,11 @@ describe('googlechatbot webhook e2e', () => {
       ?? {}) as Record<string, unknown>
     expect(metadata.user_id).toBe('users/U1')
     expect('user_email' in metadata).toBe(false)
-    expect('space_type' in metadata).toBe(false)
     expect('single_user_bot_dm' in metadata).toBe(false)
+    // api-rs's own gate inputs still ship, reporting the request honestly: the
+    // room is observable, and the skipped check reads as false, not as absent.
+    expect(metadata.googlechat_space_type).toBe('DIRECT_MESSAGE')
+    expect(metadata.googlechat_request_verified).toBe(false)
     expect(renderMetrics()).toContain(
       'googlechatbot_session_identity_total{outcome="suppressed",reason="unverified"} 1'
     )

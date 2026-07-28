@@ -1,4 +1,4 @@
-import type { ChatSpaceResource } from './types'
+import type { ChatSpaceResource, ChatSpaceType } from './types'
 
 /**
  * Whether GOOGLE — not the request body — says a space is the bot's 1:1 DM with
@@ -9,12 +9,17 @@ import type { ChatSpaceResource } from './types'
  * envelope naming a shared room while claiming `spaceType: DIRECT_MESSAGE`.
  * Since the DM shape is what lets a session claim a person's identity — and
  * with it their OAuth credentials — the claim has to be re-asked of Google.
+ *
+ * `spaceType` is always GOOGLE's own value, so a rejection can report what the
+ * space really is instead of echoing back the claim that was disbelieved. It is
+ * absent when Google said nothing usable — an unreachable API, or a value
+ * outside the three documented ones.
  */
 export type SpaceDmConfirmation =
-  | { confirmed: true; spaceType: 'DIRECT_MESSAGE'; singleUserBotDm: boolean }
+  | { confirmed: true; spaceType: 'DIRECT_MESSAGE' }
   /** `space_not_dm`: Google answered and the answer was not a 1:1 DM.
    *  `space_unverified`: Google did not answer (error, non-200, timeout). */
-  | { confirmed: false; reason: 'space_not_dm' | 'space_unverified' }
+  | { confirmed: false; reason: 'space_not_dm' | 'space_unverified'; spaceType?: ChatSpaceType }
 
 export type SpaceLookup = (spaceName: string) => Promise<ChatSpaceResource>
 
@@ -103,15 +108,29 @@ export class SpaceDmVerifier {
  * to. Anything unrecognised is `space_not_dm`.
  */
 export function classifySpaceAsDm(space: ChatSpaceResource): SpaceDmConfirmation {
-  if (space.spaceType !== 'DIRECT_MESSAGE') return { confirmed: false, reason: 'space_not_dm' }
-  if (joinedDirectHumanCount(space) !== 1) return { confirmed: false, reason: 'space_not_dm' }
-  return {
-    confirmed: true,
-    spaceType: 'DIRECT_MESSAGE',
-    // Google's own value, not the envelope's. Strict === so a truthy non-boolean
-    // cannot become `true` in the session metadata.
-    singleUserBotDm: space.singleUserBotDm === true
+  const spaceType = knownSpaceType(space.spaceType)
+  // Reported even on the rejection path: when a forged envelope claims a DM,
+  // "Google says this is a SPACE" is the useful thing to carry forward.
+  const observed = spaceType ? { spaceType } : {}
+  if (spaceType !== 'DIRECT_MESSAGE') {
+    return { confirmed: false, reason: 'space_not_dm', ...observed }
   }
+  if (joinedDirectHumanCount(space) !== 1) {
+    return { confirmed: false, reason: 'space_not_dm', spaceType }
+  }
+  return { confirmed: true, spaceType }
+}
+
+/**
+ * Google's `spaceType`, but only when it is one of the three documented values.
+ *
+ * Narrowing from `unknown` is what keeps an unexpected payload out of the
+ * metadata: a null, a number or a future/deprecated value (`ROOM`) is reported
+ * as no answer at all rather than passed through as a space type.
+ */
+function knownSpaceType(raw: unknown): ChatSpaceType | undefined {
+  if (raw === 'SPACE' || raw === 'DIRECT_MESSAGE' || raw === 'GROUP_CHAT') return raw
+  return undefined
 }
 
 /**

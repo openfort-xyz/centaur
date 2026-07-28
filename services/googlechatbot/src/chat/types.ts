@@ -25,10 +25,10 @@ export type ChatSpaceType = 'SPACE' | 'DIRECT_MESSAGE' | 'GROUP_CHAT'
 
 /**
  * A Space as GOOGLE describes it (spaces.get response), not as the request body
- * claims it. Every field is `unknown` because this is the input to a credential
- * decision: the classifier must be able to reject a `singleUserBotDm` or a
+ * claims it. The classified fields are `unknown` because this is the input to a
+ * credential decision: the classifier must be able to reject a `spaceType` or a
  * `joinedDirectHumanUserCount` that arrives as null, a boolean or a string,
- * which a typed `number`/`boolean` here would quietly launder into a pass.
+ * which a typed `string`/`number` here would quietly launder into a pass.
  * https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space
  */
 export type ChatSpaceResource = {
@@ -36,7 +36,6 @@ export type ChatSpaceResource = {
   /** Modern discriminator (SPACE | GROUP_CHAT | DIRECT_MESSAGE). Deliberately
    * NOT the deprecated `type` field, which cannot express GROUP_CHAT. */
   spaceType?: unknown
-  singleUserBotDm?: unknown
   membershipCount?: { joinedDirectHumanUserCount?: unknown } | null
   displayName?: string
 }

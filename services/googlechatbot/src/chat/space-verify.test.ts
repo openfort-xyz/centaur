@@ -8,11 +8,10 @@ import {
 import type { ChatSpaceResource } from './types'
 
 /** What Google returns for a real 1:1 DM (shape confirmed against three prod
- * DMs: DIRECT_MESSAGE, singleUserBotDm, exactly one joined human). */
+ * DMs: DIRECT_MESSAGE with exactly one joined human). */
 const CONFIRMED_DM: ChatSpaceResource = {
   name: 'spaces/AAAA',
   spaceType: 'DIRECT_MESSAGE',
-  singleUserBotDm: true,
   membershipCount: { joinedDirectHumanUserCount: 1 }
 }
 
@@ -20,18 +19,19 @@ describe('classifySpaceAsDm', () => {
   test('confirms a 1:1 DM Google itself describes as one', () => {
     expect(classifySpaceAsDm(CONFIRMED_DM)).toEqual({
       confirmed: true,
-      spaceType: 'DIRECT_MESSAGE',
-      singleUserBotDm: true
+      spaceType: 'DIRECT_MESSAGE'
     })
   })
 
   // The core threat: the request body's `spaceType: DIRECT_MESSAGE` never
   // reaches here. Only what Google returned is classified, and a shared room
-  // stays a shared room no matter what the envelope claimed.
+  // stays a shared room no matter what the envelope claimed — and the rejection
+  // reports what Google actually said, so a forged claim is visible downstream.
   test.each(['GROUP_CHAT', 'SPACE'] as const)('rejects a %s space', spaceType => {
     expect(classifySpaceAsDm({ ...CONFIRMED_DM, spaceType })).toEqual({
       confirmed: false,
-      reason: 'space_not_dm'
+      reason: 'space_not_dm',
+      spaceType
     })
   })
 
@@ -40,9 +40,15 @@ describe('classifySpaceAsDm', () => {
     ['blank', ''],
     ['null', null],
     ['the deprecated ROOM value', 'ROOM'],
-    ['lower-case', 'direct_message']
+    ['lower-case', 'direct_message'],
+    ['a number', 1]
   ])('rejects a spaceType that is %s', (_label, spaceType) => {
-    expect(classifySpaceAsDm({ ...CONFIRMED_DM, spaceType }).confirmed).toBe(false)
+    // Rejected AND not reported: a value outside the three documented ones is
+    // no answer at all, so nothing gets to pass through as a space type.
+    expect(classifySpaceAsDm({ ...CONFIRMED_DM, spaceType })).toEqual({
+      confirmed: false,
+      reason: 'space_not_dm'
+    })
   })
 
   // Reading `type` instead of `spaceType` would be a silent downgrade: the
@@ -53,7 +59,11 @@ describe('classifySpaceAsDm', () => {
       type: 'DM',
       membershipCount: { joinedDirectHumanUserCount: 1 }
     } as ChatSpaceResource
-    expect(classifySpaceAsDm(groupChat)).toEqual({ confirmed: false, reason: 'space_not_dm' })
+    expect(classifySpaceAsDm(groupChat)).toEqual({
+      confirmed: false,
+      reason: 'space_not_dm',
+      spaceType: 'GROUP_CHAT'
+    })
   })
 
   test.each([
@@ -67,7 +77,7 @@ describe('classifySpaceAsDm', () => {
     expect(classifySpaceAsDm({
       ...CONFIRMED_DM,
       membershipCount: { joinedDirectHumanUserCount: count }
-    })).toEqual({ confirmed: false, reason: 'space_not_dm' })
+    })).toEqual({ confirmed: false, reason: 'space_not_dm', spaceType: 'DIRECT_MESSAGE' })
   })
 
   // `Number(true) === 1` and `Number('1') === 1`: coercing the count would
@@ -82,7 +92,8 @@ describe('classifySpaceAsDm', () => {
   ])('rejects a joined-human count that is %s', (_label, membershipCount) => {
     expect(classifySpaceAsDm({ ...CONFIRMED_DM, membershipCount })).toEqual({
       confirmed: false,
-      reason: 'space_not_dm'
+      reason: 'space_not_dm',
+      spaceType: 'DIRECT_MESSAGE'
     })
   })
 
@@ -90,21 +101,8 @@ describe('classifySpaceAsDm', () => {
     ['membershipCount is missing', {}],
     ['membershipCount is null', { membershipCount: null }]
   ])('rejects a DIRECT_MESSAGE where %s', (_label, overrides) => {
-    const space = { spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true, ...overrides }
+    const space = { spaceType: 'DIRECT_MESSAGE', ...overrides }
     expect(classifySpaceAsDm(space).confirmed).toBe(false)
-  })
-
-  // Google's own value, strictly: a truthy non-boolean must not become `true`
-  // in the session metadata a downstream guard then reads.
-  test.each([
-    [undefined, false],
-    ['true', false],
-    [1, false],
-    [false, false],
-    [true, true]
-  ])('reports singleUserBotDm %p as %p', (singleUserBotDm, expected) => {
-    const out = classifySpaceAsDm({ ...CONFIRMED_DM, singleUserBotDm })
-    expect(out.confirmed && out.singleUserBotDm).toBe(expected)
   })
 })
 
@@ -126,8 +124,7 @@ describe('SpaceDmVerifier', () => {
 
     expect(await verifier.confirm('spaces/AAAA')).toEqual({
       confirmed: true,
-      spaceType: 'DIRECT_MESSAGE',
-      singleUserBotDm: true
+      spaceType: 'DIRECT_MESSAGE'
     })
     expect(await verifier.confirm('spaces/AAAA')).toMatchObject({ confirmed: true })
     // A space's classification is immutable, so the second turn costs nothing.
@@ -204,7 +201,8 @@ describe('SpaceDmVerifier', () => {
 
     expect(await verifier.confirm('spaces/ROOM')).toEqual({
       confirmed: false,
-      reason: 'space_not_dm'
+      reason: 'space_not_dm',
+      spaceType: 'GROUP_CHAT'
     })
     now += FAILED_LOOKUP_TTL_MS * 2
     expect(await verifier.confirm('spaces/ROOM')).toMatchObject({ reason: 'space_not_dm' })

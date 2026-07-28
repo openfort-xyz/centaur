@@ -1,7 +1,7 @@
 import { test, expect, describe, beforeAll } from 'bun:test'
 import {
-  resolveConfirmedIdentityEmission,
   resolveIdentityEmission,
+  resolveSessionIdentity,
   verifyChatRequest,
   verifyChatRequestToken
 } from './verify'
@@ -238,8 +238,10 @@ describe('resolveIdentityEmission', () => {
   })
 })
 
-describe('resolveConfirmedIdentityEmission', () => {
+describe('resolveSessionIdentity', () => {
   const ALLOWLISTED = { GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }
+
+  const CONFIRMED: SpaceDmConfirmation = { confirmed: true, spaceType: 'DIRECT_MESSAGE' }
 
   const resolve = async (
     opts: {
@@ -250,50 +252,67 @@ describe('resolveConfirmedIdentityEmission', () => {
       verified?: boolean
     } = {}
   ) =>
-    resolveConfirmedIdentityEmission({
+    resolveSessionIdentity({
       config: configWith({ ...ALLOWLISTED, ...opts.env }),
       verified: opts.verified ?? true,
       userEmail: opts.userEmail ?? 'ada@openfort.xyz',
       claimedSpaceType: opts.claimedSpaceType ?? 'DIRECT_MESSAGE',
-      confirmSpace:
-        opts.confirmSpace
-        ?? (async () => ({ confirmed: true, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true }))
+      confirmSpace: opts.confirmSpace ?? (async () => CONFIRMED)
     })
 
-  test('emits the identity and Google’s space values for a confirmed DM', async () => {
+  test('releases the email and Google’s space type for a confirmed DM', async () => {
     expect(await resolve()).toEqual({
-      emit: true,
-      userEmail: 'ada@openfort.xyz',
+      verified: true,
       spaceType: 'DIRECT_MESSAGE',
-      singleUserBotDm: true
+      email: { emit: true, userEmail: 'ada@openfort.xyz' }
     })
   })
 
   // The whole point of the gate: the request body's spaceType claim is not
-  // signature-bound, so Google's contradicting answer wins outright.
-  test('suppresses when Google contradicts the body’s DIRECT_MESSAGE claim', async () => {
+  // signature-bound, so Google's contradicting answer wins outright — and it is
+  // Google's answer, not the disbelieved claim, that gets reported.
+  test('withholds the email when Google contradicts the body’s DM claim', async () => {
     expect(
-      await resolve({ confirmSpace: async () => ({ confirmed: false, reason: 'space_not_dm' }) })
-    ).toEqual({ emit: false, reason: 'space_not_dm' })
+      await resolve({
+        confirmSpace: async () => ({ confirmed: false, reason: 'space_not_dm', spaceType: 'SPACE' })
+      })
+    ).toEqual({
+      verified: true,
+      spaceType: 'SPACE',
+      email: { emit: false, reason: 'space_not_dm' }
+    })
   })
 
-  test('suppresses when Google could not be asked', async () => {
+  // Google said "not a DM" but named no usable type, so there is nothing better
+  // than the body's claim to report. Harmless: api-rs cannot label without the
+  // email, which is withheld.
+  test('falls back to the body’s claim when Google names no usable space type', async () => {
+    expect(
+      await resolve({ confirmSpace: async () => ({ confirmed: false, reason: 'space_not_dm' }) })
+    ).toEqual({
+      verified: true,
+      spaceType: 'DIRECT_MESSAGE',
+      email: { emit: false, reason: 'space_not_dm' }
+    })
+  })
+
+  test('withholds the email when Google could not be asked', async () => {
     expect(
       await resolve({
         confirmSpace: async () => ({ confirmed: false, reason: 'space_unverified' })
       })
-    ).toEqual({ emit: false, reason: 'space_unverified' })
+    ).toMatchObject({ email: { emit: false, reason: 'space_unverified' } })
   })
 
   // Fail closed, and never let a Chat API failure escape into the turn.
-  test('suppresses rather than throwing when the confirmation itself throws', async () => {
+  test('withholds rather than throwing when the confirmation itself throws', async () => {
     expect(
       await resolve({
         confirmSpace: async () => {
           throw new Error('Chat API GET spaces/AAAA failed: 500 internal')
         }
       })
-    ).toEqual({ emit: false, reason: 'space_unverified' })
+    ).toMatchObject({ email: { emit: false, reason: 'space_unverified' } })
   })
 
   test.each(['GROUP_CHAT', 'SPACE'] as const)(
@@ -304,10 +323,16 @@ describe('resolveConfirmedIdentityEmission', () => {
         claimedSpaceType,
         confirmSpace: async () => {
           asked = true
-          return { confirmed: true, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true }
+          return CONFIRMED
         }
       })
-      expect(out).toEqual({ emit: false, reason: 'space_not_dm' })
+      // No lookup was made, so the body's own claim is what gets reported — it
+      // is a gate input for api-rs, which cannot label without an email anyway.
+      expect(out).toEqual({
+        verified: true,
+        spaceType: claimedSpaceType,
+        email: { emit: false, reason: 'space_not_dm' }
+      })
       expect(asked).toBe(false)
     }
   )
@@ -324,10 +349,20 @@ describe('resolveConfirmedIdentityEmission', () => {
       ...opts,
       confirmSpace: async () => {
         asked = true
-        return { confirmed: true, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true }
+        return CONFIRMED
       }
     })
-    expect(out).toEqual({ emit: false, reason })
+    expect(out.email).toEqual({ emit: false, reason })
     expect(asked).toBe(false)
+  })
+
+  // `verified` reports what actually happened rather than what was allowed —
+  // an unsigned request says so in the metadata instead of going unmentioned.
+  test('reports the real verification state even when the email is withheld', async () => {
+    expect(await resolve({ verified: false })).toEqual({
+      verified: false,
+      spaceType: 'DIRECT_MESSAGE',
+      email: { emit: false, reason: 'unverified' }
+    })
   })
 })

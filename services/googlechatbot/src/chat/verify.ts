@@ -170,12 +170,24 @@ export function resolveIdentityEmission(opts: {
   return { emit: true, userEmail: email }
 }
 
-/** An emission that additionally carries the space as GOOGLE described it. The
- * space values are Google's, never the envelope's — the envelope's exist only
- * as a pre-filter. */
-export type ConfirmedIdentityEmission =
-  | { emit: true; userEmail: string; spaceType: ChatSpaceType; singleUserBotDm: boolean }
-  | { emit: false; reason: IdentitySuppressionReason }
+/**
+ * Everything the create-session metadata needs to say about who sent an event.
+ *
+ * The three parts are reported separately because they are trusted separately.
+ * `verified` and `spaceType` describe the request and are always reported —
+ * api-rs gates on both, and neither hands anyone a credential on its own.
+ * `email` is the credential-bearing part, so it is the only one that has to
+ * survive every check.
+ */
+export type ResolvedSessionIdentity = {
+  /** Whether Google's signature was actually checked on this request. */
+  verified: boolean
+  /** GOOGLE's answer when the space was looked up, the body's claim otherwise
+   * (see resolveSessionIdentity). */
+  spaceType: ChatSpaceType
+  /** Whether the sender's email may be named — and, when it may not, why. */
+  email: IdentityEmission
+}
 
 /**
  * resolveIdentityEmission plus the one thing the request body cannot be trusted
@@ -186,7 +198,7 @@ export type ConfirmedIdentityEmission =
  * shared room while claiming `spaceType: DIRECT_MESSAGE` and a colleague's
  * address. Labelling that room's principal with that person would hand their
  * live OAuth credentials to everyone in it. So the DM-ness is re-asked of
- * Google, and only Google's answer counts.
+ * Google, and only Google's answer can release the email.
  *
  * Order is deliberate and cost-ordered:
  *  1. the existing local checks (signature, sender domain) — free, and their
@@ -194,12 +206,18 @@ export type ConfirmedIdentityEmission =
  *  2. the envelope's own `spaceType` as a pre-filter — a body that does not even
  *     claim a DM is suppressed without spending a Chat API call. Necessary,
  *     never sufficient;
- *  3. Google's answer, which is the only one that can grant emission.
+ *  3. Google's answer, which is the only one that can release the email.
+ *
+ * The returned `spaceType` prefers Google's answer and falls back to the body's
+ * claim on the paths that never asked (steps 1 and 2). It is therefore a mix of
+ * confirmed and unconfirmed values and is NOT a trust signal on its own — but a
+ * consumer can only label a principal once it also has an email, and the email
+ * is released only on the path where Google confirmed the DM.
  *
  * Fails closed for credentials, open for chat: a Chat API failure suppresses
- * identity and is reported, but never throws at the caller, whose turn proceeds.
+ * the email and is reported, but never throws at the caller, whose turn proceeds.
  */
-export async function resolveConfirmedIdentityEmission(opts: {
+export async function resolveSessionIdentity(opts: {
   config: AppConfig
   verified: boolean
   userEmail: string | undefined
@@ -207,11 +225,15 @@ export async function resolveConfirmedIdentityEmission(opts: {
    * to skip the API call for events that are obviously not DMs. */
   claimedSpaceType: ChatSpaceType
   confirmSpace: () => Promise<SpaceDmConfirmation>
-}): Promise<ConfirmedIdentityEmission> {
-  const local = resolveIdentityEmission(opts)
-  if (!local.emit) return local
+}): Promise<ResolvedSessionIdentity> {
+  const claimed = { verified: opts.verified, spaceType: opts.claimedSpaceType }
 
-  if (opts.claimedSpaceType !== 'DIRECT_MESSAGE') return { emit: false, reason: 'space_not_dm' }
+  const local = resolveIdentityEmission(opts)
+  if (!local.emit) return { ...claimed, email: local }
+
+  if (opts.claimedSpaceType !== 'DIRECT_MESSAGE') {
+    return { ...claimed, email: { emit: false, reason: 'space_not_dm' } }
+  }
 
   let confirmation: SpaceDmConfirmation
   try {
@@ -219,14 +241,17 @@ export async function resolveConfirmedIdentityEmission(opts: {
   } catch {
     // The verifier already fails closed on its own; this is the belt-and-braces
     // case where it (or a future one) throws anyway.
-    return { emit: false, reason: 'space_unverified' }
+    return { ...claimed, email: { emit: false, reason: 'space_unverified' } }
   }
-  if (!confirmation.confirmed) return { emit: false, reason: confirmation.reason }
+  if (!confirmation.confirmed) {
+    return {
+      verified: opts.verified,
+      // Google contradicting the body is exactly the case worth reporting
+      // truthfully; it only falls back when Google named no usable type.
+      spaceType: confirmation.spaceType ?? opts.claimedSpaceType,
+      email: { emit: false, reason: confirmation.reason }
+    }
+  }
 
-  return {
-    emit: true,
-    userEmail: local.userEmail,
-    spaceType: confirmation.spaceType,
-    singleUserBotDm: confirmation.singleUserBotDm
-  }
+  return { verified: opts.verified, spaceType: confirmation.spaceType, email: local }
 }
