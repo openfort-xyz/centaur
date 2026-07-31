@@ -5,7 +5,8 @@ import {
   defaultModelForHarness,
   defaultReasoningForHarness,
   effectiveReasoningForHarness,
-  harnessDisplayName
+  harnessDisplayName,
+  reasoningForModel
 } from './console-session-link'
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
@@ -189,6 +190,23 @@ describe('effectiveReasoningForHarness', () => {
     expect(effectiveReasoningForHarness('claudecode', 'high')).toBeUndefined()
     expect(effectiveReasoningForHarness('amp', 'high')).toBeUndefined()
     expect(effectiveReasoningForHarness(undefined, 'high')).toBeUndefined()
+  })
+})
+
+describe('reasoningForModel', () => {
+  test('accepts only efforts supported by the selected Codex model', () => {
+    expect(reasoningForModel('codex', 'gpt-5.6-sol', 'max')).toBe('max')
+    expect(reasoningForModel('codex', 'gpt-5.4-pro', 'low')).toBeUndefined()
+    expect(reasoningForModel('codex', 'gpt-5.4-pro', 'high')).toBe('high')
+  })
+
+  test('drops reasoning for non-Codex harnesses and unknown models', () => {
+    expect(reasoningForModel('claudecode', 'claude-opus-5', 'high')).toBeUndefined()
+    expect(reasoningForModel('codex', 'gpt-unknown', 'high')).toBeUndefined()
+  })
+
+  test('validates Nanocodex minimal as its effective low effort', () => {
+    expect(reasoningForModel('nanocodex', 'gpt-5.6-terra', 'minimal')).toBe('minimal')
   })
 })
 

@@ -14,7 +14,8 @@ import { resolveSpaceDefault, spaceDefaultsFromConfig } from './space-defaults'
 import {
   buildConsoleSessionWidget,
   defaultModelForHarness,
-  effectiveReasoningForHarness
+  effectiveReasoningForHarness,
+  reasoningForModel
 } from './console-session-link'
 import { chatReplyLimits } from './constants'
 
@@ -467,7 +468,15 @@ async function driveSession(
   const resolvedHarnessType = overrides.harnessType ?? spaceDefault?.harnessType
   const resolvedModel = overrides.model ?? spaceDefault?.model
   const resolvedProvider = overrides.provider ?? spaceDefault?.provider
-  const resolvedReasoning = overrides.reasoning ?? spaceDefault?.reasoning
+  const requestedHarnessType =
+    resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS ?? 'codex'
+  const requestedModel =
+    resolvedModel ?? defaultModelForHarness(requestedHarnessType, harnessDefaultModels(config))
+  const resolvedReasoning = reasoningForModel(
+    requestedHarnessType,
+    requestedModel,
+    overrides.reasoning ?? spaceDefault?.reasoning
+  )
   incr('googlechatbot_runs_total', { outcome: 'started' })
   try {
     const session = await createSession(
