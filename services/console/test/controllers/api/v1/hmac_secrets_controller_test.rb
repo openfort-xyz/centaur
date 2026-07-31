@@ -68,7 +68,8 @@ module Api
         principal = principals(:acme_channel)
         Grant.create!(
           principal: principal,
-          hmac_secret: secret, # codeql[rb/clear-text-storage-sensitive-data]
+          # codeql[rb/clear-text-storage-sensitive-data]
+          hmac_secret: secret,
           created_by: users(:acme_admin),
           priority: Grant::DEFAULT_DIRECT_PRIORITY
         )

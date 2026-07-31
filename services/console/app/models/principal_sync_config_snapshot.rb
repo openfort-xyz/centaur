@@ -134,7 +134,8 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     # The encrypted payload stores proxy configuration containing secret references
     # and short-lived generated credentials by design; access is restricted to the
     # control plane and retention is bounded.
-    snapshot.payload = payload_for(principal) # codeql[rb/clear-text-storage-sensitive-data]
+    # codeql[rb/clear-text-storage-sensitive-data]
+    snapshot.payload = payload_for(principal)
     if snapshot.changed?
       snapshot.save!
     else
