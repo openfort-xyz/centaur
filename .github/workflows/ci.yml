@@ -108,7 +108,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -122,7 +122,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -216,7 +216,7 @@ jobs:
 
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -274,7 +274,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -308,7 +308,7 @@ jobs:
 
   googlechatbot-tests:
     name: Googlechatbot typecheck and tests
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.googlechatbot_tests == 'true'
     steps:
@@ -342,7 +342,7 @@ jobs:
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -376,7 +376,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:
