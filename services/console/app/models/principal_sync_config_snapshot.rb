@@ -131,7 +131,10 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     snapshot = find_or_initialize_by(principal: principal, principal_cache_version: version)
     return snapshot if snapshot.persisted? && snapshot.fresh_for?(principal)
 
-    snapshot.payload = payload_for(principal)
+    # The encrypted payload stores proxy configuration containing secret references
+    # and short-lived generated credentials by design; access is restricted to the
+    # control plane and retention is bounded.
+    snapshot.payload = payload_for(principal) # codeql[rb/clear-text-storage-sensitive-data]
     if snapshot.changed?
       snapshot.save!
     else

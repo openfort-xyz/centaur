@@ -41,6 +41,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     secret.build_source(source_type: "control_plane", secret: "direct-token")
     secret.rules.build(host: host, position: 0)
     secret.save!
+    # codeql[rb/clear-text-storage-sensitive-data]
     Grant.create!(principal: principals(:globex_user), static_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -55,6 +56,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
                                created_by: users(:globex_admin))
     secret.rules.build(host: host, position: 0)
     secret.save!
+    # codeql[rb/clear-text-storage-sensitive-data]
     Grant.create!(role: roles(:globex_infra), gcp_auth_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -66,6 +68,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
                                created_by: users(:globex_admin))
     secret.rules.build(host: host, position: 0)
     secret.save!
+    # codeql[rb/clear-text-storage-sensitive-data]
     Grant.create!(principal: principals(:globex_user), gcp_auth_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -89,6 +92,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       secret.rules.build(host: "gmail.googleapis.com", http_methods: [ "GET" ], paths: [], position: 0)
       secret.save!
     end
+    # codeql[rb/clear-text-storage-sensitive-data]
     Grant.create!(role: roles(:globex_infra), oauth_token_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -548,7 +552,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     secret = static_secrets(:acme_prod_api_key)
     Grant.create!(
       principal: principals(:acme_user_bob),
-      static_secret: secret,
+      static_secret: secret, # codeql[rb/clear-text-storage-sensitive-data]
       created_by: users(:acme_admin)
     )
     affected = [
