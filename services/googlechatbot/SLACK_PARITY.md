@@ -274,3 +274,25 @@ The fork sits exactly **+1** on sqlx migration numbers (it inserted
 monotonic and exactly +1 from upstream. `check-migration-order.sh` passes; nothing
 references the file by name. This is the same tax paid in the 2026-07-24 sync and
 should be expected on every sync that brings a new sqlx migration.
+
+## 9. Upstream sync 2026-07-31 (24 commits, `origin/main..upstream/main`) — Slack-touching dispositions
+
+Full merge (all 24 commits). One conflict, resolved in the merge commit; the one
+portable Slack behavior change was added to Chat so the fork does not regress parity.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 9.1 | #1225 require explicit Slack reasoning intent and reject reasoning values unsupported by the selected model | Ported to `googlechatbot`: the LLM override prompt now returns reasoning only for an explicit effort-selection request, and `reasoningForModel` validates the requested effort against the effective Codex/Nanocodex model before execution. This prevents incidental words such as “fast” or “deep” from changing effort and drops incompatible values (for example Low on a Pro model or any effort on Claude). Focused compatibility tests added. | ✅ port |
+| 9.2 | #1185 auto-join Slack channels created through the Chat SDK | Slack transport behavior (`channel_created` + `conversations.join`). Google Chat apps are added to spaces through Chat membership/install flows and have no equivalent channel-created event to join. | 🟰 |
+| 9.3 | #1214 gate slackbotv2 health on its Postgres state connection | Slackbotv2 owns a Postgres-backed Chat SDK state adapter. Googlechatbot is intentionally stateless (§1.4/1.6) and therefore has no database connection to gate; its health endpoint already reports process readiness. | 🟰 / 🔜 (state store) |
+| 9.4 | #1216 require a mention before steering an active Slack thread | Slack-specific event behavior: Slack sends unmentioned thread replies to the bot, while Google Chat's app interaction contract delivers messages addressed to the app and the existing normalizer enforces supported Chat event types. No equivalent steering bypass was identified. | 🟰 |
+| 9.5 | #1193/#1201/#1202/#1204/#1206 role-owned and direct Slack channel permission management; #1184 report non-member Slack channels as skipped | Slack permission/catalog administration. Google Chat authorization derives from app space membership and its existing space principal; no channel-token permission table analogue exists. | 🟰 |
+| 9.6 | #1194/#1203/#1210/#1212/#1213/#1221/#1222/#1223/#1230/#1232 and dependency updates | Console/runtime/infra changes are platform-shared or unrelated to chat transport and benefit Google Chat unchanged through the full merge. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+One conflict in `centaur-iron-control/src/session.rs`: upstream removed the obsolete
+Slack `channel_name` field from `SlackChannelPermissionInput` at the same location
+where the fork defines Google Chat identity labels. Kept the Google Chat labeling
+function and adopted upstream's one-argument Slack permission constructor. No new
+sqlx migrations landed in this window, so no migration renumbering was required.
