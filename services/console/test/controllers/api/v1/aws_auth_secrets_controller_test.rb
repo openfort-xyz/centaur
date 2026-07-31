@@ -118,7 +118,7 @@ module Api
         principal = principals(:acme_channel)
         Grant.create!(
           principal: principal,
-          # codeql[rb/clear-text-storage-sensitive-data]
+          # lgtm[rb/clear-text-storage-sensitive-data]
           aws_auth_secret: secret,
           created_by: users(:acme_admin),
           priority: Grant::DEFAULT_DIRECT_PRIORITY

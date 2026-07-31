@@ -42,7 +42,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     secret.rules.build(host: host, position: 0)
     secret.save!
     Grant.create!(principal: principals(:globex_user),
-                  # codeql[rb/clear-text-storage-sensitive-data]
+                  # lgtm[rb/clear-text-storage-sensitive-data]
                   static_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -58,7 +58,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     secret.rules.build(host: host, position: 0)
     secret.save!
     Grant.create!(role: roles(:globex_infra),
-                  # codeql[rb/clear-text-storage-sensitive-data]
+                  # lgtm[rb/clear-text-storage-sensitive-data]
                   gcp_auth_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -71,7 +71,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     secret.rules.build(host: host, position: 0)
     secret.save!
     Grant.create!(principal: principals(:globex_user),
-                  # codeql[rb/clear-text-storage-sensitive-data]
+                  # lgtm[rb/clear-text-storage-sensitive-data]
                   gcp_auth_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -96,7 +96,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       secret.save!
     end
     Grant.create!(role: roles(:globex_infra),
-                  # codeql[rb/clear-text-storage-sensitive-data]
+                  # lgtm[rb/clear-text-storage-sensitive-data]
                   oauth_token_secret: secret, created_by: users(:globex_admin))
     secret
   end
@@ -556,7 +556,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     secret = static_secrets(:acme_prod_api_key)
     Grant.create!(
       principal: principals(:acme_user_bob),
-      # codeql[rb/clear-text-storage-sensitive-data]
+      # lgtm[rb/clear-text-storage-sensitive-data]
       static_secret: secret,
       created_by: users(:acme_admin)
     )
