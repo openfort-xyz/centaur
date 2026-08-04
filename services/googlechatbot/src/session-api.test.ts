@@ -1,5 +1,7 @@
 import { test, expect, describe, afterEach, beforeEach } from 'bun:test'
 import {
+  DEFAULT_SESSION_IDLE_TIMEOUT_MS,
+  DEFAULT_SESSION_MAX_DURATION_MS,
   SessionApiError,
   classifyExecuteConflict,
   turnMessagesFromEvent,
@@ -444,6 +446,60 @@ describe('executeSession', () => {
   })
   afterEach(() => {
     globalThis.fetch = realFetch
+  })
+
+  // Regression guard for the 2026-08-04 hung-turn incident. api-rs arms its
+  // watchdog only from what the caller sends: `max_duration_ms` schedules
+  // `spawn_max_duration_failure`, and `idle_timeout_ms` is what lets
+  // `record_max_duration_failure` suspend the sandbox and so stop the agent
+  // process. Omitting either leaves a turn able to run unbounded, which is how
+  // one sat for 45 minutes on an untimed tool call with nothing delivered.
+  // These bounds must survive on every execute path, with or without config.
+  const captureExecuteBody = async (
+    config: Parameters<typeof executeSession>[0]
+  ): Promise<{ idle_timeout_ms?: number; max_duration_ms?: number }> => {
+    let captured: string | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ execution_id: 'e1', ok: true, status: 'executing', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+    const { execute } = turnMessagesFromEvent(baseEvent)
+    await executeSession(config, baseEvent.thread_key, execute)
+    return JSON.parse(captured ?? '{}') as {
+      idle_timeout_ms?: number
+      max_duration_ms?: number
+    }
+  }
+
+  test('always bounds an execution even with no timeout config', async () => {
+    const body = await captureExecuteBody(loadConfig({}))
+
+    expect(body.max_duration_ms).toBe(DEFAULT_SESSION_MAX_DURATION_MS)
+    // Not merely present: an unbounded idle timeout would leave the runaway
+    // process alive after the execution row is failed.
+    expect(body.idle_timeout_ms).toBeGreaterThan(0)
+    expect(body.idle_timeout_ms).toBeLessThanOrEqual(DEFAULT_SESSION_IDLE_TIMEOUT_MS)
+  })
+
+  test('honours explicit timeout config over the defaults', async () => {
+    const body = await captureExecuteBody(
+      loadConfig({ SESSION_MAX_DURATION_MS: '60000', SESSION_IDLE_TIMEOUT_MS: '90000' })
+    )
+
+    expect(body.max_duration_ms).toBe(60_000)
+    expect(body.idle_timeout_ms).toBe(90_000)
+  })
+
+  test('caps the idle timeout at the max duration when only max is configured', async () => {
+    // A sandbox left idle for longer than the execution ceiling is a sandbox
+    // holding a process nothing is waiting on.
+    const body = await captureExecuteBody(loadConfig({ SESSION_MAX_DURATION_MS: '60000' }))
+
+    expect(body.max_duration_ms).toBe(60_000)
+    expect(body.idle_timeout_ms).toBe(60_000)
   })
 
   test('prepends the requester context and counts the operation', async () => {

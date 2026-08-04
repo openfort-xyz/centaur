@@ -89,6 +89,50 @@ export type ExecuteSessionResponse = {
  * active run without its own state store. */
 const ACTIVE_SESSION_STATUS = 'executing'
 
+/** Wall-clock ceiling on a single execution, sent as `max_duration_ms`.
+ *
+ * api-rs only arms `spawn_max_duration_failure` when the caller supplies this,
+ * so omitting it means a turn that blocks on a slow tool runs unbounded. On
+ * 2026-08-04 a turn sat 45 minutes on an untimed `browser-agent` call and only
+ * the out-of-band stuck-execution-reaper cronjob stopped it — after which the
+ * agent process kept running, because the reaper only writes to Postgres.
+ *
+ * Defaulted in code rather than left to `SESSION_MAX_DURATION_MS` alone: the
+ * bound is a safety property, and a missing env var in one values file is
+ * exactly how it went missing in production. Config tunes it; it does not
+ * enable it. */
+export const DEFAULT_SESSION_MAX_DURATION_MS = 30 * 60 * 1000
+
+/** Mirrors `DEFAULT_SESSION_IDLE_TIMEOUT_MS` in slackbotv2's session-api. */
+export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000
+
+/** Explicit option wins, then config, then the built-in bound. Reading config
+ * here as well as accepting an option is deliberate: a caller that forgets to
+ * thread the option through must still get a bounded execution. */
+function sessionMaxDurationMs(
+  config: AppConfig,
+  opts: { maxDurationMs?: number | undefined }
+): number {
+  return opts.maxDurationMs ?? config.SESSION_MAX_DURATION_MS ?? DEFAULT_SESSION_MAX_DURATION_MS
+}
+
+/** Resolve `idle_timeout_ms`, mirroring slackbotv2's `sessionIdleTimeoutMs`.
+ *
+ * This is not merely a sandbox-lifecycle knob: `record_max_duration_failure`
+ * in centaur-session-runtime only calls `spawn_idle_pause` — the thing that
+ * actually suspends the sandbox and so stops the agent process — when an idle
+ * timeout is present. Sending `max_duration_ms` without this fails the
+ * execution row while leaving the runaway process alive, which is the state
+ * the 2026-08-04 incident ended in. */
+function sessionIdleTimeoutMs(
+  config: AppConfig,
+  opts: { idleTimeoutMs?: number | undefined; maxDurationMs?: number | undefined }
+): number {
+  const explicit = opts.idleTimeoutMs ?? config.SESSION_IDLE_TIMEOUT_MS
+  if (explicit !== undefined) return explicit
+  return Math.min(DEFAULT_SESSION_IDLE_TIMEOUT_MS, sessionMaxDurationMs(config, opts))
+}
+
 type CreateSessionResponse = {
   // api-rs returns the session object flat on the response body; the nested
   // `session` shape never existed in api-rs and made activeExecution always
@@ -413,8 +457,8 @@ export async function executeSession(
         : {})
     }),
     input_lines: [toCodexInputLine(threadKey, message, opts.overrides, opts.history)],
-    ...(opts.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: opts.idleTimeoutMs }),
-    ...(opts.maxDurationMs === undefined ? {} : { max_duration_ms: opts.maxDurationMs })
+    idle_timeout_ms: sessionIdleTimeoutMs(config, opts),
+    max_duration_ms: sessionMaxDurationMs(config, opts)
   }
   const response = await sessionApiRequest('execute_session', 'execute session', () =>
     fetch(apiSessionUrl(config, threadKey, 'execute'), {
