@@ -3,22 +3,22 @@ require Rails.root.join("db/migrate/20260806190000_replace_github_bearer_injecti
 
 class ReplaceGithubBearerInjectionTest < ActiveSupport::TestCase
   test "converts GitHub host Bearer injection and invalidates granted principal snapshots" do
-    secret = StaticSecret.create!(
+    credential = StaticSecret.create!(
       namespace: "acme",
       name: "legacy GitHub token",
       inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
       created_by: users(:acme_admin)
     )
-    RequestRule.create!(host: "github.com", static_secret: secret)
+    RequestRule.create!(host: "github.com", static_secret: credential)
     principal = principals(:acme_channel)
-    Grant.create!(principal: principal, static_secret: secret, created_by: users(:acme_admin))
+    Grant.create!(principal: principal, static_secret: credential, created_by: users(:acme_admin))
     previous_version = principal.reload.sync_config_cache_version
 
     ReplaceGithubBearerInjection.new.up
 
-    secret.reload
-    assert_nil secret.inject_config
-    assert_equal CredentialProfiles::GithubToken::REPLACE_CONFIG, secret.replace_config
+    credential.reload
+    assert_nil credential.inject_config
+    assert_equal CredentialProfiles::GithubToken::REPLACE_CONFIG, credential.replace_config
     assert_equal previous_version + 1, principal.reload.sync_config_cache_version
   end
 

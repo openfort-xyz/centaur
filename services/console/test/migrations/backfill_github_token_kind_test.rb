@@ -3,16 +3,16 @@ require Rails.root.join("db/migrate/20260806190200_backfill_github_token_kind")
 
 class BackfillGithubTokenKindTest < ActiveSupport::TestCase
   def create_github_secret!(name:, inject_config: nil, replace_config: nil)
-    secret = StaticSecret.create!(
+    credential = StaticSecret.create!(
       namespace: "acme",
       name: name,
       inject_config: inject_config,
       replace_config: replace_config,
       created_by: users(:acme_admin)
     )
-    RequestRule.create!(host: "api.github.com", position: 0, static_secret: secret)
-    RequestRule.create!(host: "github.com", position: 1, static_secret: secret)
-    secret
+    RequestRule.create!(host: "api.github.com", position: 0, static_secret: credential)
+    RequestRule.create!(host: "github.com", position: 1, static_secret: credential)
+    credential
   end
 
   test "backfills canonical GitHub Bearer credentials" do

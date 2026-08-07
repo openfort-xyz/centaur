@@ -335,7 +335,7 @@ class WorkflowHostTests(unittest.TestCase):
         sleeps = []
         pool = FakePool()
 
-        async def create_pool(database_url):
+        async def create_pool(database_url, **_kwargs):
             calls.append(database_url)
             if len(calls) < 3:
                 raise ConnectionRefusedError("postgres is still starting")
@@ -344,7 +344,7 @@ class WorkflowHostTests(unittest.TestCase):
         async def sleep(delay):
             sleeps.append(delay)
 
-        fake_asyncpg = types.SimpleNamespace(create_pool=create_pool)
+        fake_asyncpg = types.SimpleNamespace(Connection=object, create_pool=create_pool)
 
         with (
             patch.dict(os.environ, {"DATABASE_URL": "postgresql://example/db"}, clear=False),
