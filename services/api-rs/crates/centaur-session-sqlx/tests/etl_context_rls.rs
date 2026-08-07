@@ -136,8 +136,6 @@ async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dy
     assert_expected_policies(conn).await?;
     assert_legacy_admin_state_is_removed(conn).await?;
 
-    insert_fixture_rows(conn).await?;
-
     let c_alpha = visible_rows(conn, "centaur_slack_reader", Some("C_ALPHA"), None).await?;
     assert_eq!(
         c_alpha,
