@@ -296,3 +296,32 @@ Slack `channel_name` field from `SlackChannelPermissionInput` at the same locati
 where the fork defines Google Chat identity labels. Kept the Google Chat labeling
 function and adopted upstream's one-argument Slack permission constructor. No new
 sqlx migrations landed in this window, so no migration renumbering was required.
+
+## 10. Upstream sync 2026-08-07 (36 commits, `f1984057..528ef862`) — Slack-touching dispositions
+
+Full merge (all 36 commits). Upstream's response-metadata controls were ported to
+Chat, and its first-class principal identity migration was extended so existing
+Google Chat principals keep their kind and verified DM identity.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 10.1 | #1275 split Slack response metadata controls — render model/harness/reasoning on the first response, every response, or never; optionally include Codex service tier independently of the Console link | Ported with `GOOGLECHATBOT_RESPONSE_METADATA_MODE` and `GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED` plus matching chart values. The Console link remains first-response-only; metadata can render without a Console URL. Service tier is omitted for provider overrides, matching Slack. | ✅ port |
+| 10.2 | #1264 preserve reactions in serialized Slack history messages | Slack's history response embeds reactions and its serializer was dropping them. Google Chat message-list responses do not embed reactions; Chat exposes a separate reactions API. No N+1 fetch, new scope, or reactions command was added during the sync. | 🔜 separate tool feature if needed |
+| 10.3 | #1249/#1251/#1250/#1263 promote principal identity into first-class fields and assign default roles in iron-control | Shared control-plane change adopted. Added `gchat_dm`/`gchat_space` to the Console kind allowlist and migration, and changed api-rs to send the Chat kind as a first-class field while retaining `gchat_space_id` and verified-DM `google_email` labels. The signed-request and shared-space credential gates are unchanged. | ✅ adapted |
+| 10.4 | Remaining workflow durability, company-context, console, sandbox, GitHubbot, proxy, harness, tool, and dependency changes | Platform-shared or unrelated to chat transport; merged unchanged with no fork-only feature work. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+Eight conflicts were resolved: the Google Chat workflow-delivery and existing
+OTLP egress rules were retained beside upstream's network policy; Google Chat
+principal constants and identity handling were combined with upstream's new
+Discord/Linear/Teams kinds and first-class fields; Google Chat RLS fixtures and
+space filtering were retained on upstream's rewritten company-context tests;
+the fork's broker-token stripping regression was kept with upstream's expanded
+header assertion; and the three GitHub OAuth conflicts took upstream's new
+credential-profile implementation, which supersedes the fork-local wrapper.
+
+Upstream's new `0049_company_context_reader_user_sources.sql` collided with the
+fork's already-applied `0049_company_context_reader_role.sql`; it is imported as
+`0050_company_context_reader_user_sources.sql`. The fork remains exactly +1 from
+upstream for SQLx migrations.

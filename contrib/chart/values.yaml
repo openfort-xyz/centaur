@@ -634,6 +634,11 @@ googlechatbot:
     repository: centaur-googlechatbot
     tag: latest
     pullPolicy: Always
+  # Append model, harness, and reasoning metadata to the first response, every
+  # response, or no responses. Independent of the optional Console link.
+  responseMetadataMode: first
+  # Include the Codex service tier when response metadata is rendered.
+  responseServiceTierEnabled: false
   # Path Google Chat POSTs events to. Must match the Chat app config and the ingress route.
   eventsPath: /api/chat/events
   # Comma/space-separated email-domain allowlist for inbound events. Empty = open to all domains.

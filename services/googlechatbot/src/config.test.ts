@@ -11,4 +11,19 @@ describe('googlechatbot config', () => {
     const config = loadConfig({ GOOGLECHATBOT_CHAT_API_TIMEOUT_MS: '5000' })
     expect(config.GOOGLECHATBOT_CHAT_API_TIMEOUT_MS).toBe(5_000)
   })
+
+  test('defaults response metadata to the first response without service tier', () => {
+    const config = loadConfig({})
+    expect(config.GOOGLECHATBOT_RESPONSE_METADATA_MODE).toBe('first')
+    expect(config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED).toBe(false)
+  })
+
+  test('accepts response metadata controls', () => {
+    const config = loadConfig({
+      GOOGLECHATBOT_RESPONSE_METADATA_MODE: 'always',
+      GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED: 'true'
+    })
+    expect(config.GOOGLECHATBOT_RESPONSE_METADATA_MODE).toBe('always')
+    expect(config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED).toBe(true)
+  })
 })

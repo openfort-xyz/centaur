@@ -49,6 +49,8 @@ See `.env.example`. Key variables:
 | `GOOGLECHATBOT_API_KEY` / `CENTAUR_API_KEY` | Bearer token for `api-rs`. |
 | `GOOGLECHATBOT_ALLOWED_DOMAIN` | Comma/space-separated email-domain allowlist (empty = open). |
 | `GOOGLECHATBOT_UPLOAD_USER` | Workspace user impersonated for attachment uploads (see below). Empty = uploads fail closed. |
+| `GOOGLECHATBOT_RESPONSE_METADATA_MODE` | Show model/harness/reasoning metadata on the `first`, `always`, or `never` response (default `first`). |
+| `GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED` | Include the Codex service tier in response metadata (default `false`). |
 | `CHAT_EVENTS_PATH` | Webhook path (default `/api/chat/events`). |
 
 ## Attachment uploads

@@ -406,6 +406,11 @@
         "eventsPath": { "type": "string" },
         "allowedDomain": { "type": "string" },
         "uploadUser": { "type": "string" },
+        "responseMetadataMode": {
+          "type": "string",
+          "enum": ["first", "always", "never"]
+        },
+        "responseServiceTierEnabled": { "type": "boolean" },
         "ingress": {
           "type": "object",
           "properties": {

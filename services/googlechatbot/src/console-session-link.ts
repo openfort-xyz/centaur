@@ -1,13 +1,10 @@
 /**
- * Google Chat "Open chat in Console" context line — the Chat-side port of
- * slackbotv2's console-session-link (upstream #843, renamed in #889).
+ * Google Chat response metadata and optional "Open chat in Console" line.
  *
- * On the first assistant message in a Chat thread, googlechatbot appends a
- * card `textParagraph` widget — `Open chat in Console · {MODEL} · {Harness}` —
- * to the final answer. Chat has no Slack-style `context` block appended at
- * stop-stream time; the single-write render (see renderer.ts) instead carries
- * the widget on the answer card (or on the button-only card for plain-text
- * answers), which is the same "muted trailer line" placement.
+ * The first assistant message can include the Console link; metadata can be
+ * shown on the first response, every response, or never. Chat has no
+ * Slack-style `context` block appended at stop-stream time; the single-write
+ * render (see renderer.ts) carries the widget on the answer card instead.
  */
 
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -51,6 +48,7 @@ const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
 const CODEX_CONFIG = codexConfig as {
   model?: unknown
   model_reasoning_effort?: unknown
+  service_tier?: unknown
 }
 
 // Default model each harness runs when no --model/--opus/... override is set,
@@ -79,6 +77,10 @@ const BAKED_DEFAULT_REASONING: Record<string, string | undefined> = {
     typeof CODEX_CONFIG.model_reasoning_effort === 'string'
       ? CODEX_CONFIG.model_reasoning_effort
       : undefined
+}
+
+const BAKED_DEFAULT_SERVICE_TIERS: Record<string, string | undefined> = {
+  codex: typeof CODEX_CONFIG.service_tier === 'string' ? CODEX_CONFIG.service_tier : undefined
 }
 
 /** Card textParagraph text is HTML-flavoured: `&`, `<`, `>` must be escaped. */
@@ -130,6 +132,14 @@ export function defaultReasoningForHarness(
   if (!harnessType) return undefined
   const key = harnessType.trim().toLowerCase()
   return configured?.[key]?.trim().toLowerCase() || BAKED_DEFAULT_REASONING[key]
+}
+
+/** Returns the baked service tier for a harness that consumes Codex config.toml. */
+export function defaultServiceTierForHarness(
+  harnessType: string | null | undefined
+): string | undefined {
+  if (!harnessType) return undefined
+  return BAKED_DEFAULT_SERVICE_TIERS[harnessType.trim().toLowerCase()]
 }
 
 /** Resolves the effort the selected harness actually runs for this turn. */
@@ -195,27 +205,34 @@ export type ChatTextParagraphWidget = {
 }
 
 /**
- * Builds the "Open chat in Console · {MODEL} · {Harness} · {Effort}" widget,
- * or undefined when no Console base URL is configured (a bare "Open chat in
- * Console" with no link is pointless, so the whole widget is skipped). The
- * model id is uppercased for display, matching slackbotv2.
+ * Builds the optional Console link and response metadata widget. Metadata can
+ * render without a Console URL; the Console link only renders when configured.
  */
 export function buildConsoleSessionWidget(params: {
   consoleBaseUrl: string | null | undefined
   threadKey: string
   harnessType?: string | null
+  metadataEnabled?: boolean
   model?: string | null
   reasoning?: string | null
+  serviceTier?: string | null
 }): ChatTextParagraphWidget | undefined {
   const url = consoleSessionUrl(params.consoleBaseUrl, params.threadKey)
-  if (!url) return undefined
-  const segments = [`<a href="${url}">Open chat in Console</a>`]
-  const model = params.model?.trim()
-  if (model) segments.push(escapeChatHtml(model.toUpperCase()))
-  const harness = harnessDisplayName(params.harnessType)
-  if (harness) segments.push(escapeChatHtml(harness))
-  const reasoning = reasoningDisplayName(params.reasoning)
-  if (reasoning) segments.push(escapeChatHtml(reasoning))
+  const includeMetadata = params.metadataEnabled ?? Boolean(url)
+  if (!url && !includeMetadata) return undefined
+  const segments: string[] = []
+  if (url) segments.push(`<a href="${url}">Open chat in Console</a>`)
+  if (includeMetadata) {
+    const model = params.model?.trim()
+    if (model) segments.push(escapeChatHtml(model.toUpperCase()))
+    const harness = harnessDisplayName(params.harnessType)
+    if (harness) segments.push(escapeChatHtml(harness))
+    const reasoning = reasoningDisplayName(params.reasoning)
+    if (reasoning) segments.push(escapeChatHtml(reasoning))
+    const serviceTier = params.serviceTier?.trim()
+    if (serviceTier) segments.push(escapeChatHtml(titleCase(serviceTier)))
+  }
+  if (segments.length === 0) return undefined
   // Middot (U+00B7) with a space on each side, matching slackbotv2's trailer.
   return { textParagraph: { text: segments.join(' · ') } }
 }

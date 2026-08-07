@@ -15,6 +15,7 @@ import {
   buildConsoleSessionWidget,
   defaultModelForHarness,
   effectiveReasoningForHarness,
+  defaultServiceTierForHarness,
   reasoningForModel
 } from './console-session-link'
 import { chatReplyLimits } from './constants'
@@ -575,13 +576,23 @@ async function driveSession(
       resolvedReasoning,
       harnessDefaultReasoning(config)
     )
-    const consoleSessionWidget = isFirstAssistantMessage
+    const includeResponseMetadata =
+      config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'always' ||
+      (config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'first' && isFirstAssistantMessage)
+    const consoleSessionWidget = isFirstAssistantMessage || includeResponseMetadata
       ? buildConsoleSessionWidget({
-          consoleBaseUrl: config.CENTAUR_CONSOLE_PUBLIC_URL,
+          consoleBaseUrl: isFirstAssistantMessage
+            ? config.CENTAUR_CONSOLE_PUBLIC_URL
+            : undefined,
           threadKey,
           harnessType: effectiveHarnessType,
+          metadataEnabled: includeResponseMetadata,
           model: effectiveModel,
-          reasoning: effectiveReasoning
+          reasoning: effectiveReasoning,
+          serviceTier:
+            config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED && !resolvedProvider
+              ? defaultServiceTierForHarness(effectiveHarnessType)
+              : undefined
         })
       : undefined
     const target = {
