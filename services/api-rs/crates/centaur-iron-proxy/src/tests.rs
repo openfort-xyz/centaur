@@ -152,7 +152,7 @@ fn strip_broker_token_secrets_drops_token_broker_and_empties() {
 }
 
 #[test]
-fn shipped_proxy_allowlist_preserves_railway_project_tokens() {
+fn shipped_proxy_allowlist_preserves_integration_headers() {
     let config: serde_yaml::Value =
         serde_yaml::from_str(include_str!("../../../../iron-proxy/iron-proxy.yaml")).unwrap();
     let transforms = config["transforms"].as_sequence().unwrap();
@@ -166,5 +166,15 @@ fn shipped_proxy_allowlist_preserves_railway_project_tokens() {
         headers
             .iter()
             .any(|header| header.as_str() == Some("project-access-token"))
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|header| header.as_str() == Some("originator"))
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|header| header.as_str() == Some("version"))
     );
 }
