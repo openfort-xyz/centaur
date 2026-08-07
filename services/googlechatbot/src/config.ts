@@ -88,6 +88,15 @@ const EnvSchema = z.object({
   // thread view. Unset = no line (matches slackbotv2).
   CENTAUR_CONSOLE_PUBLIC_URL: z.string().optional(),
 
+  // Append model, harness, and reasoning metadata to the first response,
+  // every response, or no responses. Independent of the optional Console link.
+  GOOGLECHATBOT_RESPONSE_METADATA_MODE: z.enum(['first', 'always', 'never']).default('first'),
+  // Include the baked Codex service tier when response metadata is rendered.
+  GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED: z
+    .string()
+    .default('false')
+    .transform(value => value === 'true' || value === '1'),
+
   // Deployment defaults for the harness models (mirrored from sandbox.extraEnv
   // by the chart, same as slackbotv2) so the Console-link line names the model
   // sandboxes actually run instead of the repo-baked default.

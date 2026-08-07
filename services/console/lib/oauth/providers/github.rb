@@ -13,28 +13,17 @@ module Oauth
       TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
       USER_ENDPOINT = "https://api.github.com/user"
       IDENTITY_SCOPES = [].freeze
-      API_HOSTS = %w[api.github.com github.com].freeze
-      # GitHub's clients send the token under their own scheme -- the gh CLI sends
-      # `Authorization: token <value>`, git-over-HTTPS sends
-      # `Authorization: Basic <base64>` -- so injecting a Bearer header is the
-      # wrong shape for both. api-rs also force-injects GITHUB_TOKEN=GITHUB_TOKEN
-      # into every sandbox, so gh always carries this placeholder in its own
-      # header. Replace is scheme-agnostic: it substitutes the placeholder
-      # wherever it appears in the matched header, which works for `token` and
-      # `Basic` alike. Mirrors the shared GITHUB_TOKEN static secret.
-      WRAPPER_REPLACE_CONFIG = { "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] }.freeze
-
       def key = KEY
       def display_name = "GitHub"
       def authorization_endpoint = AUTHORIZATION_ENDPOINT
       def token_endpoint = TOKEN_ENDPOINT
       def identity_scopes = IDENTITY_SCOPES
-      def api_hosts = API_HOSTS
-      def wrapper_replace_config = WRAPPER_REPLACE_CONFIG
       def authorization_scope_param = "scope"
       def scope_separator = " "
       def extra_authorization_params = {}
       def refreshable? = false
+
+      def wrapping_secret_kind = CredentialProfiles::GithubToken::KIND
 
       def parse_granted_scopes(scope)
         scope.to_s.split(/[,\s]+/).reject(&:blank?)

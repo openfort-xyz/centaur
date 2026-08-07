@@ -4,6 +4,7 @@ import {
   consoleSessionUrl,
   defaultModelForHarness,
   defaultReasoningForHarness,
+  defaultServiceTierForHarness,
   effectiveReasoningForHarness,
   harnessDisplayName,
   reasoningForModel
@@ -139,6 +140,45 @@ describe('buildConsoleSessionWidget', () => {
         model: 'gpt-5.2'
       })
     ).toBeUndefined()
+  })
+
+  test('renders metadata without a Console URL and can render the link alone', () => {
+    expect(
+      buildConsoleSessionWidget({
+        consoleBaseUrl: undefined,
+        threadKey: 'chat:spaces:A:1',
+        harnessType: 'codex',
+        metadataEnabled: true,
+        model: 'gpt-5.6-sol'
+      })?.textParagraph.text
+    ).toBe('GPT-5.6-SOL · Codex')
+
+    expect(
+      buildConsoleSessionWidget({
+        consoleBaseUrl: 'https://console.centaur.dev',
+        threadKey: 'chat:spaces:A:1',
+        metadataEnabled: false,
+        model: 'gpt-5.6-sol'
+      })?.textParagraph.text
+    ).toBe(
+      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1">Open chat in Console</a>'
+    )
+  })
+})
+
+describe('response metadata controls', () => {
+  test('reads and renders the baked Codex service tier', () => {
+    const serviceTier = (codexConfig as { service_tier?: string }).service_tier
+    expect(defaultServiceTierForHarness('codex')).toBe(serviceTier)
+    expect(defaultServiceTierForHarness('nanocodex')).toBeUndefined()
+    expect(
+      buildConsoleSessionWidget({
+        consoleBaseUrl: undefined,
+        threadKey: 'chat:spaces:A:1',
+        metadataEnabled: true,
+        serviceTier: 'flex_tier'
+      })?.textParagraph.text
+    ).toBe('Flex Tier')
   })
 })
 

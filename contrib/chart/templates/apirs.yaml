@@ -106,6 +106,10 @@
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS" "value" (dig "companyContextDocuments" "intervalSeconds" 14400 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS" "value" (dig "companyContextDocuments" "maxWindowSeconds" 21600 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE" "value" (dig "companyContextDocuments" "batchSize" 50 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" (dig "companyContextEmbeddings" "enabled" false $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_INTERVAL_SECONDS" "value" (dig "companyContextEmbeddings" "intervalSeconds" 300 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_BATCH_SIZE" "value" (dig "companyContextEmbeddings" "batchSize" 250 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" (dig "companyContextEmbeddings" "model" "text-embedding-3-small" $apiRsEtl))
 -}}
 {{- $apiRsEtlPassthroughNames := list -}}
 {{- range $env := $apiRsEtlEnv -}}
@@ -353,8 +357,6 @@ spec:
               value: {{ $repoCachePvcName | quote }}
 {{- end }}
 {{- end }}
-            - name: KUBERNETES_SANDBOX_IRON_PROXY_MODE
-              value: {{ .Values.apiRs.ironProxy.mode | quote }}
             - name: KUBERNETES_IRON_PROXY_IMAGE
               value: {{ printf "%s:%s" .Values.ironProxy.image.repository .Values.ironProxy.image.tag | quote }}
             - name: KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY
@@ -425,10 +427,8 @@ spec:
             - name: SESSION_SANDBOX_EXTRA_ENV
               value: {{ $sandboxEnvList | toJson | quote }}
 {{- end }}
-{{- if $console.enabled }}
             # console control plane: principals/roles/grants + per-sandbox
-            # proxy sync. When unset, the api-rs falls back to the rendered
-            # static proxy config.
+            # proxy sync.
             - name: IRON_CONTROL_URL
               value: {{ include "centaur.consoleUrl" . | quote }}
             - name: IRON_CONTROL_API_KEY
@@ -436,7 +436,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
-{{- end }}
 {{- if and .Values.toolServer.enabled (not .Values.toolServer.repo) (eq (len $toolSources) 0) }}
 {{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}
 {{- end }}

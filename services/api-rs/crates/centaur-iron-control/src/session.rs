@@ -1,20 +1,20 @@
 //! Per-session principal registration.
 //!
-//! Roles are registered once at startup (see [`crate::register_role`]); a
-//! [`SessionRegistrar`] carries the resulting role OIDs and, when a session
-//! starts, upserts the session's principal. Brand-new principals receive the
-//! default roles once; existing principals keep their current assignments so
-//! operator revocations in console or ``centaur-perms`` remain sticky. The
-//! principal is derived from the thread key (see [`crate::derive_principal`]).
+//! Roles are registered once at startup (see [`crate::register_role`]). When a
+//! session starts, [`SessionRegistrar`] upserts the session's principal.
+//! Iron-control owns default role assignment for brand-new principals, while
+//! existing principals keep their current assignments so operator revocations
+//! in console or ``centaur-perms`` remain sticky. The principal is derived from
+//! the thread key (see [`crate::derive_principal`]).
 
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
-use crate::models::{Principal, SlackChannelPermissionInput};
+use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
-    GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND, KIND_LABEL,
+    GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND,
     derive_principal_with_slack_team, is_direct_message, parse_gchat_space, slack_conversation_id,
 };
 
@@ -27,7 +27,7 @@ struct SessionPrincipalMetadata<'a> {
     /// The requester's address as the ingress reported it. Google Chat carries
     /// it on the event; ``slack_user_email`` stays separate because the
     /// slackbot resolves that one out of band (see
-    /// [`apply_gchat_identity_labels`]).
+    /// [`apply_gchat_identity`]).
     user_email: Option<&'a str>,
     /// Google Chat ``SpaceType`` for the conversation this session runs in.
     space_type: Option<&'a str>,
@@ -76,21 +76,13 @@ impl<'a> SessionPrincipalMetadata<'a> {
 pub struct SessionRegistrar {
     client: IronControlClient,
     namespace: String,
-    assign_role_ids: Vec<String>,
 }
 
 impl SessionRegistrar {
-    /// ``assign_role_ids`` are the iron-control role OIDs (from
-    /// [`crate::register_role`]) to assign to every session's principal.
-    pub fn new(
-        client: IronControlClient,
-        namespace: impl Into<String>,
-        assign_role_ids: Vec<String>,
-    ) -> Self {
+    pub fn new(client: IronControlClient, namespace: impl Into<String>) -> Self {
         Self {
             client,
             namespace: namespace.into(),
-            assign_role_ids,
         }
     }
 
@@ -99,10 +91,8 @@ impl SessionRegistrar {
     /// the OID) so callers can bind the session's egress proxy to the same
     /// identity.
     ///
-    /// Default roles are assigned only when the principal does not already
-    /// exist. Re-registering an existing channel/user still refreshes identity
-    /// metadata, but it must not restore roles that an operator manually
-    /// removed.
+    /// Re-registering an existing channel/user refreshes identity metadata but
+    /// leaves its role assignments to iron-control.
     pub async fn register_session(
         &self,
         thread_key: &str,
@@ -115,9 +105,9 @@ impl SessionRegistrar {
             metadata.slack_team_id,
             metadata.conversation_name,
         );
-        let mut input = principal.to_identity_input(&self.namespace);
-        apply_slack_dm_email_label(thread_key, metadata.slack_user_email, &mut input.labels);
-        apply_gchat_identity_labels(thread_key, &metadata, &mut input.labels);
+        let mut input = principal.to_principal_input(&self.namespace);
+        apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
+        apply_gchat_identity(thread_key, &metadata, &mut input);
         let existing = match self
             .client
             .get_principal(&self.namespace, &input.foreign_id)
@@ -130,10 +120,15 @@ impl SessionRegistrar {
         let exists = existing.is_some();
         if let Some(existing) = existing {
             let mut labels = existing.labels;
+            strip_compatibility_identity_labels(&mut labels);
             labels.extend(input.labels);
             input.labels = labels;
         }
-        let slack_permission = slack_permission_for_thread(thread_key, &input.labels);
+        let slack_permission = slack_permission_for_thread(
+            thread_key,
+            input.slack_channel_id.as_deref(),
+            input.slack_user_id.as_deref(),
+        );
         let should_upsert_slack_permission = !exists
             || slack_permission
                 .as_ref()
@@ -143,15 +138,6 @@ impl SessionRegistrar {
             self.client
                 .upsert_slack_channel_permission(&record.id, &permission)
                 .await?;
-        }
-        if !exists {
-            for role_id in &self.assign_role_ids {
-                match self.client.assign_role(&record.id, role_id).await {
-                    Ok(()) => {}
-                    Err(error) if is_status(&error, 409) || is_status(&error, 422) => {}
-                    Err(error) => return Err(error),
-                }
-            }
         }
         Ok(record)
     }
@@ -163,25 +149,24 @@ impl SessionRegistrar {
 
 fn slack_permission_for_thread(
     thread_key: &str,
-    labels: &BTreeMap<String, String>,
+    slack_channel_id: Option<&str>,
+    slack_user_id: Option<&str>,
 ) -> Option<SlackChannelPermissionInput> {
-    if let Some(channel_id) = labels.get("slack_channel_id") {
+    if let Some(channel_id) = slack_channel_id {
         let channel_id = channel_id.trim();
         return (!is_direct_message(Some(channel_id)))
             .then(|| slack_permission(channel_id.to_owned()));
     }
 
-    if !labels.contains_key("slack_user_id") {
-        return None;
-    }
+    slack_user_id?;
     let conversation_id = slack_conversation_id(thread_key)?;
     is_direct_message(Some(conversation_id)).then(|| slack_permission(conversation_id.to_owned()))
 }
 
-fn apply_slack_dm_email_label(
+fn apply_slack_dm_email(
     thread_key: &str,
     slack_user_email: Option<&str>,
-    labels: &mut BTreeMap<String, String>,
+    input: &mut PrincipalInput,
 ) {
     let Some(email) = slack_user_email
         .map(str::trim)
@@ -192,12 +177,24 @@ fn apply_slack_dm_email_label(
     let Some(conversation_id) = slack_conversation_id(thread_key) else {
         return;
     };
-    if is_direct_message(Some(conversation_id)) && labels.contains_key("slack_user_id") {
-        labels.insert("slack_email".to_owned(), email.to_owned());
+    if is_direct_message(Some(conversation_id)) && input.slack_user_id.is_some() {
+        input.slack_email = Some(email.to_owned());
     }
 }
 
-/// Label a Google Chat principal with its space kind and, for a 1:1 DM, the
+fn strip_compatibility_identity_labels(labels: &mut BTreeMap<String, String>) {
+    for label in [
+        "kind",
+        "slack_user_id",
+        "slack_channel_id",
+        "slack_team_id",
+        "slack_email",
+    ] {
+        labels.remove(label);
+    }
+}
+
+/// Identify a Google Chat principal by its space kind and, for a 1:1 DM, the
 /// requester's email.
 ///
 /// Google Chat principals key on the space, so the thread key alone cannot say
@@ -220,10 +217,10 @@ fn apply_slack_dm_email_label(
 ///
 /// A missing space type means the ingress predates this contract; we label
 /// nothing rather than guess, which leaves the principal exactly as it is today.
-fn apply_gchat_identity_labels(
+fn apply_gchat_identity(
     thread_key: &str,
     metadata: &SessionPrincipalMetadata<'_>,
-    labels: &mut BTreeMap<String, String>,
+    input: &mut PrincipalInput,
 ) {
     if parse_gchat_space(thread_key).is_none() {
         return;
@@ -241,7 +238,7 @@ fn apply_gchat_identity_labels(
     } else {
         GCHAT_SPACE_KIND
     };
-    labels.insert(KIND_LABEL.to_owned(), kind.to_owned());
+    input.kind = Some(kind.to_owned());
 
     if !is_dm || !metadata.request_verified {
         return;
@@ -253,7 +250,9 @@ fn apply_gchat_identity_labels(
     else {
         return;
     };
-    labels.insert("google_email".to_owned(), email.to_owned());
+    input
+        .labels
+        .insert("google_email".to_owned(), email.to_owned());
 }
 
 fn slack_permission(channel_id: String) -> SlackChannelPermissionInput {
@@ -273,6 +272,7 @@ fn is_status(err: &IronControlError, code: u16) -> bool {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::derive_principal;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -340,37 +340,31 @@ mod tests {
     }
 
     #[test]
-    fn slack_dm_email_label_applies_only_to_dm_user_principals() {
-        let mut dm_labels = BTreeMap::new();
-        dm_labels.insert("slack_user_id".to_owned(), "U123".to_owned());
-        apply_slack_dm_email_label(
+    fn slack_dm_email_applies_only_to_dm_user_principals() {
+        let mut dm_input = derive_principal("slack:T123:D123:ts", Some("U123"), None)
+            .to_principal_input("default");
+        apply_slack_dm_email(
             "slack:T123:D123:1773364194.179929",
             Some(" ada@example.com "),
-            &mut dm_labels,
+            &mut dm_input,
         );
-        assert_eq!(
-            dm_labels.get("slack_email").map(String::as_str),
-            Some("ada@example.com")
-        );
+        assert_eq!(dm_input.slack_email.as_deref(), Some("ada@example.com"));
 
-        let mut channel_labels = BTreeMap::new();
-        channel_labels.insert("slack_channel_id".to_owned(), "C123".to_owned());
-        apply_slack_dm_email_label(
+        let mut channel_input = derive_principal("slack:T123:C123:ts", Some("U123"), None)
+            .to_principal_input("default");
+        apply_slack_dm_email(
             "slack:T123:C123:1773364194.179929",
             Some("ada@example.com"),
-            &mut channel_labels,
+            &mut channel_input,
         );
-        assert_eq!(channel_labels.get("slack_email"), None);
+        assert_eq!(channel_input.slack_email, None);
     }
 
     #[tokio::test]
-    async fn register_session_seeds_roles_for_new_principal() {
+    async fn register_session_leaves_default_roles_to_iron_control() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar = SessionRegistrar::new(
-            IronControlClient::new(base_url, "test-key"),
-            "default",
-            vec!["role_infra".to_owned()],
-        );
+        let registrar =
+            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -394,18 +388,20 @@ mod tests {
                 &"POST /api/v1/principals/prn_channel/slack_channel_permissions".to_owned()
             )
         );
-        assert!(requests.contains(&"POST /api/v1/principals/prn_channel/roles".to_owned()));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request == "POST /api/v1/principals/prn_channel/roles"),
+            "iron-control assigns configured default roles during principal creation"
+        );
         server.abort();
     }
 
     #[tokio::test]
     async fn register_session_does_not_restore_roles_for_existing_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar = SessionRegistrar::new(
-            IronControlClient::new(base_url, "test-key"),
-            "default",
-            vec!["role_infra".to_owned()],
-        );
+        let registrar =
+            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -442,11 +438,8 @@ mod tests {
     #[tokio::test]
     async fn register_session_upserts_slack_dm_permission_for_new_user_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar = SessionRegistrar::new(
-            IronControlClient::new(base_url, "test-key"),
-            "default",
-            vec![],
-        );
+        let registrar =
+            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -470,11 +463,8 @@ mod tests {
     #[tokio::test]
     async fn register_session_upserts_slack_dm_permission_for_existing_user_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar = SessionRegistrar::new(
-            IronControlClient::new(base_url, "test-key"),
-            "default",
-            vec!["role_infra".to_owned()],
-        );
+        let registrar =
+            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -503,14 +493,14 @@ mod tests {
 
     const GCHAT_DM_THREAD: &str = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
 
-    fn gchat_labels(metadata: Value) -> BTreeMap<String, String> {
-        let mut labels = BTreeMap::new();
-        apply_gchat_identity_labels(
+    fn gchat_input(metadata: Value) -> PrincipalInput {
+        let mut input = derive_principal(GCHAT_DM_THREAD, None, None).to_principal_input("default");
+        apply_gchat_identity(
             GCHAT_DM_THREAD,
             &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
-            &mut labels,
+            &mut input,
         );
-        labels
+        input
     }
 
     #[test]
@@ -539,14 +529,14 @@ mod tests {
 
     #[test]
     fn gchat_dm_labels_carry_the_verified_requester_email() {
-        let labels = gchat_labels(json!({
+        let input = gchat_input(json!({
             "user_email": " ada@example.com ",
             "googlechat_space_type": "DIRECT_MESSAGE",
             "googlechat_request_verified": true
         }));
-        assert_eq!(labels.get("kind").map(String::as_str), Some("gchat_dm"));
+        assert_eq!(input.kind.as_deref(), Some("gchat_dm"));
         assert_eq!(
-            labels.get("google_email").map(String::as_str),
+            input.labels.get("google_email").map(String::as_str),
             Some("ada@example.com")
         );
     }
@@ -554,18 +544,18 @@ mod tests {
     #[test]
     fn gchat_group_spaces_never_carry_an_email() {
         for space_type in ["GROUP_CHAT", "SPACE"] {
-            let labels = gchat_labels(json!({
+            let input = gchat_input(json!({
                 "user_email": "ada@example.com",
                 "googlechat_space_type": space_type,
                 "googlechat_request_verified": true
             }));
             assert_eq!(
-                labels.get("kind").map(String::as_str),
+                input.kind.as_deref(),
                 Some("gchat_space"),
                 "{space_type} must not be treated as a 1:1 conversation"
             );
             assert_eq!(
-                labels.get("google_email"),
+                input.labels.get("google_email"),
                 None,
                 "{space_type} must not adopt one member's identity"
             );
@@ -576,52 +566,53 @@ mod tests {
     fn gchat_dm_email_requires_a_verified_request() {
         // An unverified event body is attacker-controllable, so its email must
         // not become an identity reconciliation will grant credentials to.
-        let labels = gchat_labels(json!({
+        let input = gchat_input(json!({
             "user_email": "attacker@example.com",
             "googlechat_space_type": "DIRECT_MESSAGE"
         }));
-        assert_eq!(labels.get("kind").map(String::as_str), Some("gchat_dm"));
-        assert_eq!(labels.get("google_email"), None);
+        assert_eq!(input.kind.as_deref(), Some("gchat_dm"));
+        assert_eq!(input.labels.get("google_email"), None);
     }
 
     #[test]
-    fn gchat_labels_are_skipped_without_a_space_type() {
+    fn gchat_identity_is_skipped_without_a_space_type() {
         // An ingress that predates the space-type contract leaves the principal
         // exactly as it is today rather than being guessed into a kind.
-        assert!(
-            gchat_labels(json!({
-                "user_email": "ada@example.com",
-                "googlechat_request_verified": true
-            }))
-            .is_empty()
-        );
+        let input = gchat_input(json!({
+            "user_email": "ada@example.com",
+            "googlechat_request_verified": true
+        }));
+        assert_eq!(input.kind, None);
+        assert_eq!(input.labels.get("google_email"), None);
     }
 
     #[test]
-    fn gchat_identity_labels_ignore_non_gchat_threads() {
+    fn gchat_identity_ignores_non_gchat_threads() {
         // The Slack-compatible `chat:C…` adapter key is not Google Chat.
-        let mut labels = BTreeMap::new();
+        let mut input = derive_principal("chat:C123:1780000000.000000", None, None)
+            .to_principal_input("default");
+        let before = input.clone();
         let metadata = json!({
             "user_email": "ada@example.com",
             "googlechat_space_type": "DIRECT_MESSAGE",
             "googlechat_request_verified": true
         });
         for thread_key in ["chat:C123:1780000000.000000", "slack:T123:D123:1780.1"] {
-            apply_gchat_identity_labels(
+            apply_gchat_identity(
                 thread_key,
                 &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
-                &mut labels,
+                &mut input,
             );
         }
-        assert!(labels.is_empty());
+        assert_eq!(input, before);
     }
 
     #[test]
     fn slack_dm_labels_are_unchanged_by_googlechat_metadata() {
         // Slack keeps sourcing its address from `slack_user_email`; a stray
         // `user_email` must not leak into a Slack principal.
-        let mut labels = BTreeMap::new();
-        labels.insert("slack_user_id".to_owned(), "U123".to_owned());
+        let mut input = derive_principal("slack:T123:D123:1780.1", Some("U123"), None)
+            .to_principal_input("default");
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_user_email": "ada@example.com",
@@ -630,26 +621,44 @@ mod tests {
             "googlechat_request_verified": true
         });
         let parsed = SessionPrincipalMetadata::from_session_metadata(Some(&metadata));
-        apply_slack_dm_email_label(
+        apply_slack_dm_email(
             "slack:T123:D123:1780.1",
             parsed.slack_user_email,
-            &mut labels,
+            &mut input,
         );
-        apply_gchat_identity_labels("slack:T123:D123:1780.1", &parsed, &mut labels);
-        assert_eq!(
-            labels.get("slack_email").map(String::as_str),
-            Some("ada@example.com")
-        );
-        assert_eq!(labels.get("google_email"), None);
-        assert_eq!(labels.get("kind"), None);
+        apply_gchat_identity("slack:T123:D123:1780.1", &parsed, &mut input);
+        assert_eq!(input.slack_email.as_deref(), Some("ada@example.com"));
+        assert_eq!(input.labels.get("google_email"), None);
+        assert_eq!(input.kind.as_deref(), Some("slack_dm"));
     }
 
     #[test]
     fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
-        let mut labels = BTreeMap::new();
-        labels.insert("slack_channel_id".to_owned(), "D123".to_owned());
+        assert_eq!(
+            slack_permission_for_thread("slack:D123:ts", Some("D123"), None),
+            None
+        );
+    }
 
-        assert_eq!(slack_permission_for_thread("slack:D123:ts", &labels), None);
+    #[test]
+    fn compatibility_identity_labels_are_not_merged_back_into_writes() {
+        let mut labels = BTreeMap::from([
+            ("kind".to_owned(), "slack_dm".to_owned()),
+            ("slack_user_id".to_owned(), "U0123456789".to_owned()),
+            ("slack_team_id".to_owned(), "T0123456789".to_owned()),
+            ("managed-by".to_owned(), "centaur".to_owned()),
+            ("team".to_owned(), "platform".to_owned()),
+        ]);
+
+        strip_compatibility_identity_labels(&mut labels);
+
+        assert_eq!(
+            labels,
+            BTreeMap::from([
+                ("managed-by".to_owned(), "centaur".to_owned()),
+                ("team".to_owned(), "platform".to_owned()),
+            ])
+        );
     }
 
     async fn spawn_iron_control_stub(

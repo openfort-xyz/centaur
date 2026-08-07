@@ -87,6 +87,10 @@ spec:
               value: {{ .Values.googlechatbot.messageOverridesStrategy.timeoutMs | quote }}
             - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS
               value: {{ .Values.googlechatbot.messageOverridesStrategy.maxOutputTokens | quote }}
+            - name: GOOGLECHATBOT_RESPONSE_METADATA_MODE
+              value: {{ .Values.googlechatbot.responseMetadataMode | quote }}
+            - name: GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED
+              value: {{ .Values.googlechatbot.responseServiceTierEnabled | quote }}
             # Shared with slackbotv2: same OPENAI_API_KEY secret key, optional so
             # a deployment without it still starts (llm mode then no-ops).
             - name: OPENAI_API_KEY

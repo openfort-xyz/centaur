@@ -434,6 +434,16 @@ module Oauth
       assert_nil cred.next_attempt_at
       assert_equal [ "api.github.com", "github.com" ], cred.static_secret.rules.map(&:host)
       assert_equal "GitHub – Pending GitHub account token", cred.static_secret.name
+      assert_equal "github_token", cred.static_secret.kind
+      assert_nil cred.static_secret.inject_config
+      assert_equal(
+        {
+          "proxy_value" => "GITHUB_TOKEN",
+          "match_headers" => [ "Authorization" ],
+          "require" => false
+        },
+        cred.static_secret.replace_config
+      )
       refute_includes BrokerCredential.refreshable, cred
     end
 
@@ -503,11 +513,11 @@ module Oauth
       # gh sends `Authorization: token <value>` and git sends `Basic <base64>`, so
       # a Bearer injection is the wrong scheme for both. Replace substitutes the
       # GITHUB_TOKEN placeholder api-rs puts in every sandbox, whatever the scheme.
-      assert_equal({ "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
+      assert_equal({ "require" => false, "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
                    secret.replace_config)
       assert_nil secret.inject_config
       assert_equal [ "header:authorization" ], secret.proxy_conflict_targets
-      assert_equal({ "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
+      assert_equal({ "require" => false, "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
                    secret.to_proxy_secret["replace"])
       # The transform changes; the host scoping does not.
       assert_equal %w[api.github.com github.com], secret.rules.order(:position).map(&:host)
