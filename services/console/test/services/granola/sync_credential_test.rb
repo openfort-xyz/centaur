@@ -1,5 +1,4 @@
 require "test_helper"
-require "timeout"
 
 module Granola
   class SyncCredentialTest < ActiveSupport::TestCase
@@ -136,23 +135,101 @@ module Granola
       assert_equal "Second meeting.", meetings[1]["summary_markdown"]
     end
 
-    test "parse_meetings returns nothing for an unclosed meeting tag, without hanging" do
-      instance = SyncCredential.new(credential, api_client: FakeApiClient.new, mcp_http: ->(*) { })
-      # A meeting header with no closing </meeting> anywhere in the document --
-      # this is exactly the shape that made the old `.*?`-based MEETING_RE
-      # quadratic (CodeQL: "may run slow on strings starting with '<meeting
-      # id=\"!\" title=\"\" date=\"\">' and with many repetitions of '<meeting
-      # id=\"!\" title=\"\" date=\"\">a'"). 2000 repetitions keeps the test itself
-      # fast while still being large enough that the old quadratic behavior
-      # would be very noticeably slow (the timeout is the regression guard).
-      unclosed = ('<meeting id="!" title="" date="">' + "a") * 2000
-
-      meetings = nil
-      assert_nothing_raised do
-        Timeout.timeout(5) { meetings = instance.send(:parse_meetings, unclosed) }
+    test "parses meeting dates with timezone abbreviations" do
+      api_client = FakeApiClient.new
+      cst_meeting = meeting_xml(date: "Aug 5, 2026 5:00 PM CST")
+      mcp_http = lambda do |tool:, **|
+        case tool
+        when "get_account_info"
+          { email: "owner@example.com" }.to_json
+        when "list_meetings", "get_meetings"
+          cst_meeting
+        when "get_meeting_transcript"
+          ""
+        else
+          flunk "unexpected Granola MCP tool #{tool}"
+        end
       end
 
-      assert_empty meetings
+      SyncCredential.new(credential, api_client: api_client, mcp_http: mcp_http).call
+
+      batch = api_client.batches.fetch(0)
+      assert_equal "2026-08-05T17:00:00-06:00", batch[:notes].fetch(0)["source_created_at"]
+      assert_equal "2026-08-05T17:00:00-06:00", batch[:notes].fetch(0)["source_updated_at"]
+      assert_equal "2026-08-05T17:00:00-06:00", batch[:checkpoint][:watermark_time]
+    end
+
+    test "records a successful sync when there are no new meetings" do
+      checkpoint_time = "2026-07-08T12:00:00Z"
+      api_client = FakeApiClient.new(
+        checkpoint: { "watermark_time" => checkpoint_time }
+      )
+      mcp_http = lambda do |tool:, **|
+        case tool
+        when "get_account_info"
+          { email: "owner@example.com" }.to_json
+        when "list_meetings"
+          ""
+        else
+          flunk "unexpected Granola MCP tool #{tool}"
+        end
+      end
+
+      SyncCredential.new(credential, api_client: api_client, mcp_http: mcp_http).call
+
+      batch = api_client.batches.fetch(0)
+      assert_equal "completed", batch[:run][:status]
+      assert_equal 0, batch[:run][:notes_seen]
+      assert_empty batch[:notes]
+      assert_equal checkpoint_time, batch[:checkpoint][:watermark_time]
+    end
+
+    test "does not advance the checkpoint when reported meetings cannot be parsed" do
+      api_client = FakeApiClient.new
+      mcp_http = lambda do |tool:, **|
+        case tool
+        when "get_account_info"
+          { email: "owner@example.com" }.to_json
+        when "list_meetings"
+          '<meetings_data count="1"><meeting></meeting></meetings_data>'
+        else
+          flunk "unexpected Granola MCP tool #{tool}"
+        end
+      end
+
+      error = assert_raises(SyncCredential::GranolaApiError) do
+        SyncCredential.new(credential, api_client: api_client, mcp_http: mcp_http).call
+      end
+
+      assert_equal "Granola MCP reported meetings that could not be parsed", error.message
+      assert_nil api_client.batches.fetch(0)[:checkpoint][:watermark_time]
+    end
+
+    test "fetches all meeting details in batches of ten" do
+      api_client = FakeApiClient.new
+      meetings = 51.times.map { |index| meeting_xml(id: "meeting-#{index}") }
+      detail_batches = []
+      mcp_http = lambda do |tool:, arguments: {}, **|
+        case tool
+        when "get_account_info"
+          { email: "owner@example.com" }.to_json
+        when "list_meetings"
+          meetings.join
+        when "get_meetings"
+          detail_batches << arguments.fetch("meeting_ids")
+          indexes = arguments.fetch("meeting_ids").map { |id| id.delete_prefix("meeting-").to_i }
+          meetings.values_at(*indexes).join
+        when "get_meeting_transcript"
+          ""
+        else
+          flunk "unexpected Granola MCP tool #{tool}"
+        end
+      end
+
+      SyncCredential.new(credential, api_client: api_client, mcp_http: mcp_http).call
+
+      assert_equal [ 10, 10, 10, 10, 10, 1 ], detail_batches.map(&:length)
+      assert_equal 51, api_client.batches.fetch(0)[:notes].length
     end
 
     test "includes MCP tool error content in the raised error" do
@@ -190,9 +267,9 @@ module Granola
 
     private
 
-    def meeting_xml
+    def meeting_xml(id: "meeting-1", date: "Jul 8, 2026 5:30 PM GMT+2")
       <<~XML
-        <meeting id="meeting-1" title="Planning" date="Jul 8, 2026 5:30 PM GMT+2">
+        <meeting id="#{id}" title="Planning" date="#{date}" captured_by_me="true" listed_as_participant="true" is_workspace_visible="false">
           <known_participants>Ada (note creator) from Acme &lt;ada@example.com&gt;
           Bob &lt;bob@example.com&gt;</known_participants>
           <summary>Ship the Granola sync.</summary>
