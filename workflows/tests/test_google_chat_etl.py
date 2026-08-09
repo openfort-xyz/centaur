@@ -14,6 +14,14 @@ def _install_api_stubs() -> None:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
+    # Sibling test modules (test_attio_sync, test_company_context_documents_
+    # attachments, the slack ETL tests) stub these into sys.modules at import
+    # time, and some stubs lack the record_etl_items_* names. Evict them so
+    # this module imports the real implementations regardless of collection
+    # order.
+    for stubbed in ("workflows.etl_metrics", "workflows.slack.shared"):
+        sys.modules.pop(stubbed, None)
+
     runtime_control = sys.modules.get("api.runtime_control") or types.ModuleType(
         "api.runtime_control"
     )
