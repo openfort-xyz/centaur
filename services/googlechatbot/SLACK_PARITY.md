@@ -325,3 +325,31 @@ Upstream's new `0049_company_context_reader_user_sources.sql` collided with the
 fork's already-applied `0049_company_context_reader_role.sql`; it is imported as
 `0050_company_context_reader_user_sources.sql`. The fork remains exactly +1 from
 upstream for SQLx migrations.
+
+## 11. Upstream sync 2026-08-09 (23 commits, `528ef862..5f3c9dca`) — Slack-touching dispositions
+
+Full sync (all 23 commits). First window with **zero Slack-touching functional
+changes** — nothing to port to Chat; every item is shared platform work or a
+generated-artifact cleanup.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 11.1 | #1301 stop tracking generated docs markdown (deletes `docs/public/md/**`, including `operate/slack-etl.md`, and gitignores the build output) | Generated artifacts only; the fork tracked no Chat files under `docs/public/md/` (docs pass is still 🔜, 2.13). Removed wholesale. | 🟰 |
+| 11.2 | #1316 searchable principals table (console) | Generic name/kind search + pagination — no hardcoded principal-kind list, so `gchat_dm`/`gchat_space` principals (10.3) list, search, and paginate unchanged. | 🟰 (shared) |
+| 11.3 | #1285 enforce global foreign ID uniqueness (console principal validation + data migration) | Applies uniformly to all principal kinds including Chat's; no Chat-specific foreign-id scheme exists that relied on per-namespace scoping. | 🟰 (shared) |
+| 11.4 | #1314/#1315 Granola MCP meeting parsing (Nokogiri strict-XML rewrite, batched detail fetches, timezone abbreviations) | Supersedes the fork-local ReDoS-safe regex scanner in `granola/sync_credential.rb` (a real parser has no quadratic-backtracking shape). Took upstream wholesale; kept the fork's multi-meeting extraction test, dropped the ReDoS regression test whose target scanner no longer exists. | 🟰 (shared; fork-local fix superseded) |
+| 11.5 | #1317 require harness server checks · #1300 run workflow and tool tests · #1302 console CI for merge groups | CI-topology changes; `ci-success` `needs`/`allowed-skips` re-unioned to keep the fork's `googlechatbot-tests` job beside upstream's new `harness-server-checks`/`workflow-python-tests`/`tool-tests`. | ✅ (union) |
+| 11.6 | #1296/#1297/#1298 hybrid + scoped company-context search · #1286 embedding workflow · #1237/#1239 raw queries / user-source scoping · #1295 workflow-run name filter | Shared company-context/workflow platform; upstream's `etl_context_rls.rs` additions are Granola-only and additive, and the fork's `google_chat_sync_*` RLS fixtures and space filtering survive untouched. | 🟰 (shared) |
+| 11.7 | #1309 require iron control · #1304 skip stale broker refresh · #1305 empty Granola syncs · #1207 api-rs pod resources · #993/#1273 sandbox scheduling/capability fixes · #1294 permissioning docs · #1274 workflow allowlist ordering · #1284 OpenAI workflow dependency · #737 LLVM 22 · #811 Datadog tool · dependency bumps | Platform-shared or unrelated to chat transport; merged unchanged, benefits both bots. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+The 2026-08-07 sync (#125) was squash-merged, so upstream ancestry stops at the
+2026-07-31 merge base; this window was applied as the tree diff
+`528ef862..5f3c9dca` with 3-way fallback rather than `git merge`. Three
+conflicts: `.github/workflows/ci.yml` (allowed-skips union, 11.5), and the two
+Granola files (11.4). Upstream's new
+`0050_company_context_granola_search_rls.sql` collided with the fork's applied
+`0050_company_context_reader_user_sources.sql` and is imported as **`0051`** —
+the fork remains exactly +1 from upstream for SQLx migrations
+(`check-migration-order.sh` passes).

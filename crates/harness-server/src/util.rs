@@ -49,7 +49,7 @@ pub(crate) fn user_input_to_anthropic_content(input: &[UserInput]) -> Vec<Value>
 /// as file-backed `attachment` blocks) delivers pasted images as
 /// `UserInput::Image` carrying a `data:<mime>;base64,<data>` URL. Emitting that
 /// URL verbatim inside a `text` block inlined the entire base64 payload - often
-/// >2 MB / ~500k tokens - into the prompt, blowing past the model context
+/// over 2 MB / ~500k tokens - into the prompt, blowing past the model context
 /// window so every turn on the thread failed with "Prompt is too long".
 /// Emitting a real `image` block instead lets the model count it as (cheap)
 /// image tokens and actually see the picture.

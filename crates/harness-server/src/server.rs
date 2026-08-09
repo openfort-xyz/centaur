@@ -1345,7 +1345,8 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 let mut terminal_stop = false;
                 for normalized in normalized_events {
                     if let Some(usage) = normalized.token_usage() {
-                        latest_usage = Some(accumulate_turn_usage(latest_usage.take(), usage.clone()));
+                        latest_usage =
+                            Some(accumulate_turn_usage(latest_usage.take(), usage.clone()));
                     }
                     append_usage_span_output(&normalized, &mut usage_span_output);
                     if let Some(session_id) = normalized.session_id() {
@@ -1454,13 +1455,12 @@ fn accumulate_turn_usage(
         .map(str::trim)
         .unwrap_or_default()
         .is_empty();
-    if next_model_is_empty {
-        if let Some(model) = previous
+    if next_model_is_empty
+        && let Some(model) = previous
             .and_then(|previous| previous.model)
             .filter(|model| !model.trim().is_empty())
-        {
-            next.model = Some(model);
-        }
+    {
+        next.model = Some(model);
     }
     next
 }
