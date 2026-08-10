@@ -48,7 +48,8 @@ pub struct HarnessAssignment {
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,
     /// The chat surface the agent is operating on: `slack`, `discord`, `linear`,
-    /// `github`, or `unknown` for threads that are not platform-addressable.
+    /// `github`, `google_chat`, or `unknown` for threads that are not
+    /// platform-addressable.
     pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,

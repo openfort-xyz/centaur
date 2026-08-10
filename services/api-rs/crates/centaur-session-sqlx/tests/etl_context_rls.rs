@@ -690,10 +690,6 @@ fn expected_policies() -> Vec<(String, String)> {
         ),
         (
             "google_chat_sync_runs",
-            "centaur_google_chat_runs_reader_select",
-        ),
-        (
-            "google_chat_sync_runs",
             "centaur_readonly_google_chat_sync_runs_select",
         ),
         (
@@ -711,10 +707,6 @@ fn expected_policies() -> Vec<(String, String)> {
         (
             "google_chat_sync_messages",
             "centaur_readonly_google_chat_sync_messages_select",
-        ),
-        (
-            "google_chat_sync_checkpoints",
-            "centaur_google_chat_checkpoints_reader_select",
         ),
         (
             "google_chat_sync_checkpoints",
