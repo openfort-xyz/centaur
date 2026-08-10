@@ -10,8 +10,11 @@ import type { GoogleChatCardClickPayload, GoogleChatEnvelope, NormalizedChatEven
 import { clampText } from './chat/render'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
-import { messageOverridesStrategyFromConfig } from './message-overrides-strategy'
-import { resolveSpaceDefault, spaceDefaultsFromConfig } from './space-defaults'
+import {
+  messageOverridesStrategyFromConfig,
+  type MessageOverridesStrategy
+} from './message-overrides-strategy'
+import { resolveSpaceDefault, spaceDefaultsFromConfig, type SpaceDefaults } from './space-defaults'
 import {
   buildConsoleSessionWidget,
   defaultModelForHarness,
@@ -58,6 +61,12 @@ type IdentityContext = {
   confirmSpace: (spaceName: string) => Promise<SpaceDmConfirmation>
 }
 
+/** Config-derived values resolved once at startup and reused for every turn. */
+type BotRuntime = {
+  messageOverrides: MessageOverridesStrategy
+  spaceDefaults: SpaceDefaults
+}
+
 /** Ceiling on the spaces.get identity lookup. Far below
  * GOOGLECHATBOT_CHAT_API_TIMEOUT_MS (30s) because this call gates a live turn:
  * a hung Chat backend must cost the turn ~3s and suppress identity, not stall
@@ -87,6 +96,10 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
   const spaceVerifier = new SpaceDmVerifier(spaceName =>
     client.getSpace(spaceName, { timeoutMs: SPACE_LOOKUP_TIMEOUT_MS })
   )
+  const runtime: BotRuntime = {
+    messageOverrides: messageOverridesStrategyFromConfig(config),
+    spaceDefaults: spaceDefaultsFromConfig(config)
+  }
 
   const app = new Hono()
 
@@ -141,7 +154,7 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     // `tokenCheck.verified` — NOT `tokenCheck.ok`: with signed requests off the
     // check is skipped, and a skipped check must not source identity metadata.
     runInBackground(
-      processChatEvent(config, client, envelope, {
+      processChatEvent(config, client, runtime, envelope, {
         verified: tokenCheck.verified,
         confirmSpace: spaceName => spaceVerifier.confirm(spaceName)
       })
@@ -310,6 +323,7 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
 async function processChatEvent(
   config: AppConfig,
   client: ChatEdgeClient,
+  runtime: BotRuntime,
   envelope: GoogleChatEnvelope,
   identity: IdentityContext
 ): Promise<void> {
@@ -382,7 +396,7 @@ async function processChatEvent(
   const [ackMessageName, historyMessages] = await Promise.all([ackPromise, historyPromise])
   if (historyMessages.length) normalized.history_messages = historyMessages
 
-  await driveSession(config, client, normalized, ackMessageName, identity)
+  await driveSession(config, client, runtime, normalized, ackMessageName, identity)
 }
 
 export function googleChatCardClickPayload(envelope: GoogleChatEnvelope): GoogleChatCardClickPayload | null {
@@ -431,6 +445,7 @@ async function handleCardClick(config: AppConfig, envelope: GoogleChatEnvelope):
 async function driveSession(
   config: AppConfig,
   client: ChatEdgeClient,
+  runtime: BotRuntime,
   event: NormalizedChatEvent,
   ackMessageName: string,
   identity: IdentityContext
@@ -441,12 +456,12 @@ async function driveSession(
   // the prompt and applied to the harness/turn, matching the Slack integration.
   // GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY=llm swaps the literal-flag parser
   // for an LLM that also understands natural-language requests.
-  const overrides = await messageOverridesStrategyFromConfig(config)(execute.text)
+  const overrides = await runtime.messageOverrides(execute.text)
   execute.text = overrides.cleanedText
   // Space default: below a per-thread flag, above the deployment default.
   // Unlike slackbotv2's channel default, there is no sticky-thread tier in
   // between -- this bot keeps no cross-turn state (parity tracked separately).
-  const spaceDefault = resolveSpaceDefault(spaceDefaultsFromConfig(config), threadKey)
+  const spaceDefault = resolveSpaceDefault(runtime.spaceDefaults, threadKey)
   const resolvedHarnessType = overrides.harnessType ?? spaceDefault?.harnessType
   const resolvedModel = overrides.model ?? spaceDefault?.model
   const resolvedProvider = overrides.provider ?? spaceDefault?.provider

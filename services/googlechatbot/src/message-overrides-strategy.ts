@@ -2,9 +2,14 @@ import type { AppConfig } from './config'
 import {
   extractMessageOverrides,
   validateStrategyOverrides,
+  STRATEGY_HARNESSES,
+  STRATEGY_MODEL_HARNESSES,
+  STRATEGY_PROVIDERS,
+  STRATEGY_REASONING_EFFORTS,
   type MessageOverrides
 } from './overrides'
 import { logInfo, logWarn } from './logging'
+import { stripTrailingSlashes } from './url'
 
 const DEFAULT_TIMEOUT_MS = 2_000
 const DEFAULT_MAX_OUTPUT_TOKENS = 300
@@ -28,46 +33,26 @@ const SYSTEM_PROMPT = [
   'Do not treat ordinary discussion of model names as a selection request.'
 ].join('\n')
 
-const MODEL_VALUES = [
-  'claude-fable-5',
-  'claude-haiku-4-5',
-  'claude-opus-4-7',
-  'claude-opus-4-8',
-  'claude-opus-5',
-  'claude-opus-5-fast',
-  'claude-sonnet-4-6',
-  'claude-sonnet-5',
-  'deep',
-  'fast',
-  'gpt-5.4',
-  'gpt-5.4-mini',
-  'gpt-5.4-nano',
-  'gpt-5.4-pro',
-  'gpt-5.5',
-  'gpt-5.5-pro',
-  'gpt-5.6-luna',
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  null
-] as const
-
+// Derived from the validation vocabulary in overrides.ts: a model the schema
+// admits but validation rejects would be silently discarded after the round
+// trip, so the two must come from the same source.
 const MESSAGE_OVERRIDES_SCHEMA = {
   additionalProperties: false,
   properties: {
     harness: {
-      enum: ['codex', 'claudecode', 'amp', 'nanocodex', null],
+      enum: [...STRATEGY_HARNESSES, null],
       type: ['string', 'null']
     },
     model: {
-      enum: MODEL_VALUES,
+      enum: [...Object.keys(STRATEGY_MODEL_HARNESSES), null],
       type: ['string', 'null']
     },
     provider: {
-      enum: ['responses', 'amazon-bedrock', 'openrouter', null],
+      enum: [...STRATEGY_PROVIDERS, null],
       type: ['string', 'null']
     },
     reasoning: {
-      enum: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', null],
+      enum: [...STRATEGY_REASONING_EFFORTS, null],
       type: ['string', 'null']
     }
   },
@@ -103,14 +88,6 @@ export function createFlagMessageOverridesStrategy(): MessageOverridesStrategy {
   return async text => extractMessageOverrides(text)
 }
 
-/** Strip trailing slashes without a `/+$/`-style regex, which CodeQL (rightly)
- * flags as quadratic-time on a long run of slashes. */
-function stripTrailingSlashes(value: string): string {
-  let end = value.length
-  while (end > 0 && value[end - 1] === '/') end -= 1
-  return value.slice(0, end)
-}
-
 export function createOpenAiMessageOverridesStrategy(
   options: OpenAiMessageOverridesStrategyOptions
 ): MessageOverridesStrategy {
@@ -124,14 +101,9 @@ export function createOpenAiMessageOverridesStrategy(
     // enables the LLM strategy for natural-language model requests. Handle them
     // first so a strict strategy schema or model failure cannot discard the
     // selection, and so flags never leak into the harness prompt.
-    const explicit = extractMessageOverrides(text)
-    if (
-      explicit.harnessType !== undefined ||
-      explicit.model !== undefined ||
-      explicit.provider !== undefined ||
-      explicit.reasoning !== undefined
-    ) {
-      return explicit
+    const { cleanedText, ...explicitOverrides } = extractMessageOverrides(text)
+    if (Object.values(explicitOverrides).some(value => value !== undefined)) {
+      return { cleanedText, ...explicitOverrides }
     }
 
     const controller = new AbortController()
@@ -217,37 +189,23 @@ function errorMessage(error: unknown): string {
   return String(error)
 }
 
-let cachedStrategy: MessageOverridesStrategy | undefined
-let cachedStrategyConfig: AppConfig | undefined
-
 /**
- * Build (and memoize, per config identity) the message-overrides strategy a
- * deployment is configured for. Called once per config from `driveSession` --
- * cheap either way, since neither strategy does eager setup, but memoizing
- * avoids re-validating the OpenAI options on every inbound message.
+ * Builds the message-overrides strategy a deployment is configured for. Called
+ * once at startup (`createGooglechatbot`); the resulting strategy is threaded
+ * down to each inbound message.
  */
 export function messageOverridesStrategyFromConfig(config: AppConfig): MessageOverridesStrategy {
-  if (cachedStrategy && cachedStrategyConfig === config) return cachedStrategy
-  const strategy = buildMessageOverridesStrategy(config)
-  cachedStrategy = strategy
-  cachedStrategyConfig = config
-  return strategy
-}
-
-function buildMessageOverridesStrategy(config: AppConfig): MessageOverridesStrategy {
   if (config.GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY !== 'llm') {
     return createFlagMessageOverridesStrategy()
   }
-  const apiKey =
-    config.GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY || config.OPENAI_API_KEY
-  if (!apiKey) {
+  if (!config.OPENAI_API_KEY) {
     logWarn('googlechatbot_message_overrides_strategy_missing_api_key', {
       strategy: 'llm'
     })
     return async text => ({ cleanedText: text })
   }
   return createOpenAiMessageOverridesStrategy({
-    apiKey,
+    apiKey: config.OPENAI_API_KEY,
     baseUrl: config.GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL,
     maxOutputTokens: config.GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS,
     model: config.GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL,

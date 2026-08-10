@@ -1,39 +1,50 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildConsoleSessionWidget,
-  consoleSessionUrl,
   defaultModelForHarness,
-  defaultReasoningForHarness,
   defaultServiceTierForHarness,
   effectiveReasoningForHarness,
-  harnessDisplayName,
   reasoningForModel
 } from './console-session-link'
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
 
-describe('harnessDisplayName', () => {
+/** Harness/URL rendering is internal to the widget, so assert it through one. */
+function widgetText(params: {
+  consoleBaseUrl?: string | null
+  harnessType?: string | null
+  model?: string | null
+}): string | undefined {
+  return buildConsoleSessionWidget({
+    consoleBaseUrl: undefined,
+    threadKey: 'chat:spaces:A:1',
+    metadataEnabled: true,
+    ...params
+  })?.textParagraph.text
+}
+
+describe('harness display names', () => {
   test('maps known harness wire values to display names', () => {
-    expect(harnessDisplayName('codex')).toBe('Codex')
-    expect(harnessDisplayName('claudecode')).toBe('Claude Code')
-    expect(harnessDisplayName('amp')).toBe('Amp')
+    expect(widgetText({ harnessType: 'codex' })).toBe('Codex')
+    expect(widgetText({ harnessType: 'claudecode' })).toBe('Claude Code')
+    expect(widgetText({ harnessType: 'amp' })).toBe('Amp')
   })
 
   test('is case-insensitive and trims', () => {
-    expect(harnessDisplayName(' Codex ')).toBe('Codex')
-    expect(harnessDisplayName('CLAUDECODE')).toBe('Claude Code')
+    expect(widgetText({ harnessType: ' Codex ' })).toBe('Codex')
+    expect(widgetText({ harnessType: 'CLAUDECODE' })).toBe('Claude Code')
   })
 
   test('title-cases unknown harnesses', () => {
-    expect(harnessDisplayName('my-custom-harness')).toBe('My Custom Harness')
-    expect(harnessDisplayName('gemini')).toBe('Gemini')
+    expect(widgetText({ harnessType: 'my-custom-harness' })).toBe('My Custom Harness')
+    expect(widgetText({ harnessType: 'gemini' })).toBe('Gemini')
   })
 
-  test('returns undefined for empty or missing values', () => {
-    expect(harnessDisplayName(undefined)).toBeUndefined()
-    expect(harnessDisplayName(null)).toBeUndefined()
-    expect(harnessDisplayName('')).toBeUndefined()
-    expect(harnessDisplayName('   ')).toBeUndefined()
+  test('drops the segment for empty or missing values', () => {
+    expect(widgetText({ harnessType: undefined })).toBeUndefined()
+    expect(widgetText({ harnessType: null })).toBeUndefined()
+    expect(widgetText({ harnessType: '' })).toBeUndefined()
+    expect(widgetText({ harnessType: '   ' })).toBeUndefined()
   })
 })
 
@@ -68,28 +79,29 @@ describe('defaultModelForHarness', () => {
   })
 })
 
-describe('consoleSessionUrl', () => {
+describe('console session URL', () => {
   test('builds the /console/threads URL with an encoded thread key', () => {
     expect(
-      consoleSessionUrl(
-        'https://console.centaur.dev',
-        'chat:spaces:AAAA:spaces:AAAA:threads:BBBB'
-      )
+      buildConsoleSessionWidget({
+        consoleBaseUrl: 'https://console.centaur.dev',
+        threadKey: 'chat:spaces:AAAA:spaces:AAAA:threads:BBBB',
+        metadataEnabled: false
+      })?.textParagraph.text
     ).toBe(
-      'https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB'
+      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB">Open chat in Console</a>'
     )
   })
 
-  test('strips trailing slashes from the base URL', () => {
-    expect(consoleSessionUrl('https://console.centaur.dev/', 'chat:spaces:A:1')).toBe(
-      'https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1'
+  test('strips one or many trailing slashes from the base URL', () => {
+    expect(widgetText({ consoleBaseUrl: 'https://console.centaur.dev///' })).toBe(
+      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1">Open chat in Console</a>'
     )
   })
 
-  test('returns undefined when no base URL is configured', () => {
-    expect(consoleSessionUrl(undefined, 'chat:spaces:A:1')).toBeUndefined()
-    expect(consoleSessionUrl(null, 'chat:spaces:A:1')).toBeUndefined()
-    expect(consoleSessionUrl('   ', 'chat:spaces:A:1')).toBeUndefined()
+  test('renders no link when no base URL is configured', () => {
+    expect(widgetText({ consoleBaseUrl: undefined })).toBeUndefined()
+    expect(widgetText({ consoleBaseUrl: null })).toBeUndefined()
+    expect(widgetText({ consoleBaseUrl: '   ' })).toBeUndefined()
   })
 })
 
@@ -99,6 +111,7 @@ describe('buildConsoleSessionWidget', () => {
       consoleBaseUrl: 'https://console.centaur.dev',
       threadKey: 'chat:spaces:AAAA:spaces:AAAA:threads:BBBB',
       harnessType: 'codex',
+      metadataEnabled: true,
       model: 'gpt-5.2'
     })
     expect(widget).toEqual({
@@ -113,7 +126,8 @@ describe('buildConsoleSessionWidget', () => {
     const widget = buildConsoleSessionWidget({
       consoleBaseUrl: 'https://console.centaur.dev',
       threadKey: 'chat:spaces:A:1',
-      harnessType: 'claudecode'
+      harnessType: 'claudecode',
+      metadataEnabled: true
     })
     expect(widget?.textParagraph.text).toBe(
       '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1">Open chat in Console</a> · Claude Code'
@@ -125,6 +139,7 @@ describe('buildConsoleSessionWidget', () => {
       consoleBaseUrl: 'https://console.centaur.dev',
       threadKey: 'chat:spaces:A:1',
       harnessType: 'a<b&c',
+      metadataEnabled: true,
       model: 'm<one>&two'
     })
     expect(widget?.textParagraph.text).toContain('M&lt;ONE&gt;&amp;TWO')
@@ -191,7 +206,7 @@ describe('nanocodex harness parity', () => {
     .model_reasoning_effort
 
   test('nanocodex renders as a first-class harness name', () => {
-    expect(harnessDisplayName('nanocodex')).toBe('Nanocodex')
+    expect(widgetText({ harnessType: 'nanocodex' })).toBe('Nanocodex')
   })
 
   test('nanocodex shares the baked Codex default model', () => {
@@ -206,8 +221,8 @@ describe('nanocodex harness parity', () => {
 
   test('defaults to the baked Codex effort for both Codex-family harnesses', () => {
     expect(bakedCodexEffort).toBeTruthy()
-    expect(defaultReasoningForHarness('codex')).toBe(bakedCodexEffort)
-    expect(defaultReasoningForHarness('nanocodex')).toBe(bakedCodexEffort)
+    expect(effectiveReasoningForHarness('codex')).toBe(bakedCodexEffort)
+    expect(effectiveReasoningForHarness('nanocodex')).toBe(bakedCodexEffort)
   })
 })
 
@@ -256,6 +271,7 @@ describe('buildConsoleSessionWidget effort segment', () => {
       consoleBaseUrl: 'https://console.centaur.dev',
       threadKey: 'chat:spaces:A:1',
       harnessType: 'nanocodex',
+      metadataEnabled: true,
       model: 'gpt-5.2',
       reasoning: 'xhigh'
     })
@@ -267,6 +283,7 @@ describe('buildConsoleSessionWidget effort segment', () => {
       consoleBaseUrl: 'https://console.centaur.dev',
       threadKey: 'chat:spaces:A:1',
       harnessType: 'claudecode',
+      metadataEnabled: true,
       model: 'claude-opus-5'
     })
     expect(widget?.textParagraph.text).toContain('CLAUDE-OPUS-5 · Claude Code')

@@ -116,9 +116,8 @@ const EnvSchema = z.object({
   GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY: z
     .enum(['flags', 'llm'])
     .default('flags'),
-  // Falls back to OPENAI_API_KEY when unset, same as slackbotv2. Required for
-  // the "llm" strategy; the strategy no-ops (no overrides) if neither is set.
-  GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY: z.string().optional(),
+  // Required for the "llm" strategy; the strategy no-ops (no overrides) when
+  // unset. Wired by the chart from the same secret key slackbotv2 reads.
   OPENAI_API_KEY: z.string().optional(),
   GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL: z.string().optional(),
   GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL: z.string().default('gpt-5.4-nano'),

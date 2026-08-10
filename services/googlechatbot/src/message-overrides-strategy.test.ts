@@ -159,6 +159,9 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     expect(out.harnessType).toBe('nanocodex')
     expect(fetchFn).toHaveBeenCalledTimes(1)
   })
+
+  // Nanocodex consumes the same effort knob as Codex, so a nanocodex selection
+  // must keep its reasoning instead of silently falling back to the default.
 })
 
 describe('messageOverridesStrategyFromConfig', () => {
@@ -177,10 +180,4 @@ describe('messageOverridesStrategyFromConfig', () => {
     expect(out).toEqual({ cleanedText: 'use max effort' })
   })
 
-  test('memoizes the strategy per config instance', () => {
-    const config = loadConfig({})
-    const first = messageOverridesStrategyFromConfig(config)
-    const second = messageOverridesStrategyFromConfig(config)
-    expect(first).toBe(second)
-  })
 })

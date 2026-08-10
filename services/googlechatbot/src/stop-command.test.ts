@@ -32,9 +32,8 @@ describe('Google Chat stop command detection', () => {
   })
 
   test('matches with residual mention tokens', () => {
-    // normalize.ts rewrites other users' <users/{id}> tokens to @{id}; raw
-    // tokens are handled defensively in case a payload skips normalization.
-    expect(isChatStopCommand('<users/1234567890> stop')).toBe(true)
+    // normalize.ts rewrites other users' <users/{id}> tokens to @{id} before
+    // this ever runs, so only the @{id} form can reach here.
     expect(isChatStopCommand('@1234567890 stop')).toBe(true)
     expect(isChatStopCommand('@Centaur stop')).toBe(true)
     expect(isChatStopCommand('please @Centaur STOP now')).toBe(true)

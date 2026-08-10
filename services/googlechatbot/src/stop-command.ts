@@ -19,11 +19,10 @@ export function isChatStopCommand(text: string): boolean {
   const trimmed = text.trim()
   if (!trimmed) return false
   // normalize.ts already prefers argumentText (bot mention pre-stripped by
-  // Google) and rewrites other <users/{id}> tokens to @{id} before the bot
-  // sees the text. Strip raw tokens (defensive) and standalone @mentions;
-  // mid-word @ (emails like user@example.com) is left alone.
+  // Google) and rewrites every remaining <users/{id}> token to @{id}, so only
+  // standalone @mentions can reach here; mid-word @ (emails like
+  // user@example.com) is left alone.
   const withoutMentions = trimmed
-    .replace(/<users\/[^>]+>/gi, ' ')
     .replace(/(^|\s)@[A-Za-z0-9._/-]+/g, '$1')
     .replace(/\s+/g, ' ')
     .trim()

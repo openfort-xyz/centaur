@@ -220,9 +220,13 @@ function stripMatch(text: string, match: RegExpExecArray): string {
   return `${before}${separator}${after}`
 }
 
-const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'nanocodex'])
-const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
-const STRATEGY_REASONING_EFFORTS = new Set([
+// The canonical vocabulary the LLM strategy is allowed to return. Also the
+// source of the strategy's JSON-schema enums (see message-overrides-strategy),
+// so the schema the model is handed and the validation it is checked against
+// can never drift apart.
+export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'nanocodex'])
+export const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
+export const STRATEGY_REASONING_EFFORTS = new Set([
   'none',
   'minimal',
   'low',
@@ -232,7 +236,7 @@ const STRATEGY_REASONING_EFFORTS = new Set([
   'max'
 ])
 
-const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
+export const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'claude-fable-5': 'claudecode',
   'claude-haiku-4-5': 'claudecode',
   'claude-opus-4-7': 'claudecode',
