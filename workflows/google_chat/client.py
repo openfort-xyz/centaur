@@ -28,11 +28,6 @@ CHAT_HTTP_TIMEOUT_SECONDS = 60.0
 # self-granted chat.bot scope alone is rejected with 403 for history.
 
 
-def _space_id(space_name: str) -> str:
-    """Accept either a bare id ("AAQA…") or a resource name ("spaces/AAQA…")."""
-    return space_name.rsplit("/", 1)[-1] if space_name else space_name
-
-
 class GoogleChatReadonlyClient:
     """Read-only Google Chat REST client used by the ETL workflow.
 
@@ -51,10 +46,9 @@ class GoogleChatReadonlyClient:
 
     def _get(self, url: str) -> dict[str, Any]:
         response, content = self._transport().request(url, method="GET")
-        status = int(getattr(response, "status", 0) or 0)
-        if status >= 400:
+        if response.status >= 400:
             body = content.decode("utf-8", "replace") if content else ""
-            raise RuntimeError(f"Chat API GET {url} failed: {status} {body}")
+            raise RuntimeError(f"Chat API GET {url} failed: {response.status} {body}")
         if not content:
             return {}
         return json.loads(content)
@@ -78,18 +72,15 @@ class GoogleChatReadonlyClient:
         page_size: int = 100,
         page_token: str | None = None,
         filter: str | None = None,
-        order_by: str = "createTime asc",
     ) -> dict[str, Any]:
-        """List messages in a space. Pass filter='createTime > "<rfc3339>"' for
-        incremental sync; order_by 'createTime asc' walks history oldest-first."""
-        params: dict[str, Any] = {"pageSize": page_size, "orderBy": order_by}
+        """List messages in a space, oldest-first. Pass filter='createTime >
+        "<rfc3339>"' for incremental sync."""
+        params: dict[str, Any] = {"pageSize": page_size, "orderBy": "createTime asc"}
         if page_token:
             params["pageToken"] = page_token
         if filter:
             params["filter"] = filter
-        return self._get(
-            f"{CHAT_API_BASE}/spaces/{_space_id(space_name)}/messages?{urlencode(params)}"
-        )
+        return self._get(f"{CHAT_API_BASE}/{space_name}/messages?{urlencode(params)}")
 
     def list_members(
         self,
@@ -102,6 +93,4 @@ class GoogleChatReadonlyClient:
         params: dict[str, Any] = {"pageSize": page_size}
         if page_token:
             params["pageToken"] = page_token
-        return self._get(
-            f"{CHAT_API_BASE}/spaces/{_space_id(space_name)}/members?{urlencode(params)}"
-        )
+        return self._get(f"{CHAT_API_BASE}/{space_name}/members?{urlencode(params)}")

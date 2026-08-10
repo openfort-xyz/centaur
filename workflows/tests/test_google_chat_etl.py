@@ -212,6 +212,38 @@ def test_message_text_falls_back_to_card_content_for_app_messages():
 def test_resource_id_strips_prefix():
     assert chat_sync._resource_id("spaces/S1/messages/m1") == "m1"
     assert chat_sync._resource_id("") == ""
+    # Configured GOOGLE_CHAT_SPACE_IDS entries are normalized through
+    # _resource_id before being re-prefixed, so a full resource name in the env
+    # cannot produce a "spaces/spaces/<id>" URL.
+    assert f"spaces/{chat_sync._resource_id('spaces/S1')}" == "spaces/S1"
+
+
+class _FakeTransport:
+    """Stands in for the httplib2 transport so no network/credentials are needed."""
+
+    def __init__(self):
+        self.urls = []
+
+    def request(self, url, method="GET"):
+        self.urls.append(url)
+        return types.SimpleNamespace(status=200), b"{}"
+
+
+def test_client_builds_space_scoped_urls():
+    from workflows.google_chat.client import GoogleChatReadonlyClient
+
+    client = GoogleChatReadonlyClient()
+    client._http = transport = _FakeTransport()
+
+    client.list_messages("spaces/S1", page_size=2, filter='createTime > "t"')
+    client.list_members("spaces/S1", page_size=2)
+
+    messages_url, members_url = transport.urls
+    assert messages_url.startswith("https://chat.googleapis.com/v1/spaces/S1/messages?")
+    assert members_url.startswith("https://chat.googleapis.com/v1/spaces/S1/members?")
+    # History is always walked oldest-first; the caller no longer passes order_by.
+    assert "orderBy=createTime+asc" in messages_url
+    assert "/spaces/spaces/" not in messages_url + members_url
 
 
 class FakeChatClient:
