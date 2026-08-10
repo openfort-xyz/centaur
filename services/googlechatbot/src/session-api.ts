@@ -77,9 +77,6 @@ type ExecuteSessionRequest = {
 
 export type ExecuteSessionResponse = {
   execution_id: string
-  ok: boolean
-  status: string
-  thread_key: string
 }
 
 /** api-rs marks a session `executing` for the lifetime of an in-flight run and
@@ -106,14 +103,10 @@ export const DEFAULT_SESSION_MAX_DURATION_MS = 30 * 60 * 1000
 /** Mirrors `DEFAULT_SESSION_IDLE_TIMEOUT_MS` in slackbotv2's session-api. */
 export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000
 
-/** Explicit option wins, then config, then the built-in bound. Reading config
- * here as well as accepting an option is deliberate: a caller that forgets to
- * thread the option through must still get a bounded execution. */
-function sessionMaxDurationMs(
-  config: AppConfig,
-  opts: { maxDurationMs?: number | undefined }
-): number {
-  return opts.maxDurationMs ?? config.SESSION_MAX_DURATION_MS ?? DEFAULT_SESSION_MAX_DURATION_MS
+/** Config tunes the bound; it does not enable it — an unset env var still gets
+ * the built-in ceiling. */
+function sessionMaxDurationMs(config: AppConfig): number {
+  return config.SESSION_MAX_DURATION_MS ?? DEFAULT_SESSION_MAX_DURATION_MS
 }
 
 /** Resolve `idle_timeout_ms`, mirroring slackbotv2's `sessionIdleTimeoutMs`.
@@ -124,13 +117,9 @@ function sessionMaxDurationMs(
  * timeout is present. Sending `max_duration_ms` without this fails the
  * execution row while leaving the runaway process alive, which is the state
  * the 2026-08-04 incident ended in. */
-function sessionIdleTimeoutMs(
-  config: AppConfig,
-  opts: { idleTimeoutMs?: number | undefined; maxDurationMs?: number | undefined }
-): number {
-  const explicit = opts.idleTimeoutMs ?? config.SESSION_IDLE_TIMEOUT_MS
-  if (explicit !== undefined) return explicit
-  return Math.min(DEFAULT_SESSION_IDLE_TIMEOUT_MS, sessionMaxDurationMs(config, opts))
+function sessionIdleTimeoutMs(config: AppConfig): number {
+  if (config.SESSION_IDLE_TIMEOUT_MS !== undefined) return config.SESSION_IDLE_TIMEOUT_MS
+  return Math.min(DEFAULT_SESSION_IDLE_TIMEOUT_MS, sessionMaxDurationMs(config))
 }
 
 type CreateSessionResponse = {
@@ -192,28 +181,16 @@ export type CreateSessionResult = {
 }
 
 export class SessionApiError extends Error {
-  readonly action: string
-  readonly body: string
   readonly retryable: boolean
   readonly status: number
-  readonly statusText: string
 
-  constructor(input: {
-    action: string
-    body: string
-    retryable: boolean
-    status: number
-    statusText: string
-  }) {
+  constructor(input: { action: string; retryable: boolean; status: number; statusText: string }) {
     // api-rs is internal and its error bodies can carry internals; the message
     // stays generic because it is surfaced verbatim into the Google Chat thread.
     super(`Centaur session ${input.action} failed: ${input.status} ${input.statusText}`)
     this.name = 'SessionApiError'
-    this.action = input.action
-    this.body = input.body
     this.retryable = input.retryable
     this.status = input.status
-    this.statusText = input.statusText
   }
 }
 
@@ -431,8 +408,6 @@ export async function executeSession(
   threadKey: string,
   message: GoogleChatTurnMessage,
   opts: {
-    idleTimeoutMs?: number
-    maxDurationMs?: number
     overrides?: TurnOverrides
     history?: GoogleChatTurnMessage[]
     /** Harness api-rs persisted for this thread (see CreateSessionResult). */
@@ -457,8 +432,8 @@ export async function executeSession(
         : {})
     }),
     input_lines: [toCodexInputLine(threadKey, message, opts.overrides, opts.history)],
-    idle_timeout_ms: sessionIdleTimeoutMs(config, opts),
-    max_duration_ms: sessionMaxDurationMs(config, opts)
+    idle_timeout_ms: sessionIdleTimeoutMs(config),
+    max_duration_ms: sessionMaxDurationMs(config)
   }
   const response = await sessionApiRequest('execute_session', 'execute session', () =>
     fetch(apiSessionUrl(config, threadKey, 'execute'), {
@@ -490,10 +465,7 @@ export async function emitWorkflowEvent(
 }
 
 export type InterruptSessionResponse = {
-  execution_id?: string | null
   interrupted: boolean
-  ok: boolean
-  thread_key: string
 }
 
 /** POST /api/session/{thread_key}/interrupt — asks api-rs to interrupt the
@@ -532,14 +504,6 @@ export async function openSessionEventStream(
   )
   if (!response.body) return emptyStream()
   return parseSessionEventStream(response.body, onEventId)
-}
-
-export function sessionStreamError(error: unknown): RustSessionStreamEvent {
-  return {
-    data: { error: error instanceof Error ? error.message : String(error) },
-    event: 'session.stream_error',
-    eventKind: 'session.stream_error'
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +831,6 @@ async function ensureApiOk(response: Response, action: string): Promise<void> {
   }
   throw new SessionApiError({
     action,
-    body,
     retryable: isRetryableApiStatus(response.status),
     status: response.status,
     statusText: response.statusText
@@ -1064,9 +1027,5 @@ function sessionErrorMessage(event: ParsedSessionEvent, fallback?: string): stri
 }
 
 function emptyStream(): AsyncIterable<RustSessionStreamEvent> {
-  return {
-    async *[Symbol.asyncIterator]() {
-      // no events
-    }
-  }
+  return (async function* () {})()
 }

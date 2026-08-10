@@ -106,7 +106,7 @@ describe('normalizeChatEnvelope', () => {
           text: '/centaur ship the feature',
           argumentText: 'ship the feature',
           sender: { name: 'users/U1', displayName: 'Alice' },
-          annotations: [{ type: 'SLASH_COMMAND', slashCommand: { commandName: '/centaur' } }]
+          annotations: [{ type: 'SLASH_COMMAND' }]
         }
       }),
       BOT_USER
@@ -158,7 +158,6 @@ describe('normalizeChatEnvelope', () => {
       {
         type: 'APP_COMMAND',
         space: { name: 'spaces/AAAA', type: 'SPACE' },
-        appCommandMetadata: { appCommandId: 42, appCommandType: 'SLASH_COMMAND' }
       },
       BOT_USER
     )
@@ -290,8 +289,7 @@ describe('normalizeChatEnvelope (attachments)', () => {
           name: 'spaces/AAAA/messages/M1/attachments/2',
           contentName: 'roadmap.png',
           contentType: 'image/png',
-          source: 'DRIVE_FILE',
-          driveDataRef: { driveFileId: 'drive-file-1' }
+          source: 'DRIVE_FILE'
         }
       ]),
       BOT_USER,

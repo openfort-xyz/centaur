@@ -11,8 +11,6 @@ const SECRET_FIELD_NAMES = new Set([
   'refreshtoken'
 ])
 const EMAIL_FIELD_NAMES = new Set(['email', 'useremail'])
-const PHONE_FIELD_NAMES = new Set(['phone', 'phonenumber', 'userphone'])
-const SSN_FIELD_NAMES = new Set(['ssn', 'socialsecuritynumber'])
 
 function normalizeFieldName(fieldName: string | undefined): string {
   return (fieldName ?? '').toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -51,8 +49,6 @@ export function sanitizeLogValue(
       return '[REDACTED:secret]'
     }
     if (EMAIL_FIELD_NAMES.has(normalizedField) || tokens.has('email')) return '[REDACTED:email]'
-    if (PHONE_FIELD_NAMES.has(normalizedField) || tokens.has('phone')) return '[REDACTED:phone]'
-    if (SSN_FIELD_NAMES.has(normalizedField) || tokens.has('ssn')) return '[REDACTED:ssn]'
     return sanitizeLogString(value)
   }
   if (typeof value !== 'object') return String(value)

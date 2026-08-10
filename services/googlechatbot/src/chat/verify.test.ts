@@ -5,7 +5,7 @@ import {
   verifyChatRequest,
   verifyChatRequestToken
 } from './verify'
-import { GOOGLE_CHAT_ISSUER } from './token'
+import { GOOGLE_CHAT_SA_ISSUER } from './token'
 import { generateRsaKeyPair, signJwt, staticKeyResolver } from './test-jwt'
 import { loadConfig, type AppConfig } from '../config'
 import type { SpaceDmConfirmation } from './space-verify'
@@ -107,7 +107,7 @@ describe('verifyChatRequestToken', () => {
     const token = await signJwt({
       privateKey: pair.privateKey,
       kid: KID,
-      claims: { iss: GOOGLE_CHAT_ISSUER, aud: AUD, iat: NOW, exp: NOW + 300, ...overrides }
+      claims: { iss: GOOGLE_CHAT_SA_ISSUER, aud: AUD, iat: NOW, exp: NOW + 300, ...overrides }
     })
     return `Bearer ${token}`
   }

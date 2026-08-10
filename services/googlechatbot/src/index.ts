@@ -7,6 +7,7 @@ import { verifyChatRequest, verifyChatRequestToken } from './chat/verify'
 import { SpaceDmVerifier, type SpaceDmConfirmation } from './chat/space-verify'
 import { googleRequestKeyResolver } from './chat/token'
 import type { GoogleChatCardClickPayload, GoogleChatEnvelope, NormalizedChatEvent } from './chat/types'
+import { clampText } from './chat/render'
 import { logError, logWarn } from './logging'
 import { incr, renderMetrics } from './metrics'
 import { messageOverridesStrategyFromConfig } from './message-overrides-strategy'
@@ -19,12 +20,6 @@ import {
   reasoningForModel
 } from './console-session-link'
 import { chatReplyLimits } from './constants'
-
-/** Clamp to Google Chat's plain `text` cap so an oversized body can't 400 the send. */
-function clampPlainText(text: string): string {
-  const max = chatReplyLimits.message.maxPlainTextChars
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text
-}
 import {
   INITIAL_STATUS,
   consumeRenderStream,
@@ -44,9 +39,10 @@ import {
 } from './session-api'
 import { isChatStopCommand } from './stop-command'
 
-type Variables = Record<string, never>
-
-type WaitUntilContext = { waitUntil(promise: Promise<unknown>): void }
+/** Clamp to Google Chat's plain `text` cap so an oversized body can't 400 the send. */
+function clampPlainText(text: string): string {
+  return clampText(text, chatReplyLimits.message.maxPlainTextChars)
+}
 
 /** Bounded re-opens of a dropped SSE stream before we give up and deliver. */
 const MAX_RESUME_ATTEMPTS = 3
@@ -77,7 +73,7 @@ const WELCOME_TEXT =
   'Mention me in a thread to get started.'
 
 export type Googlechatbot = {
-  app: Hono<{ Variables: Variables }>
+  app: Hono
   client: ChatEdgeClient
 }
 
@@ -92,15 +88,14 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     client.getSpace(spaceName, { timeoutMs: SPACE_LOOKUP_TIMEOUT_MS })
   )
 
-  const app = new Hono<{ Variables: Variables }>()
+  const app = new Hono()
 
   app.get('/health', c =>
     c.json({ ok: true, service: 'googlechatbot', commit: process.env.COMMIT_SHA ?? 'local' })
   )
-  app.get('/health/ready', c => c.redirect('/health'))
   app.get('/metrics', c => c.text(renderMetrics(), 200, { 'content-type': 'text/plain; version=0.0.4' }))
 
-  const chatEventsHandler = async (c: Context<{ Variables: Variables }>) => {
+  const chatEventsHandler = async (c: Context) => {
     // Google Chat is strict about the sync HTTP response shape. To silently
     // acknowledge an event (and respond later via the Chat REST API), the bot
     // MUST return `{}` with Content-Type: application/json. Anything else — an
@@ -146,7 +141,6 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
     // `tokenCheck.verified` — NOT `tokenCheck.ok`: with signed requests off the
     // check is skipped, and a skipped check must not source identity metadata.
     runInBackground(
-      c,
       processChatEvent(config, client, envelope, {
         verified: tokenCheck.verified,
         confirmSpace: spaceName => spaceVerifier.confirm(spaceName)
@@ -156,15 +150,12 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
   }
 
   app.post(config.CHAT_EVENTS_PATH, chatEventsHandler)
-  if (config.CHAT_EVENTS_PATH !== '/api/chat/events') {
-    app.post('/api/chat/events', chatEventsHandler)
-  }
 
   // Outbound message API used by the `google-chat` workflow tool so scheduled
   // digest workflows can post/list/edit/delete Chat messages. A thin relay to
   // the Chat REST client — the caller (the overlay _openfort_chat helper) has
   // already rendered the text for the plain `text` field, so we pass it through.
-  const requireOutboundAuth = (c: Context<{ Variables: Variables }>): Response | null => {
+  const requireOutboundAuth = (c: Context): Response | null => {
     if (!config.CHATBOT_API_KEY) return c.json({ error: 'CHATBOT_API_KEY not configured' }, 503)
     const provided = (c.req.header('Authorization') ?? '').replace(/^Bearer\s+/i, '')
     if (provided !== config.CHATBOT_API_KEY) return c.json({ error: 'unauthorized' }, 401)
@@ -316,16 +307,6 @@ export function createGooglechatbot(config: AppConfig): Googlechatbot {
   return { app, client }
 }
 
-function botResourceName(config: AppConfig): string | undefined {
-  if (!config.GOOGLE_SERVICE_ACCOUNT_JSON) return undefined
-  try {
-    const parsed = JSON.parse(config.GOOGLE_SERVICE_ACCOUNT_JSON) as { client_email?: string }
-    return parsed.client_email ? `users/${parsed.client_email}` : undefined
-  } catch {
-    return undefined
-  }
-}
-
 async function processChatEvent(
   config: AppConfig,
   client: ChatEdgeClient,
@@ -343,7 +324,7 @@ async function processChatEvent(
     return
   }
 
-  const botUser = botResourceName(config)
+  const botUser = client.botUserName
   const normalized = await normalizeChatEnvelope(envelope, botUser, client)
   if (!normalized) return
 
@@ -518,8 +499,6 @@ async function driveSession(
     let execution
     try {
       execution = await executeSession(config, threadKey, execute, {
-        idleTimeoutMs: config.SESSION_IDLE_TIMEOUT_MS,
-        maxDurationMs: config.SESSION_MAX_DURATION_MS,
         overrides: {
           model: resolvedModel,
           provider: resolvedProvider,
@@ -599,7 +578,6 @@ async function driveSession(
       spaceName: event.space_name,
       ackMessageName,
       threadName: event.chat.thread_name,
-      sessionUrl: sessionUrl(config, threadKey, execution.execution_id),
       consoleSessionWidget,
       plainTextOnly: isPlainTextOnlyRequest(execute.text)
     }
@@ -787,43 +765,19 @@ function harnessDefaultReasoning(config: AppConfig): Record<string, string> {
   return effort ? { codex: effort, nanocodex: effort } : {}
 }
 
-/** Build the "View session" deep link from the configured template, if any. */
-function sessionUrl(
-  config: AppConfig,
-  threadKey: string,
-  executionId: string | undefined
-): string | undefined {
-  const template = config.GOOGLECHATBOT_SESSION_URL_TEMPLATE
-  if (!template) return undefined
-  return template
-    .replace('{thread}', encodeURIComponent(threadKey))
-    .replace('{execution}', encodeURIComponent(executionId ?? ''))
-}
-
 /** Human-readable conversation name for the api-rs session principal. */
 function conversationName(event: NormalizedChatEvent): string | undefined {
   if (event.space_type === 'DIRECT_MESSAGE') return event.user_name || undefined
   return undefined
 }
 
-function runInBackground(c: Context, promise: Promise<void>): void {
-  const guarded = promise.catch((error: unknown) => {
+/** The webhook must ack within ~5s, so the turn runs after the response. Bun
+ * keeps the process alive for the floating promise; there is no Workers
+ * executionCtx to hand it to. */
+function runInBackground(promise: Promise<void>): void {
+  void promise.catch((error: unknown) => {
     logError('googlechatbot_event_processing_failed', error)
   })
-  const executionCtx = getExecutionContext(c)
-  if (executionCtx) {
-    executionCtx.waitUntil(guarded)
-    return
-  }
-  void guarded
-}
-
-function getExecutionContext(c: Context): WaitUntilContext | null {
-  try {
-    return c.executionCtx
-  } catch {
-    return null
-  }
 }
 
 export function parseChatBody(rawBody: string): GoogleChatEnvelope | null {

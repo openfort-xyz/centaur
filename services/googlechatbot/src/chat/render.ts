@@ -10,7 +10,7 @@ const MAX_CARD_BYTES = chatReplyLimits.card.maxCardBytes
 /** Google Chat renders Markdown in card text only when textSyntax is MARKDOWN. */
 const MARKDOWN = 'MARKDOWN' as const
 
-export function markdownToChatMessage(markdown: string, opts: { header?: string } = {}): {
+export function markdownToChatMessage(markdown: string): {
   /** Full answer for the card-less (plain) path. */
   text: string
   cardsV2?: Array<{ cardId: string; card: GoogleChatCard }>
@@ -35,12 +35,7 @@ export function markdownToChatMessage(markdown: string, opts: { header?: string 
   const cards = splitMarkdownToCards(flattenCardProseInline(normalizeCardBreaks(fenced)))
   const cardsV2 = cards.slice(0, MAX_CARDS).map((card, index) => ({
     cardId: `card-${index}`,
-    card: {
-      ...(index === 0 && opts.header
-        ? { header: { title: stripInlineMarkdown(opts.header).slice(0, MAX_HEADER_CHARS) } }
-        : {}),
-      sections: card
-    }
+    card: { sections: card }
   }))
 
   return {
@@ -443,7 +438,7 @@ function isTableSeparator(line: string): boolean {
   return trimmed.includes('-') && trimmed.includes('|') && /^[\s|:-]+$/.test(trimmed)
 }
 
-export function splitMarkdownText(input: string, maxChars: number): string[] {
+function splitMarkdownText(input: string, maxChars: number): string[] {
   const chunks: string[] = []
   let remaining = input
   while (remaining.length > maxChars) {
@@ -461,7 +456,8 @@ export function splitMarkdownText(input: string, maxChars: number): string[] {
   return chunks
 }
 
-function clampText(text: string, maxChars: number): string {
+/** Truncate to `maxChars`, marking the cut with an ellipsis. */
+export function clampText(text: string, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text
 }
 

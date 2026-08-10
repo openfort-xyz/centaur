@@ -23,8 +23,6 @@ export const GOOGLE_CHAT_SA_ISSUER = 'chat@system.gserviceaccount.com'
 export const GOOGLE_OIDC_ISSUERS = ['https://accounts.google.com', 'accounts.google.com']
 /** Every issuer we accept, in one list. */
 export const GOOGLE_REQUEST_ISSUERS = [GOOGLE_CHAT_SA_ISSUER, ...GOOGLE_OIDC_ISSUERS]
-/** @deprecated kept for back-compat; prefer GOOGLE_CHAT_SA_ISSUER. */
-export const GOOGLE_CHAT_ISSUER = GOOGLE_CHAT_SA_ISSUER
 
 const GOOGLE_CHAT_SA_JWKS_URL =
   'https://www.googleapis.com/service_accounts/v1/jwk/chat@system.gserviceaccount.com'
@@ -45,12 +43,9 @@ type Jwk = { kid?: string; kty?: string; n?: string; e?: string; alg?: string }
 type JwkSet = { keys?: Jwk[] }
 
 function base64urlToBytes(input: string): Uint8Array<ArrayBuffer> {
-  const pad = input.length % 4 === 0 ? '' : '='.repeat(4 - (input.length % 4))
-  const base64 = input.replace(/-/g, '+').replace(/_/g, '/') + pad
-  const binary = atob(base64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  return bytes
+  // Copied out of the Buffer so the bytes are backed by a plain ArrayBuffer,
+  // which is what crypto.subtle's BufferSource requires.
+  return Uint8Array.from(Buffer.from(input, 'base64url'))
 }
 
 function decodeJsonSegment(segment: string): Record<string, unknown> | null {
@@ -77,7 +72,6 @@ export async function verifyGoogleSignedJwt(opts: {
   audiences: string[]
   allowedIssuers: string[]
   nowSeconds?: number
-  clockSkewSeconds?: number
   resolveKey: KeyResolver
 }): Promise<JwtVerifyResult> {
   const parts = opts.token.split('.')
@@ -99,12 +93,7 @@ export async function verifyGoogleSignedJwt(opts: {
   const key = await opts.resolveKey(kid, iss)
   if (!key) return { ok: false, reason: `unknown_key(kid=${String(kid)},iss=${iss})` }
 
-  let signature: Uint8Array<ArrayBuffer>
-  try {
-    signature = base64urlToBytes(signatureB64)
-  } catch {
-    return { ok: false, reason: 'malformed_token' }
-  }
+  const signature = base64urlToBytes(signatureB64)
   const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`)
   const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, signature, signingInput)
   if (!valid) return { ok: false, reason: 'bad_signature' }
@@ -116,7 +105,7 @@ export async function verifyGoogleSignedJwt(opts: {
   }
 
   const now = opts.nowSeconds ?? Math.floor(Date.now() / 1000)
-  const skew = opts.clockSkewSeconds ?? 30
+  const skew = 30
   if (typeof payload.exp === 'number' && now > payload.exp + skew) {
     return { ok: false, reason: 'token_expired' }
   }
@@ -146,23 +135,21 @@ function parseMaxAgeSeconds(cacheControl: string | null): number | null {
 /**
  * A single-JWK-set resolver, caching imported keys until the JWK set's
  * `Cache-Control: max-age` (default 1h). Ignores `iss` (the caller routes by
- * issuer). Exported mainly for tests / custom sets.
+ * issuer).
  */
-export function jwksKeyResolver(opts: {
+function jwksKeyResolver(opts: {
   jwksUrl: string
   fetchImpl?: typeof fetch
   nowMs?: () => number
-  fetchTimeoutMs?: number
 }): KeyResolver {
   const fetchImpl = opts.fetchImpl ?? fetch
   const nowMs = opts.nowMs ?? (() => Date.now())
   const url = opts.jwksUrl
-  const timeoutMs = opts.fetchTimeoutMs ?? 5000
 
   let cache: { keys: Map<string, CryptoKey>; expiresAt: number } | null = null
 
   async function refresh(): Promise<void> {
-    const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(5000) })
     if (!res.ok) throw new Error(`jwks_fetch_failed_${res.status}`)
     const body = (await res.json()) as JwkSet
     const keys = new Map<string, CryptoKey>()
@@ -183,16 +170,6 @@ export function jwksKeyResolver(opts: {
   }
 }
 
-/** @deprecated single-set resolver for the SA model; use {@link googleRequestKeyResolver}. */
-export function googleChatKeyResolver(opts?: {
-  fetchImpl?: typeof fetch
-  nowMs?: () => number
-  jwksUrl?: string
-  fetchTimeoutMs?: number
-}): KeyResolver {
-  return jwksKeyResolver({ jwksUrl: opts?.jwksUrl ?? GOOGLE_CHAT_SA_JWKS_URL, ...opts })
-}
-
 /**
  * Resolver for inbound Google Chat request tokens, routing to the correct JWK
  * set by issuer: the `chat@system` SA set for the project-number model, and
@@ -202,7 +179,6 @@ export function googleChatKeyResolver(opts?: {
 export function googleRequestKeyResolver(opts?: {
   fetchImpl?: typeof fetch
   nowMs?: () => number
-  fetchTimeoutMs?: number
 }): KeyResolver {
   const sa = jwksKeyResolver({ jwksUrl: GOOGLE_CHAT_SA_JWKS_URL, ...opts })
   const oidc = jwksKeyResolver({ jwksUrl: GOOGLE_OIDC_JWKS_URL, ...opts })

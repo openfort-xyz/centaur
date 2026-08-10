@@ -77,11 +77,6 @@ const EnvSchema = z.object({
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
   SESSION_MAX_DURATION_MS: z.coerce.number().int().positive().optional(),
 
-  // Optional deep-link template for the final answer's "View session" button.
-  // `{thread}` and `{execution}` are substituted, e.g.
-  // "https://centaur.example/sessions/{thread}". Button is omitted if unset.
-  GOOGLECHATBOT_SESSION_URL_TEMPLATE: z.string().optional(),
-
   // Public origin of the Console UI (same env name the Console and slackbotv2
   // use). When set, the first assistant message in a Chat thread carries an
   // "Open chat in Console · MODEL · Harness" line linking to the Console
