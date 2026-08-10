@@ -73,10 +73,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * any other thread key shape (Slack, DM adapter, etc.).
  */
 export function spaceIdFromThreadId(threadId: string): string | undefined {
-  const rest = threadId.startsWith('chat:spaces:') ? threadId.slice('chat:spaces:'.length) : undefined
-  if (!rest) return undefined
-  const spaceId = rest.split(':')[0]
-  return spaceId ? spaceId : undefined
+  if (!threadId.startsWith('chat:spaces:')) return undefined
+  return threadId.split(':')[2] || undefined
 }
 
 /** Resolves the space default for a thread, or undefined when none applies. */
@@ -90,21 +88,14 @@ export function resolveSpaceDefault(
   return defaults[spaceId]
 }
 
-let cachedDefaults: SpaceDefaults | undefined
-let cachedDefaultsConfig: AppConfig | undefined
-
 /**
- * Parse (and memoize, per config identity) GOOGLECHATBOT_SPACE_DEFAULTS.
- * Parse errors are logged once per config rather than raised, so a typo in
- * one space's entry never blocks the deployment default for every other
- * thread.
+ * Parses GOOGLECHATBOT_SPACE_DEFAULTS. Called once at startup
+ * (`createGooglechatbot`); the parsed map is threaded down to each inbound
+ * message. Parse errors are logged rather than raised, so a typo in one
+ * space's entry never blocks the deployment default for every other thread.
  */
 export function spaceDefaultsFromConfig(config: AppConfig): SpaceDefaults {
-  if (cachedDefaults && cachedDefaultsConfig === config) return cachedDefaults
-  const defaults = parseSpaceDefaults(config.GOOGLECHATBOT_SPACE_DEFAULTS, message =>
+  return parseSpaceDefaults(config.GOOGLECHATBOT_SPACE_DEFAULTS, message =>
     logWarn('googlechatbot_space_defaults_invalid', { error: message })
   )
-  cachedDefaults = defaults
-  cachedDefaultsConfig = config
-  return defaults
 }

@@ -55,17 +55,10 @@ type CacheEntry = { confirmation: SpaceDmConfirmation; expiresAt: number }
 export class SpaceDmVerifier {
   private readonly cache = new Map<string, CacheEntry>()
   private readonly lookup: SpaceLookup
-  private readonly confirmedTtlMs: number
-  private readonly failedTtlMs: number
   private readonly now: () => number
 
-  constructor(
-    lookup: SpaceLookup,
-    opts: { confirmedTtlMs?: number; failedTtlMs?: number; now?: () => number } = {}
-  ) {
+  constructor(lookup: SpaceLookup, opts: { now?: () => number } = {}) {
     this.lookup = lookup
-    this.confirmedTtlMs = opts.confirmedTtlMs ?? CONFIRMED_SPACE_TTL_MS
-    this.failedTtlMs = opts.failedTtlMs ?? FAILED_LOOKUP_TTL_MS
     this.now = opts.now ?? Date.now
   }
 
@@ -77,12 +70,12 @@ export class SpaceDmVerifier {
     let ttlMs: number
     try {
       confirmation = classifySpaceAsDm(await this.lookup(spaceName))
-      ttlMs = this.confirmedTtlMs
+      ttlMs = CONFIRMED_SPACE_TTL_MS
     } catch {
       // Non-200, timeout, unreachable, unparseable — Google said nothing, so
       // nothing is confirmed. Retried soon rather than pinned for the long TTL.
       confirmation = { confirmed: false, reason: 'space_unverified' }
-      ttlMs = this.failedTtlMs
+      ttlMs = FAILED_LOOKUP_TTL_MS
     }
     this.remember(spaceName, { confirmation, expiresAt: this.now() + ttlMs })
     return confirmation

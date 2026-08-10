@@ -14,7 +14,6 @@ spaces and requires the admin Marketplace install.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -84,7 +83,6 @@ class GoogleChatSyncClient(Protocol):
         page_size: int,
         page_token: str | None = None,
         filter: str | None = None,
-        order_by: str = "createTime asc",
     ) -> dict[str, Any]: ...
 
     def list_members(
@@ -112,10 +110,6 @@ def _parse_datetime(value: str | None) -> dt.datetime | None:
 
 def _rfc3339(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _content_hash(*parts: Any) -> str:
-    return hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()
 
 
 def _resource_id(resource_name: str) -> str:
@@ -276,17 +270,16 @@ async def _record_run_start(
     *,
     run_id: str,
     workflow_run_id: str,
-    scopes_requested: list[dict[str, str]],
     metadata: dict[str, Any],
 ) -> None:
     await pool.execute(
         "INSERT INTO google_chat_sync_runs ("
         "run_id, workflow_run_id, mode, status, scopes_requested, metadata"
-        ") VALUES ($1, $2, 'incremental', 'running', $3::jsonb, $4::jsonb) "
+        ") VALUES ($1, $2, 'incremental', 'running', '[]'::jsonb, $3::jsonb) "
         "ON CONFLICT (run_id) DO UPDATE SET "
         "workflow_run_id = EXCLUDED.workflow_run_id, "
         "status = 'running', "
-        "scopes_requested = EXCLUDED.scopes_requested, "
+        "scopes_requested = '[]'::jsonb, "
         "scopes_synced = '[]'::jsonb, "
         "scopes_failed = '[]'::jsonb, "
         "spaces_seen = 0, "
@@ -298,7 +291,6 @@ async def _record_run_start(
         "metadata = EXCLUDED.metadata",
         run_id,
         workflow_run_id,
-        canonical_json(scopes_requested),
         canonical_json(metadata),
     )
 
@@ -387,11 +379,11 @@ async def _upsert_message(
     await pool.execute(
         "INSERT INTO google_chat_sync_messages ("
         "space_id, message_id, message_name, thread_id, sender_id, sender_name, "
-        "sender_type, text_content, content_hash, source_create_time, "
+        "sender_type, text_content, source_create_time, "
         "source_last_update_time, raw_payload, source_run_id, last_seen_at, "
         "last_error, updated_at"
         ") VALUES ("
-        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW(), '', NOW()"
+        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, NOW(), '', NOW()"
         ") ON CONFLICT (space_id, message_id) DO UPDATE SET "
         "message_name = EXCLUDED.message_name, "
         "thread_id = EXCLUDED.thread_id, "
@@ -399,7 +391,6 @@ async def _upsert_message(
         "sender_name = EXCLUDED.sender_name, "
         "sender_type = EXCLUDED.sender_type, "
         "text_content = EXCLUDED.text_content, "
-        "content_hash = EXCLUDED.content_hash, "
         "source_create_time = EXCLUDED.source_create_time, "
         "source_last_update_time = EXCLUDED.source_last_update_time, "
         "raw_payload = EXCLUDED.raw_payload, "
@@ -415,7 +406,6 @@ async def _upsert_message(
         sender_name,
         sender_type,
         text,
-        _content_hash(text, sender_id, thread_id),
         create_time,
         last_update_time,
         canonical_json(message),
@@ -463,7 +453,6 @@ async def _sync_space(
             page_size=page_size,
             page_token=page_token,
             filter=msg_filter,
-            order_by="createTime asc",
         )
         messages = [m for m in page.get("messages", []) if isinstance(m, dict)]
         counts["messages_seen"] += len(messages)
@@ -519,22 +508,21 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 
     page_size = positive_int(inp.limit, DEFAULT_PAGE_SIZE)
     overlap_seconds = max(int(inp.watermark_overlap_seconds), 0)
-    max_pages = max(
-        int(inp.max_pages_per_run),
-        positive_int(os.getenv("GOOGLE_CHAT_MAX_PAGES_PER_RUN"), DEFAULT_MAX_PAGES_PER_RUN)
-        if inp.max_pages_per_run == DEFAULT_MAX_PAGES_PER_RUN
-        else 0,
+    max_pages = positive_int(
+        inp.max_pages_per_run,
+        positive_int(os.getenv("GOOGLE_CHAT_MAX_PAGES_PER_RUN"), DEFAULT_MAX_PAGES_PER_RUN),
     )
     explicit_since = _parse_datetime(inp.since)
     run_id = _workflow_run_id_to_sync_run_id(ctx.run_id)
     include_types = _include_space_types()
     # Pinned spaces come from the input, falling back to GOOGLE_CHAT_SPACE_IDS
     # (comma-separated) so scheduled runs — which pass no input — still cover the
-    # spaces the app reads but is not a listed member of.
-    explicit_space_ids = {sid.strip() for sid in inp.space_ids if sid.strip()}
+    # spaces the app reads but is not a listed member of. _resource_id lets either
+    # a bare id or a full "spaces/<id>" resource name be configured.
+    explicit_space_ids = {_resource_id(sid.strip()) for sid in inp.space_ids if sid.strip()}
     if not explicit_space_ids:
         explicit_space_ids = {
-            sid.strip()
+            _resource_id(sid.strip())
             for sid in (os.getenv("GOOGLE_CHAT_SPACE_IDS") or "").split(",")
             if sid.strip()
         }
@@ -545,7 +533,6 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         ctx._pool,
         run_id=run_id,
         workflow_run_id=ctx.run_id,
-        scopes_requested=[],
         metadata={**inp.metadata, "page_size": page_size, "max_pages": max_pages},
     )
 
@@ -566,27 +553,25 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     # Otherwise enumerate the member spaces the app can see (filtered to types).
     page_token: str | None = None
     try:
-        while not explicit_space_ids:
-            page = client.list_spaces(page_size=DEFAULT_PAGE_SIZE, page_token=page_token)
-            for space in page.get("spaces", []):
-                if not isinstance(space, dict):
-                    continue
-                space_id = _resource_id(str(space.get("name") or ""))
-                if not space_id:
-                    continue
-                if explicit_space_ids and space_id not in explicit_space_ids:
-                    continue
-                space_type = str(space.get("type") or space.get("spaceType") or "").upper()
-                if (
-                    not explicit_space_ids
-                    and include_types
-                    and space_type not in include_types
-                ):
-                    continue
-                spaces.append(space)
-            page_token = page.get("nextPageToken")
-            if not page_token:
-                break
+        if not explicit_space_ids:
+            while True:
+                page = client.list_spaces(
+                    page_size=DEFAULT_PAGE_SIZE, page_token=page_token
+                )
+                for space in page.get("spaces", []):
+                    if not isinstance(space, dict):
+                        continue
+                    if not _resource_id(str(space.get("name") or "")):
+                        continue
+                    space_type = str(
+                        space.get("type") or space.get("spaceType") or ""
+                    ).upper()
+                    if include_types and space_type not in include_types:
+                        continue
+                    spaces.append(space)
+                page_token = page.get("nextPageToken")
+                if not page_token:
+                    break
     except Exception as exc:
         error = str(exc)
         record_etl_items_failed("google_chat", "message", "spaces", "api_error")

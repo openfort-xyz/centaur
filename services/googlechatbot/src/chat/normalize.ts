@@ -1,4 +1,5 @@
 import { logWarn } from '../logging'
+import { INITIAL_STATUS } from '../renderer'
 import type {
   ChatListMessage,
   ChatSpaceType,
@@ -243,7 +244,7 @@ export async function collectThreadHistory(
   // Prevents quote/backslash/newline injection into the filter expression
   // and guards against unexpected envelope mutations.
   if (!THREAD_NAME_PATTERN.test(opts.threadName)) {
-    console.warn('chat_thread_history_invalid_thread_name', {
+    logWarn('chat_thread_history_invalid_thread_name', {
       space: opts.spaceName,
       thread: opts.threadName
     })
@@ -280,7 +281,7 @@ export async function collectThreadHistory(
     // rather than silently degrading every event for days.
     const message = error instanceof Error ? error.message : String(error)
     const isAuth = /\b(401|403)\b/.test(message)
-    console.warn(
+    logWarn(
       isAuth ? 'chat_thread_history_scope_denied' : 'chat_thread_history_collect_failed',
       {
         space: opts.spaceName,
@@ -323,10 +324,10 @@ function isThreadRoot(threadName: string, currentMessageName: string): boolean {
 function isAckOrEmpty(message: ChatListMessage): boolean {
   const text = (message.argumentText ?? message.text ?? '').trim()
   if (!text) return true
-  // The inline ack we post at the start of every mention is the same literal
-  // string — it would otherwise show up as an "assistant said this" turn on
-  // every follow-up mention in the same thread.
-  if (text === '_Condor is thinking…_') return true
+  // The inline ack we post at the start of every mention — it would otherwise
+  // show up as an "assistant said this" turn on every follow-up mention in the
+  // same thread.
+  if (text === INITIAL_STATUS) return true
   return false
 }
 

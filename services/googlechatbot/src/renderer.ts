@@ -41,8 +41,6 @@ export type RenderTarget = {
   ackMessageName: string
   /** Thread to fall back into if the ack PATCH fails and we must post fresh. */
   threadName?: string
-  /** Optional deep link rendered as a "View session" button on the final answer. */
-  sessionUrl?: string
   /** Optional "Open chat in Console · MODEL · Harness" trailer widget, set on
    * the first assistant message of a thread (see console-session-link.ts). */
   consoleSessionWidget?: GoogleChatCardWidget
@@ -58,19 +56,9 @@ export type RenderTarget = {
  * streaming primitive and rate-limits edits — so the canonical answer is only
  * written once, at the end.
  *
- * Single-shot helper; callers that need resume-on-drop use createRenderState +
- * consumeRenderStream + finalizeRender directly (see driveSession).
+ * Drive it with createRenderState + consumeRenderStream + finalizeRender, which
+ * lets the caller re-open a dropped stream between passes (see driveSession).
  */
-export async function renderSessionToChat(
-  client: ChatEdgeClient,
-  stream: AsyncIterable<RustSessionStreamEvent>,
-  target: RenderTarget
-): Promise<void> {
-  const state = createRenderState()
-  await consumeRenderStream(client, stream, target, state)
-  await finalizeRender(client, target, state)
-}
-
 export type RenderState = {
   answer: string
   error: string | undefined
@@ -204,12 +192,9 @@ async function deliverFinal(
 ): Promise<void> {
   const text = finalText(state)
   const rendered = markdownToChatMessage(text)
-  const button = sessionButtonWidget(target.sessionUrl)
-  // Trailer widgets appended after the answer: the optional "View session"
-  // button and the first-message "Open chat in Console · …" line.
-  const trailers = [button, target.consoleSessionWidget].filter(
-    (widget): widget is GoogleChatCardWidget => widget !== undefined
-  )
+  // Trailer widget appended after the answer: the first-message
+  // "Open chat in Console · …" line.
+  const trailers = target.consoleSessionWidget ? [target.consoleSessionWidget] : []
   // Use the card (no `text`) only when the text surface cannot carry the
   // answer: image embeds (need image widgets) or overflow past Google Chat's
   // 4096-char `text` cap — the card envelope is ~32 KB, so routing long answers
@@ -241,15 +226,6 @@ async function deliverFinal(
   } catch (error) {
     logError('googlechatbot_final_create_failed', error)
   }
-}
-
-/**
- * Optional "View session" deep link on the final answer. A plain openLink — no
- * callback, so it can't error like an action button. Omitted when no URL is set.
- */
-function sessionButtonWidget(sessionUrl?: string): GoogleChatCardWidget | undefined {
-  if (!sessionUrl) return undefined
-  return { buttonList: { buttons: [{ text: 'View session', onClick: { openLink: { url: sessionUrl } } }] } }
 }
 
 /** Append trailer widgets to the last card's sections, or make a card if there are none. */

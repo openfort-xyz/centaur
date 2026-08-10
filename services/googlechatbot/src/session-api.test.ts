@@ -794,7 +794,6 @@ describe('classifyExecuteConflict', () => {
   const apiError = (status: number) =>
     new SessionApiError({
       action: 'execute session',
-      body: '',
       retryable: status >= 500,
       status,
       statusText: 'x'
@@ -851,7 +850,6 @@ describe('interruptSessionExecution', () => {
       reason: 'Interrupted from Google Chat by Alice'
     })
     expect(response.interrupted).toBe(true)
-    expect(response.execution_id).toBe('e1')
     expect(renderMetrics()).toContain(
       'googlechatbot_session_api_operations_total{operation="interrupt_session",outcome="success"} 1'
     )

@@ -159,6 +159,25 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     expect(out.harnessType).toBe('nanocodex')
     expect(fetchFn).toHaveBeenCalledTimes(1)
   })
+
+  // Nanocodex consumes the same effort knob as Codex, so a nanocodex selection
+  // must keep its reasoning instead of silently falling back to the default.
+
+  test('keeps the reasoning effort when the strategy selects nanocodex', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'nanocodex', model: null, provider: null, reasoning: 'high' })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use nanocodex with high effort')
+
+    expect(out.harnessType).toBe('nanocodex')
+    expect(out.reasoning).toBe('high')
+  })
 })
 
 describe('messageOverridesStrategyFromConfig', () => {
@@ -177,10 +196,4 @@ describe('messageOverridesStrategyFromConfig', () => {
     expect(out).toEqual({ cleanedText: 'use max effort' })
   })
 
-  test('memoizes the strategy per config instance', () => {
-    const config = loadConfig({})
-    const first = messageOverridesStrategyFromConfig(config)
-    const second = messageOverridesStrategyFromConfig(config)
-    expect(first).toBe(second)
-  })
 })

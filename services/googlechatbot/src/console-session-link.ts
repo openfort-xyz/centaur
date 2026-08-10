@@ -9,6 +9,7 @@
 
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
+import { stripTrailingSlashes } from './url'
 
 const HARNESS_DISPLAY_NAMES: Record<string, string> = {
   amp: 'Amp',
@@ -40,6 +41,7 @@ const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
   'gpt-5.4-pro': PRO_CODEX_REASONING_EFFORTS,
   'gpt-5.5': STANDARD_CODEX_REASONING_EFFORTS,
   'gpt-5.5-pro': PRO_CODEX_REASONING_EFFORTS,
+  'gpt-5.6': GPT_5_6_REASONING_EFFORTS,
   'gpt-5.6-luna': GPT_5_6_REASONING_EFFORTS,
   'gpt-5.6-sol': GPT_5_6_REASONING_EFFORTS,
   'gpt-5.6-terra': GPT_5_6_REASONING_EFFORTS
@@ -65,22 +67,17 @@ const BAKED_DEFAULT_MODELS: Record<string, string | undefined> = {
   nanocodex: typeof CODEX_CONFIG.model === 'string' ? CODEX_CONFIG.model : undefined
 }
 
+const BAKED_CODEX_EFFORT =
+  typeof CODEX_CONFIG.model_reasoning_effort === 'string'
+    ? CODEX_CONFIG.model_reasoning_effort
+    : undefined
+
 // Nanocodex deliberately shares Codex's default reasoning policy. Its harness
 // adapter consumes the same CODEX_MODEL_REASONING_EFFORT deployment override,
 // and falls back to the baked Codex effort when that override is absent.
 const BAKED_DEFAULT_REASONING: Record<string, string | undefined> = {
-  codex:
-    typeof CODEX_CONFIG.model_reasoning_effort === 'string'
-      ? CODEX_CONFIG.model_reasoning_effort
-      : undefined,
-  nanocodex:
-    typeof CODEX_CONFIG.model_reasoning_effort === 'string'
-      ? CODEX_CONFIG.model_reasoning_effort
-      : undefined
-}
-
-const BAKED_DEFAULT_SERVICE_TIERS: Record<string, string | undefined> = {
-  codex: typeof CODEX_CONFIG.service_tier === 'string' ? CODEX_CONFIG.service_tier : undefined
+  codex: BAKED_CODEX_EFFORT,
+  nanocodex: BAKED_CODEX_EFFORT
 }
 
 /** Card textParagraph text is HTML-flavoured: `&`, `<`, `>` must be escaped. */
@@ -101,7 +98,7 @@ function titleCase(value: string): string {
  * Unknown harnesses fall back to a title-cased form of the raw value. Returns
  * undefined when no harness is provided.
  */
-export function harnessDisplayName(harnessType: string | null | undefined): string | undefined {
+function harnessDisplayName(harnessType: string | null | undefined): string | undefined {
   if (!harnessType) return undefined
   const key = harnessType.trim().toLowerCase()
   if (!key) return undefined
@@ -125,7 +122,7 @@ export function defaultModelForHarness(
 }
 
 /** Returns the configured or baked default reasoning effort for a harness. */
-export function defaultReasoningForHarness(
+function defaultReasoningForHarness(
   harnessType: string | null | undefined,
   configured?: Record<string, string>
 ): string | undefined {
@@ -138,8 +135,8 @@ export function defaultReasoningForHarness(
 export function defaultServiceTierForHarness(
   harnessType: string | null | undefined
 ): string | undefined {
-  if (!harnessType) return undefined
-  return BAKED_DEFAULT_SERVICE_TIERS[harnessType.trim().toLowerCase()]
+  if (harnessType?.trim().toLowerCase() !== 'codex') return undefined
+  return typeof CODEX_CONFIG.service_tier === 'string' ? CODEX_CONFIG.service_tier : undefined
 }
 
 /** Resolves the effort the selected harness actually runs for this turn. */
@@ -167,9 +164,6 @@ export function reasoningForModel(
   if (!selectedModel || !effort) return undefined
   if (harness !== 'codex' && harness !== 'nanocodex') return undefined
   const effectiveEffort = harness === 'nanocodex' && effort === 'minimal' ? 'low' : effort
-  if (selectedModel === 'gpt-5.6') {
-    return GPT_5_6_REASONING_EFFORTS.has(effectiveEffort) ? effort : undefined
-  }
   const supported = Object.entries(CODEX_REASONING_EFFORTS_BY_MODEL).find(
     ([modelId]) => selectedModel === modelId || selectedModel.startsWith(`${modelId}-20`)
   )?.[1]
@@ -188,16 +182,13 @@ function reasoningDisplayName(reasoning: string | null | undefined): string | un
  * thread key is the exact value googlechatbot sends as `thread_key` to the
  * session API, URL-encoded into the `thread` query parameter the Console reads.
  */
-export function consoleSessionUrl(
+function consoleSessionUrl(
   consoleBaseUrl: string | null | undefined,
   threadKey: string
 ): string | undefined {
   const base = consoleBaseUrl?.trim()
   if (!base) return undefined
-  // Trailing-slash strip without a `/+$/` regex (polynomial-ReDoS lint).
-  let normalized = base
-  while (normalized.endsWith('/')) normalized = normalized.slice(0, -1)
-  return `${normalized}/console/threads?thread=${encodeURIComponent(threadKey)}`
+  return `${stripTrailingSlashes(base)}/console/threads?thread=${encodeURIComponent(threadKey)}`
 }
 
 export type ChatTextParagraphWidget = {
@@ -218,7 +209,7 @@ export function buildConsoleSessionWidget(params: {
   serviceTier?: string | null
 }): ChatTextParagraphWidget | undefined {
   const url = consoleSessionUrl(params.consoleBaseUrl, params.threadKey)
-  const includeMetadata = params.metadataEnabled ?? Boolean(url)
+  const includeMetadata = params.metadataEnabled === true
   if (!url && !includeMetadata) return undefined
   const segments: string[] = []
   if (url) segments.push(`<a href="${url}">Open chat in Console</a>`)

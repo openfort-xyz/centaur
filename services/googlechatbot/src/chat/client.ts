@@ -18,6 +18,9 @@ export class ChatEdgeClient {
   // DWD read tokens are keyed by the impersonated user (the requester), since a
   // DM's history is only readable by that DM's human member — not a fixed user.
   private readonly userReadTokens = new Map<string, { token: string | null; expiry: number }>()
+  /** The bot's own Chat user resource name (`users/<sa-email>`), used to skip
+   * its own messages. Undefined when no service account is configured. */
+  readonly botUserName: string | undefined
   private readonly serviceAccountEmail: string | null
   private readonly privateKey: string | null
   private readonly uploadUser: string
@@ -42,6 +45,7 @@ export class ChatEdgeClient {
       this.serviceAccountEmail = null
       this.privateKey = null
     }
+    this.botUserName = this.serviceAccountEmail ? `users/${this.serviceAccountEmail}` : undefined
   }
 
   private async getAccessToken(): Promise<string | null> {
@@ -121,11 +125,6 @@ export class ChatEdgeClient {
     )
     this.userReadTokens.set(subject, grant)
     return grant.token
-  }
-
-  /** True when DWD user impersonation is possible: SA credentials are configured. */
-  canImpersonateUser(): boolean {
-    return Boolean(this.serviceAccountEmail && this.privateKey)
   }
 
   private async exchangeJwtForToken(
@@ -229,20 +228,16 @@ export class ChatEdgeClient {
 
   /**
    * Update a message.
-   * Path: PATCH /v1/{message.name}?updateMask=<fields>
+   * Path: PATCH /v1/{message.name}?updateMask=text,cardsV2
    *
    * Google Chat requires updateMask as a query parameter listing the fields to
-   * patch. We default to "text,cardsV2" because those are the only writable
-   * fields we change. Pass a custom mask via opts.updateMask if patching a
-   * different field.
+   * patch. "text,cardsV2" are the only writable fields we ever change.
    */
   async updateMessage(
     messageName: string,
-    update: Partial<GoogleChatMessage>,
-    opts: { updateMask?: string } = {}
+    update: Partial<GoogleChatMessage>
   ): Promise<GoogleChatMessage> {
-    const mask = opts.updateMask ?? 'text,cardsV2'
-    const path = `${messageName}?updateMask=${encodeURIComponent(mask)}`
+    const path = `${messageName}?updateMask=${encodeURIComponent('text,cardsV2')}`
     return this.request('PATCH', path, update)
   }
 
@@ -252,14 +247,6 @@ export class ChatEdgeClient {
    */
   async deleteMessage(messageName: string): Promise<void> {
     return this.request('DELETE', messageName)
-  }
-
-  /**
-   * Get a single message.
-   * Path: GET /v1/{message.name}
-   */
-  async getMessage(messageName: string): Promise<GoogleChatMessage> {
-    return this.request('GET', messageName)
   }
 
   /**
@@ -319,32 +306,6 @@ export class ChatEdgeClient {
   }
 
   /**
-   * Create a reaction on a message.
-   * Path: POST /v1/spaces/{space}/messages/{message}/reactions
-   */
-  async createReaction(parentResource: string, emoji: string): Promise<unknown> {
-    return this.request('POST', `${parentResource}/reactions`, {
-      emoji: { unicode: emoji }
-    })
-  }
-
-  /**
-   * List reactions on a message.
-   * Path: GET /v1/{message.name}/reactions
-   */
-  async listReactions(messageName: string): Promise<unknown> {
-    return this.request('GET', `${messageName}/reactions`)
-  }
-
-  /**
-   * Delete a reaction from a message.
-   * Path: DELETE /v1/{reaction.name}
-   */
-  async deleteReaction(reactionName: string): Promise<void> {
-    return this.request('DELETE', reactionName)
-  }
-
-  /**
    * Get a space by name.
    * Path: GET /v1/spaces/{space}
    *
@@ -366,34 +327,6 @@ export class ChatEdgeClient {
   async getSpace(spaceName: string, opts: { timeoutMs?: number } = {}): Promise<ChatSpaceResource> {
     const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
     return this.request('GET', `spaces/${encodeURIComponent(id)}`, undefined, opts)
-  }
-
-  /**
-   * List spaces the app is a member of.
-   * Path: GET /v1/spaces
-   */
-  async listSpaces(opts: { pageSize?: number; pageToken?: string } = {}): Promise<{
-    spaces?: Array<{ name: string; type: string; displayName?: string }>
-    nextPageToken?: string
-  }> {
-    const params = new URLSearchParams()
-    if (opts.pageSize) params.set('pageSize', String(opts.pageSize))
-    if (opts.pageToken) params.set('pageToken', opts.pageToken)
-    const query = params.toString()
-    return this.request('GET', `spaces${query ? `?${query}` : ''}`)
-  }
-
-  /**
-   * List members in a space.
-   * Path: GET /v1/spaces/{space}/members
-   */
-  async listMembers(spaceName: string): Promise<{
-    memberships?: Array<{
-      name: string
-      member?: { name?: string; displayName?: string; email?: string }
-    }>
-  }> {
-    return this.request('GET', `${spaceName}/members`)
   }
 
   /**
@@ -573,22 +506,16 @@ async function createJWT(opts: {
 }
 
 function base64urlEncode(data: string | ArrayBuffer): string {
-  const bytes =
-    typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data)
-  const base64 = btoa(String.fromCharCode(...bytes))
-  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return Buffer.from(typeof data === 'string' ? data : new Uint8Array(data)).toString('base64url')
 }
 
 async function signRS256(signingInput: string, privateKeyPem: string): Promise<ArrayBuffer> {
-  const pemHeader = '-----BEGIN PRIVATE KEY-----'
-  const pemFooter = '-----END PRIVATE KEY-----'
-  let keyData = privateKeyPem
-    .replace(pemHeader, '')
-    .replace(pemFooter, '')
+  const keyData = privateKeyPem
+    .replace('-----BEGIN PRIVATE KEY-----', '')
+    .replace('-----END PRIVATE KEY-----', '')
     .replace(/\s/g, '')
 
-  const keyBytes = Uint8Array.from(atob(keyData), c => c.charCodeAt(0))
-  const algorithm: HmacImportParams = { name: 'HMAC', hash: 'SHA-256' }
+  const keyBytes = Buffer.from(keyData, 'base64')
 
   const cryptoKey = await crypto.subtle.importKey(
     'pkcs8',

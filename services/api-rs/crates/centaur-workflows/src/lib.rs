@@ -3902,6 +3902,39 @@ async fn send_slack_message(token: &str, payload: Value) -> Result<Value, Workfl
     Ok(response)
 }
 
+/// POST `body` to one of the in-cluster googlechatbot's outbound routes.
+///
+/// api-rs is the trusted host that holds `CHATBOT_API_KEY`, so the credential
+/// never reaches a sandbox and the call bypasses the sandbox egress proxy.
+/// `timeout` is bounded by every caller so a blocked or slow bot can never hang
+/// the workflow run.
+async fn post_to_googlechatbot(
+    path: &str,
+    body: &Value,
+    timeout: std::time::Duration,
+    failure: &str,
+) -> Result<Value, WorkflowRuntimeError> {
+    let token = env::var("CHATBOT_API_KEY")
+        .map_err(|_| WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned()))?;
+    let base_url = env::var("CHATBOT_URL")
+        .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
+    let response = reqwest::Client::new()
+        .post(format!("{}{path}", base_url.trim_end_matches('/')))
+        .bearer_auth(&token)
+        .json(body)
+        .timeout(timeout)
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "{failure}: {status} {value}"
+        )));
+    }
+    Ok(value)
+}
+
 /// Deliver a Google Chat message on behalf of a workflow, mirroring
 /// `ctx.post_to_slack`: the `CHATBOT_API_KEY` lives only in this trusted host
 /// (never the sandbox), and the post goes to the in-cluster googlechatbot
@@ -3925,33 +3958,18 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
         .and_then(|args| args.get("thread_name"))
         .and_then(Value::as_str);
 
-    let token = env::var("CHATBOT_API_KEY")
-        .map_err(|_| WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned()))?;
-    let base_url = env::var("CHATBOT_URL")
-        .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
-    let base_url = base_url.trim_end_matches('/');
-
     let mut body = json!({ "space_name": space_name, "text": text });
     if let Some(thread) = thread_name {
         body["thread_name"] = json!(thread);
     }
 
-    let response = reqwest::Client::new()
-        .post(format!("{base_url}/api/chat/messages"))
-        .bearer_auth(&token)
-        .json(&body)
-        // Bound the call so a blocked/slow bot can never hang the workflow run.
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await?;
-    let status = response.status();
-    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(WorkflowRuntimeError::Upstream(format!(
-            "google chat send failed: {status} {value}"
-        )));
-    }
-    Ok(value)
+    post_to_googlechatbot(
+        "/api/chat/messages",
+        &body,
+        std::time::Duration::from_secs(30),
+        "google chat send failed",
+    )
+    .await
 }
 
 /// Upload a file to a Google Chat space via the chatbot's attachments route.
@@ -3983,12 +4001,6 @@ async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowR
             .and_then(Value::as_str)
     };
 
-    let token = env::var("CHATBOT_API_KEY")
-        .map_err(|_| WorkflowRuntimeError::BadRequest("CHATBOT_API_KEY must be set".to_owned()))?;
-    let base_url = env::var("CHATBOT_URL")
-        .unwrap_or_else(|_| "http://centaur-centaur-googlechatbot:3002".to_owned());
-    let base_url = base_url.trim_end_matches('/');
-
     let mut body = json!({
         "space_name": space_name,
         "filename": filename,
@@ -4000,24 +4012,15 @@ async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowR
         }
     }
 
-    let response = reqwest::Client::new()
-        .post(format!("{base_url}/api/chat/attachments"))
-        .bearer_auth(&token)
-        .json(&body)
-        // Uploads are larger than text posts, so allow more than the 30s a
-        // message send gets — but still bound it so a stuck bot can't hang
-        // the workflow run.
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await?;
-    let status = response.status();
-    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(WorkflowRuntimeError::Upstream(format!(
-            "google chat attachment upload failed: {status} {value}"
-        )));
-    }
-    Ok(value)
+    // Uploads are larger than text posts, so allow more than the 30s a message
+    // send gets.
+    post_to_googlechatbot(
+        "/api/chat/attachments",
+        &body,
+        std::time::Duration::from_secs(120),
+        "google chat attachment upload failed",
+    )
+    .await
 }
 
 fn slack_post_result_from_response(channel: &str, response: Value) -> SlackPostResult {

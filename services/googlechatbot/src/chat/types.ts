@@ -4,7 +4,7 @@ export type NormalizedTextPart = {
 }
 
 export type NormalizedBinaryPart = {
-  type: 'image' | 'document' | 'file'
+  type: 'image' | 'file'
   name: string
   mime_type: string
   size: number
@@ -72,8 +72,6 @@ export type NormalizedChatEvent = {
 export type GoogleChatEnvelope = {
   type?: string
   eventTime?: string
-  token?: string
-  threadKey?: string
   space?: {
     name?: string
     type?: string
@@ -83,48 +81,28 @@ export type GoogleChatEnvelope = {
   message?: {
     name?: string
     text?: string
-    thread?: { name?: string; threadKey?: string }
-    sender?: { name?: string; displayName?: string; email?: string; avatarUrl?: string }
+    thread?: { name?: string }
+    sender?: { name?: string; displayName?: string; email?: string }
     argumentText?: string
     attachment?: Array<{
       name?: string
       contentName?: string
       contentType?: string
-      contentData?: string
       size?: string
       source?: 'UPLOADED_CONTENT' | 'DRIVE_FILE'
       attachmentDataRef?: { resourceName?: string }
-      driveDataRef?: { driveFileId?: string }
     }>
-    annotations?: Array<{
-      type?: string
-      slashCommand?: {
-        commandName?: string
-        commandId?: number
-        triggersDialog?: boolean
-      }
-    }>
+    annotations?: Array<{ type?: string }>
     formattedText?: string
-    fallbackText?: string
-    cardsV2?: Array<{ cardId?: string; card: unknown }>
   }
   user?: {
     name?: string
     displayName?: string
     email?: string
-    avatarUrl?: string
   }
   thread?: {
     name?: string
-    threadKey?: string
   }
-  isDialogEvent?: boolean
-  dialogEventType?: string
-  appCommandMetadata?: {
-    appCommandId?: number
-    appCommandType?: string
-  }
-  configCompleteRedirectUrl?: string
   // CARD_CLICKED events: the invoked cardsV2 button (onClick.action.function)
   // and its parameters come back under `common`, per the modern Chat API
   // (event.common.invokedFunction / event.common.parameters). NOTE: this
@@ -134,7 +112,6 @@ export type GoogleChatEnvelope = {
   common?: {
     invokedFunction?: string
     parameters?: Record<string, string>
-    hostApp?: string
   }
 }
 
@@ -160,34 +137,24 @@ export type ChatListMessage = {
   name?: string
   text?: string
   argumentText?: string
-  formattedText?: string
-  fallbackText?: string
   createTime?: string
-  lastUpdateTime?: string
-  threadReply?: boolean
-  thread?: { name?: string }
   sender?: {
     name?: string
     displayName?: string
     type?: 'HUMAN' | 'BOT'
-    domainId?: string
   }
-  annotations?: Array<{ type?: string }>
 }
 
 export type GoogleChatMessage = {
   name?: string
   text?: string
-  fallbackText?: string
   cardsV2?: Array<{
     cardId?: string
     card: GoogleChatCard
   }>
   thread?: {
     name?: string
-    threadReply?: boolean
   }
-  privateMessageViewer?: { name?: string }
   // Outbound uploads: the whole UploadAttachmentResponse goes in this list,
   // per the official "Upload media as a file attachment" flow.
   attachment?: UploadAttachmentResponse[]
@@ -198,18 +165,12 @@ export type UploadAttachmentResponse = {
 }
 
 export type GoogleChatCard = {
-  header?: {
-    title: string
-    subtitle?: string
-    imageUrl?: string
-  }
+  header?: { title: string }
   sections?: GoogleChatCardSection[]
-  fixedFooter?: { primaryButton?: GoogleChatButton }
 }
 
 export type GoogleChatCardSection = {
   header?: string
-  collapsible?: boolean
   widgets?: GoogleChatCardWidget[]
 }
 
@@ -218,16 +179,8 @@ export type GoogleChatCardWidget = {
   // inline code, code fences, lists) instead of the default HTML. Available for
   // Chat apps; see cards reference Message.TextSyntax.
   textParagraph?: { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
-  decoratedText?: {
-    icon?: { knownIcon?: string }
-    text: string
-    bottomLabel?: string
-    wrapText?: boolean
-  }
   image?: { imageUrl: string; altText?: string }
   buttonList?: { buttons: GoogleChatButton[] }
-  divider?: Record<string, never>
-  columns?: { columnItems: Array<{ widgets: GoogleChatCardWidget[] }> }
 }
 
 export type GoogleChatButton = {
@@ -239,5 +192,4 @@ export type GoogleChatButton = {
       parameters?: Array<{ key: string; value: string }>
     }
   }
-  color?: { red?: number; green?: number; blue?: number }
 }

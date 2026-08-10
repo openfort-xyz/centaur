@@ -4,10 +4,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import json
-import typer
-from rich.console import Console
-from rich.table import Table
+import json  # noqa: E402
+
+import typer  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.table import Table  # noqa: E402
+
+from .client import _client  # noqa: E402
 
 app = typer.Typer(name="google-chat", help="Google Chat CLI for AI agents")
 console = Console()
@@ -21,8 +24,6 @@ def send_message(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Send a message to a Google Chat space."""
-    from .client import _client
-
     client = _client()
     result = client.send_message(space_name, text, thread_name=thread_name)
 
@@ -40,8 +41,6 @@ def list_messages(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """List messages in a Google Chat space."""
-    from .client import _client
-
     client = _client()
     result = client.list_messages(space_name, page_size=page_size)
 
@@ -68,8 +67,6 @@ def update_message(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Update a message in a Google Chat space."""
-    from .client import _client
-
     client = _client()
     result = client.update_message(message_name, text)
 
@@ -86,8 +83,6 @@ def delete_message(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Delete a message from a Google Chat space."""
-    from .client import _client
-
     client = _client()
     result = client.delete_message(message_name)
 
@@ -115,8 +110,6 @@ def upload(
     import mimetypes
     from pathlib import Path
 
-    from .client import _client
-
     path = Path(file)
     if not path.is_file():
         console.print(f"[red]Error: no such file: {file}[/red]")
@@ -143,8 +136,6 @@ def upload(
 @app.command()
 def health():
     """Assert googlechatbot connectivity with the unauthenticated health check."""
-    from .client import _client
-
     try:
         details = _client().health()
         payload = {"ok": True, "tool": "google_chat", "error": None, "details": details}
