@@ -483,7 +483,6 @@ module Oauth
       assert_nil secret.foreign_id # found by association, so no collidable foreign_id
       assert_nil secret.created_by # the wrapping secret is not owned by an operator
       assert_equal({ "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }, secret.inject_config)
-      assert_nil secret.replace_config
       assert_equal "token_broker", secret.source.source_type
       assert_equal cred.oid, secret.source.config["credential_id"]
       # Enumerated, not "*.googleapis.com": a wildcard overlaps every googleapis
@@ -495,25 +494,6 @@ module Oauth
       ], secret.rules.order(:position).map(&:host)
       # The source resolves the credential's live token at sync time.
       assert_equal({ "type" => "control_plane", "value" => "AT" }, secret.source.to_proxy_source)
-    end
-
-    test "the GitHub wrapping secret replaces the placeholder token instead of injecting Bearer" do
-      state = start_flow(slug: "github", scopes: "repo read:user")
-      stub_exchange(status: 200, body: github_token_body)
-      get oauth_callback_url(slug: "github"), params: { state: state, code: "auth-code" }
-
-      secret = BrokerCredential.find_by(oauth_app: oauth_apps(:acme_github)).static_secret
-      # gh sends `Authorization: token <value>` and git sends `Basic <base64>`, so
-      # a Bearer injection is the wrong scheme for both. Replace substitutes the
-      # GITHUB_TOKEN placeholder api-rs puts in every sandbox, whatever the scheme.
-      assert_equal({ "require" => false, "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
-                   secret.replace_config)
-      assert_nil secret.inject_config
-      assert_equal [ "header:authorization" ], secret.proxy_conflict_targets
-      assert_equal({ "require" => false, "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
-                   secret.to_proxy_secret["replace"])
-      # The transform changes; the host scoping does not.
-      assert_equal %w[api.github.com github.com], secret.rules.order(:position).map(&:host)
     end
 
     test "re-consent neither duplicates the wrapping secret nor clobbers operator edits" do

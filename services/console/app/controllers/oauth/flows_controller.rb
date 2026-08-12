@@ -28,10 +28,6 @@ module Oauth
     FLOW_TTL = 10.minutes
     FLOW_COOKIE = :oauth_flow
 
-    # How the static secret wrapping a minted credential presents the token, for
-    # providers that do not declare their own shape (see ensure_wrapping_secret).
-    DEFAULT_WRAPPER_INJECT_CONFIG = { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }.freeze
-
     # Tests swap in an AuthorizationCodeClient built around an http double,
     # mirroring BrokerCredential#refresh_client.
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }

@@ -145,10 +145,7 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     snapshot = find_or_initialize_by(principal: principal, principal_cache_version: version)
     return snapshot if snapshot.persisted? && snapshot.fresh_for?(principal)
 
-    # `payload` is an Active Record encrypted attribute. Writing through the typed
-    # attribute interface keeps encryption in the persistence path while making that
-    # boundary explicit to static analysis.
-    snapshot[:payload] = payload_for(principal)
+    snapshot.payload = payload_for(principal)
     if snapshot.changed?
       snapshot.save!
     else

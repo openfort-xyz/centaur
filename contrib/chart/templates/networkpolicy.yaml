@@ -332,7 +332,6 @@ spec:
           port: {{ .Values.ironProxy.service.pgPort }}
         - protocol: TCP
           port: {{ .Values.ironProxy.service.managementPort }}
-{{- if $console.enabled }}
     # console control plane: register principals/roles/grants and per-sandbox proxies.
     - to:
         - podSelector:
@@ -341,7 +340,6 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
-{{- end }}
 {{- if .Values.googlechatbot.enabled }}
     # Workflow deliveries: api-rs (centaur-workflows) POSTs digest messages to
     # the Google Chat bot's local API. Without this rule every scheduled
@@ -355,18 +353,6 @@ spec:
       ports:
         - protocol: TCP
           port: 3002
-{{- end }}
-{{- if .Values.networkPolicy.otlpEgress.enabled }}
-    # OTLP trace export (e.g. Laminar). The collector lives in another
-    # namespace; without this rule api-rs's own spans die with
-    # BatchSpanProcessor "network error" export failures.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ required "networkPolicy.otlpEgress.namespace is required when networkPolicy.otlpEgress.enabled" .Values.networkPolicy.otlpEgress.namespace | quote }}
-      ports:
-        - protocol: TCP
-          port: {{ .Values.networkPolicy.otlpEgress.port }}
 {{- end }}
     - ports:
         - protocol: TCP

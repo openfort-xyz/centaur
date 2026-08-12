@@ -118,7 +118,7 @@ module Api
         principal = principals(:acme_channel)
         Grant.create!(
           principal: principal,
-          aws_auth_secret_id: secret.id,
+          aws_auth_secret: secret,
           created_by: users(:acme_admin),
           priority: Grant::DEFAULT_DIRECT_PRIORITY
         )

@@ -16,7 +16,7 @@ use centaur_sandbox_core::SandboxSpec;
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
-    SessionRuntime, final_answer_text_from_output_lines,
+    SessionRuntime,
 };
 use centaur_session_sqlx::PgSessionStore;
 use chrono::{DateTime, Utc};
@@ -1055,11 +1055,6 @@ fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
         | "company_context_documents"
         | "slack_retention"
         | "google_chat_sync"
-        // Openfort overlay ETL (centaur-overlay/workflows): Notion sync + its
-        // company-context projection, and Google Chat retention. Routed to the
-        // single-concurrency ETL queue so scheduled runs don't overlap.
-        | "notion_sync"
-        | "notion_company_context"
         | "google_chat_retention"
         | "chief_of_staff_daily" => WorkflowQueueClass::Etl,
         _ => WorkflowQueueClass::Standard,
@@ -3897,12 +3892,6 @@ async fn send_slack_message(token: &str, payload: Value) -> Result<Value, Workfl
     Ok(response)
 }
 
-/// POST `body` to one of the in-cluster googlechatbot's outbound routes.
-///
-/// api-rs is the trusted host that holds `CHATBOT_API_KEY`, so the credential
-/// never reaches a sandbox and the call bypasses the sandbox egress proxy.
-/// `timeout` is bounded by every caller so a blocked or slow bot can never hang
-/// the workflow run.
 async fn post_to_googlechatbot(
     path: &str,
     body: &Value,
@@ -3930,12 +3919,6 @@ async fn post_to_googlechatbot(
     Ok(value)
 }
 
-/// Deliver a Google Chat message on behalf of a workflow, mirroring
-/// `ctx.post_to_slack`: the `CHATBOT_API_KEY` lives only in this trusted host
-/// (never the sandbox), and the post goes to the in-cluster googlechatbot
-/// outbound route — so it bypasses the sandbox egress proxy entirely. The text
-/// is already rendered for Google Chat's plain `text` field by the caller
-/// (`_openfort_chat.to_chat_text`); this is a thin relay that also threads.
 async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
     let space_name = message
         .get("space_name")
@@ -3967,12 +3950,6 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
     .await
 }
 
-/// Upload a file to a Google Chat space via the chatbot's attachments route.
-///
-/// Mirrors [`post_google_chat_message`]: api-rs is the trusted host that holds
-/// `CHATBOT_API_KEY` and reaches the bot in-cluster, so the workflow host never
-/// handles the credential. `content_base64` is produced by the workflow host
-/// (charts and PDFs are rendered there), not by an agent sandbox.
 async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowRuntimeError> {
     let required = |key: &str| -> Result<String, WorkflowRuntimeError> {
         message
@@ -4007,8 +3984,6 @@ async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowR
         }
     }
 
-    // Uploads are larger than text posts, so allow more than the 30s a message
-    // send gets.
     post_to_googlechatbot(
         "/api/chat/attachments",
         &body,
@@ -4194,18 +4169,19 @@ async fn run_agent_session_turn(
     ))
 }
 
-/// The text a workflow's `agent_turn` surfaces as `result_text`.
-///
-/// This must be the agent's *final answer* — the same thing an interactive
-/// session shows and what the workflow docs treat `result` as (a report or
-/// summary), not the streamed transcript. Concatenating every `delta` field
-/// (an earlier implementation) folded all intermediate narration — tool output
-/// the agent echoed, tracebacks, JSON it was reasoning over — into the result,
-/// so a debugging-heavy turn delivered its whole working log. Share the session
-/// runtime's canonical extraction instead so the two paths can never diverge
-/// again.
 fn result_text_from_output_lines(lines: &[String]) -> String {
-    final_answer_text_from_output_lines(lines)
+    lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| {
+            value
+                .get("delta")
+                .or_else(|| value.pointer("/params/delta"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, WorkflowRuntimeError> {
@@ -4481,8 +4457,6 @@ mod tests {
             "company_context_documents",
             "slack_retention",
             "google_chat_sync",
-            "notion_sync",
-            "notion_company_context",
             "google_chat_retention",
             "chief_of_staff_daily",
         ] {

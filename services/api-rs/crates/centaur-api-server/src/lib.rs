@@ -574,7 +574,6 @@ mod tests {
         assert!(body.get("slack").is_none());
         assert!(body.get("discord").is_none());
         assert!(body.get("linear").is_none());
-        assert!(body.get("github").is_none());
         assert!(body.get("google_chat").is_none());
     }
 

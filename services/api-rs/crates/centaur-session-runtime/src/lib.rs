@@ -5960,14 +5960,8 @@ fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate>
                 Some("final_answer" | "answer") | None
             )
         {
-            // A completed final-answer agentMessage is the canonical final
-            // answer — including an *empty* one. Agents deliberately return an
-            // empty final message to signal "nothing to say" (e.g. the
-            // silent-if-nothing-new digests), so this must Replace even when
-            // empty; otherwise the working text falls back to accumulated
-            // intermediate narration deltas and that leaks out as the result.
             let text = terminal_payload_text(item).trim().to_owned();
-            return Some(FinalAnswerTextUpdate::Replace(text));
+            return (!text.is_empty()).then_some(FinalAnswerTextUpdate::Replace(text));
         }
     }
     None
@@ -6840,42 +6834,6 @@ fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
     None
 }
 
-/// Extract the agent's final answer text from a turn's raw harness output lines.
-///
-/// This is the batch (non-streaming) counterpart of the live stdout pump's
-/// `final_answer_text_by_execution` accumulation: completed agent messages
-/// *replace* the working text (last final answer wins) while only streamed
-/// deltas append, so intermediate narration is never concatenated into the
-/// result. Workflow `agent_turn` collects the full set of output lines for a
-/// turn and must use this — concatenating every `delta` field instead yields
-/// the whole transcript, not the final answer.
-pub fn final_answer_text_from_output_lines(lines: &[String]) -> String {
-    match terminal_output_from_lines(lines) {
-        Some(TerminalOutput::Completed {
-            result_text: Some(text),
-            ..
-        }) => text,
-        // No terminal `Completed` carrying text (e.g. an interrupted/failed turn
-        // with only a partial answer): fall back to the accumulated final-answer
-        // text rather than the raw delta soup.
-        _ => {
-            let mut final_answer_text = String::new();
-            for line in lines {
-                let Ok(value) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if let Some(update) = output_line_final_answer_text(&value) {
-                    match update {
-                        FinalAnswerTextUpdate::Append(delta) => final_answer_text.push_str(&delta),
-                        FinalAnswerTextUpdate::Replace(canonical) => final_answer_text = canonical,
-                    }
-                }
-            }
-            final_answer_text.trim().to_owned()
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum SessionRuntimeError {
     #[error("{0}")]
@@ -7412,69 +7370,6 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_from_lines_returns_only_the_final_answer() {
-        // A debugging-heavy turn: the agent streams narration deltas (echoing
-        // CLI output, a traceback) for an intermediate message, then emits a
-        // clean final answer. The result must be the final answer alone — never
-        // the concatenated narration.
-        let lines = vec![
-            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Running crisp --help...\n<huge --help dump>\n"}}).to_string(),
-            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Attio returned 404: <traceback>\n"}}).to_string(),
-            json!({"type": "item.completed", "item": {"id": "m-final", "type": "agentMessage", "phase": "final_answer", "text": "Crisp→Attio: synced 0 records."}}).to_string(),
-            json!({"type": "turn.completed", "turn": {"id": "t1", "status": "completed"}}).to_string(),
-        ];
-
-        assert_eq!(
-            final_answer_text_from_output_lines(&lines),
-            "Crisp→Attio: synced 0 records."
-        );
-    }
-
-    #[test]
-    fn final_answer_from_lines_is_empty_when_agent_returns_empty_final_message() {
-        // The "silent if nothing new" path: the agent streams narration deltas
-        // while working, then deliberately completes its final-answer message
-        // with empty text. The result must be empty (→ nothing delivered), not
-        // the leaked accumulated narration.
-        let lines = vec![
-            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "I'll run the GitHub scan first, then dedup in Notion."}}).to_string(),
-            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Scanning repos... no new issues since yesterday."}}).to_string(),
-            json!({"method": "item/completed", "params": {"item": {"id": "m-final", "type": "agentMessage", "phase": "final_answer", "text": ""}}}).to_string(),
-            json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed"}}}).to_string(),
-        ];
-
-        assert_eq!(final_answer_text_from_output_lines(&lines), "");
-    }
-
-    #[test]
-    fn final_answer_from_lines_keeps_a_full_report_intact() {
-        // A report digest's final answer is itself long and multi-section; the
-        // canonical extraction must deliver it whole, not truncate it.
-        let report = "# Releases\n\nLine one.\n\nLine two.\n\n## Details\n\n- a\n- b";
-        let lines = vec![
-            json!({"type": "item.completed", "item": {"id": "m-1", "type": "agentMessage", "phase": "final_answer", "text": report}}).to_string(),
-            json!({"type": "turn.completed", "turn": {"id": "t1", "status": "completed"}}).to_string(),
-        ];
-
-        assert_eq!(final_answer_text_from_output_lines(&lines), report);
-    }
-
-    #[test]
-    fn final_answer_from_lines_falls_back_to_partial_on_nonterminal_completion() {
-        // Streamed final-answer text with no terminal `Completed` (interrupted
-        // turn): fall back to the accumulated final-answer text, not raw delta
-        // soup or an empty string.
-        let lines = vec![
-            json!({"method": "item/agentMessage/delta", "params": {"turnId": "t1", "delta": "Partial answer so far"}}).to_string(),
-        ];
-
-        assert_eq!(
-            final_answer_text_from_output_lines(&lines),
-            "Partial answer so far"
-        );
-    }
-
-    #[test]
     fn turn_failed_is_terminal_failure() {
         let event = json!({
             "type": "turn.failed",
@@ -7576,25 +7471,6 @@ mod tests {
         assert!(redacted.contains("Authorization: Bearer [REDACTED_TOKEN]"));
         assert!(redacted.contains("SANDBOX_TOKEN=[REDACTED_TOKEN]"));
         assert!(redacted.contains("SLACK_BOT_TOKEN=[REDACTED_TOKEN]"));
-    }
-
-    #[test]
-    fn redaction_spares_key_prefixes_glued_inside_words() {
-        // A digest link whose slug happens to contain `sk-` (inside "metamask-")
-        // must survive intact — the prefix is part of the word, not a token.
-        let url = "https://metamask.io/news/introducing-metamask-smart-accounts";
-        assert_eq!(redact_sensitive_text(url), url);
-
-        // ...but a real bare token at a word boundary is still redacted.
-        let bare = "token is ghp_ABCDEFghijkl0123456789 here";
-        let redacted = redact_sensitive_text(bare);
-        assert!(!redacted.contains("ghp_ABCDEFghijkl0123456789"));
-        assert!(redacted.contains("[REDACTED_TOKEN]"));
-        // NOTE: upstream #1132 (should_redact_prefixed_token) deliberately
-        // treats `=`/`:`/`/`/`.` as token-internal, so a prefixed secret glued
-        // directly after a URL-query separator (e.g. `?key=sk-ant-...`) is no
-        // longer redacted by this path — only the env-key path catches it when
-        // the key name itself is sensitive (TOKEN/SECRET/API_KEY/PASSWORD).
     }
 
     #[test]

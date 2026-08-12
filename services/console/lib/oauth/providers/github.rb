@@ -13,6 +13,7 @@ module Oauth
       TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
       USER_ENDPOINT = "https://api.github.com/user"
       IDENTITY_SCOPES = [].freeze
+
       def key = KEY
       def display_name = "GitHub"
       def authorization_endpoint = AUTHORIZATION_ENDPOINT

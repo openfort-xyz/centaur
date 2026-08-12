@@ -86,10 +86,6 @@ module Oauth
         # resolution suppresses the whole lower-priority credential on overlap.
         assert_empty strategy.api_hosts.select { |host| host.include?("*") }
       end
-
-      test "does not override the default wrapping-secret transform" do
-        refute_respond_to strategy, :wrapper_replace_config
-      end
     end
   end
 end
