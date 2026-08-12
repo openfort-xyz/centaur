@@ -75,15 +75,11 @@ impl<'a> SessionPrincipalMetadata<'a> {
 #[derive(Clone, Debug)]
 pub struct SessionRegistrar {
     client: IronControlClient,
-    namespace: String,
 }
 
 impl SessionRegistrar {
-    pub fn new(client: IronControlClient, namespace: impl Into<String>) -> Self {
-        Self {
-            client,
-            namespace: namespace.into(),
-        }
+    pub fn new(client: IronControlClient) -> Self {
+        Self { client }
     }
 
     /// Upsert the principal for ``thread_key`` using the session metadata the
@@ -105,14 +101,10 @@ impl SessionRegistrar {
             metadata.slack_team_id,
             metadata.conversation_name,
         );
-        let mut input = principal.to_principal_input(&self.namespace);
+        let mut input = principal.to_principal_input();
         apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
         apply_gchat_identity(thread_key, &metadata, &mut input);
-        let existing = match self
-            .client
-            .get_principal(&self.namespace, &input.foreign_id)
-            .await
-        {
+        let existing = match self.client.get_principal(&input.foreign_id).await {
             Ok(existing) => Some(existing),
             Err(error) if is_status(&error, 404) => None,
             Err(error) => return Err(error),
@@ -143,7 +135,7 @@ impl SessionRegistrar {
     }
 
     pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
-        self.client.get_principal(&self.namespace, principal).await
+        self.client.get_principal(principal).await
     }
 }
 
@@ -341,8 +333,8 @@ mod tests {
 
     #[test]
     fn slack_dm_email_applies_only_to_dm_user_principals() {
-        let mut dm_input = derive_principal("slack:T123:D123:ts", Some("U123"), None)
-            .to_principal_input("default");
+        let mut dm_input =
+            derive_principal("slack:T123:D123:ts", Some("U123"), None).to_principal_input();
         apply_slack_dm_email(
             "slack:T123:D123:1773364194.179929",
             Some(" ada@example.com "),
@@ -350,8 +342,8 @@ mod tests {
         );
         assert_eq!(dm_input.slack_email.as_deref(), Some("ada@example.com"));
 
-        let mut channel_input = derive_principal("slack:T123:C123:ts", Some("U123"), None)
-            .to_principal_input("default");
+        let mut channel_input =
+            derive_principal("slack:T123:C123:ts", Some("U123"), None).to_principal_input();
         apply_slack_dm_email(
             "slack:T123:C123:1773364194.179929",
             Some("ada@example.com"),
@@ -363,8 +355,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_leaves_default_roles_to_iron_control() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -378,9 +369,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
+            requests.contains(&"GET /api/v1/principals/lookup/slack-channel-t123-c123".to_owned())
         );
         assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
         assert!(
@@ -400,8 +389,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_does_not_restore_roles_for_existing_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -415,9 +403,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
+            requests.contains(&"GET /api/v1/principals/lookup/slack-channel-t123-c123".to_owned())
         );
         assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
         assert!(
@@ -438,8 +424,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_upserts_slack_dm_permission_for_new_user_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -463,8 +448,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_upserts_slack_dm_permission_for_existing_user_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -494,7 +478,7 @@ mod tests {
     const GCHAT_DM_THREAD: &str = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
 
     fn gchat_input(metadata: Value) -> PrincipalInput {
-        let mut input = derive_principal(GCHAT_DM_THREAD, None, None).to_principal_input("default");
+        let mut input = derive_principal(GCHAT_DM_THREAD, None, None).to_principal_input();
         apply_gchat_identity(
             GCHAT_DM_THREAD,
             &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
@@ -589,8 +573,8 @@ mod tests {
     #[test]
     fn gchat_identity_ignores_non_gchat_threads() {
         // The Slack-compatible `chat:C…` adapter key is not Google Chat.
-        let mut input = derive_principal("chat:C123:1780000000.000000", None, None)
-            .to_principal_input("default");
+        let mut input =
+            derive_principal("chat:C123:1780000000.000000", None, None).to_principal_input();
         let before = input.clone();
         let metadata = json!({
             "user_email": "ada@example.com",
@@ -611,8 +595,8 @@ mod tests {
     fn slack_dm_labels_are_unchanged_by_googlechat_metadata() {
         // Slack keeps sourcing its address from `slack_user_email`; a stray
         // `user_email` must not leak into a Slack principal.
-        let mut input = derive_principal("slack:T123:D123:1780.1", Some("U123"), None)
-            .to_principal_input("default");
+        let mut input =
+            derive_principal("slack:T123:D123:1780.1", Some("U123"), None).to_principal_input();
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_user_email": "ada@example.com",
@@ -689,18 +673,18 @@ mod tests {
                 seen.lock().unwrap().push(format!("{method} {path}"));
 
                 let (status_line, body) = match (method, path) {
-                    ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
+                    ("GET", "/api/v1/principals/lookup/slack-channel-t123-c123")
                         if principal_exists =>
                     {
                         ("200 OK", channel_principal_body())
                     }
-                    ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123")
+                    ("GET", "/api/v1/principals/lookup/slack-user-t123-u123")
                         if principal_exists =>
                     {
                         ("200 OK", user_principal_body())
                     }
-                    ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
-                    | ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123") => {
+                    ("GET", "/api/v1/principals/lookup/slack-channel-t123-c123")
+                    | ("GET", "/api/v1/principals/lookup/slack-user-t123-u123") => {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
                     }
                     ("PUT", "/api/v1/principals/slack-channel-t123-c123") => {
@@ -734,10 +718,10 @@ mod tests {
     }
 
     fn channel_principal_body() -> String {
-        r#"{"data":{"id":"prn_channel","namespace":"default","foreign_id":"slack-channel-t123-c123","name":"Slack Channel #general","labels":{}}}"#.to_owned()
+        r#"{"data":{"id":"prn_channel","foreign_id":"slack-channel-t123-c123","name":"Slack Channel #general","labels":{}}}"#.to_owned()
     }
 
     fn user_principal_body() -> String {
-        r#"{"data":{"id":"prn_user","namespace":"default","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
+        r#"{"data":{"id":"prn_user","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
     }
 }

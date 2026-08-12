@@ -353,3 +353,26 @@ Granola files (11.4). Upstream's new
 `0050_company_context_reader_user_sources.sql` and is imported as **`0051`** —
 the fork remains exactly +1 from upstream for SQLx migrations
 (`check-migration-order.sh` passes).
+
+## 12. Upstream sync 2026-08-12 (21 commits, `5f3c9dca..0d9f9d5a`) — Slack-touching dispositions
+
+Full sync (all 21 commits). Hermes harness selection is ported to Chat; the
+remaining Slack changes are transport-specific or shared platform work.
+
+| # | Upstream change (PR) | Chat disposition | Status |
+|---|----------------------|------------------|--------|
+| 12.1 | #1333 Hermes as a first-class harness, including Slack `--hermes` and strategy vocabulary | Shared harness/runtime support merged. Ported `--hermes` and LLM-selected `hermes` to `googlechatbot` with focused tests. | ✅ port |
+| 12.2 | #1346 clear rejected sticky Slack model overrides | Chat does not persist sticky per-thread overrides; each turn resolves flags/defaults before session creation. Existing state-store follow-up (§1.4/1.6) still covers any future sticky implementation. | 🟰 |
+| 12.3 | #1347 preserve Slack transcript ordering · #1349 omit external Slack user emails · #1351 sanitize Slack DM sync payloads | Slack Events/API and Slack DM sync behavior only; Google Chat uses its own ordered envelope/history path and verified Google identity contract. | 🟰 |
+| 12.4 | #1282 remove resource namespaces · #1350 remove identity label shims · #1327 pg dsn identity migration | Shared authorization/identity changes. Chat's `gchat_dm`/`gchat_space` principals retain first-class kind and verified `google_email` metadata through the namespace removal. | 🟰 (shared) |
+| 12.5 | #1339 console-authored skills · #1257/#1258 OAuth owner matching and always-available apps · #1269 requester grant union | Shared console/credential features; no transport-specific port. | 🟰 (shared) |
+| 12.6 | #1303 websearch auth · #1328 Dune empty-body fix · dependency/CI/docs changes | Shared tools and maintenance; merged unchanged. | 🟰 (shared/N/A) |
+
+### Merge mechanics note (this sync)
+
+Normal ancestry-preserving merge from `upstream/main`. Three content conflicts:
+`centaur-iron-control/session.rs` kept Google Chat's verified identity mapping
+while adopting namespace-free client calls; the two console migration tests took
+upstream's namespace-free fixtures. Upstream's `0051_hermes_harness.sql` collided
+with the fork's applied `0051` and `0052` migrations, so it is imported as
+**`0053_hermes_harness.sql`** (`check-migration-order.sh` passes).
