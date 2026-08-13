@@ -155,14 +155,18 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
             continue
         if tool_name in blocklist:
             continue
-        if tool_name in existing:
-            print(
-                f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
-                file=sys.stderr,
-            )
-            continue
         relative_package_dir = package_dir.relative_to(published)
         target = tool_dir / relative_package_dir
+        previous = existing.get(tool_name)
+        if previous is not None:
+            # Sources are copied base-first, then overlays. A later source owns
+            # a duplicate name; otherwise an overlay can never override base.
+            print(
+                f"overriding tool {tool_name}: {package_dir} replaces {previous}",
+                file=sys.stderr,
+            )
+            if previous != target:
+                _remove_path(previous)
         if target.exists() or target.is_symlink():
             _remove_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
