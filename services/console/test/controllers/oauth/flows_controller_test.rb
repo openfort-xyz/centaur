@@ -294,7 +294,6 @@ module Oauth
       assert_equal "google connected as user@example.com.", flash[:notice]
 
       cred = BrokerCredential.find_by(oauth_app: @app, provider_subject: "google-sub-1")
-      assert_equal "acme", cred.namespace
       assert_equal "google-google-google-sub-1", cred.foreign_id
       assert_equal "https://oauth2.googleapis.com/token", cred.token_endpoint
       assert_equal "user@example.com", cred.provider_email
@@ -319,7 +318,6 @@ module Oauth
 
       app = oauth_apps(:acme_slack)
       cred = BrokerCredential.find_by(oauth_app: app, provider_subject: "U0R7MFMJM")
-      assert_equal "acme", cred.namespace
       assert_equal "slack-slack-u0r7mfmjm", cred.foreign_id
       assert_equal "Slack – grace", cred.name
       assert_equal "https://slack.com/api/oauth.v2.access", cred.token_endpoint
@@ -364,7 +362,6 @@ module Oauth
 
       app = oauth_apps(:acme_slack)
       cred = BrokerCredential.find_by(oauth_app: app, provider_subject: "U0BOTUSER")
-      assert_equal "acme", cred.namespace
       assert_equal "slack-slack-u0botuser", cred.foreign_id
       assert_equal "Slack – Acme", cred.name
       assert_equal "https://slack.com/api/oauth.v2.access", cred.token_endpoint
@@ -393,7 +390,6 @@ module Oauth
 
       app = oauth_apps(:acme_attio)
       cred = BrokerCredential.find_by(oauth_app: app)
-      assert_equal "acme", cred.namespace
       assert_match(/\Aattio-attio-pending-[a-f0-9]{32}\z/, cred.foreign_id)
       assert_match(/\Apending-[a-f0-9]{32}\z/, cred.provider_subject)
       assert_equal "Attio – Pending Attio workspace", cred.name
@@ -422,7 +418,6 @@ module Oauth
 
       app = oauth_apps(:acme_github)
       cred = BrokerCredential.find_by(oauth_app: app)
-      assert_equal "acme", cred.namespace
       assert_match(/\Agithub-github-pending-[a-f0-9]{32}\z/, cred.foreign_id)
       assert_match(/\Apending-[a-f0-9]{32}\z/, cred.provider_subject)
       assert_equal "GitHub – Pending GitHub account", cred.name
@@ -461,7 +456,6 @@ module Oauth
 
       app = oauth_apps(:acme_linear)
       cred = BrokerCredential.find_by(oauth_app: app)
-      assert_equal "acme", cred.namespace
       assert_match(/\Alinear-linear-pending-[a-f0-9]{32}\z/, cred.foreign_id)
       assert_match(/\Apending-[a-f0-9]{32}\z/, cred.provider_subject)
       assert_equal "Linear – Pending Linear account", cred.name
@@ -486,11 +480,9 @@ module Oauth
       cred = BrokerCredential.find_by(oauth_app: @app, provider_subject: "google-sub-1")
       secret = cred.static_secret
       assert_equal cred, secret.broker_credential # first-class link to the credential
-      assert_equal cred.namespace, secret.namespace
       assert_nil secret.foreign_id # found by association, so no collidable foreign_id
       assert_nil secret.created_by # the wrapping secret is not owned by an operator
       assert_equal({ "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }, secret.inject_config)
-      assert_nil secret.replace_config
       assert_equal "token_broker", secret.source.source_type
       assert_equal cred.oid, secret.source.config["credential_id"]
       # Enumerated, not "*.googleapis.com": a wildcard overlaps every googleapis
@@ -502,25 +494,6 @@ module Oauth
       ], secret.rules.order(:position).map(&:host)
       # The source resolves the credential's live token at sync time.
       assert_equal({ "type" => "control_plane", "value" => "AT" }, secret.source.to_proxy_source)
-    end
-
-    test "the GitHub wrapping secret replaces the placeholder token instead of injecting Bearer" do
-      state = start_flow(slug: "github", scopes: "repo read:user")
-      stub_exchange(status: 200, body: github_token_body)
-      get oauth_callback_url(slug: "github"), params: { state: state, code: "auth-code" }
-
-      secret = BrokerCredential.find_by(oauth_app: oauth_apps(:acme_github)).static_secret
-      # gh sends `Authorization: token <value>` and git sends `Basic <base64>`, so
-      # a Bearer injection is the wrong scheme for both. Replace substitutes the
-      # GITHUB_TOKEN placeholder api-rs puts in every sandbox, whatever the scheme.
-      assert_equal({ "require" => false, "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
-                   secret.replace_config)
-      assert_nil secret.inject_config
-      assert_equal [ "header:authorization" ], secret.proxy_conflict_targets
-      assert_equal({ "require" => false, "proxy_value" => "GITHUB_TOKEN", "match_headers" => [ "Authorization" ] },
-                   secret.to_proxy_secret["replace"])
-      # The transform changes; the host scoping does not.
-      assert_equal %w[api.github.com github.com], secret.rules.order(:position).map(&:host)
     end
 
     test "re-consent neither duplicates the wrapping secret nor clobbers operator edits" do

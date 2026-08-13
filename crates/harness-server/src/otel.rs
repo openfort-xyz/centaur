@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::thread;
@@ -383,33 +383,13 @@ impl OtlpTarget {
     }
 }
 
-fn connect_with_timeout(target: &OtlpTarget, timeout: Duration) -> Result<TcpStream> {
-    let mut last_err: Option<std::io::Error> = None;
-    for addr in (target.host.as_str(), target.port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_err = Some(error),
-        }
-    }
-    Err(HarnessServerError::from(last_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "no socket addresses resolved for OTLP endpoint",
-        )
-    })))
-}
-
 fn post_otlp_trace_payload(
     endpoint: &str,
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> Result<()> {
     let target = OtlpTarget::parse(endpoint)?;
-    // Bounded connect: a plain TcpStream::connect blocks until the OS connect
-    // timeout (minutes) when the endpoint is firewalled/blackholed. This export
-    // can run on the turn-completion path, so an unbounded connect would stall
-    // the turn. Telemetry is best-effort and must never delay protocol output.
-    let mut upstream = connect_with_timeout(&target, Duration::from_secs(2))?;
+    let mut upstream = TcpStream::connect((target.host.as_str(), target.port))?;
     upstream.set_read_timeout(Some(Duration::from_secs(10)))?;
     upstream.set_write_timeout(Some(Duration::from_secs(10)))?;
     write!(

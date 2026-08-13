@@ -1,7 +1,7 @@
 /**
  * Inline message directives, shared in spirit with the Slack integration:
- *   --claude | --claude-code | --amp | --codex | --nanocodex
- *                                                pick the harness for the thread
+ *   --claude | --claude-code | --amp | --codex | --nanocodex | --hermes
+ *                                                           pick the harness for the thread
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
  *   --model <name> (or --model=<name>)           pick the model within that harness
@@ -45,6 +45,7 @@ const HARNESS_FLAGS: Record<string, string> = {
   'claude-code': 'claudecode',
   claudecode: 'claudecode',
   codex: 'codex',
+  hermes: 'hermes',
   nanocodex: 'nanocodex'
 }
 
@@ -224,7 +225,7 @@ function stripMatch(text: string, match: RegExpExecArray): string {
 // source of the strategy's JSON-schema enums (see message-overrides-strategy),
 // so the schema the model is handed and the validation it is checked against
 // can never drift apart.
-export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'nanocodex'])
+export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex'])
 export const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 export const STRATEGY_REASONING_EFFORTS = new Set([
   'none',

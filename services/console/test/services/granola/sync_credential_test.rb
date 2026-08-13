@@ -27,7 +27,6 @@ module Granola
         client_id: "granola-client",
         client_secret: "granola-secret",
         allowed_scopes: %w[meetings:read],
-        credential_namespace: "acme",
         created_by: users(:acme_admin)
       )
     end
@@ -35,7 +34,6 @@ module Granola
     def credential
       @credential ||= BrokerCredential.create!(
         oauth_app: granola_app,
-        namespace: "acme",
         foreign_id: "granola-sync-#{SecureRandom.hex(6)}",
         token_endpoint: Oauth::Providers::Granola::TOKEN_ENDPOINT,
         access_token: "granola-access-token",
@@ -113,26 +111,6 @@ module Granola
       assert_equal "failed", failed[:run][:status]
       assert_equal "oauth:#{credential.oid}", failed[:run][:scope_id]
       assert_includes failed[:run][:error_text], "rate limited"
-    end
-
-    test "parse_meetings extracts every well-formed meeting block, in order" do
-      instance = SyncCredential.new(credential, api_client: FakeApiClient.new, mcp_http: ->(*) { })
-      xml = <<~XML
-        <meeting id="meeting-1" title="Planning" date="Jul 8, 2026 5:30 PM GMT+2">
-          <known_participants>Ada (note creator) &lt;ada@example.com&gt;</known_participants>
-          <summary>First meeting.</summary>
-        </meeting>
-        <meeting id="meeting-2" title="Retro" date="Jul 9, 2026 5:30 PM GMT+2">
-          <known_participants>Bob (note creator) &lt;bob@example.com&gt;</known_participants>
-          <summary>Second meeting.</summary>
-        </meeting>
-      XML
-
-      meetings = instance.send(:parse_meetings, xml)
-
-      assert_equal [ "meeting-1", "meeting-2" ], meetings.map { |m| m["id"] }
-      assert_equal "First meeting.", meetings[0]["summary_markdown"]
-      assert_equal "Second meeting.", meetings[1]["summary_markdown"]
     end
 
     test "parses meeting dates with timezone abbreviations" do

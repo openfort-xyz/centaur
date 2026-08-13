@@ -1,6 +1,6 @@
 //! Per-session principal registration.
 //!
-//! Roles are registered once at startup (see [`crate::register_role`]). When a
+//! Roles are registered once at startup (see [`crate::register_role`]); a
 //! session starts, [`SessionRegistrar`] upserts the session's principal.
 //! Iron-control owns default role assignment for brand-new principals, while
 //! existing principals keep their current assignments so operator revocations
@@ -8,14 +8,14 @@
 //! the thread key (see [`crate::derive_principal`]).
 
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
 use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
     GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND,
-    derive_principal_with_slack_team, is_direct_message, parse_gchat_space, slack_conversation_id,
+    derive_principal_with_slack_team, derive_slack_requester_principal, is_direct_message,
+    parse_gchat_space, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -75,15 +75,11 @@ impl<'a> SessionPrincipalMetadata<'a> {
 #[derive(Clone, Debug)]
 pub struct SessionRegistrar {
     client: IronControlClient,
-    namespace: String,
 }
 
 impl SessionRegistrar {
-    pub fn new(client: IronControlClient, namespace: impl Into<String>) -> Self {
-        Self {
-            client,
-            namespace: namespace.into(),
-        }
+    pub fn new(client: IronControlClient) -> Self {
+        Self { client }
     }
 
     /// Upsert the principal for ``thread_key`` using the session metadata the
@@ -104,26 +100,11 @@ impl SessionRegistrar {
             metadata.actor_user_id,
             metadata.slack_team_id,
             metadata.conversation_name,
-        );
-        let mut input = principal.to_principal_input(&self.namespace);
+        )?;
+        let mut input = principal.to_principal_input();
         apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
         apply_gchat_identity(thread_key, &metadata, &mut input);
-        let existing = match self
-            .client
-            .get_principal(&self.namespace, &input.foreign_id)
-            .await
-        {
-            Ok(existing) => Some(existing),
-            Err(error) if is_status(&error, 404) => None,
-            Err(error) => return Err(error),
-        };
-        let exists = existing.is_some();
-        if let Some(existing) = existing {
-            let mut labels = existing.labels;
-            strip_compatibility_identity_labels(&mut labels);
-            labels.extend(input.labels);
-            input.labels = labels;
-        }
+        let exists = self.merge_existing_labels(&mut input).await?;
         let slack_permission = slack_permission_for_thread(
             thread_key,
             input.slack_channel_id.as_deref(),
@@ -142,9 +123,84 @@ impl SessionRegistrar {
         Ok(record)
     }
 
-    pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
-        self.client.get_principal(&self.namespace, principal).await
+    /// Upsert the principal of the human requesting a Slack channel turn,
+    /// derived from the execute metadata (``slack_user_id`` and friends).
+    /// Returns ``Ok(None)`` for DM threads (the conversation principal already
+    /// is the user's), for non-Slack threads, when the metadata carries no
+    /// ``slack_user_id``, and when the requester is not proven to belong to the
+    /// Slack app's home team. This prevents Slack Connect users from supplying
+    /// requester credentials to a shared channel turn.
+    ///
+    /// Unlike [`Self::register_session`], this never writes Slack channel
+    /// permissions: the requester principal only scopes proxy credentials, and
+    /// the conversation principal already owns the thread's Slack permission.
+    /// Roles are left to iron-control's default assignment, as for sessions.
+    pub async fn register_requester(
+        &self,
+        thread_key: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Option<Principal>> {
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        let Some(slack_team_id) = eligible_slack_requester_team(metadata) else {
+            return Ok(None);
+        };
+        let Some(slack_user_id) = metadata.get("slack_user_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(principal) = derive_slack_requester_principal(
+            thread_key,
+            slack_user_id,
+            slack_team_id,
+            metadata.get("slack_display_name").and_then(Value::as_str),
+        ) else {
+            return Ok(None);
+        };
+        let mut input = principal.to_principal_input();
+        set_slack_email(
+            &mut input,
+            metadata.get("slack_user_email").and_then(Value::as_str),
+        );
+        self.merge_existing_labels(&mut input).await?;
+        Ok(Some(self.client.upsert_principal(&input).await?))
     }
+
+    pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
+        self.client.get_principal(principal).await
+    }
+
+    /// Fold an existing principal's labels under the freshly derived ones so
+    /// labels an operator or the console added survive re-registration.
+    /// Returns whether the principal already existed.
+    async fn merge_existing_labels(&self, input: &mut PrincipalInput) -> Result<bool> {
+        let existing = match self.client.get_principal(&input.foreign_id).await {
+            Ok(existing) => Some(existing),
+            Err(error) if is_status(&error, 404) => None,
+            Err(error) => return Err(error),
+        };
+        let Some(existing) = existing else {
+            return Ok(false);
+        };
+        let mut labels = existing.labels;
+        labels.extend(std::mem::take(&mut input.labels));
+        input.labels = labels;
+        Ok(true)
+    }
+}
+
+fn eligible_slack_requester_team(metadata: &Value) -> Option<&str> {
+    let requester_team = metadata
+        .get("slack_team_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|team| !team.is_empty())?;
+    let home_team = metadata
+        .get("slack_home_team_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|team| !team.is_empty())?;
+    (requester_team == home_team).then_some(requester_team)
 }
 
 fn slack_permission_for_thread(
@@ -168,29 +224,26 @@ fn apply_slack_dm_email(
     slack_user_email: Option<&str>,
     input: &mut PrincipalInput,
 ) {
+    let Some(conversation_id) = slack_conversation_id(thread_key) else {
+        return;
+    };
+    if is_direct_message(Some(conversation_id)) {
+        set_slack_email(input, slack_user_email);
+    }
+}
+
+/// Stamp ``slack_email`` on a user principal, skipping blank emails. Shared by
+/// the DM session path and the channel requester path so a user carries the
+/// same identity either way.
+fn set_slack_email(input: &mut PrincipalInput, slack_user_email: Option<&str>) {
     let Some(email) = slack_user_email
         .map(str::trim)
         .filter(|email| !email.is_empty())
     else {
         return;
     };
-    let Some(conversation_id) = slack_conversation_id(thread_key) else {
-        return;
-    };
-    if is_direct_message(Some(conversation_id)) && input.slack_user_id.is_some() {
+    if input.slack_user_id.is_some() {
         input.slack_email = Some(email.to_owned());
-    }
-}
-
-fn strip_compatibility_identity_labels(labels: &mut BTreeMap<String, String>) {
-    for label in [
-        "kind",
-        "slack_user_id",
-        "slack_channel_id",
-        "slack_team_id",
-        "slack_email",
-    ] {
-        labels.remove(label);
     }
 }
 
@@ -272,7 +325,7 @@ fn is_status(err: &IronControlError, code: u16) -> bool {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::derive_principal;
+    use crate::{PrincipalDerivationError, derive_principal};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -342,7 +395,8 @@ mod tests {
     #[test]
     fn slack_dm_email_applies_only_to_dm_user_principals() {
         let mut dm_input = derive_principal("slack:T123:D123:ts", Some("U123"), None)
-            .to_principal_input("default");
+            .expect("DM principal should be derivable")
+            .to_principal_input();
         apply_slack_dm_email(
             "slack:T123:D123:1773364194.179929",
             Some(" ada@example.com "),
@@ -351,7 +405,8 @@ mod tests {
         assert_eq!(dm_input.slack_email.as_deref(), Some("ada@example.com"));
 
         let mut channel_input = derive_principal("slack:T123:C123:ts", Some("U123"), None)
-            .to_principal_input("default");
+            .expect("channel principal should be derivable")
+            .to_principal_input();
         apply_slack_dm_email(
             "slack:T123:C123:1773364194.179929",
             Some("ada@example.com"),
@@ -361,10 +416,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_session_rejects_slack_dm_without_team_id() {
+        let registrar =
+            SessionRegistrar::new(IronControlClient::new("http://127.0.0.1:1", "test-key"));
+        let metadata = json!({ "slack_user_id": "U123" });
+
+        let error = registrar
+            .register_session("slack:D123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IronControlError::PrincipalDerivation(PrincipalDerivationError::MissingSlackTeamId)
+        ));
+    }
+
+    #[tokio::test]
+    async fn register_session_rejects_slack_dm_without_user_id() {
+        let registrar =
+            SessionRegistrar::new(IronControlClient::new("http://127.0.0.1:1", "test-key"));
+        let metadata = json!({ "slack_team_id": "T123" });
+
+        let error = registrar
+            .register_session("slack:D123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IronControlError::PrincipalDerivation(PrincipalDerivationError::MissingSlackUserId)
+        ));
+    }
+
+    #[tokio::test]
     async fn register_session_leaves_default_roles_to_iron_control() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -378,9 +466,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
+            requests.contains(&"GET /api/v1/principals/lookup/slack-channel-t123-c123".to_owned())
         );
         assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
         assert!(
@@ -400,8 +486,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_does_not_restore_roles_for_existing_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -415,9 +500,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert!(
-            requests.contains(
-                &"GET /api/v1/principals/lookup/default/slack-channel-t123-c123".to_owned()
-            )
+            requests.contains(&"GET /api/v1/principals/lookup/slack-channel-t123-c123".to_owned())
         );
         assert!(requests.contains(&"PUT /api/v1/principals/slack-channel-t123-c123".to_owned()));
         assert!(
@@ -438,8 +521,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_upserts_slack_dm_permission_for_new_user_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(false).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -463,8 +545,7 @@ mod tests {
     #[tokio::test]
     async fn register_session_upserts_slack_dm_permission_for_existing_user_principal() {
         let (base_url, requests, server) = spawn_iron_control_stub(true).await;
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new(base_url, "test-key"), "default");
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_team_id": "T123",
@@ -494,7 +575,9 @@ mod tests {
     const GCHAT_DM_THREAD: &str = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
 
     fn gchat_input(metadata: Value) -> PrincipalInput {
-        let mut input = derive_principal(GCHAT_DM_THREAD, None, None).to_principal_input("default");
+        let mut input = derive_principal(GCHAT_DM_THREAD, None, None)
+            .expect("Google Chat principal should be derivable")
+            .to_principal_input();
         apply_gchat_identity(
             GCHAT_DM_THREAD,
             &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
@@ -590,7 +673,8 @@ mod tests {
     fn gchat_identity_ignores_non_gchat_threads() {
         // The Slack-compatible `chat:C…` adapter key is not Google Chat.
         let mut input = derive_principal("chat:C123:1780000000.000000", None, None)
-            .to_principal_input("default");
+            .expect("Slack-compatible principal should be derivable")
+            .to_principal_input();
         let before = input.clone();
         let metadata = json!({
             "user_email": "ada@example.com",
@@ -612,7 +696,8 @@ mod tests {
         // Slack keeps sourcing its address from `slack_user_email`; a stray
         // `user_email` must not leak into a Slack principal.
         let mut input = derive_principal("slack:T123:D123:1780.1", Some("U123"), None)
-            .to_principal_input("default");
+            .expect("Slack DM principal should be derivable")
+            .to_principal_input();
         let metadata = json!({
             "slack_user_id": "U123",
             "slack_user_email": "ada@example.com",
@@ -633,31 +718,225 @@ mod tests {
     }
 
     #[test]
-    fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
+    fn slack_email_applies_only_to_user_principals_with_non_blank_email() {
+        let mut user_input = derive_principal("slack:T123:D123:ts", Some("U123"), None)
+            .expect("DM principal should be derivable")
+            .to_principal_input();
+        set_slack_email(&mut user_input, Some(" ada@example.com "));
+        assert_eq!(user_input.slack_email.as_deref(), Some("ada@example.com"));
+
+        let mut blank_input = derive_principal("slack:T123:D123:ts", Some("U123"), None)
+            .expect("DM principal should be derivable")
+            .to_principal_input();
+        set_slack_email(&mut blank_input, Some("   "));
+        assert_eq!(blank_input.slack_email, None);
+
+        let mut channel_input = derive_principal("slack:T123:C123:ts", None, None)
+            .expect("channel principal should be derivable")
+            .to_principal_input();
+        set_slack_email(&mut channel_input, Some("ada@example.com"));
+        assert_eq!(channel_input.slack_email, None);
+    }
+
+    #[tokio::test]
+    async fn register_requester_upserts_user_principal_without_roles_or_permissions() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_home_team_id": "T123",
+            "slack_display_name": "Ada Lovelace",
+            "slack_user_email": "ada@example.com"
+        });
+
+        let principal = registrar
+            .register_requester("slack:T123:C123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap()
+            .expect("channel requester resolves to a principal");
+        assert_eq!(principal.id, "prn_user");
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.contains(&"GET /api/v1/principals/lookup/slack-user-t123-u123".to_owned())
+        );
+        assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.ends_with("/slack_channel_permissions")),
+            "requester upserts must not write Slack channel permissions"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request == "POST /api/v1/principals/prn_user/roles"),
+            "iron-control owns default role assignment"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_merges_labels_for_existing_principal() {
+        let (base_url, requests, server) = spawn_iron_control_stub(true).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_home_team_id": "T123"
+        });
+
+        let principal = registrar
+            .register_requester("slack:T123:C123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap()
+            .expect("channel requester resolves to a principal");
+        assert_eq!(principal.id, "prn_user");
+
+        let requests = requests.lock().unwrap();
+        assert!(requests.contains(&"PUT /api/v1/principals/slack-user-t123-u123".to_owned()));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.ends_with("/slack_channel_permissions")),
+            "existing requester principals must not have Slack permissions reset"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request == "POST /api/v1/principals/prn_user/roles"),
+            "existing requester principals must not have removed roles restored"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_for_dm_thread() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_home_team_id": "T123"
+        });
+
+        let principal = registrar
+            .register_requester("slack:T123:D123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_without_slack_user_id() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "aad_object_id": "aad-user-1",
+            "user_id": "teams-user-1",
+            "slack_team_id": "T123",
+            "slack_home_team_id": "T123"
+        });
+
+        let principal = registrar
+            .register_requester("slack:T123:C123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_for_non_slack_thread() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123",
+            "slack_home_team_id": "T123"
+        });
+
+        let principal = registrar
+            .register_requester("linear:issue-1", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_for_external_slack_team() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T_EXTERNAL",
+            "slack_home_team_id": "T_HOME"
+        });
+
+        let principal = registrar
+            .register_requester("slack:T_HOME:C123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn register_requester_returns_none_without_home_team() {
+        let (base_url, requests, server) = spawn_iron_control_stub(false).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_team_id": "T123"
+        });
+
+        let principal = registrar
+            .register_requester("slack:T123:C123:1773364194.179929", Some(&metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(principal, None);
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn requester_team_eligibility_requires_matching_non_blank_teams() {
+        for metadata in [
+            json!({"slack_home_team_id": "T123"}),
+            json!({"slack_team_id": "T123"}),
+            json!({"slack_team_id": "", "slack_home_team_id": "T123"}),
+            json!({"slack_team_id": "T123", "slack_home_team_id": "   "}),
+            json!({"slack_team_id": "T_EXTERNAL", "slack_home_team_id": "T_HOME"}),
+        ] {
+            assert_eq!(eligible_slack_requester_team(&metadata), None);
+        }
+
         assert_eq!(
-            slack_permission_for_thread("slack:D123:ts", Some("D123"), None),
-            None
+            eligible_slack_requester_team(&json!({
+                "slack_team_id": " T123 ",
+                "slack_home_team_id": "T123"
+            })),
+            Some("T123")
         );
     }
 
     #[test]
-    fn compatibility_identity_labels_are_not_merged_back_into_writes() {
-        let mut labels = BTreeMap::from([
-            ("kind".to_owned(), "slack_dm".to_owned()),
-            ("slack_user_id".to_owned(), "U0123456789".to_owned()),
-            ("slack_team_id".to_owned(), "T0123456789".to_owned()),
-            ("managed-by".to_owned(), "centaur".to_owned()),
-            ("team".to_owned(), "platform".to_owned()),
-        ]);
-
-        strip_compatibility_identity_labels(&mut labels);
-
+    fn slack_permission_for_thread_skips_dm_channel_fallback_without_user() {
         assert_eq!(
-            labels,
-            BTreeMap::from([
-                ("managed-by".to_owned(), "centaur".to_owned()),
-                ("team".to_owned(), "platform".to_owned()),
-            ])
+            slack_permission_for_thread("slack:D123:ts", Some("D123"), None),
+            None
         );
     }
 
@@ -689,18 +968,18 @@ mod tests {
                 seen.lock().unwrap().push(format!("{method} {path}"));
 
                 let (status_line, body) = match (method, path) {
-                    ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
+                    ("GET", "/api/v1/principals/lookup/slack-channel-t123-c123")
                         if principal_exists =>
                     {
                         ("200 OK", channel_principal_body())
                     }
-                    ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123")
+                    ("GET", "/api/v1/principals/lookup/slack-user-t123-u123")
                         if principal_exists =>
                     {
                         ("200 OK", user_principal_body())
                     }
-                    ("GET", "/api/v1/principals/lookup/default/slack-channel-t123-c123")
-                    | ("GET", "/api/v1/principals/lookup/default/slack-user-t123-u123") => {
+                    ("GET", "/api/v1/principals/lookup/slack-channel-t123-c123")
+                    | ("GET", "/api/v1/principals/lookup/slack-user-t123-u123") => {
                         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
                     }
                     ("PUT", "/api/v1/principals/slack-channel-t123-c123") => {
@@ -734,10 +1013,10 @@ mod tests {
     }
 
     fn channel_principal_body() -> String {
-        r#"{"data":{"id":"prn_channel","namespace":"default","foreign_id":"slack-channel-t123-c123","name":"Slack Channel #general","labels":{}}}"#.to_owned()
+        r#"{"data":{"id":"prn_channel","foreign_id":"slack-channel-t123-c123","name":"Slack Channel #general","labels":{}}}"#.to_owned()
     }
 
     fn user_principal_body() -> String {
-        r#"{"data":{"id":"prn_user","namespace":"default","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
+        r#"{"data":{"id":"prn_user","foreign_id":"slack-user-t123-u123","name":"Slack DM @Ada Lovelace","labels":{}}}"#.to_owned()
     }
 }

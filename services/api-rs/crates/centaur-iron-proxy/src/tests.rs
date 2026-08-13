@@ -27,6 +27,17 @@ fn harness_auth_fragments_are_baked_in() {
         Some("OPENROUTER_API_KEY")
     );
 
+    let hermes = harness_auth_fragment("hermes", "api_key").unwrap().unwrap();
+    assert_eq!(
+        hermes.transforms[0].config.secrets[0].rules[0]["host"].as_str(),
+        Some("inference-api.nousresearch.com")
+    );
+    let hermes_placeholders = placeholder_env(&[hermes]);
+    assert_eq!(
+        hermes_placeholders.get("NOUS_API_KEY").map(String::as_str),
+        Some("NOUS_API_KEY")
+    );
+
     let meta_ai = harness_auth_fragment("meta-ai", "api_key")
         .unwrap()
         .unwrap();
@@ -57,13 +68,8 @@ fn harness_auth_fragments_are_baked_in() {
         Some("120s")
     );
     let placeholders = placeholder_env(&[infra]);
-    for name in [
-        "AMP_API_KEY",
-        "GITHUB_TOKEN",
-        "GITHUB_PACKAGES_TOKEN",
-        "SLACK_BOT_TOKEN",
-    ] {
-        assert_eq!(placeholders.get(name).map(String::as_str), Some(name));
+    for name in ["GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {
+        assert_eq!(placeholders.get(name).map(String::as_str), None);
     }
 }
 
@@ -107,48 +113,6 @@ fn access_token_fragment_carries_no_broker_credentials_block() {
         .unwrap()
         .unwrap();
     assert!(!codex.top_level.contains_key("broker_credentials"));
-}
-
-#[test]
-fn strip_broker_token_secrets_drops_token_broker_and_empties() {
-    // The claude-code access-token fragment is a single token_broker secret;
-    // stripping it leaves the `secrets` transform empty, which is then removed.
-    let mut claude = harness_auth_fragment("claude-code", "access_token")
-        .unwrap()
-        .unwrap();
-    assert!(
-        serde_yaml::to_string(&claude)
-            .unwrap()
-            .contains("token_broker")
-    );
-    claude.strip_broker_token_secrets();
-    let rendered = serde_yaml::to_string(&claude).unwrap();
-    assert!(!rendered.contains("token_broker"), "rendered: {rendered}");
-    assert!(
-        !claude.transforms.iter().any(|t| t.is_secrets()),
-        "emptied secrets transform should be removed: {rendered}"
-    );
-
-    // The codex access-token fragment pairs a token_broker with a non-broker
-    // placeholder secret (the account-id header); only the broker is dropped.
-    let mut codex = harness_auth_fragment("codex", "access_token")
-        .unwrap()
-        .unwrap();
-    codex.strip_broker_token_secrets();
-    let rendered = serde_yaml::to_string(&codex).unwrap();
-    assert!(!rendered.contains("token_broker"), "rendered: {rendered}");
-    assert!(
-        rendered.contains("OPENAI_CODEX_ACCOUNT_ID"),
-        "non-broker secret must survive: {rendered}"
-    );
-
-    // api_key fragments have no token_broker source, so they are untouched.
-    let mut api_key = harness_auth_fragment("claude-code", "api_key")
-        .unwrap()
-        .unwrap();
-    let before = serde_yaml::to_string(&api_key).unwrap();
-    api_key.strip_broker_token_secrets();
-    assert_eq!(before, serde_yaml::to_string(&api_key).unwrap());
 }
 
 #[test]

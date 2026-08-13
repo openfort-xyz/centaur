@@ -60,6 +60,15 @@ mod tests {
             Ok(test_principal("prn_test"))
         }
 
+        async fn register_requester(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+        ) -> Result<Option<centaur_iron_control::Principal>, centaur_iron_control::IronControlError>
+        {
+            Ok(None)
+        }
+
         async fn get_principal(
             &self,
             principal: &str,
@@ -72,7 +81,6 @@ mod tests {
     fn test_principal(id: &str) -> centaur_iron_control::Principal {
         centaur_iron_control::Principal {
             id: id.to_owned(),
-            namespace: "default".to_owned(),
             foreign_id: Some("test".to_owned()),
             name: "Test".to_owned(),
             labels: Default::default(),
@@ -575,7 +583,6 @@ mod tests {
         assert!(body.get("slack").is_none());
         assert!(body.get("discord").is_none());
         assert!(body.get("linear").is_none());
-        assert!(body.get("github").is_none());
         assert!(body.get("google_chat").is_none());
     }
 

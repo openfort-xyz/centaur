@@ -210,9 +210,7 @@ export function consoleSessionUrl(
 ): string | undefined {
   const base = consoleBaseUrl?.trim()
   if (!base) return undefined
-  // Trailing-slash strip without a `/+$/` regex (polynomial-ReDoS lint).
-  let normalized = base
-  while (normalized.endsWith('/')) normalized = normalized.slice(0, -1)
+  const normalized = base.replace(/\/+$/, '')
   return `${normalized}/console/threads?thread=${encodeURIComponent(threadKey)}`
 }
 

@@ -160,6 +160,22 @@ describe('createOpenAiMessageOverridesStrategy', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 
+  test('allows the OpenAI strategy to select hermes from natural language', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'hermes', model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use hermes for this')
+
+    expect(out.harnessType).toBe('hermes')
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
   // Nanocodex consumes the same effort knob as Codex, so a nanocodex selection
   // must keep its reasoning instead of silently falling back to the default.
 

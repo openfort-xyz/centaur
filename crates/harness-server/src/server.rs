@@ -1345,8 +1345,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 let mut terminal_stop = false;
                 for normalized in normalized_events {
                     if let Some(usage) = normalized.token_usage() {
-                        latest_usage =
-                            Some(accumulate_turn_usage(latest_usage.take(), usage.clone()));
+                        latest_usage = Some(usage.clone());
                     }
                     append_usage_span_output(&normalized, &mut usage_span_output);
                     if let Some(session_id) = normalized.session_id() {
@@ -1397,18 +1396,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
             }
         }
         if terminal {
-            // Emit turn/completed FIRST, before the best-effort usage export.
-            // The export does blocking OTLP/Laminar network I/O; if it ran first
-            // and the endpoint were slow or firewalled, it would stall (or with a
-            // bad connect, hang) the turn-completion path and the terminal
-            // notification would never reach the client. Telemetry must never
-            // delay protocol output.
-            if let Some(notification) = normalizer.finish_turn(None)? {
-                if let ServerNotification::TurnCompleted(completed) = &notification {
-                    completed_turn = Some(completed.turn.clone());
-                }
-                write_value(stdout, &notification_to_wire_value(&notification)?)?;
-            }
             export_harness_usage_if_available(
                 trace_context,
                 harness.kind(),
@@ -1420,6 +1407,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 usage_span_start,
                 latest_usage.as_ref(),
             );
+            if let Some(notification) = normalizer.finish_turn(None)? {
+                if let ServerNotification::TurnCompleted(completed) = &notification {
+                    completed_turn = Some(completed.turn.clone());
+                }
+                write_value(stdout, &notification_to_wire_value(&notification)?)?;
+            }
             break;
         }
     }
@@ -1434,35 +1427,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
     Ok(completed_turn)
-}
-
-/// Fold a freshly observed token-usage event into the turn's running total,
-/// carrying the last known model forward.
-///
-/// Claude Code's terminal `result` event reports cumulative usage but omits the
-/// model, while the interim `assistant` events carry it. Because usage is
-/// last-wins, the trailing `result` would otherwise blank the model, leaving the
-/// exported usage span unpriceable (`pricing_for_usage` keys off the model, so an
-/// empty model yields zero cost). Inheriting the prior non-empty model keeps the
-/// turn priced without changing the authoritative token counts.
-fn accumulate_turn_usage(
-    previous: Option<NormalizedTokenUsage>,
-    mut next: NormalizedTokenUsage,
-) -> NormalizedTokenUsage {
-    let next_model_is_empty = next
-        .model
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .is_empty();
-    if next_model_is_empty
-        && let Some(model) = previous
-            .and_then(|previous| previous.model)
-            .filter(|model| !model.trim().is_empty())
-    {
-        next.model = Some(model);
-    }
-    next
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1748,64 +1712,6 @@ mod tests {
         let same = downscale_oversized_image(&original);
 
         assert_eq!(same, original, "within-limit image is returned unchanged");
-    }
-
-    #[test]
-    fn accumulate_turn_usage_carries_model_into_terminal_result() {
-        // The Claude Code `assistant` event supplies the model; the trailing
-        // `result` event reports cumulative usage with no model. The folded
-        // usage must retain the model so the turn stays priceable.
-        let assistant = NormalizedTokenUsage {
-            model: Some("claude-opus-4-8".to_string()),
-            input_tokens: Some(1_000),
-            output_tokens: Some(200),
-            ..Default::default()
-        };
-        let result = NormalizedTokenUsage {
-            model: None,
-            input_tokens: Some(2_000),
-            output_tokens: Some(400),
-            cache_read_input_tokens: Some(1_500),
-            ..Default::default()
-        };
-
-        let folded = accumulate_turn_usage(Some(assistant), result);
-
-        assert_eq!(folded.model.as_deref(), Some("claude-opus-4-8"));
-        // Token counts come from the latest (terminal) usage, untouched.
-        assert_eq!(folded.input_tokens, Some(2_000));
-        assert_eq!(folded.output_tokens, Some(400));
-        assert_eq!(folded.cache_read_input_tokens, Some(1_500));
-    }
-
-    #[test]
-    fn accumulate_turn_usage_prefers_explicit_model_over_prior() {
-        let prior = NormalizedTokenUsage {
-            model: Some("claude-opus-4-8".to_string()),
-            ..Default::default()
-        };
-        let next = NormalizedTokenUsage {
-            model: Some("claude-fable-5".to_string()),
-            input_tokens: Some(5),
-            ..Default::default()
-        };
-
-        let folded = accumulate_turn_usage(Some(prior), next);
-
-        assert_eq!(folded.model.as_deref(), Some("claude-fable-5"));
-    }
-
-    #[test]
-    fn accumulate_turn_usage_leaves_model_empty_without_prior() {
-        let next = NormalizedTokenUsage {
-            model: None,
-            input_tokens: Some(5),
-            ..Default::default()
-        };
-
-        let folded = accumulate_turn_usage(None, next);
-
-        assert_eq!(folded.model, None);
     }
 
     #[test]

@@ -28,10 +28,6 @@ module Oauth
     FLOW_TTL = 10.minutes
     FLOW_COOKIE = :oauth_flow
 
-    # How the static secret wrapping a minted credential presents the token, for
-    # providers that do not declare their own shape (see ensure_wrapping_secret).
-    DEFAULT_WRAPPER_INJECT_CONFIG = { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }.freeze
-
     # Tests swap in an AuthorizationCodeClient built around an http double,
     # mirroring BrokerCredential#refresh_client.
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }
@@ -170,7 +166,6 @@ module Oauth
         # overwritten: the first linked user keeps the credential.
         credential.created_by ||= current_user
         if credential.new_record?
-          credential.namespace = @app.credential_namespace
           credential.foreign_id = "#{@app.provider}-#{@app.slug}-#{identity[:subject].downcase}"
           credential.name = "#{@provider.display_name} – #{identity_display_name(identity)}"
           credential.token_endpoint = @provider.token_endpoint
@@ -268,7 +263,6 @@ module Oauth
       secret = StaticSecret.find_or_initialize_by(broker_credential: credential)
       return secret unless secret.new_record?
 
-      secret.namespace = credential.namespace
       secret.name = "#{credential.name} token"
       secret.kind = wrapping_secret_kind
       secret.assign_attributes(wrapping_secret_config) if secret.kind == CredentialProfiles::Registry::CUSTOM_KIND

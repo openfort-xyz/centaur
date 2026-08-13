@@ -45,6 +45,10 @@ const MANAGED_BY_VALUE: &str = "api-rs";
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
 const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-principal";
+// Requesting user's principal OID bound to the proxy for the current turn.
+// Absent when the turn has no requester, so an annotation-vs-binding
+// comparison treats "absent" and "no requester" as equal.
+const IRON_CONTROL_REQUESTER_ANNOTATION: &str = "centaur.ai/iron-control-requester-principal";
 // RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
 // on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";
@@ -104,8 +108,6 @@ pub struct IronControlSettings {
     pub client: IronControlClient,
     /// Base URL injected into the proxy pod as `IRON_CONTROL_URL`.
     pub control_url: String,
-    /// iron-control namespace, used to resolve principals by `foreign_id`.
-    pub namespace: String,
 }
 
 #[cfg(test)]
@@ -113,7 +115,6 @@ fn test_iron_control_settings() -> IronControlSettings {
     IronControlSettings {
         client: IronControlClient::new("http://127.0.0.1:1", "test-key"),
         control_url: "http://iron-control".to_owned(),
-        namespace: "default".to_owned(),
     }
 }
 
@@ -471,49 +472,27 @@ impl SandboxBackend for AgentSandboxBackend {
         &self,
         id: &SandboxId,
         principal_id: &str,
+        requester_principal_id: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
-        self.assign_proxy_principal(id, principal_id, labels).await
+        self.assign_proxy_principal(id, principal_id, requester_principal_id, labels)
+            .await
     }
 
     async fn ensure_iron_control_proxy_resources(
         &self,
         id: &SandboxId,
         principal_id: &str,
+        requester_principal_id: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
-        self.ensure_proxy_resources_for_principal(id, principal_id, labels)
+        self.ensure_proxy_resources_for_principal(id, principal_id, requester_principal_id, labels)
             .await
     }
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await?;
-        // Reclaim the proxy: a paused sandbox has no pod for it to serve, and the
-        // ownerReference cascade only fires when the Sandbox CR is *deleted*, so
-        // without this the proxy pod stays Running until max-lifetime reaping —
-        // hours later. On a small node those retained proxies accumulate until new
-        // sandboxes cannot be scheduled at all.
-        //
-        // Nothing depends on them surviving the pause. resume() rebuilds the set
-        // from scratch (create_iron_proxy_resources starts by deleting whatever is
-        // there), and assign/ensure_proxy_resources_for_principal recreate on
-        // demand when has_usable_iron_proxy_resources reports them missing. The
-        // principal needed to rebind lives in a CR annotation, not in these
-        // resources, so it still survives.
-        //
-        // Best-effort: the sandbox IS paused once the patch above lands, so a
-        // failure here must not fail the pause. The resources remain owned by the
-        // CR and are still reclaimed by cascade deletion at stop()/max-lifetime,
-        // which is exactly the old behaviour.
-        if let Err(error) = self.delete_iron_proxy_resources(id).await {
-            tracing::warn!(
-                sandbox_id = id.as_str(),
-                %error,
-                "failed to delete iron-proxy resources on pause; they will be reclaimed when the sandbox is deleted"
-            );
-        }
-        Ok(())
+            .await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -890,6 +869,12 @@ fn build_agent_sandbox(
             principal.clone(),
         );
     }
+    if let Some(requester) = &spec.iron_control_requester_principal {
+        annotations.insert(
+            IRON_CONTROL_REQUESTER_ANNOTATION.to_owned(),
+            requester.clone(),
+        );
+    }
 
     let crd_spec = serde_json::from_value(agent_spec)
         .map_err(|err| SandboxError::InvalidSpec(format!("invalid Agent Sandbox spec: {err}")))?;
@@ -1180,6 +1165,36 @@ mod tests {
         assert!(pod_spec.node_selector.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
+    }
+
+    #[test]
+    fn stamps_requester_annotation_only_when_spec_carries_one() {
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+
+        let mut spec = SandboxSpec::new("centaur-agent:latest").iron_control_principal("prn_conv");
+        spec.iron_control_requester_principal = Some("prn_req".to_owned());
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let annotations = sandbox.metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            annotations
+                .get(IRON_CONTROL_PRINCIPAL_ANNOTATION)
+                .map(String::as_str),
+            Some("prn_conv")
+        );
+        assert_eq!(
+            annotations
+                .get(IRON_CONTROL_REQUESTER_ANNOTATION)
+                .map(String::as_str),
+            Some("prn_req")
+        );
+
+        let spec = SandboxSpec::new("centaur-agent:latest").iron_control_principal("prn_conv");
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert!(
+            sandbox.metadata.annotations.as_ref().is_none_or(
+                |annotations| !annotations.contains_key(IRON_CONTROL_REQUESTER_ANNOTATION)
+            )
+        );
     }
 
     #[test]

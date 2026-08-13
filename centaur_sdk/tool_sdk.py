@@ -105,10 +105,8 @@ def current_session_context() -> dict[str, Any]:
     """Return API-owned context for the current thread.
 
     For Slack-originated sessions this includes ``slack.channel_id`` and
-    ``slack.thread_ts``. For Google Chat-originated sessions this includes
-    ``google_chat.space_name`` and ``google_chat.thread_name``. The API remains
-    the source of truth so warm pooled sandboxes do not need per-thread
-    environment mutation.
+    ``slack.thread_ts``. The API remains the source of truth so warm pooled
+    sandboxes do not need per-thread environment mutation.
     """
     _require_api_server_enabled("current_session_context")
     thread_key = current_thread_key()
@@ -135,24 +133,6 @@ def current_slack_thread() -> dict[str, str]:
     return {
         "channel_id": str(slack["channel_id"]),
         "thread_ts": str(slack["thread_ts"]),
-    }
-
-
-def current_google_chat_space() -> dict[str, str]:
-    """Return ``{"space_name": ..., "thread_name": ...}`` for the current Google Chat thread."""
-    context = current_session_context()
-    google_chat = context.get("google_chat")
-    if (
-        not isinstance(google_chat, dict)
-        or not google_chat.get("space_name")
-        or not google_chat.get("thread_name")
-    ):
-        raise RuntimeError(
-            f"current thread is not a Google Chat thread: {context.get('thread_key')!r}"
-        )
-    return {
-        "space_name": str(google_chat["space_name"]),
-        "thread_name": str(google_chat["thread_name"]),
     }
 
 
@@ -231,13 +211,13 @@ def current_chat_destination() -> dict[str, str | int]:
     """Return the current chat surface in a platform-agnostic shape.
 
     Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"`` /
-    ``"github"`` / ``"google_chat"``) plus that platform's destination ids (Slack:
+    ``"github"``) plus that platform's destination ids (Slack:
     ``channel_id``/``thread_ts``; Discord: ``guild_id``/``channel_id``/``thread_id``;
     Linear: ``issue_id``/``comment_id``/``agent_session_id``; GitHub:
-    ``owner``/``repo``/``number``/``kind``/``review_comment_id``; Google Chat:
-    ``space_name``/``thread_name``). Prefer this over the platform-specific
-    helpers when writing tooling that should work on any chat surface. Raises if
-    the current thread is not a recognized chat surface.
+    ``owner``/``repo``/``number``/``kind``/``review_comment_id``). Prefer this
+    over the platform-specific helpers when writing tooling that should work on
+    any chat surface. Raises if the current thread is not a recognized chat
+    surface.
     """
     context = current_session_context()
     platform = context.get("platform")
@@ -249,8 +229,6 @@ def current_chat_destination() -> dict[str, str | int]:
         return {"platform": "linear", **current_linear_thread()}
     if platform == "github":
         return {"platform": "github", **current_github_thread()}
-    if platform == "google_chat":
-        return {"platform": "google_chat", **current_google_chat_space()}
     raise RuntimeError(
         f"current thread is not a recognized chat surface: {context.get('thread_key')!r}"
     )

@@ -155,20 +155,14 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
             continue
         if tool_name in blocklist:
             continue
-        relative_package_dir = package_dir.relative_to(published)
-        target = tool_dir / relative_package_dir
-        previous = existing.get(tool_name)
-        if previous is not None:
-            # Later sources shadow earlier ones by tool name (base tree first,
-            # then each overlay source in order). Remove the earlier install if
-            # it lives elsewhere so it doesn't linger alongside the replacement
-            # with a duplicate [project.scripts] shim name.
+        if tool_name in existing:
             print(
-                f"overriding tool {tool_name}: {package_dir} replaces {previous}",
+                f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
                 file=sys.stderr,
             )
-            if previous != target:
-                _remove_path(previous)
+            continue
+        relative_package_dir = package_dir.relative_to(published)
+        target = tool_dir / relative_package_dir
         if target.exists() or target.is_symlink():
             _remove_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -479,22 +473,6 @@ MAX_ANALYTICS_ARGS = 32
 MAX_ANALYTICS_ARGS_LENGTH = 512
 TRUNCATION_SUFFIX = "..."
 
-# Wall-clock ceiling on a single tool invocation. Tools are third-party-facing
-# (browsers, vendor APIs) and several have no timeout of their own, so without
-# this a hung call is bounded only by the execution ceiling — and, since a
-# blocked call emits no output, it reads as silence to everything watching.
-# On 2026-08-04 a `browser-agent` call ran 61 minutes inside a turn that was
-# killed at 45, and because the agent had piped it through `tail` there was no
-# partial output either: the turn spent its whole life blocked on a result that
-# could not arrive.
-#
-# 0 disables the bound. Set CENTAUR_TOOL_TIMEOUT_SECS to raise it for a tool
-# that genuinely needs longer.
-TOOL_TIMEOUT_SECS = int(os.environ.get("CENTAUR_TOOL_TIMEOUT_SECS") or 600)
-# Conventional exit status for `timeout(1)`, so callers reading only the code
-# can still tell a timeout from an ordinary failure.
-TOOL_TIMEOUT_EXIT_CODE = 124
-
 
 def load():
     with open(INDEX) as f:
@@ -691,29 +669,10 @@ def run_tool(tool, args):
     started_at = time.monotonic()
     emit_tool_call_event("tool_call_started", tool, "cli", tool_args=args)
     try:
-        # Popen + wait(timeout) rather than subprocess.call(timeout=...): call()
-        # raises TimeoutExpired without killing the child, which would leave the
-        # very process we are trying to bound still running.
-        proc = subprocess.Popen(
+        returncode = subprocess.call(
             ["uvx", "--from", str(project_dir), tool["name"], *args],
             env=tool_env(),
         )
-        try:
-            returncode = proc.wait(timeout=TOOL_TIMEOUT_SECS or None)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            returncode = TOOL_TIMEOUT_EXIT_CODE
-            # To stderr so it reaches the agent as tool output. A tool that dies
-            # silently is indistinguishable from one still working, which is the
-            # failure this bound exists to prevent — say plainly what happened
-            # and what to do instead.
-            sys.stderr.write(
-                f"centaur-tools: {{tool['name']}} exceeded "
-                f"{{TOOL_TIMEOUT_SECS}}s and was killed.\\n"
-                "Re-run with a narrower scope, or raise CENTAUR_TOOL_TIMEOUT_SECS "
-                "for this call if it genuinely needs longer.\\n"
-            )
     except Exception:
         emit_tool_call_event(
             "tool_call_completed",

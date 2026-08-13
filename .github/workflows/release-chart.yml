@@ -19,21 +19,35 @@ permissions: {}
 jobs:
   release:
     permissions:
-      contents: read
-      packages: write
-    # ubuntu-latest, not depot-ubuntu-24.04-16: every step here is a lightweight
-    # checkout/lint/publish (no compilation), and this job has queued for the
-    # full 24h GitHub Actions timeout and been auto-cancelled on every run for
-    # the last three weeks without ever picking up a depot runner -- so the
-    # chart version-bump check and chart publish silently never ran.
-    runs-on: ubuntu-latest
+      contents: write
+    runs-on: depot-ubuntu-24.04-16
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Full history: the version-bump check diffs against the merge base.
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Bootstrap gh-pages branch
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "gh-pages branch already exists"
+          else
+            echo "Creating empty gh-pages branch"
+            git switch --orphan gh-pages
+            git commit --allow-empty -m "chore: initialize gh-pages"
+            git push origin gh-pages
+            git switch -
+          fi
 
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
@@ -83,45 +97,11 @@ jobs:
           echo "::error file=${CHART_YAML}::contrib/chart changed but chart version stayed at ${CURRENT_VERSION}. Bump .version in the PR."
           exit 1
 
-      # Published as an OCI artifact into the same ghcr.io namespace as the six
-      # fleet images, rather than as a GitHub release asset indexed on gh-pages.
-      #
-      # chart-releaser cannot publish here: this org enables GitHub's immutable
-      # releases, and cr creates the release *before* uploading the .tgz, so the
-      # upload always fails with "422 Cannot upload assets to an immutable
-      # release" (helm/chart-releaser-action#228). The upstream fix for that is
-      # still unmerged (helm/chart-releaser#587) and is in no released cr
-      # version, so this was not a version bump away. OCI sidesteps GitHub
-      # Releases entirely and keeps release immutability switched on.
-      #
-      # This is the *distribution* copy only. Argo does not consume it: the
-      # op-helm CMP clones the fork at the pinned SHA and templates
-      # contrib/chart straight from the git tree.
-      - name: Package chart
+      - name: Run chart-releaser
         if: github.event_name == 'push'
-        run: helm package contrib/chart --destination .chart-packages
-
-      - name: Publish chart to ghcr.io
-        if: github.event_name == 'push'
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
+        with:
+          skip_existing: true
+          charts_dir: contrib
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          # Exactly one package is expected. A glob matching several would
-          # otherwise push an arbitrary one and still report success.
-          shopt -s nullglob
-          packages=(.chart-packages/*.tgz)
-          if [ "${#packages[@]}" -ne 1 ]; then
-            echo "::error::expected exactly 1 packaged chart, found ${#packages[@]}"
-            exit 1
-          fi
-
-          # ghcr.io rejects uppercase path segments; owners may not be lowercase.
-          repo=$(echo "${REPOSITORY}" | tr '[:upper:]' '[:lower:]')
-
-          echo "${GH_TOKEN}" | helm registry login ghcr.io \
-            --username "${ACTOR}" --password-stdin
-          helm push "${packages[0]}" "oci://ghcr.io/${repo}/charts"
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

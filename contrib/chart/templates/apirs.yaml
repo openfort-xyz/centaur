@@ -15,7 +15,6 @@
 {{- $apiWorkflowDirList := list -}}
 {{- $sandboxWorkflowDirList := list -}}
 {{- $skillDirs := list -}}
-{{- $overlayPromptDir := "" -}}
 {{- $publicSkillDirs := list -}}
 {{- range $source := $overlaySources -}}
 {{- $repo := get $source "repo" | default "" -}}
@@ -39,9 +38,6 @@
 {{- if eq $visibility "public" -}}
 {{- $publicSkillDirs = append $publicSkillDirs $skillDir -}}
 {{- end -}}
-{{- end -}}
-{{- if and (not $overlayPromptDir) (get $source "promptPath") -}}
-{{- $overlayPromptDir = printf "/home/agent/github/%s" $repo -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -99,11 +95,6 @@
   (dict "name" "GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS" "value" (dig "googleDrive" "syncIntervalSeconds" 14400 $apiRsEtl))
   (dict "name" "GOOGLE_CALENDAR_ETL_ENABLED" "value" (dig "googleCalendar" "enabled" false $apiRsEtl))
   (dict "name" "GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS" "value" (dig "googleCalendar" "syncIntervalSeconds" 14400 $apiRsEtl))
-  (dict "name" "GOOGLE_CHAT_ETL_ENABLED" "value" (dig "googleChat" "enabled" false $apiRsEtl))
-  (dict "name" "GOOGLE_CHAT_SYNC_INTERVAL_SECONDS" "value" (dig "googleChat" "syncIntervalSeconds" 14400 $apiRsEtl))
-  (dict "name" "GOOGLE_CHAT_INCLUDE_SPACE_TYPES" "value" (dig "googleChat" "includeSpaceTypes" "SPACE" $apiRsEtl))
-  (dict "name" "GOOGLE_CHAT_MAX_PAGES_PER_RUN" "value" (dig "googleChat" "maxPagesPerRun" 0 $apiRsEtl))
-  (dict "name" "GOOGLE_CHAT_SPACE_IDS" "value" (dig "googleChat" "spaceIds" "" $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_ENABLED" "value" (dig "companyContextDocuments" "enabled" true $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS" "value" (dig "companyContextDocuments" "intervalSeconds" 14400 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS" "value" (dig "companyContextDocuments" "maxWindowSeconds" 21600 $apiRsEtl))
@@ -296,9 +287,6 @@ spec:
 {{- if .Values.overlay.systemPrompt }}
             - name: CENTAUR_OVERLAY_DIR
               value: {{ .Values.overlay.mountPath | quote }}
-{{- else if $overlayPromptDir }}
-            - name: CENTAUR_OVERLAY_DIR
-              value: {{ $overlayPromptDir | quote }}
 {{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}
@@ -434,11 +422,6 @@ spec:
 {{- $sandboxEnvList := list }}
 {{- if and .Values.repoCache.enabled (gt (len $skillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SKILL_DIRS" "value" (join ":" $skillDirs)) }}
-{{- end }}
-{{- if .Values.overlay.systemPrompt }}
-{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_OVERLAY_DIR" "value" .Values.overlay.mountPath) }}
-{{- else if $overlayPromptDir }}
-{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_OVERLAY_DIR" "value" $overlayPromptDir) }}
 {{- end }}
 {{- if and .Values.repoCache.enabled (gt (len $publicSkillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_PUBLIC_SKILL_DIRS" "value" (join ":" $publicSkillDirs)) }}

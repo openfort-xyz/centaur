@@ -21,6 +21,12 @@ describe('extractMessageOverrides', () => {
     expect(out.cleanedText).toBe('review this')
   })
 
+  test('recognizes --hermes as a harness flag', () => {
+    const out = extractMessageOverrides('--hermes review this')
+    expect(out.harnessType).toBe('hermes')
+    expect(out.cleanedText).toBe('review this')
+  })
+
   test('extracts -rsn reasoning effort', () => {
     const out = extractMessageOverrides('think hard -rsn high')
     expect(out.reasoning).toBe('high')

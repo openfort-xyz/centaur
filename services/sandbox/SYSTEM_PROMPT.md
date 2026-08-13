@@ -74,6 +74,8 @@
 
 [Named skill resolution]
 |When the user explicitly names a skill, resolve that request against local skill definitions before doing broad semantic matching.
+|Use `centaur-skills search "<task>"` to search Console-authored guidance when no skill already listed for the current session clearly applies. Read the best match by name or OID with `centaur-skills read <skill-identifier>` before following it.
+|The `centaur-skills` catalog contains only Console-authored skills. Builtin skills are loaded separately by the harness. Console applies private and public visibility rules for the current principal. Catalog results are instructions only and never expand the current principal's tool or credential grants.
 |Start with the skills listed for the current session, then check local skill definitions in `.agents/skills` and any mounted overlay skills when you need to confirm the exact name or an obvious alias from the skill title or description.
 |Prefer exact name matches first, then obvious aliases, and only then fall back to broader description-level matching. Do not choose a generic adjacent workflow while a more specific named skill remains plausible.
 |Treat "exists locally" and "is live in this deployment" as separate questions. Local skill files or prompt hints show that a skill exists in the repo; the current session's available-skills list or a successful `skill` load shows that it is live here.
@@ -82,7 +84,6 @@
 
 [Environment]
 |repos: ~/github/{org}/{repo} (READ-ONLY mounts) | git pre-configured | gh authenticated
-|Private @openfort-xyz npm packages (npm.pkg.github.com): install with `NODE_AUTH_TOKEN="$GITHUB_PACKAGES_TOKEN" pnpm install`. The gh token has no packages scope — do NOT use `gh auth token` for npm installs.
 |installed: Rust,Node24,Python3+uv,Foundry(forge/cast/anvil),Nushell(nu),rg,fd,jq,tmux,cmake,protobuf
 |To modify a repo (commit, push, open PR): first choose a short descriptive lowercase kebab-case branch slug, then run `git-branch <org/repo> <branch-slug>` → creates writable clone at ~/branches/<org>/<repo> on `centaur/<branch-slug>-<timestamp>`
 |Example: for a request to fix auth token refresh, use `git-branch paradigmxyz/centaur fix-auth-token-refresh`
@@ -122,6 +123,8 @@
 
 [Tool CLI access — use shell commands]
 |centaur-tools list              → list available deployment tool CLIs
+|centaur-skills search "task"    → discover relevant private and public Console skills
+|centaur-skills read <name-or-oid> → read a Console skill's complete current SKILL.md
 |<tool> --help                   → inspect commands/options for one tool
 |<tool> health                   → smoke test one tool's configured auth/connectivity path
 |websearch search "query"        → web research

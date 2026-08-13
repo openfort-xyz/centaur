@@ -31,13 +31,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # Fork override: upstream publishes to paradigmxyz/centaur. We publish to
-  # our org so the deploy box can pull from a registry it has access to.
-  # Keep these as static literals (not github.repository_owner) so upstream
-  # restructuring of the workflow doesn't silently flip our images to the
-  # wrong org.
-  IMAGE_NAMESPACE: openfort-xyz/centaur
-  IMAGE_SOURCE: https://github.com/openfort-xyz/centaur
+  IMAGE_NAMESPACE: paradigmxyz/centaur
+  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
   # Main/tags keep optimized release images. PRs and manual branch publishes
   # use debug builds so staging/dev iteration does not spend minutes optimizing
   # Rust binaries that are immediately replaced by the next test build.

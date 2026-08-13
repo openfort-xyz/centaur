@@ -10,7 +10,6 @@ from centaur_sdk import (
     current_chat_destination,
     current_discord_thread,
     current_github_thread,
-    current_google_chat_space,
     current_linear_thread,
     current_session_context,
     current_slack_thread,
@@ -207,36 +206,6 @@ def test_current_discord_thread_returns_api_discord_destination(
         reset_tool_context(token)
 
 
-def _google_chat_context(thread_key: str, monkeypatch: pytest.MonkeyPatch):
-    payload = (
-        b'{"thread_key":"' + thread_key.encode() + b'","platform":"google_chat",'
-        b'"google_chat":{"space_name":"spaces/AAAA","thread_name":"spaces/AAAA/threads/BBBB"}}'
-    )
-    monkeypatch.setattr(
-        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
-    )
-    return set_tool_context(
-        ToolContext(
-            name="fake-tool",
-            thread_key=thread_key,
-            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
-        )
-    )
-
-
-def test_current_google_chat_space_returns_api_chat_destination(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    token = _google_chat_context("chat:spaces:AAAA:spaces:AAAA:threads:BBBB", monkeypatch)
-    try:
-        assert current_google_chat_space() == {
-            "space_name": "spaces/AAAA",
-            "thread_name": "spaces/AAAA/threads/BBBB",
-        }
-    finally:
-        reset_tool_context(token)
-
-
 def test_current_chat_destination_tags_platform(monkeypatch: pytest.MonkeyPatch):
     token = _discord_context("discord:111:222:333", monkeypatch)
     try:
@@ -245,18 +214,6 @@ def test_current_chat_destination_tags_platform(monkeypatch: pytest.MonkeyPatch)
             "guild_id": "111",
             "channel_id": "222",
             "thread_id": "333",
-        }
-    finally:
-        reset_tool_context(token)
-
-
-def test_current_chat_destination_tags_google_chat_platform(monkeypatch: pytest.MonkeyPatch):
-    token = _google_chat_context("chat:spaces:AAAA:spaces:AAAA:threads:BBBB", monkeypatch)
-    try:
-        assert current_chat_destination() == {
-            "platform": "google_chat",
-            "space_name": "spaces/AAAA",
-            "thread_name": "spaces/AAAA/threads/BBBB",
         }
     finally:
         reset_tool_context(token)
@@ -421,28 +378,6 @@ def test_current_discord_thread_rejects_slack_thread(monkeypatch: pytest.MonkeyP
         reset_tool_context(token)
 
 
-def test_current_google_chat_space_rejects_slack_thread(monkeypatch: pytest.MonkeyPatch):
-    payload = (
-        b'{"thread_key":"slack:C123:123.456","platform":"slack",'
-        b'"slack":{"channel_id":"C123","thread_ts":"123.456"}}'
-    )
-    monkeypatch.setattr(
-        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
-    )
-    token = set_tool_context(
-        ToolContext(
-            name="fake-tool",
-            thread_key="slack:C123:123.456",
-            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
-        )
-    )
-    try:
-        with pytest.raises(RuntimeError, match="not a Google Chat thread"):
-            current_google_chat_space()
-    finally:
-        reset_tool_context(token)
-
-
 def test_save_attachment_writes_to_sandbox_uploads_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
@@ -486,37 +421,6 @@ def test_save_attachment_requires_api_server_capability_without_uploads_dir(
     try:
         with pytest.raises(RuntimeError, match="API server sandbox capability"):
             save_attachment(name="report.txt", data=b"hello")
-    finally:
-        reset_tool_context(token)
-
-
-def test_current_google_chat_space_rejects_non_chat_threads(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self) -> bytes:
-            return (
-                b'{"thread_key":"slack:C123:123.456",'
-                b'"slack":{"channel_id":"C123","thread_ts":"123.456"}}'
-            )
-
-    monkeypatch.setattr("urllib.request.urlopen", lambda _request, timeout: FakeResponse())
-    token = set_tool_context(
-        ToolContext(
-            name="fake-tool",
-            thread_key="slack:C123:123.456",
-            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
-        )
-    )
-    try:
-        with pytest.raises(RuntimeError, match="not a Google Chat thread"):
-            current_google_chat_space()
     finally:
         reset_tool_context(token)
 

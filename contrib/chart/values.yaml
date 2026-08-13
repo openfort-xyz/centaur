@@ -66,11 +66,9 @@ toolServer:
   visibility: private
   # Subdirectory in the repo holding the tools tree (mounted at /app/tools).
   subdir: tools
-  # Additional repo/subdir sources copied after the base tools source. On a
-  # duplicate tool name, the later source replaces the earlier one (base tree
-  # first, then each extra source in order), matching overlays.sources
-  # shadowing semantics. These repos are cached automatically when
-  # repoCache.enabled=true.
+  # Additional repo/subdir sources copied after the base tools source. Duplicate
+  # tool names are skipped by the sandbox copy helper. These repos are cached
+  # automatically when repoCache.enabled=true.
   extraSources: []
   # - repo: tempoxyz/centaur-tempo
   #   ref: ""
@@ -191,6 +189,34 @@ console:
   worker:
     replicaCount: 1
     resources: {}
+  # Prometheus SQL Exporter for Console database metrics, initially Solid Queue.
+  # This runs as one internal-only replica because every instance would report
+  # the same global database state. The exporter reads a dedicated, read-only DSN
+  # from secretManager.existingSecretName without writing the credential into
+  # its ConfigMap or command-line arguments.
+  sqlExporter:
+    # Enable after CONSOLE_SQLEXPORTER_DATABASE_URL has been added to the
+    # shared infra Secret and its PostgreSQL role has been granted SELECT on
+    # every table queried by a configured collector.
+    enabled: false
+    image:
+      repository: burningalchemist/sql_exporter
+      tag: 0.24.4
+      pullPolicy: IfNotPresent
+    port: 9399
+    # Key in secretManager.existingSecretName containing the complete database
+    # URL for a dedicated read-only PostgreSQL role.
+    databaseUrlSecretKey: CONSOLE_SQLEXPORTER_DATABASE_URL
+    # Used by NetworkPolicy when postgres.enabled=false and the queue database
+    # is externally managed.
+    databasePort: 5432
+    minInterval: 15s
+    scrapeTimeout: 5s
+    metrics:
+      scrapeAnnotations: true
+      path: /metrics
+      annotations: {}
+    resources: {}
 
 # Values for the upstream 1Password Connect subchart
 # (https://github.com/1Password/connect-helm-charts/tree/main/charts/connect).
@@ -222,24 +248,21 @@ overlay:
 # only need `repo`; set `ref` to a branch, tag, or commit when you do not want
 # the repo's default branch. Directories missing from a repo are skipped at
 # runtime. Set a subdir to "" to explicitly disable that surface for a source.
-# Set promptPath to services/sandbox/SYSTEM_PROMPT.md when a source should
-# provide the sandbox prompt overlay loaded through CENTAUR_OVERLAY_DIR.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
 overlays:
-  # Ordered tool/workflow sources. The first entry is the base: this fork's own
-  # tools (the upstream tool set plus google_chat). The second is our org overlay
-  # with org-specific tools/workflows (crisp, stripe, cloudflare, gcp_logs,
-  # openfort_pulse_daily). Listing the base explicitly is required: when
-  # `sources` is non-empty the legacy toolServer.repo base is NOT auto-included.
-  # The overlay repo is private, so repo-cache needs read credentials for it
-  # (see repoCache.githubToken).
-  sources:
-    - repo: openfort-xyz/centaur
-      ref: main
-    - repo: openfort-xyz/centaur-overlay
-      ref: main
-      promptPath: services/sandbox/SYSTEM_PROMPT.md
+  sources: []
+  # - repo: paradigmxyz/centaur
+  #   ref: ""
+  #   visibility: public
+  # - repo: your-org/centaur-overlay
+  #   ref: main
+  #   visibility: private
+  # - repo: your-org/workflows-only
+  #   ref: main
+  #   visibility: private
+  #   toolsSubdir: ""
+  #   skillsSubdir: ""
 
 sandbox:
   controller: pod
@@ -772,6 +795,10 @@ networkPolicy:
   enabled: true
   ingressSourceNamespaces: []
   apiIngressSourceNamespaces: []
+  # Namespaces containing Prometheus-compatible collectors that may scrape
+  # internal metrics-only Services such as the Console queue SQL Exporter.
+  # Same-namespace collectors are always admitted.
+  metricsIngressSourceNamespaces: []
   ingressControllerNamespaces:
     - kube-system
   # Port the kubernetes.default ClusterIP forwards to for the API server. The
@@ -816,36 +843,6 @@ networkPolicy:
     #     ports:
     #       - port: 8428
     #         protocol: TCP
-
-# Optional in-cluster TCP relay to an OTLP trace collector that runs OFF-cluster
-# (e.g. Laminar via docker-compose on the node). Sandboxes cannot reach
-# off-cluster hosts directly (their egress NetworkPolicy denies it), and api-rs
-# only opens a per-sandbox OTLP egress rule when sandbox.extraEnv's
-# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is an in-cluster `<svc>.<ns>.svc` host.
-# Enable this to deploy a relay the sandboxes CAN reach, then point
-# sandbox.extraEnv.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT (and any LAMINAR_BASE_URL)
-# at `http://<service>.<namespace>.svc:<port>/v1/traces`. api-rs's own spans can
-# keep using the off-cluster endpoint directly (it is not sandbox-restricted).
-otlpForwarder:
-  enabled: false
-  # Namespace the relay lives in. Becomes the `<ns>` the sandbox endpoint host
-  # encodes, which api-rs maps to the per-sandbox egress rule.
-  namespace: laminar
-  service: otlp
-  port: 8000
-  # host:port of the off-cluster collector to relay TCP to (e.g. the node IP
-  # that exposes the docker-compose Laminar OTLP ingest).
-  target: "10.42.0.1:8000"
-  image:
-    repository: alpine/socat
-    tag: "1.8.0.0"
-    pullPolicy: IfNotPresent
-  resources:
-    requests:
-      cpu: 10m
-      memory: 16Mi
-    limits:
-      memory: 64Mi
 
 podSecurityContext:
   fsGroupChangePolicy: OnRootMismatch

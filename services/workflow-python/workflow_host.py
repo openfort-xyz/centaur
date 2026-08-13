@@ -263,41 +263,18 @@ def coerce_input(raw: Any, input_cls: type | None) -> Any:
 
 
 async def create_pool() -> Any:
-    # Prefer the iron-proxy-routed DSN. In a sandbox the egress NetworkPolicy
-    # only permits Postgres through the per-sandbox proxy, never the direct
-    # DATABASE_URL, so a workflow using DATABASE_URL fails at connect. The proxy
-    # DSN (CENTAUR_POSTGRES_DSN) carries no database path; borrow it from
-    # DATABASE_URL — mirroring how the company_context tool connects.
-    proxy_dsn = os.getenv("CENTAUR_POSTGRES_DSN", "").strip()
-    direct_dsn = os.getenv("DATABASE_URL", "").strip()
-    database_url = proxy_dsn or direct_dsn
+    database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
         return None
-    if proxy_dsn and direct_dsn:
-        from urllib.parse import urlparse, urlunparse
-
-        proxy = urlparse(proxy_dsn)
-        if not proxy.path.strip("/"):
-            database_url = urlunparse(proxy._replace(path=urlparse(direct_dsn).path))
     try:
         import asyncpg  # type: ignore
     except ImportError:
         return None
 
-    # asyncpg resets each connection on release with `RESET ALL`, which the
-    # iron-proxy pg policy blocks (it manages the session role/settings). Skip
-    # the automatic reset — workflow handlers use autocommit execute/fetch, so
-    # there is no per-connection state that needs clearing between acquisitions.
-    class _ProxySafeConnection(asyncpg.Connection):  # type: ignore[misc]
-        async def reset(self, *, timeout=None):
-            return None
-
     last_error: Exception | None = None
     for attempt in range(1, DATABASE_CONNECT_ATTEMPTS + 1):
         try:
-            return await asyncpg.create_pool(
-                database_url, connection_class=_ProxySafeConnection
-            )
+            return await asyncpg.create_pool(database_url)
         except Exception as exc:
             last_error = exc
             if attempt == DATABASE_CONNECT_ATTEMPTS:

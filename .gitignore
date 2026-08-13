@@ -76,4 +76,3 @@ next-env.d.ts
 *.tsbuildinfo
 _
 .notes
-.pnpm-store/
