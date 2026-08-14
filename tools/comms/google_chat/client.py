@@ -100,7 +100,9 @@ class GoogleChatClient:
         space_name: str,
         *,
         page_size: int = 20,
+        page_token: str | None = None,
         filter: str | None = None,
+        order_by: str | None = None,
     ) -> dict[str, Any]:
         """List messages in a space, reading the real Chat API directly.
 
@@ -112,14 +114,20 @@ class GoogleChatClient:
         context instead; this path serves multi-party SPACE reads.
 
         Returns the Chat API `{messages, nextPageToken}` shape unchanged.
-        `filter` scopes to a thread, e.g. ``thread.name="spaces/S/threads/T"``.
+        ``filter`` supports ``createTime`` and ``thread.name`` expressions.
+        Pass ``nextPageToken`` back as ``page_token`` without changing the
+        other query options.
         """
         import httpx
 
         space_id = _space_id(space_name)
         params: dict[str, Any] = {"pageSize": page_size}
+        if page_token:
+            params["pageToken"] = page_token
         if filter:
             params["filter"] = filter
+        if order_by:
+            params["orderBy"] = order_by
         response = httpx.get(
             f"{_GOOGLE_CHAT_API_BASE}/v1/spaces/{space_id}/messages",
             params=params,

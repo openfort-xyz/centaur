@@ -38,11 +38,47 @@ def send_message(
 def list_messages(
     space_name: str = typer.Argument(..., help="Google Chat space resource name"),
     page_size: int = typer.Option(20, "--page-size", "-n", help="Number of messages per page"),
+    page_token: str | None = typer.Option(None, "--page-token", help="Token from nextPageToken"),
+    filter: str | None = typer.Option(None, "--filter", help="Google Chat message filter"),
+    order_by: str | None = typer.Option(None, "--order-by", help="Message order: ASC or DESC"),
+    all_pages: bool = typer.Option(False, "--all-pages", help="Follow nextPageToken automatically"),
+    max_pages: int = typer.Option(20, "--max-pages", min=1, help="Safety cap with --all-pages"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """List messages in a Google Chat space."""
     client = _client()
-    result = client.list_messages(space_name, page_size=page_size)
+    if all_pages:
+        messages = []
+        pages_fetched = 0
+        token = page_token
+        seen_tokens = {token} if token else set()
+        while pages_fetched < max_pages:
+            result = client.list_messages(
+                space_name,
+                page_size=page_size,
+                page_token=token,
+                filter=filter,
+                order_by=order_by,
+            )
+            messages.extend(result.get("messages") or [])
+            pages_fetched += 1
+            token = result.get("nextPageToken")
+            if not token:
+                break
+            if token in seen_tokens:
+                raise RuntimeError(f"Google Chat repeated page token {token!r}")
+            seen_tokens.add(token)
+        result = {"messages": messages, "pagesFetched": pages_fetched}
+        if token:
+            result["nextPageToken"] = token
+    else:
+        result = client.list_messages(
+            space_name,
+            page_size=page_size,
+            page_token=page_token,
+            filter=filter,
+            order_by=order_by,
+        )
 
     if json_output:
         print(json.dumps(result, indent=2))

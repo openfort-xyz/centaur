@@ -153,12 +153,23 @@ def test_list_messages_reads_chat_api_directly(monkeypatch) -> None:
     # sandbox's CONNECT-only firewall cannot reach — so no Authorization header.
     fake = _patch_httpx(monkeypatch, {"upload": {}, "default": {"messages": []}})
 
-    _client().list_messages("spaces/AAAA", page_size=7, filter='thread.name="spaces/AAAA/threads/T"')
+    _client().list_messages(
+        "spaces/AAAA",
+        page_size=7,
+        page_token="next-page",
+        filter='thread.name="spaces/AAAA/threads/T"',
+        order_by="DESC",
+    )
 
     call = fake.calls[0]
     assert call["method"] == "GET"
     assert call["url"] == "https://chat.googleapis.com/v1/spaces/AAAA/messages"
-    assert call["params"] == {"pageSize": 7, "filter": 'thread.name="spaces/AAAA/threads/T"'}
+    assert call["params"] == {
+        "pageSize": 7,
+        "pageToken": "next-page",
+        "filter": 'thread.name="spaces/AAAA/threads/T"',
+        "orderBy": "DESC",
+    }
     assert "Authorization" not in call["headers"]
 
 
