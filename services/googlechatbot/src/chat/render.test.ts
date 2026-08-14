@@ -1,5 +1,15 @@
 import { test, expect, describe } from 'bun:test'
-import { markdownToChatMessage, fenceMarkdownTables, toChatTextMarkup, normalizeCardBreaks, stripInlineMarkdown, flattenCardProseInline } from './render'
+import {
+  CARD_FALLBACK_TEXT,
+  fenceMarkdownTables,
+  flattenCardProseInline,
+  markdownToChatMessage,
+  messageUtf8Bytes,
+  normalizeCardBreaks,
+  splitUtf8Text,
+  stripInlineMarkdown,
+  toChatTextMarkup
+} from './render'
 import { chatReplyLimits } from '../constants'
 
 type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
@@ -113,11 +123,10 @@ describe('markdownToChatMessage', () => {
     expect(joined).toContain('Summary prose here')
   })
 
-  test('plain text path is clamped to the 4096-char Chat cap (overflow routes to card)', () => {
+  test('plain text remains complete for exact byte-aware splitting by the renderer', () => {
     const long = 'x'.repeat(10_000)
     const out = markdownToChatMessage(long)
-    expect(out.text.length).toBe(chatReplyLimits.message.maxPlainTextChars)
-    expect(out.text.endsWith('…')).toBe(true)
+    expect(out.text).toBe(long)
   })
 
   test('stripInlineMarkdown removes markup card headers cannot render', () => {
@@ -223,11 +232,28 @@ describe('markdownToChatMessage', () => {
     const out = markdownToChatMessage(md)
     for (const entry of out.cardsV2 ?? []) {
       const widgets = (entry.card.sections ?? []).reduce(
-        (n, s) => n + (s.header ? 1 : 0) + (s.widgets?.length ?? 0),
+        (n, s) => n + (s.widgets?.length ?? 0),
         0
       )
-      expect(widgets).toBeLessThanOrEqual(chatReplyLimits.card.maxWidgetsPerCard + 1)
+      expect(widgets).toBeLessThanOrEqual(chatReplyLimits.card.maxWidgetsPerCard)
+      expect(messageUtf8Bytes({ fallbackText: CARD_FALLBACK_TEXT, cardsV2: [entry] }))
+        .toBeLessThanOrEqual(chatReplyLimits.message.maxBytes)
     }
+  })
+
+  test('never emits an empty card section for terminal or consecutive headings', () => {
+    const out = markdownToChatMessage('# One\n## Two\nbody\n### Three')
+    const sections = (out.cardsV2 ?? []).flatMap(card => card.card.sections ?? [])
+    expect(sections.length).toBeGreaterThan(0)
+    expect(sections.every(section => (section.widgets?.length ?? 0) >= 1)).toBe(true)
+    expect(sections.map(section => section.header)).toContain('Three')
+  })
+
+  test('splits text by UTF-8 bytes without cutting or losing emoji and CJK', () => {
+    const source = '😀漢字abc'.repeat(2_000)
+    const chunks = splitUtf8Text(source, 31_999)
+    expect(chunks.join('')).toBe(source)
+    expect(chunks.every(chunk => Buffer.byteLength(chunk, 'utf8') <= 31_999)).toBe(true)
   })
 })
 

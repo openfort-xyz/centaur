@@ -1,5 +1,10 @@
 import { z } from 'zod'
 
+const strictBoolean = z
+  .enum(['true', 'false', '1', '0'])
+  .default('true')
+  .transform(value => value === 'true' || value === '1')
+
 const EnvSchema = z.object({
   NODE_ENV: z.string().default('development'),
   PORT: z.coerce.number().int().positive().default(3002),
@@ -19,11 +24,25 @@ const EnvSchema = z.object({
   // Preferred bearer token for api-rs; falls back to CENTAUR_API_KEY.
   GOOGLECHATBOT_API_KEY: z.string().optional(),
 
-  // Bearer token the `google-chat` workflow tool presents to the outbound
-  // /api/chat/messages routes (send/list/update/delete a Chat message on behalf
-  // of a scheduled digest workflow). The tool reads the same value from its own
-  // CHATBOT_API_KEY secret. When unset, those routes fail closed (503).
-  CHATBOT_API_KEY: z.string().optional(),
+  // Durable webhook/dedupe/render state. The database URL follows the same
+  // precedence as slackbotv2 so both bots can share the deployment Postgres.
+  GOOGLECHATBOT_DATABASE_URL: z.string().optional(),
+  DATABASE_URL: z.string().optional(),
+  POSTGRES_URL: z.string().optional(),
+  GOOGLECHATBOT_STATE_KEY_PREFIX: z.string().default('centaur-googlechatbot'),
+  GOOGLECHATBOT_STATE_CONNECT_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(250),
+  GOOGLECHATBOT_STATE_CONNECT_MAX_DELAY_MS: z.coerce.number().int().positive().default(10_000),
+  GOOGLECHATBOT_STATE_POOL_MAX: z.coerce.number().int().positive().default(10),
+  GOOGLECHATBOT_STATE_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  GOOGLECHATBOT_STATE_POOL_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  GOOGLECHATBOT_RECOVERY_MAX_OBLIGATION_AGE_MS: z.coerce.number().int().positive().default(86_400_000),
+  GOOGLECHATBOT_RECOVERY_FAILURE_BUDGET: z.coerce.number().int().positive().default(5),
+  GOOGLECHATBOT_RECOVERY_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+
+  // Shared only with api-rs. Agent tools never receive this credential: they
+  // authenticate to api-rs, which authorizes an exact Google Chat resource and
+  // operation before calling the internal /api/chat/* routes.
+  GOOGLECHATBOT_INTERNAL_API_KEY: z.string().optional(),
 
   // Workspace user the service account impersonates for attachment uploads.
   // Google Chat's media.upload rejects app auth (chat.bot) — the official path
@@ -31,6 +50,10 @@ const EnvSchema = z.object({
   // client ID the chat.messages.create scope, and uploads run as this user.
   // Unset = the /api/chat/attachments route fails closed (503).
   GOOGLECHATBOT_UPLOAD_USER: z.string().default(''),
+  // Separate least-privilege DWD subjects. DM setup impersonates its validated
+  // target directly; fixed subjects remain only for these shared capabilities.
+  GOOGLECHATBOT_REACTION_READ_USER: z.string().default(''),
+  GOOGLECHATBOT_DRIVE_DOWNLOAD_USER: z.string().default(''),
 
   CHAT_EVENTS_PATH: z.string().default('/api/chat/events'),
   CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
@@ -42,11 +65,9 @@ const EnvSchema = z.object({
   // calls are best-effort and bounded, mirroring slackbotv2's slackApiTimeoutMs.
   GOOGLECHATBOT_CHAT_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
 
-  // Comma/space-separated email-domain allowlist for inbound events. The bot is
-  // OPEN to all domains until set; set it (e.g. "openfort.xyz") to fail closed.
-  // NOTE: this is a coarse filter on the (attacker-controllable) event body, not
-  // an authentication control — enable GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS for
-  // that.
+  // Comma/space-separated email-domain allowlist for verified inbound identity.
+  // The bot is OPEN to all domains until set. Legacy Chat events have no signed
+  // user email and therefore fail closed when this allowlist is configured.
   GOOGLECHATBOT_ALLOWED_DOMAIN: z
     .string()
     .default('')
@@ -58,24 +79,37 @@ const EnvSchema = z.object({
     ),
 
   // Authenticate inbound webhook requests by verifying Google Chat's signed
-  // bearer JWT (issuer chat@system.gserviceaccount.com). OFF by default so the
-  // rollout can gate the code independently of the edge; flip to `true`/`1` to
-  // fail closed. Requires at least one audience below or every request 401s.
-  GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: z
-    .string()
-    .default('false')
-    .transform(value => value === 'true' || value === '1'),
+  // bearer JWT (issuer chat@system.gserviceaccount.com). ON by default; the
+  // explicit false/0 switch is only for local development and rollback.
+  // Requires at least one audience below or every request 401s.
+  GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: strictBoolean,
 
-  // Accepted `aud` claim(s) for the signed request token. Google Chat mints the
-  // token with either the app's Cloud project number or the endpoint URL as the
-  // audience depending on the app config; set whichever the app uses (both may
-  // be set — a token matching either is accepted).
+  // Inbound authentication contracts are not interchangeable. Keep the
+  // issuer, audience, key set, and signer identity paired to the configured
+  // Google surface. The project-number Chat API model remains the default for
+  // existing deployments.
+  GOOGLECHATBOT_INGRESS_MODE: z
+    .enum(['chat_api_project', 'chat_api_url', 'workspace_addon'])
+    .default('chat_api_project'),
+
+  // Reject validly signed replay tokens minted more than this many seconds ago.
+  GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(300),
+
+  // Exact audience for the selected ingress mode.
   GOOGLECHATBOT_PROJECT_NUMBER: z.string().optional(),
   GOOGLECHATBOT_WEBHOOK_AUDIENCE: z.string().optional(),
+  // Workspace Add-ons use the deployment's per-project service account, not
+  // chat@system.gserviceaccount.com.
+  GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL: z.string().email().optional(),
+  // Audience used to verify authorizationEventObject.userIdToken when an
+  // Add-on supplies one. The verified email, never the token, becomes identity.
+  GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID: z.string().optional(),
 
   // Optional per-run guards forwarded to api-rs.
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
   SESSION_MAX_DURATION_MS: z.coerce.number().int().positive().optional(),
+  GOOGLECHATBOT_SESSION_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  GOOGLECHATBOT_SESSION_STREAM_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 
   // Public origin of the Console UI (same env name the Console and slackbotv2
   // use). When set, the first assistant message in a Chat thread carries an
@@ -108,6 +142,12 @@ const EnvSchema = z.object({
     .string()
     .default('false')
     .transform(value => value === 'true' || value === '1'),
+  GOOGLECHATBOT_THREAD_HISTORY_LIMIT: z.coerce.number().int().positive().max(1000).default(50),
+  GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(100 * 1024 * 1024),
 
   // How inline harness/model/provider/reasoning overrides are resolved from a
   // message: "flags" (default) parses literal --flags; "llm" additionally asks

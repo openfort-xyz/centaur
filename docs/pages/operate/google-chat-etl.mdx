@@ -1,0 +1,261 @@
+---
+title: Google Chat ETL
+description: Sync Google Chat spaces, optional owner-scoped DMs, attachments, and reactions into Postgres with continuation, RLS, projection, retention, and metrics.
+---
+
+# Google Chat ETL
+
+:::warning[Off by default]
+Google Chat ETL is disabled unless Helm values set
+`apiRs.etl.googleChat.enabled=true`. Enable it only after choosing the exact app
+spaces and delegated DM subjects whose data Centaur may retain.
+:::
+
+Google Chat ETL is separate from live bot delivery. The `google_chat_sync`
+workflow reads Chat history into Postgres, and `company_context_documents`
+projects shared-space threads and attachment metadata/text into searchable
+documents. The optional `google_chat_retention` workflow deletes only
+Centaur-derived rows; it never mutates Google Chat.
+
+## Authentication and scope
+
+Shared-space sync uses the Chat app credential with:
+
+- `chat.bot`;
+- administrator-approved `chat.app.messages.readonly`.
+
+The app can enumerate spaces where it is a formal member. Use explicit
+`spaceIds` for readable spaces that `spaces.list` does not return.
+
+Private DM sync is a separate opt-in path. It impersonates only the Workspace
+users listed in `dmSync.subjects` and requests these read-only DWD scopes:
+
+- `chat.messages.readonly`;
+- `chat.spaces.readonly`;
+- `chat.memberships.readonly`;
+- `chat.messages.reactions.readonly`.
+
+The sandbox sends only the requested subject, operation, resource name, and
+bounded pagination through `WorkflowContext` to api-rs. api-rs accepts an exact
+lowercase subject from `dmSync.subjects`, validates the resource and operation,
+and forwards the read to googlechatbot. googlechatbot alone holds the service
+account and mints the subject-bound token. Never add the service-account JSON to
+`SESSION_SANDBOX_PASSTHROUGH_ENV`; subjects remain explicit and are never
+discovered from a global Workspace directory.
+
+## Enable the schedules
+
+```yaml
+apiRs:
+  etl:
+    googleChat:
+      enabled: true
+      syncIntervalSeconds: 14400
+      includeSpaceTypes: SPACE
+      maxPagesPerRun: 5
+      spaceIds: "AAAAengineering,AAAAincidents"
+      dmSync:
+        enabled: false
+        subjects: ""
+      retention:
+        enabled: true
+        intervalMinutes: 60
+        days: 0
+        batchLimit: 1000
+```
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `GOOGLE_CHAT_ETL_ENABLED` | `false` | Enables the `google_chat_sync` schedule and Google Chat document projection. |
+| `GOOGLE_CHAT_SYNC_INTERVAL_SECONDS` | `14400` | Incremental sync cadence. |
+| `GOOGLE_CHAT_INCLUDE_SPACE_TYPES` | `SPACE` | Comma-separated shared space types. `DIRECT_MESSAGE` is ignored here and uses the owner-scoped path below. |
+| `GOOGLE_CHAT_MAX_PAGES_PER_RUN` | `0` | Per-space page budget. `0` drains to completion; a positive value persists a continuation for later runs. |
+| `GOOGLE_CHAT_SPACE_IDS` | empty | Comma-separated pinned space IDs or resource names. |
+| `GOOGLE_CHAT_DWD_DM_SYNC_ENABLED` | `false` | Enables delegated, owner-scoped DM enumeration. |
+| `GOOGLE_CHAT_DWD_DM_SUBJECTS` | empty | Exact comma-separated Workspace users permitted as DWD subjects. |
+| `GOOGLE_CHAT_RETENTION_ENABLED` | `true` | Allows the retention schedule when `GOOGLE_CHAT_RETENTION_DAYS` is positive. |
+| `GOOGLE_CHAT_RETENTION_INTERVAL_MINUTES` | `60` | Retention cadence. |
+| `GOOGLE_CHAT_RETENTION_DAYS` | `0` | TTL for Google Chat rows/documents. `0` disables deletion. |
+| `GOOGLE_CHAT_RETENTION_BATCH_LIMIT` | `1000` | Maximum rows deleted from each target per run. |
+
+The chart renders these non-secret values into api-rs and the workflow host,
+including the sandbox passthrough list used by scheduled workflows. Do not
+duplicate them by hand in `SESSION_SANDBOX_PASSTHROUGH_ENV`.
+
+## Continuation and incremental reads
+
+Each `(owner_email, space_id)` checkpoint records a create-time watermark,
+last error, and optional `nextPageToken` plus the exact filter that produced it.
+A bounded read resumes the same page chain on the next run instead of advancing
+the watermark past unread history.
+
+Scheduled runs deliberately rescan history without a `createTime` filter so
+old messages edited later converge; Chat has no `updateTime` list filter.
+Explicit manual `since` runs retain a bounded create-time filter. Every message
+scan requests the official `showDeleted=true` option. Tombstones contain no
+content, so the ETL deletes the corresponding retained message, attachment, and
+reaction rows for both shared spaces and owner-scoped DMs. A failure updates the
+affected checkpoint without advancing its successful
+watermark; other spaces continue and the run becomes `partial_failed` when
+appropriate.
+
+## Stored data and privacy
+
+| Table | Contents |
+| --- | --- |
+| `google_chat_sync_spaces` | Space metadata, owner identity, canonical member IDs, and display names. |
+| `google_chat_sync_messages` | Message/thread identity, sender, normalized text, timestamps, raw payload, and error state. |
+| `google_chat_sync_attachments` | Official message-qualified attachment metadata and raw payload. Google does not expose attachment text or byte size in this resource. |
+| `google_chat_sync_reactions` | Message-qualified reaction, user, Unicode/custom emoji, and raw payload. |
+| `google_chat_sync_checkpoints` | Watermarks, resumable continuations, and last error. |
+| `google_chat_sync_runs` | Workflow run status, counts, successful/failed scopes, and safe error text. |
+
+Shared spaces use an empty `owner_email`. Their eligible threads and attachment
+records can become company context documents with `access_scope=company`.
+
+Delegated DMs use the normalized, explicitly allowlisted DWD subject as
+`owner_email`. Memberships contribute canonical user IDs and display names;
+Google Chat's `User` resource does not expose email. RLS permits a private row
+only when the current requester's verified email matches its owner; private DM
+rows are not projected into the company-wide Google Chat corpus.
+
+Attachment projection stores only official names, content names/types, source
+kind, and raw metadata. It does not invent text/size/source URI fields, follow
+arbitrary URLs, or retain downloaded file bodies. Reaction projection adds
+bounded reaction context to shared-space thread documents.
+
+## Run and verify manually
+
+Start a sync from inside api-rs:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
+  http://localhost:8080/api/workflows/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "workflow_name": "google_chat_sync",
+    "input": {"max_pages_per_run": 2, "metadata": {"reason": "manual_check"}},
+    "eager_start": true
+  }' | jq
+```
+
+Inspect checkpoints and continuation pressure:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
+  psql "$DATABASE_URL" -c \
+  "SELECT owner_email, space_id, watermark_time,
+          continuation_token <> '' AS continuing,
+          continuation_started_at, last_error
+     FROM google_chat_sync_checkpoints
+    ORDER BY updated_at DESC;"
+```
+
+Check data counts without printing message or DM content:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
+  psql "$DATABASE_URL" -c \
+  "SELECT owner_email = '' AS shared, count(*)
+     FROM google_chat_sync_messages
+    GROUP BY shared
+    ORDER BY shared DESC;"
+```
+
+Force projection after a completed shared-space sync:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
+  http://localhost:8080/api/workflows/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"workflow_name":"company_context_documents","input":{},"eager_start":true}' | jq
+```
+
+Verify that private DMs did not enter the company corpus:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
+  psql "$DATABASE_URL" -c \
+  "SELECT count(*)
+     FROM company_context_documents d
+     JOIN google_chat_sync_messages m
+       ON d.source = 'google_chat'
+      AND d.source_type = 'google_chat_thread'
+      AND d.metadata->>'space_id' = m.space_id
+      AND d.metadata->>'thread_id' = m.thread_id
+    WHERE m.owner_email <> '';"
+```
+
+The expected count is zero. Also test RLS with two distinct non-production
+identities: each identity must see its own DM rows and must not see the other's.
+
+## Retention
+
+Start with a count-only run:
+
+```bash
+kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
+  http://localhost:8080/api/workflows/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "workflow_name":"google_chat_retention",
+    "input":{"retention_days":30,"mode":"count","batch_limit":1000},
+    "eager_start":true
+  }' | jq
+```
+
+`dry_run` and `count` report bounded candidate counts. `delete` removes, in
+dependency order, expired projected documents, attachments, reactions,
+messages, completed checkpoints, empty spaces, and terminal runs. Active
+continuations and running workflow records are not retention candidates.
+
+Only switch to `delete` after reviewing the result. Each run deletes at most
+`batch_limit` rows from each target, so repeated scheduled runs drain a large
+backlog without one unbounded transaction.
+
+## Metrics and alerts
+
+The workflow exports bounded-label metrics for:
+
+- run status and duration;
+- Chat API operations and rate limits;
+- messages, files, and reactions processed;
+- failed spaces and failure reason;
+- continuation age and watermark lag;
+- last failure time;
+- retention items by mode and type.
+
+Alert on a growing `google_chat_etl_continuation_age_seconds`, stale
+`google_chat_etl_watermark_lag_seconds`, a non-zero failed-space gauge, or a
+recent failure timestamp. Correlate those metrics with
+`google_chat_sync_runs` and checkpoint errors without logging OAuth tokens or
+message bodies.
+
+## Live acceptance gate
+
+Before calling the ETL production-ready, verify in a non-production Workspace:
+
+1. an app-member shared space and a pinned shared space converge across a
+   positive page budget without duplicates or skipped history;
+2. card-only text, attachments, and reactions appear in the expected rows and
+   projected shared-space documents;
+3. two allowlisted DM subjects can read only their owner-scoped rows through
+   RLS, and neither DM is projected into company context;
+4. a 429 and a permission error leave resumable checkpoints and safe,
+   credential-free errors;
+5. retention `count` and `delete` remove only expired Centaur rows and never
+   mutate Workspace messages.
+
+Save redacted workflow IDs, checkpoint output, metrics, and RLS assertions in
+the parity verification ledger. These live ETL checks are still pending.
+
+## Disable or roll back
+
+Set both `apiRs.etl.googleChat.enabled=false` and
+`apiRs.etl.googleChat.dmSync.enabled=false`, then deploy. Existing rows remain
+available until retention or an explicit reviewed cleanup removes them. Revoke
+the DWD grants if DM ingestion is being retired. Application rollback should
+leave the additive ETL schema in place until no deployed version references it.
+
+See [Google Chat](/reference/google-chat) for ingress, permissions, delegated
+operations, files, durable delivery, and the complete live smoke matrix.

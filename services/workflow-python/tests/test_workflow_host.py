@@ -76,6 +76,8 @@ class RequestRpc(FakeRpc):
             return {"slept": True}
         if message_type == "ctx.event.wait":
             return {"approved": True}
+        if message_type == "ctx.google_chat_dwd_read":
+            return {"spaces": []}
         raise AssertionError(f"unexpected request {payload}")
 
 
@@ -224,6 +226,46 @@ class WorkflowHostTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_google_chat_dwd_read_sends_only_broker_inputs(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="google_chat_sync",
+        )
+
+        result = asyncio.run(
+            ctx.google_chat_dwd_read(
+                "alice@example.com",
+                "list_messages",
+                resource_name="spaces/A",
+                page_size=50,
+                page_token="next",
+                filter='createTime > "2026-08-01T00:00:00Z"',
+                show_deleted=True,
+            )
+        )
+
+        self.assertEqual(result, {"spaces": []})
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.google_chat_dwd_read",
+                    "subject": "alice@example.com",
+                    "operation": "list_messages",
+                    "resource_name": "spaces/A",
+                    "page_size": 50,
+                    "page_token": "next",
+                    "filter": 'createTime > "2026-08-01T00:00:00Z"',
+                    "show_deleted": True,
+                }
+            ],
+        )
+        self.assertNotIn("credential", str(rpc.requests).lower())
 
     def test_tools_proxy_calls_tool_manager(self) -> None:
         host = load_workflow_host()

@@ -594,6 +594,17 @@ spec:
       ports:
         - protocol: TCP
           port: 3002
+{{- if .Values.apiRs.enabled }}
+    # Internal Google Chat operations are accepted only from api-rs. Sandboxes
+    # call api-rs and are never admitted directly to this service.
+    - from:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
+{{- end }}
   egress:
 {{- if .Values.apiRs.enabled }}
     - to:

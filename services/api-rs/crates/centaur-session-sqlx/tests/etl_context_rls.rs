@@ -151,6 +151,111 @@ async fn company_context_reader_public_membership_does_not_grant_channel_access(
     fixture.finish(result).await
 }
 
+#[tokio::test]
+async fn google_chat_attachment_reaction_and_dm_owner_rls() -> Result<(), Box<dyn Error>> {
+    let Some(mut fixture) = RlsTestFixture::create().await? else {
+        return Ok(());
+    };
+    let result = assert_google_chat_parity_rls(&mut fixture.conn).await;
+    fixture.finish(result).await
+}
+
+async fn assert_google_chat_parity_rls(conn: &mut PgConnection) -> Result<(), Box<dyn Error>> {
+    sqlx::query(concat!(
+        "insert into google_chat_sync_spaces ",
+        "(owner_email,space_id,space_name,space_type,participant_emails) values ",
+        "('alice@example.com','DM_SHARED','spaces/DM_SHARED','DIRECT_MESSAGE',",
+        "array['alice@example.com','bob@example.com']),",
+        "('bob@example.com','DM_SHARED','spaces/DM_SHARED','DIRECT_MESSAGE',",
+        "array['alice@example.com','bob@example.com'])",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into company_context_documents ",
+        "(document_id,source,source_type,source_document_id,metadata) values ",
+        "('doc_chat_alpha','google_chat','google_chat_thread','SPACE_ALPHA:T',",
+        "'{\"space_id\":\"SPACE_ALPHA\"}'),",
+        "('doc_chat_beta','google_chat','google_chat_thread','SPACE_BETA:T',",
+        "'{\"space_id\":\"SPACE_BETA\"}')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_messages ",
+        "(owner_email,space_id,message_id,message_name,text_content) values ",
+        "('alice@example.com','DM_SHARED','M_ALICE','spaces/DM_SHARED/messages/M_ALICE','a'),",
+        "('bob@example.com','DM_SHARED','M_BOB','spaces/DM_SHARED/messages/M_BOB','b')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_attachments ",
+        "(owner_email,space_id,message_id,attachment_id,content_name) values ",
+        "('alice@example.com','DM_SHARED','M_ALICE','A_ALICE','alice.txt'),",
+        "('bob@example.com','DM_SHARED','M_BOB','A_BOB','bob.txt')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_reactions ",
+        "(owner_email,space_id,message_id,reaction_id,emoji_unicode) values ",
+        "('alice@example.com','DM_SHARED','M_ALICE','R_ALICE','👍'),",
+        "('bob@example.com','DM_SHARED','M_BOB','R_BOB','✅')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+
+    let mut tx = conn.begin().await?;
+    tx.execute("set local role centaur_slack_reader").await?;
+    sqlx::query("select set_config('centaur.user_email', 'alice@example.com', true)")
+        .execute(&mut *tx)
+        .await?;
+    let messages: Vec<String> = sqlx::query_scalar(concat!(
+        "select message_id from google_chat_sync_messages ",
+        "where space_id='DM_SHARED' order by message_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    let attachments: Vec<String> = sqlx::query_scalar(concat!(
+        "select attachment_id from google_chat_sync_attachments ",
+        "where space_id='DM_SHARED' order by attachment_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    let reactions: Vec<String> = sqlx::query_scalar(concat!(
+        "select reaction_id from google_chat_sync_reactions ",
+        "where space_id='DM_SHARED' order by reaction_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    assert_eq!(messages, vec!["M_ALICE"]);
+    assert_eq!(attachments, vec!["A_ALICE"]);
+    assert_eq!(reactions, vec!["R_ALICE"]);
+    let delete_error =
+        sqlx::query("delete from google_chat_sync_messages where space_id='DM_SHARED'")
+            .execute(&mut *tx)
+            .await
+            .expect_err("reader role must not delete Google Chat derived rows");
+    assert!(delete_error.to_string().contains("permission denied"));
+    tx.rollback().await?;
+
+    let mut tx = conn.begin().await?;
+    tx.execute("set local role centaur_slack_reader").await?;
+    sqlx::query("select set_config('centaur.google_chat_space_id', 'SPACE_ALPHA', true)")
+        .execute(&mut *tx)
+        .await?;
+    let docs: Vec<String> = sqlx::query_scalar(concat!(
+        "select document_id from company_context_documents where source='google_chat' ",
+        "order by document_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    assert_eq!(docs, vec!["doc_chat_alpha"]);
+    tx.rollback().await?;
+    Ok(())
+}
+
 async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dyn Error>> {
     assert_rls_enabled(conn).await?;
     assert_expected_policies(conn).await?;

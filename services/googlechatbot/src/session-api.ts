@@ -1,8 +1,9 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
+import { createHash } from 'node:crypto'
 import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
 import { logWarn } from './logging'
-import { incr } from './metrics'
+import { addGauge, incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
 import type { SpaceDmConfirmation } from './chat/space-verify'
 import { resolveSessionIdentity, type ResolvedSessionIdentity } from './chat/verify'
@@ -102,6 +103,11 @@ export const DEFAULT_SESSION_MAX_DURATION_MS = 30 * 60 * 1000
 
 /** Mirrors `DEFAULT_SESSION_IDLE_TIMEOUT_MS` in slackbotv2's session-api. */
 export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000
+export const SESSION_CONTROL_TIMEOUT_MS = 30_000
+export const SESSION_STREAM_CONNECT_TIMEOUT_MS = 10_000
+export const MAX_INLINE_ATTACHMENT_BYTES = 25 * 1024 * 1024
+export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024
 
 /** Config tunes the bound; it does not enable it — an unset env var still gets
  * the built-in ceiling. */
@@ -256,8 +262,7 @@ export type RequesterIdentityClaim = {
   /** True ONLY when the request carried a valid Google signature — never
    * derived from a verification result's `ok`. */
   verified: boolean
-  /** Sender email the identity would be built from (message.sender.email, or
-   * the envelope user's as a fallback). */
+  /** Verified Workspace Add-on userIdToken email, when present. */
   userEmail?: string
   /** The space type THE BODY CLAIMS. A signed Chat request does not bind its
    * body, so this is only a pre-filter that saves an API call; what actually
@@ -327,12 +332,10 @@ export async function createSession(
       ...(name ? { googlechat_conversation_name: name } : {})
     }
   }
-  const response = await sessionApiRequest('create_session', 'create session', () =>
+  const response = await sessionApiRequest('create_session', 'create session', signal =>
     fetch(apiSessionUrl(config, threadKey), {
-      method: 'POST',
-      headers: apiHeaders(config),
-      body: JSON.stringify(body)
-    })
+      method: 'POST', headers: apiHeaders(config), body: JSON.stringify(body), signal
+    }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
   )
   const payload = (await response.json().catch(() => ({}))) as CreateSessionResponse
   const status = payload.status ?? payload.session?.status ?? ''
@@ -388,12 +391,13 @@ export async function appendSessionMessages(
       metadata: sessionMetadata(threadKey, message)
     }))
   }
-  await sessionApiRequest('append_messages', 'append session messages', () =>
+  await sessionApiRequest('append_messages', 'append session messages', signal =>
     fetch(apiSessionUrl(config, threadKey, 'messages'), {
       method: 'POST',
       headers: apiHeaders(config),
-      body: JSON.stringify(body)
-    })
+      body: JSON.stringify(body),
+      signal
+    }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
   )
 }
 
@@ -431,16 +435,23 @@ export async function executeSession(
           }
         : {})
     }),
-    input_lines: [toCodexInputLine(threadKey, message, opts.overrides, opts.history)],
+    input_lines: toCodexInputLines(
+      config,
+      threadKey,
+      message,
+      opts.overrides,
+      opts.history
+    ),
     idle_timeout_ms: sessionIdleTimeoutMs(config),
     max_duration_ms: sessionMaxDurationMs(config)
   }
-  const response = await sessionApiRequest('execute_session', 'execute session', () =>
+  const response = await sessionApiRequest('execute_session', 'execute session', signal =>
     fetch(apiSessionUrl(config, threadKey, 'execute'), {
       method: 'POST',
       headers: apiHeaders(config),
-      body: JSON.stringify(body)
-    })
+      body: JSON.stringify(body),
+      signal
+    }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
   )
   return (await response.json()) as ExecuteSessionResponse
 }
@@ -455,12 +466,13 @@ export async function emitWorkflowEvent(
   eventName: string,
   payload: Record<string, unknown>
 ): Promise<void> {
-  await sessionApiRequest('emit_workflow_event', `emit workflow event ${eventName}`, () =>
+  await sessionApiRequest('emit_workflow_event', `emit workflow event ${eventName}`, signal =>
     fetch(new URL('/api/workflows/events', ensureTrailingSlash(config.CENTAUR_API_URL)).toString(), {
       method: 'POST',
       headers: apiHeaders(config),
-      body: JSON.stringify({ event_name: eventName, payload })
-    })
+      body: JSON.stringify({ event_name: eventName, payload }),
+      signal
+    }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
   )
 }
 
@@ -476,12 +488,13 @@ export async function interruptSessionExecution(
   threadKey: string,
   reason: string
 ): Promise<InterruptSessionResponse> {
-  const response = await sessionApiRequest('interrupt_session', 'interrupt session', () =>
+  const response = await sessionApiRequest('interrupt_session', 'interrupt session', signal =>
     fetch(apiSessionUrl(config, threadKey, 'interrupt'), {
       method: 'POST',
       headers: apiHeaders(config),
-      body: JSON.stringify({ reason })
-    })
+      body: JSON.stringify({ reason }),
+      signal
+    }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
   )
   return (await response.json()) as InterruptSessionResponse
 }
@@ -496,14 +509,19 @@ export async function openSessionEventStream(
   const url = new URL(apiSessionUrl(config, threadKey, 'events'))
   url.searchParams.set('after_event_id', String(afterEventId))
   if (executionId) url.searchParams.set('execution_id', executionId)
-  const response = await sessionApiRequest('open_event_stream', 'stream events', () =>
-    fetch(url.toString(), {
-      method: 'GET',
-      headers: apiHeaders(config, false)
-    })
+  const response = await sessionApiRequest(
+    'open_event_stream',
+    'stream events',
+    signal =>
+      fetch(url.toString(), {
+        method: 'GET',
+        headers: apiHeaders(config, false),
+        signal
+      }),
+    config.GOOGLECHATBOT_SESSION_STREAM_CONNECT_TIMEOUT_MS
   )
   if (!response.body) return emptyStream()
-  return parseSessionEventStream(response.body, onEventId)
+  return trackOpenStream(parseSessionEventStream(response.body, onEventId))
 }
 
 // ---------------------------------------------------------------------------
@@ -521,19 +539,38 @@ type SessionApiOperation =
 async function sessionApiRequest(
   operation: SessionApiOperation,
   action: string,
-  request: () => Promise<Response>
+  request: (signal: AbortSignal) => Promise<Response>,
+  timeoutMs = SESSION_CONTROL_TIMEOUT_MS
 ): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await request()
+    const response = await request(controller.signal)
     await ensureApiOk(response, action)
     incr('googlechatbot_session_api_operations_total', { operation, outcome: 'success' })
     return response
   } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      incr('googlechatbot_upstream_timeouts_total', { operation })
+    }
     incr('googlechatbot_session_api_operations_total', {
       operation,
       outcome: isRetryableSessionApiError(error) ? 'retryable_error' : 'error'
     })
     throw error
+  } finally {
+    // For SSE this intentionally stops timing once headers establish the body;
+    // the session idle/max-duration policies own the established stream.
+    clearTimeout(timer)
+  }
+}
+
+async function* trackOpenStream<T>(stream: AsyncIterable<T>): AsyncIterable<T> {
+  addGauge('googlechatbot_open_sse_connections', 1)
+  try {
+    for await (const event of stream) yield event
+  } finally {
+    addGauge('googlechatbot_open_sse_connections', -1)
   }
 }
 
@@ -609,7 +646,8 @@ function toCodexInputLine(
   threadKey: string,
   message: GoogleChatTurnMessage,
   overrides?: TurnOverrides,
-  history?: GoogleChatTurnMessage[]
+  history?: GoogleChatTurnMessage[],
+  staged: ReadonlyMap<NormalizedPart, string> = new Map()
 ): string {
   return JSON.stringify({
     type: 'user',
@@ -621,9 +659,84 @@ function toCodexInputLine(
     ...(overrides?.reasoning ? { reasoning: overrides.reasoning } : {}),
     message: {
       role: 'user',
-      content: codexInputContent(threadKey, message, history)
+      content: codexInputContent(threadKey, message, history, staged)
     }
   })
+}
+
+export function toCodexInputLines(
+  config: AppConfig,
+  threadKey: string,
+  message: GoogleChatTurnMessage,
+  overrides?: TurnOverrides,
+  history?: GoogleChatTurnMessage[]
+): string[] {
+  const staged = new Map<NormalizedPart, string>()
+  let aggregateBytes = 0
+  for (const part of message.parts) {
+    if (part.type === 'text' || !part.source?.data) continue
+    const bytes = base64DecodedSize(part.source.data)
+    if (bytes < 0 || bytes !== part.size) {
+      throw new Error(`invalid attachment payload for ${part.name}`)
+    }
+    if (bytes > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`attachment exceeds ${MAX_ATTACHMENT_BYTES} byte limit: ${part.name}`)
+    }
+    aggregateBytes += bytes
+    if (aggregateBytes > config.GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES) {
+      throw new Error(
+        `attachment payloads exceed ${config.GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES} byte aggregate limit`
+      )
+    }
+    if (bytes > MAX_INLINE_ATTACHMENT_BYTES) {
+      staged.set(part, `google-chat-${message.id}-${staged.size + 1}`)
+    }
+  }
+
+  const lines: string[] = []
+  for (const [part, id] of staged) lines.push(...stagedAttachmentInputLines(part, id))
+  lines.push(toCodexInputLine(threadKey, message, overrides, history, staged))
+  return lines
+}
+
+function base64DecodedSize(value: string): number {
+  if (value.length === 0 || value.length % 4 !== 0) return -1
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+  for (let index = 0; index < value.length - padding; index++) {
+    const code = value.charCodeAt(index)
+    if (
+      !(code >= 48 && code <= 57)
+      && !(code >= 65 && code <= 90)
+      && !(code >= 97 && code <= 122)
+      && code !== 43
+      && code !== 47
+    ) return -1
+  }
+  return value.length / 4 * 3 - padding
+}
+
+function stagedAttachmentInputLines(part: NormalizedPart, attachmentId: string): string[] {
+  if (part.type === 'text' || !part.source?.data) return []
+  const lines: string[] = []
+  const chunkSize = STAGED_ATTACHMENT_CHUNK_CHARS - (STAGED_ATTACHMENT_CHUNK_CHARS % 4)
+  const chunkCount = Math.ceil(part.source.data.length / chunkSize)
+  const sha256 = createHash('sha256').update(Buffer.from(part.source.data, 'base64')).digest('hex')
+  for (let offset = 0, index = 0; offset < part.source.data.length; offset += chunkSize, index++) {
+    lines.push(JSON.stringify({
+      type: 'attachment.chunk',
+      attachmentId,
+      name: part.name,
+      mimeType: part.mime_type,
+      attachmentType: part.type,
+      chunkIndex: index,
+      chunkCount,
+      byteSize: part.size,
+      sha256,
+      final: offset + chunkSize >= part.source.data.length,
+      dataBase64: part.source.data.slice(offset, offset + chunkSize)
+    }))
+  }
+  return lines
 }
 
 /**
@@ -747,7 +860,8 @@ function indentChatContext(text: string): string {
 function codexInputContent(
   threadKey: string,
   message: GoogleChatTurnMessage,
-  history?: GoogleChatTurnMessage[]
+  history?: GoogleChatTurnMessage[],
+  staged: ReadonlyMap<NormalizedPart, string> = new Map()
 ): JsonValue[] {
   const content: JsonValue[] = []
   const sessionContext = chatSessionContext(message, threadKey)
@@ -759,6 +873,18 @@ function codexInputContent(
   if (message.text.trim()) content.push({ type: 'text', text: message.text })
   for (const part of message.parts) {
     if (part.type === 'text') continue
+    const stagedAttachmentId = staged.get(part)
+    if (stagedAttachmentId) {
+      content.push({
+        type: 'attachment',
+        attachment_type: part.type,
+        stagedAttachmentId,
+        mimeType: part.mime_type,
+        name: part.name,
+        size: part.size
+      })
+      continue
+    }
     if (part.source?.data && part.mime_type) {
       if (part.type === 'image') {
         content.push({

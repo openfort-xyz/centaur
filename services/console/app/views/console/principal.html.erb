@@ -35,6 +35,16 @@
            inherited_permissions: @inherited_slack_channel_permissions,
            api_managed_direct_messages: true %>
 
+<%= render "console/shared/google_chat_space_permissions",
+           owner: @principal,
+           url: console_principal_google_chat_space_permissions_path(@principal.oid),
+           inherited_permissions: @inherited_google_chat_space_permissions %>
+
+<%= render "console/shared/google_chat_dm_permissions",
+           owner: @principal,
+           url: console_principal_google_chat_dm_permissions_path(@principal.oid),
+           inherited_permissions: @inherited_google_chat_dm_permissions %>
+
 <!-- Sandbox access -->
 <section class="mb-8">
   <div class="mb-4">

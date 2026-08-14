@@ -27,10 +27,42 @@ const COUNTERS: CounterSpec[] = [
     // Shared with slackbotv2 so cross-bot delivery dashboards aggregate both.
     name: 'centaur_session_delivery_total',
     help: 'User-visible delivery outcome of an agent run.'
-  }
+  },
+  { name: 'googlechatbot_dedupe_total', help: 'Durable event dedupe outcomes.' },
+  { name: 'googlechatbot_recovery_total', help: 'Durable work recovery outcomes.' },
+  { name: 'googlechatbot_upstream_timeouts_total', help: 'Upstream timeouts by operation.' },
+  { name: 'googlechatbot_delivery_total', help: 'Google Chat delivery attempts by outcome.' }
+]
+
+const GAUGES: CounterSpec[] = [
+  { name: 'googlechatbot_state_connected', help: 'Whether durable state is connected.' },
+  { name: 'googlechatbot_open_sse_connections', help: 'Open api-rs SSE connections.' },
+  { name: 'googlechatbot_pending_render_obligations', help: 'Pending durable render obligations.' }
 ]
 
 const values = new Map<string, number>()
+
+export function setGauge(name: string, value: number, labels: Labels = {}): void {
+  values.set(key(name, labels), value)
+}
+
+export function addGauge(name: string, by: number, labels: Labels = {}): void {
+  const k = key(name, labels)
+  values.set(k, Math.max(0, (values.get(k) ?? 0) + by))
+}
+
+function renderMetric(lines: string[], metric: CounterSpec, type: 'counter' | 'gauge'): void {
+  lines.push(`# HELP ${metric.name} ${metric.help}`)
+  lines.push(`# TYPE ${metric.name} ${type}`)
+  let emitted = false
+  for (const [k, v] of values) {
+    if (k === metric.name || k.startsWith(`${metric.name}{`)) {
+      lines.push(`${k} ${v}`)
+      emitted = true
+    }
+  }
+  if (!emitted) lines.push(`${metric.name} 0`)
+}
 
 function key(name: string, labels: Labels): string {
   const label = Object.entries(labels)
@@ -52,19 +84,8 @@ export function incr(name: string, labels: Labels = {}, by = 1): void {
 /** Render the current counters in Prometheus exposition format. */
 export function renderMetrics(): string {
   const lines: string[] = []
-  for (const counter of COUNTERS) {
-    lines.push(`# HELP ${counter.name} ${counter.help}`)
-    lines.push(`# TYPE ${counter.name} counter`)
-    const prefix = counter.name
-    let emitted = false
-    for (const [k, v] of values) {
-      if (k === prefix || k.startsWith(`${prefix}{`)) {
-        lines.push(`${k} ${v}`)
-        emitted = true
-      }
-    }
-    if (!emitted) lines.push(`${prefix} 0`)
-  }
+  for (const counter of COUNTERS) renderMetric(lines, counter, 'counter')
+  for (const gauge of GAUGES) renderMetric(lines, gauge, 'gauge')
   return lines.join('\n') + '\n'
 }
 

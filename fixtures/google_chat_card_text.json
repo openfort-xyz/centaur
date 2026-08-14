@@ -1,0 +1,279 @@
+[
+  {
+    "name": "empty",
+    "message": {"cardsV2": [{"card": {"sections": []}}]},
+    "text": ""
+  },
+  {
+    "name": "header-and-widgets",
+    "message": {
+      "cardsV2": [
+        {
+          "card": {
+            "header": {"title": "Build failed", "subtitle": "main"},
+            "sections": [
+              {
+                "header": "Details",
+                "widgets": [
+                  {"textParagraph": {"text": "build 123 broke"}},
+                  {
+                    "decoratedText": {
+                      "topLabel": "Repository",
+                      "text": "openfort/centaur",
+                      "bottomLabel": "required"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "text": "Build failed — main\nDetails\nbuild 123 broke\nRepository\nopenfort/centaur\nrequired"
+  },
+  {
+    "name": "nested-columns-and-invalid-values",
+    "message": {
+      "cardsV2": [
+        null,
+        {
+          "card": {
+            "sections": [
+              {
+                "widgets": [
+                  {
+                    "columns": {
+                      "columnItems": [
+                        {"widgets": [{"textParagraph": {"text": "left"}}]},
+                        {
+                          "widgets": [
+                            {"decoratedText": {"topLabel": "", "text": "right"}}
+                          ]
+                        },
+                        {"widgets": "ignored"}
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "text": "left\nright"
+  },
+  {
+    "name": "cards-v2-all-text-bearing-components",
+    "message": {
+      "cardsV2": [
+        {
+          "card": {
+            "header": {
+              "title": "Ops",
+              "subtitle": "Incident",
+              "imageAltText": "Incident badge"
+            },
+            "peekCardHeader": {
+              "title": "Peek",
+              "imageAltText": "Peek badge"
+            },
+            "cardActions": [{"actionLabel": "Card menu"}],
+            "sections": [
+              {
+                "header": "Controls",
+                "collapseControl": {
+                  "expandButton": {
+                    "text": "Expand",
+                    "icon": {"altText": "Expand icon"},
+                    "altText": "Expand all"
+                  },
+                  "collapseButton": {"text": "Collapse"}
+                },
+                "widgets": [
+                  {"textParagraph": {"text": "Paragraph"}},
+                  {
+                    "image": {
+                      "altText": "Architecture diagram",
+                      "onClick": {
+                        "overflowMenu": {
+                          "items": [
+                            {
+                              "startIcon": {"altText": "Menu icon"},
+                              "text": "Inspect image"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "decoratedText": {
+                      "icon": {"altText": "Legacy start icon"},
+                      "startIcon": {"altText": "Start icon"},
+                      "topLabel": "Legacy top",
+                      "topLabelText": {"text": "Rich top"},
+                      "text": "Legacy content",
+                      "contentText": {"text": "Rich content"},
+                      "bottomLabel": "Legacy bottom",
+                      "bottomLabelText": {"text": "Rich bottom"},
+                      "button": {
+                        "text": "Acknowledge",
+                        "icon": {"altText": "Ack icon"},
+                        "altText": "Acknowledge incident"
+                      },
+                      "endIcon": {"altText": "Status icon"},
+                      "onClick": {
+                        "overflowMenu": {
+                          "items": [{"text": "Decorated menu"}]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "buttonList": {
+                      "buttons": [
+                        {
+                          "text": "Open runbook",
+                          "icon": {"altText": "Book icon"},
+                          "altText": "Open the runbook"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "textInput": {
+                      "label": "Comment",
+                      "value": "Investigating",
+                      "hintText": "Add evidence",
+                      "placeholderText": "Type a comment",
+                      "initialSuggestions": {
+                        "items": [{"text": "Resolved"}, {"text": "Escalated"}]
+                      }
+                    }
+                  },
+                  {
+                    "selectionInput": {
+                      "label": "Severity",
+                      "hintText": "Choose one",
+                      "items": [
+                        {"text": "P1", "bottomText": "Critical"},
+                        {"text": "P2", "bottomText": "High"}
+                      ]
+                    }
+                  },
+                  {
+                    "dateTimePicker": {
+                      "label": "Started at",
+                      "valueMsEpoch": "1786665600000"
+                    }
+                  },
+                  {
+                    "grid": {
+                      "title": "Responders",
+                      "items": [
+                        {
+                          "title": "Alice",
+                          "subtitle": "Incident commander",
+                          "image": {"altText": "Alice portrait"}
+                        }
+                      ],
+                      "onClick": {
+                        "overflowMenu": {
+                          "items": [{"text": "Grid menu"}]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "columns": {
+                      "columnItems": [
+                        {"widgets": [{"textParagraph": {"text": "Column text"}}]}
+                      ]
+                    }
+                  },
+                  {
+                    "carousel": {
+                      "carouselCards": [
+                        {
+                          "widgets": [
+                            {"textParagraph": {"text": "Carousel text"}},
+                            {"image": {"altText": "Carousel image"}}
+                          ],
+                          "footerWidgets": [
+                            {
+                              "buttonList": {
+                                "buttons": [{"text": "Carousel action"}]
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "chipList": {
+                      "chips": [
+                        {
+                          "label": "Owner",
+                          "icon": {"altText": "Person icon"},
+                          "altText": "Filter by owner",
+                          "onClick": {
+                            "overflowMenu": {
+                              "items": [{"text": "Chip menu"}]
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ],
+            "fixedFooter": {
+              "primaryButton": {"text": "Save"},
+              "secondaryButton": {"text": "Cancel"}
+            }
+          }
+        }
+      ]
+    },
+    "text": "Ops — Incident\nIncident badge\nPeek\nPeek badge\nCard menu\nControls\nExpand\nExpand icon\nExpand all\nCollapse\nParagraph\nArchitecture diagram\nMenu icon\nInspect image\nLegacy start icon\nStart icon\nLegacy top\nRich top\nLegacy content\nRich content\nLegacy bottom\nRich bottom\nAcknowledge\nAck icon\nAcknowledge incident\nStatus icon\nDecorated menu\nOpen runbook\nBook icon\nOpen the runbook\nComment\nInvestigating\nAdd evidence\nType a comment\nResolved\nEscalated\nSeverity\nChoose one\nP1\nCritical\nP2\nHigh\nStarted at\n1786665600000\nResponders\nAlice\nIncident commander\nAlice portrait\nGrid menu\nColumn text\nCarousel text\nCarousel image\nCarousel action\nOwner\nPerson icon\nFilter by owner\nChip menu\nSave\nCancel"
+  },
+  {
+    "name": "deprecated-message-cards-v1",
+    "message": {
+      "cards": [
+        {
+          "header": {"title": "Legacy alert", "subtitle": "v1"},
+          "cardActions": [{"actionLabel": "Legacy card menu"}],
+          "sections": [
+            {
+              "header": "Legacy details",
+              "widgets": [
+                {"textParagraph": {"text": "Legacy paragraph"}},
+                {"image": {"imageUrl": "https://example.invalid/image.png"}},
+                {
+                  "keyValue": {
+                    "topLabel": "Service",
+                    "content": "api-rs",
+                    "bottomLabel": "Production",
+                    "button": {"textButton": {"text": "Open service"}}
+                  }
+                },
+                {
+                  "buttons": [
+                    {"textButton": {"text": "Retry"}},
+                    {"imageButton": {"name": "Dismiss alert"}}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "text": "Legacy alert — v1\nLegacy card menu\nLegacy details\nLegacy paragraph\nService\napi-rs\nProduction\nOpen service\nRetry\nDismiss alert"
+  }
+]

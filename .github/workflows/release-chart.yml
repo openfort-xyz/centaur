@@ -6,12 +6,14 @@ name: Release Chart
       - main
     paths:
       - "contrib/chart/**"
+      - "scripts/verify-google-chat-network-policy.sh"
       - ".github/workflows/release-chart.yml"
   push:
     branches:
       - main
     paths:
       - "contrib/chart/**"
+      - "scripts/verify-google-chat-network-policy.sh"
       - ".github/workflows/release-chart.yml"
 
 permissions: {}
@@ -62,6 +64,9 @@ jobs:
 
       - name: Lint chart
         run: helm lint contrib/chart
+
+      - name: Verify Google Chat chart security
+        run: scripts/verify-google-chat-network-policy.sh
 
       - name: Install yq
         uses: mikefarah/yq@1b9b4ac5187171d2e5e3129be0cfa827c7f9d53d # v4.53.3

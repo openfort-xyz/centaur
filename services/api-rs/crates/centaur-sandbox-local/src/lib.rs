@@ -73,6 +73,9 @@ impl SandboxBackend for LocalSandboxBackend {
         let (program, args) = command_parts(&spec)?;
         let mut command = Command::new(program);
         command.args(args);
+        // A local sandbox receives only its declared environment, matching the
+        // Kubernetes backend instead of inheriting api-rs credentials.
+        command.env_clear();
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -359,6 +362,23 @@ mod tests {
             manager.reconcile_one(&handle.id).await.unwrap(),
             centaur_sandbox_manager::ReconcileOutcome::Drift(DriftReason::MissingWhileRunning)
         );
+        manager.stop(&handle.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_backend_exposes_only_explicit_environment() {
+        let backend = Arc::new(LocalSandboxBackend::new());
+        let manager = SandboxManager::new(backend);
+        let spec = SandboxSpec::new("/bin/sh")
+            .command(["/bin/sh", "-c"])
+            .args(["printf '%s|%s' \"${CARGO_MANIFEST_DIR-unset}\" \"$EXPLICIT_ENV\""])
+            .env("EXPLICIT_ENV", "visible");
+        let handle = manager.create_running(spec).await.unwrap();
+        let mut io = manager.open_io(&handle.id).await.unwrap().into_parts();
+        let mut output = Vec::new();
+        io.stdout.read_to_end(&mut output).await.unwrap();
+
+        assert_eq!(output, b"unset|visible");
         manager.stop(&handle.id).await.unwrap();
     }
 

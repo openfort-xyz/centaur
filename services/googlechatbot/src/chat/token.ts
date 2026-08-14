@@ -1,8 +1,8 @@
 // Inbound request authentication for the Google Chat webhook.
 //
 // Google Chat signs every event it POSTs to an app's HTTP endpoint with a
-// bearer JWT in the `Authorization` header. The event body (including
-// `user.email`) is entirely attacker-controllable, so verifying that token is
+// bearer JWT in the `Authorization` header. The event body is not bound to that
+// token and is attacker-controllable, so verifying the request token is
 // the only way to prove a request actually came from Google.
 //
 // Google Chat uses ONE OF TWO token models depending on the app's configured
@@ -12,10 +12,11 @@
 //     OAuth2 certs (oauth2/v3/certs).
 //   - Project number -> a self-signed JWT: iss `chat@system.gserviceaccount.com`,
 //     `aud` = the app's Cloud project number, signed by that SA's JWK set.
-// We accept both, picking the JWK set by the (signature-verified) issuer, so the
-// verifier works whichever model the app is configured with.
+// The caller selects exactly one contract and supplies its paired issuer,
+// audience, and JWK route. The generic verifier can validate either model but
+// never treats them as an interchangeable issuer/audience cross-product.
 // Web Crypto (RSASSA-PKCS1-v1_5 / SHA-256), no new deps.
-// https://developers.google.com/workspace/chat/authenticate-user
+// https://developers.google.com/workspace/chat/verify-requests-from-chat
 
 /** Self-signed-JWT model issuer (audience = project number). */
 export const GOOGLE_CHAT_SA_ISSUER = 'chat@system.gserviceaccount.com'
@@ -71,6 +72,7 @@ export async function verifyGoogleSignedJwt(opts: {
   token: string
   audiences: string[]
   allowedIssuers: string[]
+  maxAgeSeconds?: number
   nowSeconds?: number
   resolveKey: KeyResolver
 }): Promise<JwtVerifyResult> {
@@ -106,11 +108,21 @@ export async function verifyGoogleSignedJwt(opts: {
 
   const now = opts.nowSeconds ?? Math.floor(Date.now() / 1000)
   const skew = 30
-  if (typeof payload.exp === 'number' && now > payload.exp + skew) {
+  if (typeof payload.iat !== 'number' || !Number.isFinite(payload.iat)) {
+    return { ok: false, reason: 'invalid_iat' }
+  }
+  if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp)) {
+    return { ok: false, reason: 'invalid_exp' }
+  }
+  if (payload.exp <= payload.iat) return { ok: false, reason: 'invalid_token_lifetime' }
+  if (now > payload.exp + skew) {
     return { ok: false, reason: 'token_expired' }
   }
-  if (typeof payload.iat === 'number' && payload.iat > now + skew) {
+  if (payload.iat > now + skew) {
     return { ok: false, reason: 'token_not_yet_valid' }
+  }
+  if (now > payload.iat + (opts.maxAgeSeconds ?? 300) + skew) {
+    return { ok: false, reason: 'token_too_old' }
   }
 
   return { ok: true, claims: payload }

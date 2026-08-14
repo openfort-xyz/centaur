@@ -1,15 +1,20 @@
 import { test, expect, describe, afterEach, beforeEach } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   DEFAULT_SESSION_IDLE_TIMEOUT_MS,
   DEFAULT_SESSION_MAX_DURATION_MS,
   SessionApiError,
   classifyExecuteConflict,
+  appendSessionMessages,
   turnMessagesFromEvent,
   createSession,
   emitWorkflowEvent,
   executeSession,
   interruptSessionExecution,
   openSessionEventStream,
+  MAX_ATTACHMENT_BYTES,
+  MAX_INLINE_ATTACHMENT_BYTES,
+  toCodexInputLines,
   type RequesterIdentityClaim,
   type SessionRequester
 } from './session-api'
@@ -619,7 +624,7 @@ describe('executeSession', () => {
           role: 'assistant',
           parts: [{ type: 'text', text: 'Done — profile drafted.' }],
           user_id: 'users/bot',
-          metadata: { user_name: 'Condor' }
+          metadata: { user_name: 'Centaur' }
         },
         // The current message must not echo into its own context block.
         {
@@ -695,7 +700,7 @@ describe('executeSession', () => {
           role: 'assistant',
           parts: [{ type: 'text', text: `newest ${'y'.repeat(20_000)}` }],
           user_id: 'users/bot',
-          metadata: { user_name: 'Condor' }
+          metadata: { user_name: 'Centaur' }
         }
       ]
     })
@@ -709,6 +714,99 @@ describe('executeSession', () => {
     expect(context?.text).toContain('…(1 earlier messages truncated)')
     expect(context?.text).toContain('newest')
     expect(context?.text).not.toContain('oldest')
+  })
+})
+
+describe('attachment.chunk staging', () => {
+  function messageWithBytes(bytes: number): ReturnType<typeof turnMessagesFromEvent>['execute'] {
+    const data = Buffer.alloc(bytes, 0x5a)
+    return turnMessagesFromEvent({
+      ...baseEvent,
+      parts: [
+        { type: 'text', text: 'inspect this' },
+        {
+          type: 'file',
+          name: 'payload.bin',
+          mime_type: 'application/octet-stream',
+          size: bytes,
+          source: { type: 'base64', media_type: 'application/octet-stream', data: data.toString('base64') }
+        }
+      ]
+    }).execute
+  }
+
+  function parseLines(bytes: number): Array<Record<string, unknown>> {
+    return toCodexInputLines(loadConfig({}), baseEvent.thread_key, messageWithBytes(bytes))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+  }
+
+  test('keeps exactly 25 MiB inline and stages 25 MiB plus one byte', () => {
+    expect(parseLines(MAX_INLINE_ATTACHMENT_BYTES)).toHaveLength(1)
+    const lines = parseLines(MAX_INLINE_ATTACHMENT_BYTES + 1)
+    expect(lines.length).toBeGreaterThan(1)
+    expect(lines.slice(0, -1).every(line => line.type === 'attachment.chunk')).toBe(true)
+  })
+
+  test('accepts exactly 100 MiB and reconstructs chunk bytes and hash', () => {
+    const lines = parseLines(MAX_ATTACHMENT_BYTES)
+    const chunks = lines.slice(0, -1)
+    const dataBase64 = chunks.map(chunk => String(chunk.dataBase64)).join('')
+    const reconstructed = Buffer.from(dataBase64, 'base64')
+    expect(reconstructed.byteLength).toBe(MAX_ATTACHMENT_BYTES)
+    expect(reconstructed.every(byte => byte === 0x5a)).toBe(true)
+    expect(new Set(chunks.map(chunk => chunk.sha256))).toEqual(
+      new Set([createHash('sha256').update(reconstructed).digest('hex')])
+    )
+    expect(chunks.map(chunk => chunk.chunkIndex)).toEqual(
+      Array.from({ length: chunks.length }, (_, index) => index)
+    )
+    expect(chunks.every(chunk => chunk.chunkCount === chunks.length)).toBe(true)
+    expect(chunks.at(-1)?.final).toBe(true)
+  }, 30_000)
+
+  test('rejects 100 MiB plus one byte before any execution request', async () => {
+    let calls = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async () => {
+      calls++
+      return Response.json({ execution_id: 'never' })
+    }) as unknown as typeof fetch
+    try {
+      await expect(
+        executeSession(loadConfig({}), baseEvent.thread_key, messageWithBytes(MAX_ATTACHMENT_BYTES + 1))
+      ).rejects.toThrow('attachment exceeds')
+      expect(calls).toBe(0)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  }, 30_000)
+
+  test('rejects malformed base64, declared-size mismatch, and aggregate overflow', () => {
+    const malformed = messageWithBytes(1)
+    const malformedPart = malformed.parts[1]
+    if (malformedPart?.type !== 'file' || !malformedPart.source) throw new Error('test setup')
+    malformedPart.source.data = '***='
+    expect(() => toCodexInputLines(loadConfig({}), baseEvent.thread_key, malformed)).toThrow(
+      'invalid attachment payload'
+    )
+
+    const mismatch = messageWithBytes(1)
+    const mismatchPart = mismatch.parts[1]
+    if (mismatchPart?.type !== 'file') throw new Error('test setup')
+    mismatchPart.size = 2
+    expect(() => toCodexInputLines(loadConfig({}), baseEvent.thread_key, mismatch)).toThrow(
+      'invalid attachment payload'
+    )
+
+    const aggregate = messageWithBytes(6)
+    const first = aggregate.parts[1]
+    if (!first || first.type === 'text') throw new Error('test setup')
+    aggregate.parts.push({ ...first, name: 'second.bin' })
+    expect(() => toCodexInputLines(
+      loadConfig({ GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES: '10' }),
+      baseEvent.thread_key,
+      aggregate
+    )).toThrow('aggregate limit')
   })
 })
 
@@ -741,6 +839,91 @@ describe('openSessionEventStream', () => {
     expect(events[0]?.eventKind).toBe('session.activity_summary')
     expect((events[0]?.data as { summary?: string }).summary).toBe('Running tests')
     expect(events[1]?.eventKind).toBe('session.execution_completed')
+  })
+
+  test('does not apply the connection deadline to an established stream and releases it', async () => {
+    let cancelled = false
+    let signal: AbortSignal | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      signal = init?.signal ?? undefined
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          setTimeout(() => {
+            controller.enqueue(new TextEncoder().encode(
+              'event: session.execution_completed\ndata: {}\n\n'
+            ))
+          }, 25)
+        },
+        cancel() {
+          cancelled = true
+        }
+      })
+      return new Response(body, { status: 200 })
+    }) as typeof fetch
+
+    const stream = await openSessionEventStream(
+      loadConfig({ GOOGLECHATBOT_SESSION_STREAM_CONNECT_TIMEOUT_MS: '5' }),
+      'chat:spaces:AAAA:threads:T1',
+      0,
+      'e1',
+      () => undefined
+    )
+    for await (const _event of stream) void _event
+    expect(signal?.aborted).toBe(false)
+    expect(cancelled).toBe(true)
+    expect(renderMetrics()).toContain('googlechatbot_open_sse_connections 0')
+  })
+
+  test('aborts a hanging stream connection at its configured deadline', async () => {
+    globalThis.fetch = ((_url: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('aborted', 'AbortError')))
+      })) as typeof fetch
+    await expect(openSessionEventStream(
+      loadConfig({ GOOGLECHATBOT_SESSION_STREAM_CONNECT_TIMEOUT_MS: '5' }),
+      'chat:spaces:AAAA:threads:T1', 0, 'e1', () => undefined
+    )).rejects.toMatchObject({ name: 'AbortError' })
+    expect(renderMetrics()).toContain(
+      'googlechatbot_upstream_timeouts_total{operation="open_event_stream"} 1'
+    )
+  })
+})
+
+describe('session control request deadlines', () => {
+  const realFetch = globalThis.fetch
+  beforeEach(() => resetMetrics())
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  test('aborts create, append, execute, interrupt, and workflow calls', async () => {
+    globalThis.fetch = ((_url: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('aborted', 'AbortError')))
+      })) as typeof fetch
+    const config = loadConfig({ GOOGLECHATBOT_SESSION_API_TIMEOUT_MS: '5' })
+    const message = turnMessagesFromEvent(baseEvent).execute
+    const calls = [
+      () => createSession(config, baseEvent.thread_key),
+      () => appendSessionMessages(config, baseEvent.thread_key, [message]),
+      () => executeSession(config, baseEvent.thread_key, message),
+      () => interruptSessionExecution(config, baseEvent.thread_key, 'stop'),
+      () => emitWorkflowEvent(config, 'test.event', {})
+    ]
+    for (const call of calls) {
+      await expect(call()).rejects.toMatchObject({ name: 'AbortError' })
+    }
+    const metrics = renderMetrics()
+    for (const operation of [
+      'create_session', 'append_messages', 'execute_session', 'interrupt_session',
+      'emit_workflow_event'
+    ]) {
+      expect(metrics).toContain(
+        `googlechatbot_upstream_timeouts_total{operation="${operation}"} 1`
+      )
+    }
   })
 })
 

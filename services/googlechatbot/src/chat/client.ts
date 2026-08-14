@@ -1,6 +1,9 @@
 import type { AppConfig } from '../config'
+import type { StateAdapter } from 'chat'
 import type {
   ChatListMessage,
+  NormalizedBinaryPart,
+  ChatSpaceType,
   ChatSpaceResource,
   GoogleChatMessage,
   UploadAttachmentResponse
@@ -8,27 +11,103 @@ import type {
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1'
 const CHAT_UPLOAD_BASE = 'https://chat.googleapis.com/upload/v1'
+const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
+export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+export const MAX_DRIVE_EXPORT_BYTES = 10 * 1024 * 1024
+const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
+const MAX_FETCH_ATTEMPTS = 3
+const MAX_RETRY_DELAY_MS = 30_000
+const SPACE_READ_INTERVAL_MS = Math.ceil(1_000 / 15)
+
+export type ChatCredential =
+  | 'app'
+  | 'upload-user'
+  | 'dm-setup-user'
+  | 'reaction-reader'
+  | { kind: 'delegated-reader' | 'delegated-etl-reader'; subject: string }
+
+export type ChatPageOptions = {
+  pageSize?: number
+  pageToken?: string
+  credential?: ChatCredential
+}
+
+export type ChatSpacePage = { spaces?: ChatSpaceResource[]; nextPageToken?: string }
+export type ChatMessagePage = { messages?: ChatListMessage[]; nextPageToken?: string }
+export type ChatMembership = {
+  name?: string
+  state?: string
+  role?: string
+  member?: { name?: string; displayName?: string; type?: 'HUMAN' | 'BOT' }
+}
+export type ChatMembershipPage = { memberships?: ChatMembership[]; nextPageToken?: string }
+export type ChatReaction = {
+  name?: string
+  user?: { name?: string; displayName?: string }
+  emoji?: { unicode?: string; customEmoji?: { uid?: string } }
+  messageName?: string
+}
+export type ChatReactionPage = {
+  reactions?: ChatReaction[]
+  nextPageToken?: string
+  incomplete?: boolean
+}
+export type ChatAttachmentResource = NonNullable<ChatListMessage['attachment']>[number]
+export type DownloadedAttachment = {
+  data: ArrayBuffer
+  mimeType: string
+  name: string
+  size: number
+}
 
 export class ChatEdgeClient {
   private accessToken: string | null = null
   private tokenExpiry = 0
   private uploadUserToken: string | null = null
   private uploadUserTokenExpiry = 0
+  private delegatedMutationToken: string | null = null
+  private delegatedMutationTokenExpiry = 0
+  private readonly dmSetupTokens = new Map<string, { token: string | null; expiry: number }>()
+  private reactionReadToken: string | null = null
+  private reactionReadTokenExpiry = 0
+  private driveReadToken: string | null = null
+  private driveReadTokenExpiry = 0
   // DWD read tokens are keyed by the impersonated user (the requester), since a
   // DM's history is only readable by that DM's human member — not a fixed user.
   private readonly userReadTokens = new Map<string, { token: string | null; expiry: number }>()
-  /** The bot's own Chat user resource name (`users/<sa-email>`), used to skip
-   * its own messages. Undefined when no service account is configured. */
-  readonly botUserName: string | undefined
+  private readonly userEtlReadTokens = new Map<string, { token: string | null; expiry: number }>()
+  private botUserNamePromise: Promise<string | undefined> | null = null
   private readonly serviceAccountEmail: string | null
   private readonly privateKey: string | null
   private readonly uploadUser: string
+  private readonly reactionReadUser: string
+  private readonly driveDownloadUser: string
   private readonly apiTimeoutMs: number
+  private readonly now: () => number
+  private readonly sleep: (milliseconds: number) => Promise<void>
+  private readonly quotaState?: StateAdapter
+  private readonly writeTails = new Map<string, Promise<void>>()
+  private readonly nextWriteStart = new Map<string, number>()
+  private readonly reactionReadTails = new Map<string, Promise<void>>()
+  private readonly nextReactionReadStart = new Map<string, number>()
 
-  constructor(config: AppConfig) {
+  constructor(
+    config: AppConfig,
+    timing: {
+      now?: () => number
+      sleep?: (milliseconds: number) => Promise<void>
+      quotaState?: StateAdapter
+    } = {}
+  ) {
     this.apiTimeoutMs = config.GOOGLECHATBOT_CHAT_API_TIMEOUT_MS
+    this.now = timing.now ?? Date.now
+    this.sleep = timing.sleep
+      ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)))
+    this.quotaState = timing.quotaState
     this.uploadUser = config.GOOGLECHATBOT_UPLOAD_USER
+    this.reactionReadUser = config.GOOGLECHATBOT_REACTION_READ_USER
+    this.driveDownloadUser = config.GOOGLECHATBOT_DRIVE_DOWNLOAD_USER
     if (config.GOOGLE_SERVICE_ACCOUNT_JSON) {
       try {
         const parsed = JSON.parse(config.GOOGLE_SERVICE_ACCOUNT_JSON) as {
@@ -45,7 +124,29 @@ export class ChatEdgeClient {
       this.serviceAccountEmail = null
       this.privateKey = null
     }
-    this.botUserName = this.serviceAccountEmail ? `users/${this.serviceAccountEmail}` : undefined
+  }
+
+  /** Resolve the calling app alias through its membership and cache Google's
+   * canonical numeric `users/<id>` resource name. */
+  async getBotUserName(spaceName: string): Promise<string | undefined> {
+    if (!this.serviceAccountEmail || !this.privateKey) return undefined
+    if (!this.botUserNamePromise) {
+      const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+      this.botUserNamePromise = this.request<{
+        member?: { name?: string; type?: 'HUMAN' | 'BOT' }
+      }>('GET', `spaces/${encodeURIComponent(id)}/members/app`)
+        .then(membership => {
+          const name = membership.member?.name
+          return membership.member?.type === 'BOT' && /^users\/\d+$/.test(name ?? '')
+            ? name
+            : undefined
+        })
+        .catch(error => {
+          this.botUserNamePromise = null
+          throw error
+        })
+    }
+    return this.botUserNamePromise
   }
 
   private async getAccessToken(): Promise<string | null> {
@@ -92,9 +193,80 @@ export class ChatEdgeClient {
     return this.uploadUserToken
   }
 
+  private async getDelegatedMutationToken(): Promise<string | null> {
+    if (!this.canUploadAttachments()) return null
+    if (this.delegatedMutationToken && Date.now() < this.delegatedMutationTokenExpiry - 60_000) {
+      return this.delegatedMutationToken
+    }
+    const grant = await this.exchangeJwtForToken(
+      [
+        'https://www.googleapis.com/auth/chat.messages',
+        'https://www.googleapis.com/auth/chat.memberships.readonly'
+      ].join(' '),
+      this.uploadUser
+    )
+    this.delegatedMutationToken = grant.token
+    this.delegatedMutationTokenExpiry = grant.expiry
+    return grant.token
+  }
+
   /** True when uploads are configured: SA credentials + a user to impersonate. */
   canUploadAttachments(): boolean {
     return Boolean(this.serviceAccountEmail && this.privateKey && this.uploadUser)
+  }
+
+  canSetupDm(): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey)
+  }
+
+  canReadReactions(): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey && this.reactionReadUser)
+  }
+
+  canDownloadDriveAttachments(): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey && this.driveDownloadUser)
+  }
+
+  private async getDriveReadToken(): Promise<string | null> {
+    if (!this.canDownloadDriveAttachments()) return null
+    if (this.driveReadToken && Date.now() < this.driveReadTokenExpiry - 60_000) {
+      return this.driveReadToken
+    }
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/drive.readonly',
+      this.driveDownloadUser
+    )
+    this.driveReadToken = grant.token
+    this.driveReadTokenExpiry = grant.expiry
+    return grant.token
+  }
+
+  private async getReactionReadToken(): Promise<string | null> {
+    if (!this.canReadReactions()) return null
+    if (this.reactionReadToken && Date.now() < this.reactionReadTokenExpiry - 60_000) {
+      return this.reactionReadToken
+    }
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/chat.messages.reactions.readonly',
+      this.reactionReadUser
+    )
+    this.reactionReadToken = grant.token
+    this.reactionReadTokenExpiry = grant.expiry
+    return grant.token
+  }
+
+  private async getDmSetupToken(subject: string): Promise<string | null> {
+    if (!this.canSetupDm()) return null
+    const cached = this.dmSetupTokens.get(subject)
+    if (cached?.token && Date.now() < cached.expiry - 60_000) {
+      return cached.token
+    }
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/chat.spaces.create',
+      subject
+    )
+    this.dmSetupTokens.set(subject, grant)
+    return grant.token
   }
 
   /**
@@ -127,6 +299,28 @@ export class ChatEdgeClient {
     return grant.token
   }
 
+  /** Combined read-only grant used only by the owner-scoped DM ETL broker. */
+  private async getUserEtlReadToken(subject: string): Promise<string | null> {
+    if (!this.serviceAccountEmail || !this.privateKey || !subject) return null
+
+    const cached = this.userEtlReadTokens.get(subject)
+    if (cached && cached.token && Date.now() < cached.expiry - 60_000) {
+      return cached.token
+    }
+
+    const grant = await this.exchangeJwtForToken(
+      [
+        'https://www.googleapis.com/auth/chat.messages.readonly',
+        'https://www.googleapis.com/auth/chat.spaces.readonly',
+        'https://www.googleapis.com/auth/chat.memberships.readonly',
+        'https://www.googleapis.com/auth/chat.messages.reactions.readonly'
+      ].join(' '),
+      subject
+    )
+    this.userEtlReadTokens.set(subject, grant)
+    return grant.token
+  }
+
   private async exchangeJwtForToken(
     scope: string,
     sub?: string
@@ -146,22 +340,22 @@ export class ChatEdgeClient {
     // Bound the token exchange too: it runs before every request()'s own timed
     // fetch, so an unbounded hang here would stall the whole handoff despite the
     // downstream call being timed.
-    const response = await fetch(TOKEN_URL, {
+    const response = await fetchWithRetry(TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
         assertion: jwt
-      }),
-      signal: AbortSignal.timeout(this.apiTimeoutMs)
-    })
+      })
+    }, this.apiTimeoutMs)
 
+    const responseText = await boundedResponseText(response)
     if (!response.ok) {
-      const errorText = await response.text()
+      const errorText = responseText
       throw new Error(`Google OAuth2 token exchange failed: ${response.status} ${errorText}`)
     }
 
-    const data = (await response.json()) as {
+    const data = (responseText ? JSON.parse(responseText) : {}) as {
       access_token?: string
       expires_in?: number
     }
@@ -175,26 +369,101 @@ export class ChatEdgeClient {
     method: string,
     path: string,
     body?: unknown,
-    opts: { baseUrl?: string; token?: string | null; timeoutMs?: number } = {}
+    opts: {
+      baseUrl?: string
+      token?: string | null
+      timeoutMs?: number
+      credential?: ChatCredential
+    } = {}
   ): Promise<T> {
     const url = `${opts.baseUrl ?? CHAT_API_BASE}/${path.replace(/^\//, '')}`
-    const token = opts.token ?? (await this.getAccessToken())
-    const response = await fetch(url, {
+    const token = opts.token ?? (await this.tokenForCredential(opts.credential ?? 'app'))
+    const send = () => fetchWithRetry(url, {
       method,
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {})
       },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(opts.timeoutMs ?? this.apiTimeoutMs)
-    })
+      body: body ? JSON.stringify(body) : undefined
+    }, opts.timeoutMs ?? this.apiTimeoutMs)
+    const writeSpace = method === 'GET' ? undefined : spaceFromApiPath(path)
+    const response = writeSpace
+      ? await this.scheduleSpaceWrite(writeSpace, send)
+      : await send()
 
     if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`Chat API ${method} ${path} failed: ${response.status} ${errorText}`)
+      const rawErrorText = await boundedResponseText(response)
+      const errorText = token ? rawErrorText.replaceAll(token, '[redacted]') : rawErrorText
+      throw new ChatApiError(method, path, response.status, errorText)
     }
 
-    return response.json() as T
+    if (response.status === 204 || response.headers.get('content-length') === '0') {
+      return {} as T
+    }
+    const text = await boundedResponseText(response)
+    return (text ? JSON.parse(text) : {}) as T
+  }
+
+  private scheduleSpaceWrite<T>(spaceName: string, write: () => Promise<T>): Promise<T> {
+    if (this.quotaState) {
+      return this.reserveDistributedQuota('write', spaceName, 1_000).then(write)
+    }
+    const previous = this.writeTails.get(spaceName) ?? Promise.resolve()
+    const scheduled = previous.catch(() => undefined).then(async () => {
+      const delay = Math.max(0, (this.nextWriteStart.get(spaceName) ?? 0) - this.now())
+      if (delay) await this.sleep(delay)
+      this.nextWriteStart.set(spaceName, this.now() + 1_000)
+      return write()
+    })
+    const tail = scheduled.then(() => undefined, () => undefined)
+    this.writeTails.set(spaceName, tail)
+    void tail.finally(() => {
+      if (this.writeTails.get(spaceName) === tail) this.writeTails.delete(spaceName)
+    })
+    return scheduled
+  }
+
+  private async reserveDistributedQuota(
+    operation: 'write' | 'reaction-read',
+    spaceName: string,
+    intervalMs: number
+  ): Promise<void> {
+    const state = this.quotaState!
+    const key = `google-chat-quota:${operation}:${spaceName}`
+    const deadline = this.now() + this.apiTimeoutMs
+    while (true) {
+      const lock = await state.acquireLock(key, 5_000)
+      if (lock) {
+        try {
+          const previous = await state.get<number>(key)
+          const delay = Math.max(
+            0,
+            (Number.isFinite(previous) ? previous! + intervalMs : 0) - this.now()
+          )
+          if (delay) await this.sleep(delay)
+          await state.set(key, this.now(), 60_000)
+          return
+        } finally {
+          await state.releaseLock(lock)
+        }
+      }
+      if (this.now() >= deadline) {
+        throw new ChatConfigurationError('Google Chat per-space write quota gate timed out')
+      }
+      await this.sleep(25)
+    }
+  }
+
+  private async tokenForCredential(credential: ChatCredential): Promise<string | null> {
+    if (credential === 'app') return this.getAccessToken()
+    if (credential === 'upload-user') return this.getUploadUserToken()
+    if (credential === 'dm-setup-user') {
+      throw new ChatConfigurationError('DM setup credentials require a target email')
+    }
+    if (credential === 'reaction-reader') return this.getReactionReadToken()
+    return credential.kind === 'delegated-etl-reader'
+      ? this.getUserEtlReadToken(credential.subject)
+      : this.getUserReadToken(credential.subject)
   }
 
   /**
@@ -213,16 +482,23 @@ export class ChatEdgeClient {
   async createMessage(
     spaceName: string,
     message: Partial<GoogleChatMessage>,
-    opts: { threadName?: string } = {}
+    opts: { messageId?: string; threadName?: string; spaceType?: ChatSpaceType } = {}
   ): Promise<GoogleChatMessage> {
     const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
     const body: Partial<GoogleChatMessage> = { ...message }
-    if (opts.threadName) {
+    const supportsThreads = !opts.spaceType || opts.spaceType === 'SPACE'
+    if (opts.threadName && supportsThreads) {
       body.thread = { name: opts.threadName }
     }
-    const path = opts.threadName
-      ? `spaces/${id}/messages?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
-      : `spaces/${id}/messages`
+    const query = new URLSearchParams()
+    if (opts.threadName && supportsThreads) {
+      query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD')
+    }
+    // Generate both idempotency keys once per invocation; fetch retries reuse
+    // this exact URL instead of duplicating a committed message.
+    query.set('messageId', opts.messageId ?? generatedMessageId())
+    query.set('requestId', crypto.randomUUID())
+    const path = `spaces/${id}/messages${query.size ? `?${query}` : ''}`
     return this.request('POST', path, body)
   }
 
@@ -231,7 +507,7 @@ export class ChatEdgeClient {
    * Path: PATCH /v1/{message.name}?updateMask=text,cardsV2
    *
    * Google Chat requires updateMask as a query parameter listing the fields to
-   * patch. "text,cardsV2" are the only writable fields we ever change.
+   * patch. fallbackText is create-only and is not a supported update path.
    */
   async updateMessage(
     messageName: string,
@@ -249,11 +525,69 @@ export class ChatEdgeClient {
     return this.request('DELETE', messageName)
   }
 
+  /** Mutate only messages authored by this app or the configured delegated
+   * upload user. Google also checks ownership, but doing it here prevents a
+   * broader future credential from turning this internal API into an arbitrary
+   * message editor. */
+  async updateOwnedMessage(
+    spaceName: string,
+    messageName: string,
+    update: Partial<GoogleChatMessage>
+  ): Promise<GoogleChatMessage> {
+    const owner = await this.ownedMessageCredential(spaceName, messageName)
+    return this.request(
+      'PATCH',
+      `${messageName}?updateMask=${encodeURIComponent(
+        owner.kind === 'app' ? 'text,cardsV2' : 'text'
+      )}`,
+      update,
+      { token: owner.token }
+    )
+  }
+
+  async deleteOwnedMessage(spaceName: string, messageName: string): Promise<Record<string, never>> {
+    const owner = await this.ownedMessageCredential(spaceName, messageName)
+    return this.request('DELETE', messageName, undefined, { token: owner.token })
+  }
+
+  private async ownedMessageCredential(
+    spaceName: string,
+    messageName: string
+  ): Promise<{ kind: 'app' | 'delegated'; token: string }> {
+    const botToken = await this.getAccessToken()
+    if (!botToken) throw new ChatOwnershipError('Google Chat app credentials are not configured')
+    const message = await this.request<ChatListMessage>('GET', messageName, undefined, {
+      token: botToken
+    }).catch(() => null)
+    const botUserName = await this.getBotUserName(spaceName).catch(() => undefined)
+    if (botUserName && message?.sender?.name === botUserName) {
+      return { kind: 'app', token: botToken }
+    }
+
+    const delegatedToken = await this.getDelegatedMutationToken()
+    if (delegatedToken) {
+      const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+      const membership = await this.request<ChatMembership>(
+        'GET',
+        `spaces/${encodeURIComponent(id)}/members/${encodeURIComponent(this.uploadUser)}`,
+        undefined,
+        { token: delegatedToken }
+      )
+      const delegatedView = await this.request<ChatListMessage>('GET', messageName, undefined, {
+        token: delegatedToken
+      })
+      if (membership.member?.name && delegatedView.sender?.name === membership.member.name) {
+        return { kind: 'delegated', token: delegatedToken }
+      }
+    }
+    throw new ChatOwnershipError('Google Chat message is not owned by this integration')
+  }
+
   /**
    * List messages in a space.
    * Path: GET /v1/spaces/{space}/messages
    *
-   * Pass `filter='thread.name="spaces/<id>/threads/<id>"'` to scope the listing
+   * Pass `filter='thread.name = spaces/<id>/threads/<id>'` to scope the listing
    * to a single thread — this is how thread-history context is fetched after a
    * bot @mention. Requires `chat.app.messages.readonly` (admin-approved) or a
    * user-auth scope; the self-granted `chat.bot` scope is rejected with 403.
@@ -270,6 +604,8 @@ export class ChatEdgeClient {
       pageToken?: string
       filter?: string
       orderBy?: string
+      showDeleted?: boolean
+      credential?: ChatCredential
       /** Requester email to impersonate (DWD) if app auth is refused on a DM. */
       impersonateSubject?: string
     } = {}
@@ -280,10 +616,11 @@ export class ChatEdgeClient {
     if (opts.pageToken) params.set('pageToken', opts.pageToken)
     if (opts.filter) params.set('filter', opts.filter)
     if (opts.orderBy) params.set('orderBy', opts.orderBy)
+    if (opts.showDeleted) params.set('showDeleted', 'true')
     const query = params.toString()
     const path = `spaces/${id}/messages${query ? `?${query}` : ''}`
     try {
-      return await this.request('GET', path)
+      return await this.request('GET', path, undefined, { credential: opts.credential })
     } catch (error) {
       // DMs reject app auth; retry as the requesting human, the only member who
       // can read the DM. No subject (e.g. out-of-domain requester) → give up.
@@ -324,9 +661,165 @@ export class ChatEdgeClient {
    * can sit in front of a turn; a hung Chat backend must cost the turn seconds,
    * not the deployment-wide 30s ceiling.
    */
-  async getSpace(spaceName: string, opts: { timeoutMs?: number } = {}): Promise<ChatSpaceResource> {
+  async getSpace(
+    spaceName: string,
+    opts: { timeoutMs?: number; credential?: ChatCredential } = {}
+  ): Promise<ChatSpaceResource> {
     const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
     return this.request('GET', `spaces/${encodeURIComponent(id)}`, undefined, opts)
+  }
+
+  async listSpaces(opts: ChatPageOptions = {}): Promise<ChatSpacePage> {
+    const params = new URLSearchParams()
+    if (opts.pageSize) params.set('pageSize', String(opts.pageSize))
+    if (opts.pageToken) params.set('pageToken', opts.pageToken)
+    const query = params.toString()
+    return this.request('GET', `spaces${query ? `?${query}` : ''}`, undefined, {
+      credential: opts.credential
+    })
+  }
+
+  async listMemberships(
+    spaceName: string,
+    opts: ChatPageOptions = {}
+  ): Promise<ChatMembershipPage> {
+    return this.listResource(spaceName, 'members', opts)
+  }
+
+  async listThreadMessages(
+    spaceName: string,
+    threadName: string,
+    opts: ChatPageOptions = {}
+  ): Promise<ChatMessagePage> {
+    return this.listMessages(spaceName, {
+      ...opts,
+      filter: `thread.name = ${threadName}`
+    })
+  }
+
+  /** Google exposes reactions below each message, so this space-level method
+   * aggregates one bounded message page for the internal scoped proxy. */
+  async listReactions(
+    spaceName: string,
+    opts: ChatPageOptions = {}
+  ): Promise<ChatReactionPage> {
+    const messages = await this.listMessages(spaceName, opts)
+    const namedMessages = (messages.messages ?? []).filter(message => message.name)
+    const pages: ChatReactionPage[] = []
+    for (let index = 0; index < namedMessages.length; index += 1) {
+      pages.push(await this.listMessageReactions(namedMessages[index]!.name!, {
+          pageSize: opts.pageSize,
+          credential: opts.credential
+      }))
+    }
+    return {
+      reactions: pages.flatMap((page, index) =>
+        (page.reactions ?? []).map(reaction => ({
+          ...reaction,
+          messageName: namedMessages[index]?.name
+        }))
+      ),
+      ...(messages.nextPageToken ? { nextPageToken: messages.nextPageToken } : {}),
+      ...(pages.some(page => page.nextPageToken) ? { incomplete: true } : {})
+    }
+  }
+
+  async listMessageReactions(
+    messageName: string,
+    opts: ChatPageOptions = {}
+  ): Promise<ChatReactionPage> {
+    const read = () => this.listNamedResource<ChatReactionPage>(messageName, 'reactions', {
+      ...opts,
+      ...(opts.pageSize ? { pageSize: Math.min(opts.pageSize, 200) } : {})
+    })
+    const spaceName = spaceFromMessageName(messageName)
+    return spaceName ? this.scheduleReactionRead(spaceName, read) : read()
+  }
+
+  private scheduleReactionRead<T>(spaceName: string, read: () => Promise<T>): Promise<T> {
+    if (this.quotaState) {
+      return this.reserveDistributedQuota(
+        'reaction-read',
+        spaceName,
+        SPACE_READ_INTERVAL_MS
+      ).then(read)
+    }
+    const previous = this.reactionReadTails.get(spaceName) ?? Promise.resolve()
+    const scheduled = previous.catch(() => undefined).then(async () => {
+      const delay = Math.max(
+        0,
+        (this.nextReactionReadStart.get(spaceName) ?? 0) - this.now()
+      )
+      if (delay) await this.sleep(delay)
+      this.nextReactionReadStart.set(spaceName, this.now() + SPACE_READ_INTERVAL_MS)
+      return read()
+    })
+    const tail = scheduled.then(() => undefined, () => undefined)
+    this.reactionReadTails.set(spaceName, tail)
+    void tail.finally(() => {
+      if (this.reactionReadTails.get(spaceName) === tail) this.reactionReadTails.delete(spaceName)
+    })
+    return scheduled
+  }
+
+  async listAttachments(
+    spaceName: string,
+    opts: { pageSize?: number; pageToken?: string } = {}
+  ): Promise<{ attachments: Array<Record<string, unknown>>; nextPageToken?: string }> {
+    const page = await this.listMessages(spaceName, opts)
+    return {
+      attachments: (page.messages ?? []).flatMap(message => message.attachment ?? []),
+      ...(page.nextPageToken ? { nextPageToken: page.nextPageToken } : {})
+    }
+  }
+
+  async getAttachment(messageName: string, attachmentId: string): Promise<ChatAttachmentResource> {
+    return this.request<ChatAttachmentResource>(
+      'GET',
+      `${messageName}/attachments/${encodeURIComponent(attachmentId)}`
+    )
+  }
+
+  async setupDm(
+    targetIdentity: string,
+    credential: 'dm-setup-user' = 'dm-setup-user'
+  ): Promise<ChatSpaceResource> {
+    if (credential !== 'dm-setup-user' || !validEmail(targetIdentity)) {
+      throw new ChatConfigurationError('Google Chat DM target must be an email address')
+    }
+    const token = await this.getDmSetupToken(targetIdentity)
+    if (!token) throw new ChatConfigurationError('Google Chat DM setup is not configured')
+    return this.request('POST', 'spaces:setup', {
+      space: { spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true },
+      requestId: crypto.randomUUID(),
+      memberships: []
+    }, { token })
+  }
+
+  private async listResource(
+    spaceName: string,
+    resource: string,
+    opts: ChatPageOptions
+  ): Promise<ChatMembershipPage> {
+    return this.listNamedResource(
+      `spaces/${spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName}`,
+      resource,
+      opts
+    )
+  }
+
+  private async listNamedResource<T>(
+    parent: string,
+    resource: string,
+    opts: ChatPageOptions
+  ): Promise<T> {
+    const params = new URLSearchParams()
+    if (opts.pageSize) params.set('pageSize', String(opts.pageSize))
+    if (opts.pageToken) params.set('pageToken', opts.pageToken)
+    const query = params.toString()
+    return this.request('GET', `${parent}/${resource}${query ? `?${query}` : ''}`, undefined, {
+      credential: opts.credential
+    })
   }
 
   /**
@@ -337,24 +830,219 @@ export class ChatEdgeClient {
    * /v1/media/, not /v1/spaces/, and return raw bytes rather than JSON — so
    * this bypasses request() the same way uploadAttachment does.
    */
-  async downloadAttachment(resourceName: string): Promise<ArrayBuffer> {
+  async downloadAttachment(
+    resourceName: string,
+    expectedMimeType?: string,
+    expectedSize?: number
+  ): Promise<ArrayBuffer> {
+    if (!validAttachmentDataResource(resourceName)) {
+      throw new ChatConfigurationError('invalid Google Chat attachment resource ID')
+    }
     const token = await this.getAccessToken()
     const url = `${CHAT_API_BASE}/media/${resourceName.replace(/^\//, '')}?alt=media`
 
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       method: 'GET',
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {})
-      },
-      signal: AbortSignal.timeout(this.apiTimeoutMs)
-    })
+      }
+    }, this.apiTimeoutMs)
 
     if (!response.ok) {
-      const errorText = await response.text()
+      const errorText = await boundedResponseText(response)
       throw new Error(`Chat API media download failed: ${response.status} ${errorText}`)
     }
 
-    return response.arrayBuffer()
+    const mimeType = response.headers.get('content-type')?.split(';', 1)[0]?.trim()
+    if (isHtmlContentType(mimeType) || (expectedMimeType && mimeType !== expectedMimeType)) {
+      throw new ChatConfigurationError('Google Chat attachment MIME type mismatch')
+    }
+    const declared = contentLength(response)
+    if (declared !== undefined && declared > MAX_DOWNLOAD_BYTES) {
+      await response.body?.cancel().catch(() => undefined)
+      throw new ChatConfigurationError('Google Chat attachment exceeds 100 MiB')
+    }
+    if (declared !== undefined && expectedSize !== undefined && declared !== expectedSize) {
+      await response.body?.cancel().catch(() => undefined)
+      throw new ChatConfigurationError('Google Chat attachment size mismatch')
+    }
+    const body = await boundedResponseBytes(response, MAX_DOWNLOAD_BYTES)
+    if (!body.data) {
+      throw new ChatConfigurationError('Google Chat attachment exceeds 100 MiB')
+    }
+    if (expectedSize !== undefined && body.size !== expectedSize) {
+      throw new ChatConfigurationError('Google Chat attachment size mismatch')
+    }
+    return body.data
+  }
+
+  async downloadDriveAttachment(input: {
+    driveFileId: string
+    expectedMimeType: string
+    declaredSize?: number
+  }): Promise<{
+    data?: ArrayBuffer
+    mimeType?: string
+    name?: string
+    size?: number
+    unavailableReason?: NormalizedBinaryPart['unavailable_reason']
+  }> {
+    if (safeMimeType(input.expectedMimeType) !== input.expectedMimeType) {
+      return { unavailableReason: 'metadata_mismatch' }
+    }
+    if (!this.canDownloadDriveAttachments()) {
+      return { unavailableReason: 'download_not_configured' }
+    }
+    if (
+      input.declaredSize !== undefined
+      && (!Number.isSafeInteger(input.declaredSize) || input.declaredSize < 0)
+    ) return { unavailableReason: 'metadata_mismatch' }
+    if (!validDriveFileId(input.driveFileId)) return { unavailableReason: 'invalid_resource' }
+    if (input.declaredSize !== undefined && input.declaredSize > MAX_DOWNLOAD_BYTES) {
+      return { unavailableReason: 'declared_too_large' }
+    }
+    const token = await this.getDriveReadToken()
+    if (!token) return { unavailableReason: 'download_not_configured' }
+
+    const path = `files/${encodeURIComponent(input.driveFileId)}`
+    const metadataResponse = await this.driveFetch(
+      `${DRIVE_API_BASE}/${path}?fields=id,name,mimeType,size,capabilities(canDownload)&supportsAllDrives=true`,
+      token
+    )
+    if (!metadataResponse.ok) throw await driveApiError('metadata', metadataResponse)
+    if (!isJsonContentType(metadataResponse.headers.get('content-type'))) {
+      throw new DriveApiError('metadata', 502, 'unexpected content type')
+    }
+    const metadataText = await boundedResponseText(
+      metadataResponse,
+      MAX_JSON_RESPONSE_BYTES,
+      'Google Drive API response exceeded the size limit'
+    )
+    const metadata = JSON.parse(metadataText) as {
+      id?: string
+      name?: string
+      mimeType?: string
+      size?: string
+      capabilities?: { canDownload?: boolean }
+    }
+    const metadataSize = parseByteSize(metadata.size)
+    const exportFormat = driveExportFormat(metadata.mimeType)
+    const googleNative = typeof metadata.mimeType === 'string'
+      && isGoogleNativeMimeType(metadata.mimeType)
+    if (
+      metadata.id !== input.driveFileId
+      || typeof metadata.name !== 'string'
+      || !metadata.name
+      || !metadata.mimeType
+      || metadata.mimeType !== input.expectedMimeType
+      || metadata.capabilities?.canDownload !== true
+      || (!googleNative && metadataSize === undefined)
+      || (metadataSize !== undefined && metadataSize > MAX_DOWNLOAD_BYTES)
+      || (input.declaredSize !== undefined && metadataSize !== input.declaredSize)
+    ) {
+      return { mimeType: metadata.mimeType, size: metadataSize, unavailableReason: 'metadata_mismatch' }
+    }
+    if (googleNative && !exportFormat) {
+      return {
+        mimeType: metadata.mimeType,
+        name: metadata.name,
+        unavailableReason: 'unsupported_native_file'
+      }
+    }
+
+    const response = await this.driveFetch(
+      exportFormat
+        ? `${DRIVE_API_BASE}/${path}/export?mimeType=${encodeURIComponent(exportFormat.mimeType)}`
+        : `${DRIVE_API_BASE}/${path}?alt=media&supportsAllDrives=true`,
+      token
+    )
+    if (!response.ok) {
+      if (exportFormat && await isDriveExportTooLarge(response)) {
+        return { name: metadata.name, unavailableReason: 'export_too_large' }
+      }
+      throw await driveApiError('download', response)
+    }
+    const mimeType = response.headers.get('content-type')?.split(';', 1)[0]?.trim()
+    const length = contentLength(response)
+    const maxBytes = exportFormat ? MAX_DRIVE_EXPORT_BYTES : MAX_DOWNLOAD_BYTES
+    if (
+      mimeType !== (exportFormat?.mimeType ?? metadata.mimeType)
+      || isHtmlContentType(mimeType)
+      || (length !== undefined && (
+        (!exportFormat && length !== metadataSize) || length > maxBytes
+      ))
+    ) {
+      return {
+        mimeType,
+        size: length,
+        unavailableReason: exportFormat && length !== undefined && length > maxBytes
+          ? 'export_too_large'
+          : 'metadata_mismatch'
+      }
+    }
+    const body = await boundedResponseBytes(response, maxBytes)
+    if (!body.data || (!exportFormat && body.size !== metadataSize)) {
+      return {
+        mimeType,
+        size: body.size,
+        unavailableReason: exportFormat && body.size > maxBytes
+          ? 'export_too_large'
+          : 'metadata_mismatch'
+      }
+    }
+    return {
+      data: body.data,
+      mimeType,
+      name: exportFormat
+        ? withExtension(metadata.name, exportFormat.extension)
+        : metadata.name,
+      size: body.size
+    }
+  }
+
+  async downloadAttachmentResource(attachment: ChatAttachmentResource): Promise<DownloadedAttachment> {
+    const name = attachment.contentName ?? 'attachment'
+    const mimeType = attachment.contentType ?? 'application/octet-stream'
+    if (safeMimeType(mimeType) !== mimeType) {
+      throw new ChatConfigurationError('invalid Google attachment MIME type')
+    }
+    if (attachment.source === 'DRIVE_FILE') {
+      const driveFileId = attachment.driveDataRef?.driveFileId
+      if (!driveFileId) throw new ChatConfigurationError('invalid Google Drive attachment resource')
+      const result = await this.downloadDriveAttachment({
+        driveFileId,
+        expectedMimeType: mimeType
+      })
+      if (!result.data || !result.mimeType || result.size === undefined) {
+        throw new ChatConfigurationError(
+          `Google Drive attachment is unavailable: ${result.unavailableReason ?? 'download_failed'}`
+        )
+      }
+      return { data: result.data, mimeType: result.mimeType, name: result.name ?? name, size: result.size }
+    }
+    const resourceName = attachment.attachmentDataRef?.resourceName
+    if (!resourceName) throw new ChatConfigurationError('invalid Google Chat attachment resource')
+    const data = await this.downloadAttachment(resourceName, mimeType)
+    return { data, mimeType, name, size: data.byteLength }
+  }
+
+  private async driveFetch(url: string, token: string): Promise<Response> {
+    let current = new URL(url)
+    for (let redirects = 0; redirects <= 3; redirects++) {
+      if (!allowedDriveHost(current.hostname)) {
+        throw new DriveApiError('redirect', 502, 'unapproved redirect host')
+      }
+      const response = await fetchWithRetry(current, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+        redirect: 'manual'
+      }, this.apiTimeoutMs)
+      if (![301, 302, 303, 307, 308].includes(response.status)) return response
+      const location = response.headers.get('location')
+      if (!location) throw new DriveApiError('redirect', 502, 'redirect missing location')
+      current = new URL(location, current)
+    }
+    throw new DriveApiError('redirect', 502, 'too many redirects')
   }
 
   /**
@@ -403,24 +1091,24 @@ export class ChatEdgeClient {
     body.set(data, head.byteLength)
     body.set(tail, head.byteLength + data.byteLength)
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/related; boundary=${boundary}`,
-        Authorization: `Bearer ${token}`
-      },
-      // Coerce to BufferSource — tsgo's BodyInit overload set rejects the bare
-      // Uint8Array<ArrayBufferLike> shape Bun infers here.
-      body: body as BodyInit,
-      signal: AbortSignal.timeout(this.apiTimeoutMs)
-    })
+    const response = await this.scheduleSpaceWrite(spaceName, () => fetchWithRetry(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/related; boundary=${boundary}`,
+          Authorization: `Bearer ${token}`
+        },
+        // Coerce to BufferSource — tsgo's BodyInit overload set rejects the bare
+        // Uint8Array<ArrayBufferLike> shape Bun infers here.
+        body: body as BodyInit
+      }, this.apiTimeoutMs, 'rate-limit-only'))
 
     if (!response.ok) {
-      const errorText = await response.text()
+      const errorText = await boundedResponseText(response)
       throw new Error(`Chat API upload failed: ${response.status} ${errorText}`)
     }
 
-    return (await response.json()) as UploadAttachmentResponse
+    const responseText = await boundedResponseText(response)
+    return (responseText ? JSON.parse(responseText) : {}) as UploadAttachmentResponse
   }
 
   /**
@@ -433,7 +1121,7 @@ export class ChatEdgeClient {
   async createAttachmentMessage(
     spaceName: string,
     attachment: UploadAttachmentResponse,
-    opts: { text?: string; threadName?: string } = {}
+    opts: { text?: string; threadName?: string; spaceType?: ChatSpaceType } = {}
   ): Promise<GoogleChatMessage> {
     const token = await this.getUploadUserToken()
     if (!token) {
@@ -445,27 +1133,83 @@ export class ChatEdgeClient {
       attachment: [attachment],
       ...(opts.text ? { text: opts.text } : {})
     }
-    if (opts.threadName) body.thread = { name: opts.threadName }
-    const path = opts.threadName
-      ? `spaces/${id}/messages?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
-      : `spaces/${id}/messages`
-
-    const response = await fetch(`${CHAT_API_BASE}/${path}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.apiTimeoutMs)
+    const supportsThreads = !opts.spaceType || opts.spaceType === 'SPACE'
+    if (opts.threadName && supportsThreads) body.thread = { name: opts.threadName }
+    const query = new URLSearchParams({
+      messageId: generatedMessageId(),
+      requestId: crypto.randomUUID()
     })
-
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`Chat API attachment message failed: ${response.status} ${errorText}`)
+    if (opts.threadName && supportsThreads) {
+      query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD')
     }
+    const path = `spaces/${id}/messages?${query}`
 
-    return (await response.json()) as GoogleChatMessage
+    return this.request('POST', path, body, { token })
+  }
+}
+
+function driveExportFormat(
+  sourceMimeType: string | undefined
+): { mimeType: string; extension: string } | undefined {
+  switch (sourceMimeType) {
+    case 'application/vnd.google-apps.document':
+      return { mimeType: 'text/markdown', extension: '.md' }
+    case 'application/vnd.google-apps.spreadsheet':
+      return {
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        extension: '.xlsx'
+      }
+    case 'application/vnd.google-apps.presentation':
+      return {
+        mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        extension: '.pptx'
+      }
+    case 'application/vnd.google-apps.drawing':
+      return { mimeType: 'application/pdf', extension: '.pdf' }
+    case 'application/vnd.google-apps.script':
+      return { mimeType: 'application/vnd.google-apps.script+json', extension: '.json' }
+    default:
+      return undefined
+  }
+}
+
+function isGoogleNativeMimeType(mimeType: string): boolean {
+  return mimeType.startsWith('application/vnd.google-apps.')
+}
+
+function withExtension(name: string, extension: string): string {
+  return name.toLowerCase().endsWith(extension) ? name : `${name}${extension}`
+}
+
+export class ChatOwnershipError extends Error {}
+
+export class ChatConfigurationError extends Error {}
+
+export class DriveApiError extends Error {
+  constructor(readonly operation: string, readonly status: number, detail: string) {
+    super(`Drive API ${operation} failed: ${status}${detail ? ` ${detail}` : ''}`)
+  }
+}
+
+export class ChatApiError extends Error {
+  readonly category: 'unauthenticated' | 'forbidden' | 'rate_limited' | 'upstream' | 'request'
+
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly status: number,
+    detail: string
+  ) {
+    super(`Chat API ${method} ${path} failed: ${status}${detail ? ` ${detail}` : ''}`)
+    this.category = status === 401
+      ? 'unauthenticated'
+      : status === 403
+        ? 'forbidden'
+        : status === 429
+          ? 'rate_limited'
+          : status >= 500
+            ? 'upstream'
+            : 'request'
   }
 }
 
@@ -473,6 +1217,177 @@ export class ChatEdgeClient {
  * back to a generic binary type for anything malformed or injection-shaped. */
 function safeMimeType(value: string): string {
   return /^[\w.+-]+\/[\w.+-]+$/.test(value) ? value : 'application/octet-stream'
+}
+
+function validAttachmentDataResource(value: string): boolean {
+  return /^[A-Za-z0-9._/-]{1,512}$/.test(value) && !value.includes('..')
+}
+
+function validDriveFileId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,256}$/.test(value)
+}
+
+function validEmail(value: string): boolean {
+  return /^[^@\s/]+@[^@\s/]+$/.test(value)
+}
+
+function spaceFromApiPath(path: string): string | undefined {
+  const id = /^spaces\/([^/?]+)/.exec(path)?.[1]
+  return id ? `spaces/${id}` : undefined
+}
+
+function spaceFromMessageName(name: string): string | undefined {
+  const id = /^spaces\/([^/]+)\/messages\/[^/]+$/.exec(name)?.[1]
+  return id ? `spaces/${id}` : undefined
+}
+
+function generatedMessageId(): string {
+  return `client-centaur-${crypto.randomUUID().replaceAll('-', '')}`
+}
+
+function parseByteSize(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+$/.test(value)) return undefined
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
+function contentLength(response: Response): number | undefined {
+  return parseByteSize(response.headers.get('content-length') ?? undefined)
+}
+
+async function boundedResponseText(
+  response: Response,
+  maxBytes = MAX_JSON_RESPONSE_BYTES,
+  errorMessage = 'Google Chat API response exceeded the size limit'
+): Promise<string> {
+  const body = await boundedResponseBytes(response, maxBytes)
+  if (!body.data) throw new Error(errorMessage)
+  return new TextDecoder().decode(body.data)
+}
+
+async function boundedResponseBytes(
+  response: Response,
+  maxBytes: number
+): Promise<{ data?: ArrayBuffer; size: number }> {
+  const declared = contentLength(response)
+  if (declared !== undefined && declared > maxBytes) {
+    await response.body?.cancel().catch(() => undefined)
+    return { size: declared }
+  }
+  const reader = response.body?.getReader()
+  if (!reader) return { data: new ArrayBuffer(0), size: 0 }
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        return { size }
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return { data: bytes.buffer, size }
+}
+
+async function fetchWithRetry(
+  input: string | URL,
+  init: RequestInit,
+  timeoutMs: number,
+  mode: 'safe' | 'rate-limit-only' = 'safe'
+): Promise<Response> {
+  for (let attempt = 0; attempt < MAX_FETCH_ATTEMPTS; attempt += 1) {
+    let response: Response
+    try {
+      response = await fetch(input, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs)
+      })
+    } catch (error) {
+      if (mode === 'rate-limit-only' || attempt === MAX_FETCH_ATTEMPTS - 1) throw error
+      const delayMs = Math.random() * Math.min(MAX_RETRY_DELAY_MS, 250 * 2 ** attempt)
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
+      continue
+    }
+    if (
+      !retryableStatus(response.status)
+      || (mode === 'rate-limit-only' && response.status !== 429)
+      || attempt === MAX_FETCH_ATTEMPTS - 1
+    ) return response
+    const retryAfter = retryAfterMs(response.headers.get('retry-after'))
+    await response.body?.cancel().catch(() => undefined)
+    const delayMs = retryAfter ?? retryBackoffMs(response.status, attempt)
+    if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
+  }
+  throw new Error('unreachable')
+}
+
+export function retryBackoffMs(
+  status: number,
+  attempt: number,
+  random: () => number = Math.random
+): number {
+  if (status === 429) {
+    return Math.min(MAX_RETRY_DELAY_MS, 1_000 * 2 ** attempt + random() * 1_000)
+  }
+  return random() * Math.min(MAX_RETRY_DELAY_MS, 250 * 2 ** attempt)
+}
+
+function retryableStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+}
+
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined
+  const seconds = Number(value)
+  const delay = Number.isFinite(seconds)
+    ? seconds * 1_000
+    : Date.parse(value) - Date.now()
+  return Number.isFinite(delay) ? Math.max(0, Math.min(MAX_RETRY_DELAY_MS, delay)) : undefined
+}
+
+function isJsonContentType(value: string | null): boolean {
+  return value?.split(';', 1)[0]?.trim().toLowerCase() === 'application/json'
+}
+
+function isHtmlContentType(value: string | null | undefined): boolean {
+  const normalized = value?.toLowerCase()
+  return normalized === 'text/html' || normalized === 'application/xhtml+xml'
+}
+
+function allowedDriveHost(hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  return host === 'www.googleapis.com'
+    || host === 'content.googleapis.com'
+    || host.endsWith('.googleusercontent.com')
+}
+
+async function driveApiError(operation: string, response: Response): Promise<DriveApiError> {
+  // Never echo OAuth or signed-download diagnostics across the internal boundary.
+  await response.body?.cancel().catch(() => undefined)
+  return new DriveApiError(operation, response.status, '')
+}
+
+async function isDriveExportTooLarge(response: Response): Promise<boolean> {
+  try {
+    const payload = JSON.parse(await boundedResponseText(response)) as {
+      error?: { errors?: Array<{ reason?: string }> }
+    }
+    return payload.error?.errors?.some(error => error.reason === 'exportSizeLimitExceeded') ?? false
+  } catch {
+    return false
+  }
 }
 
 async function createJWT(opts: {
@@ -490,7 +1405,7 @@ async function createJWT(opts: {
   const payload = base64urlEncode(
     JSON.stringify({
       iss: opts.email,
-      sub: opts.sub ?? opts.email,
+      ...(opts.sub ? { sub: opts.sub } : {}),
       scope: opts.scope,
       aud: 'https://oauth2.googleapis.com/token',
       iat: opts.iat,

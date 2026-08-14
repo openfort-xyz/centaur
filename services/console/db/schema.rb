@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_12_042212) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_13_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_search"
@@ -112,6 +112,43 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_12_042212) do
     t.index ["created_by_id"], name: "index_gcp_id_token_secrets_on_created_by_id"
     t.index ["foreign_id"], name: "index_gcp_id_token_secrets_on_foreign_id", unique: true
     t.index ["labels"], name: "index_gcp_id_token_secrets_on_labels", using: :gin
+  end
+
+  create_table "google_chat_dm_permissions", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "principal_id"
+    t.bigint "role_id"
+    t.boolean "setup_enabled", default: false, null: false
+    t.string "target_identity", null: false
+    t.datetime "updated_at", null: false
+    t.index ["principal_id", "target_identity"], name: "idx_on_principal_id_target_identity_cd775a52b9", unique: true, where: "(principal_id IS NOT NULL)"
+    t.index ["principal_id"], name: "index_google_chat_dm_permissions_on_principal_id"
+    t.index ["role_id", "target_identity"], name: "idx_on_role_id_target_identity_f0e866707b", unique: true, where: "(role_id IS NOT NULL)"
+    t.index ["role_id"], name: "index_google_chat_dm_permissions_on_role_id"
+    t.check_constraint "(principal_id IS NULL) <> (role_id IS NULL)", name: "google_chat_dm_permissions_exactly_one_grantee"
+    t.check_constraint "setup_enabled", name: "google_chat_dm_permissions_setup_enabled"
+  end
+
+  create_table "google_chat_space_permissions", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.boolean "delete_enabled", default: false, null: false
+    t.boolean "download_enabled", default: false, null: false
+    t.boolean "history_enabled", default: false, null: false
+    t.boolean "members_enabled", default: false, null: false
+    t.bigint "principal_id"
+    t.boolean "reactions_enabled", default: false, null: false
+    t.bigint "role_id"
+    t.boolean "send_enabled", default: false, null: false
+    t.string "space_name", null: false
+    t.boolean "update_enabled", default: false, null: false
+    t.datetime "updated_at", null: false
+    t.boolean "upload_enabled", default: false, null: false
+    t.index ["principal_id", "space_name"], name: "idx_on_principal_id_space_name_f47ea1bb0e", unique: true, where: "(principal_id IS NOT NULL)"
+    t.index ["principal_id"], name: "index_google_chat_space_permissions_on_principal_id"
+    t.index ["role_id", "space_name"], name: "index_google_chat_space_permissions_on_role_id_and_space_name", unique: true, where: "(role_id IS NOT NULL)"
+    t.index ["role_id"], name: "index_google_chat_space_permissions_on_role_id"
+    t.check_constraint "(principal_id IS NULL) <> (role_id IS NULL)", name: "google_chat_space_permissions_exactly_one_grantee"
+    t.check_constraint "send_enabled OR update_enabled OR delete_enabled OR upload_enabled OR download_enabled OR history_enabled OR members_enabled OR reactions_enabled", name: "google_chat_space_permissions_at_least_one_permission"
   end
 
   create_table "grants", force: :cascade do |t|
@@ -508,6 +545,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_12_042212) do
   add_foreign_key "broker_credentials", "users", column: "created_by_id"
   add_foreign_key "gcp_auth_secrets", "users", column: "created_by_id"
   add_foreign_key "gcp_id_token_secrets", "users", column: "created_by_id"
+  add_foreign_key "google_chat_dm_permissions", "principals"
+  add_foreign_key "google_chat_dm_permissions", "roles"
+  add_foreign_key "google_chat_space_permissions", "principals"
+  add_foreign_key "google_chat_space_permissions", "roles"
   add_foreign_key "grants", "aws_auth_secrets"
   add_foreign_key "grants", "gcp_auth_secrets"
   add_foreign_key "grants", "gcp_id_token_secrets"

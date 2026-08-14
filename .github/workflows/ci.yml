@@ -492,6 +492,10 @@ jobs:
         working-directory: services/googlechatbot
         run: bun run test
 
+      - name: Googlechatbot fixture smoke
+        working-directory: services/googlechatbot
+        run: bun run smoke
+
   githubbot-checks:
     name: Githubbot typecheck and tests
     runs-on: depot-ubuntu-24.04-16

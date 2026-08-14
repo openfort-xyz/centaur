@@ -9,10 +9,23 @@ module ApiServer
 
     def encode_for_principal(principal, now: Time.current)
       channels = principal.slack_channel_ids_by_permission
-      upload_channels = channels.fetch(:upload)
-      download_channels = channels.fetch(:download)
-      history_channels = channels.fetch(:history)
-      return nil if upload_channels.empty? && download_channels.empty? && history_channels.empty?
+      google_chat_spaces = principal.google_chat_space_names_by_permission
+      dm_setup_targets = principal.google_chat_dm_setup_targets
+      return nil if channels.values.all?(&:empty?) && google_chat_spaces.values.all?(&:empty?) && dm_setup_targets.empty?
+
+      claims = { "sub" => principal.oid }
+      unless channels.values.all?(&:empty?)
+        claims["slack"] = {
+          "upload_channels" => channels.fetch(:upload).sort,
+          "download_channels" => channels.fetch(:download).sort,
+          "history_channels" => channels.fetch(:history).sort
+        }
+      end
+      unless google_chat_spaces.values.all?(&:empty?) && dm_setup_targets.empty?
+        claims["google_chat"] = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h do |flag|
+          [ flag.fetch(:claim).to_s, google_chat_spaces.fetch(flag.fetch(:claim)).sort ]
+        end.merge("dm_setup_targets" => dm_setup_targets.sort)
+      end
 
       CentaurJwt::WindowedToken.encode(
         subject_oid: principal.oid,
@@ -21,14 +34,7 @@ module ApiServer
         window_seconds: DEFAULT_WINDOW_SECONDS,
         ttl_seconds: DEFAULT_TTL_SECONDS,
         now: now,
-        claims: {
-          "sub" => principal.oid,
-          "slack" => {
-            "upload_channels" => upload_channels,
-            "download_channels" => download_channels,
-            "history_channels" => history_channels
-          }
-        }
+        claims: claims
       )
     end
 

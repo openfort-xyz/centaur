@@ -78,10 +78,18 @@ Rails.application.routes.draw do
         delete "grants/:grant_id", to: "roles#revoke_grant", as: :revoke_grant
         patch "slack_channel_permissions", to: "roles#update_slack_channel_permissions",
               as: :slack_channel_permissions
+        patch "google_chat_space_permissions", to: "roles#update_google_chat_space_permissions",
+              as: :google_chat_space_permissions
+        patch "google_chat_dm_permissions", to: "roles#update_google_chat_dm_permissions",
+              as: :google_chat_dm_permissions
       end
     end
     delete "slack_channel_permissions/:slack_channel_permission_id", to: "slack_channel_permissions#destroy",
            as: :slack_channel_permission
+    delete "google_chat_space_permissions/:google_chat_space_permission_id",
+           to: "google_chat_permissions#destroy_space", as: :google_chat_space_permission
+    delete "google_chat_dm_permissions/:google_chat_dm_permission_id",
+           to: "google_chat_permissions#destroy_dm", as: :google_chat_dm_permission
   end
   # Role assignments and direct grants managed from the principal detail page. The
   # extra /roles and /grants path segments keep these clear of the show route above
@@ -90,6 +98,8 @@ Rails.application.routes.draw do
     delete "principals/:id",                  to: "principals#destroy", as: :delete_principal
     patch  "principals/:id/sandbox_access",   to: "principals#update_sandbox_access", as: :principal_sandbox_access
     patch  "principals/:id/slack_channel_permissions", to: "principals#update_slack_channel_permissions", as: :principal_slack_channel_permissions
+    patch  "principals/:id/google_chat_space_permissions", to: "principals#update_google_chat_space_permissions", as: :principal_google_chat_space_permissions
+    patch  "principals/:id/google_chat_dm_permissions", to: "principals#update_google_chat_dm_permissions", as: :principal_google_chat_dm_permissions
     post   "principals/:id/roles",            to: "principals#assign_role",   as: :principal_assign_role
     delete "principals/:id/roles/:role_id",   to: "principals#unassign_role", as: :principal_unassign_role
     post   "principals/:id/grants",           to: "principals#grant_secret",  as: :principal_grant_secret
@@ -210,6 +220,10 @@ Rails.application.routes.draw do
         end
         member do
           post "slack_channel_permissions", action: :upsert_slack_channel_permission
+          post "google_chat_space_permissions", action: :upsert_google_chat_space_permission
+          delete "google_chat_space_permissions/:permission_id", action: :destroy_google_chat_space_permission
+          post "google_chat_dm_permissions", action: :upsert_google_chat_dm_permission
+          delete "google_chat_dm_permissions/:permission_id", action: :destroy_google_chat_dm_permission
         end
         # Grants whose grantee is this role. :role_id is the role's oid.
         resources :grants, only: %i[index], controller: :grantee_grants
@@ -225,6 +239,10 @@ Rails.application.routes.draw do
         member do
           get "effective_config"
           post "slack_channel_permissions", action: :upsert_slack_channel_permission
+          post "google_chat_space_permissions", action: :upsert_google_chat_space_permission
+          delete "google_chat_space_permissions/:permission_id", action: :destroy_google_chat_space_permission
+          post "google_chat_dm_permissions", action: :upsert_google_chat_dm_permission
+          delete "google_chat_dm_permissions/:permission_id", action: :destroy_google_chat_dm_permission
         end
         # Role assignments for a principal. :id is the role's oid.
         resources :roles, only: %i[index create destroy], controller: :principal_roles

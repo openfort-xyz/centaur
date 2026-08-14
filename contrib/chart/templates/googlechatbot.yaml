@@ -1,4 +1,18 @@
 {{- if .Values.googlechatbot.enabled }}
+{{- if and .Values.googlechatbot.requireSignedRequests (eq .Values.googlechatbot.ingressMode "chat_api_project") (not .Values.googlechatbot.projectNumber) }}
+{{- fail "googlechatbot chat_api_project ingress requires googlechatbot.projectNumber when signed requests are enabled" }}
+{{- end }}
+{{- if and .Values.googlechatbot.requireSignedRequests (or (eq .Values.googlechatbot.ingressMode "chat_api_url") (eq .Values.googlechatbot.ingressMode "workspace_addon")) (not .Values.googlechatbot.webhookAudience) }}
+{{- fail "googlechatbot URL-based ingress requires googlechatbot.webhookAudience when signed requests are enabled" }}
+{{- end }}
+{{- if and .Values.googlechatbot.requireSignedRequests (eq .Values.googlechatbot.ingressMode "workspace_addon") (not .Values.googlechatbot.addonServiceAccountEmail) }}
+{{- fail "googlechatbot workspace_addon ingress requires googlechatbot.addonServiceAccountEmail when signed requests are enabled" }}
+{{- end }}
+{{- range $name := tuple "GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS" "GOOGLECHATBOT_INGRESS_MODE" "GOOGLECHATBOT_PROJECT_NUMBER" "GOOGLECHATBOT_WEBHOOK_AUDIENCE" "GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL" "GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID" "GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS" }}
+{{- if hasKey $.Values.googlechatbot.extraEnv $name }}
+{{- fail (printf "configure %s through the first-class googlechatbot ingress-auth values, not googlechatbot.extraEnv" $name) }}
+{{- end }}
+{{- end }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- $googleChatBotMetricsAnnotations := dict -}}
 {{- if .Values.googlechatbot.metrics.scrapeAnnotations -}}
@@ -45,6 +59,10 @@ spec:
             # still override). Mirrors the other bots: driven by sandbox.harnessEngine.
             - name: GOOGLECHATBOT_DEFAULT_HARNESS
               value: {{ .Values.sandbox.harnessEngine | quote }}
+            - name: GOOGLECHATBOT_THREAD_HISTORY_LIMIT
+              value: {{ .Values.googlechatbot.threadHistoryLimit | quote }}
+            - name: GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES
+              value: {{ .Values.googlechatbot.attachmentAggregateMaxBytes | quote }}
             # Service account key for the Chat REST client (JWT OAuth2) and bot identity.
             - name: GOOGLE_SERVICE_ACCOUNT_JSON
               valueFrom:
@@ -59,8 +77,69 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sGOOGLECHATBOT_API_KEY" .Values.secretManager.envPrefix }}
                   optional: true
+            # Backward-compatible rollout path for existing Centaur Secrets,
+            # where api-rs uses CHATBOT_API_KEY. Config prefers the dedicated
+            # GOOGLECHATBOT_API_KEY above when both keys exist.
+            - name: CENTAUR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCHATBOT_API_KEY" .Values.secretManager.envPrefix }}
+                  optional: true
+            - name: GOOGLECHATBOT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: GOOGLECHATBOT_STATE_KEY_PREFIX
+              value: {{ .Values.googlechatbot.stateKeyPrefix | quote }}
+            - name: GOOGLECHATBOT_STATE_POOL_MAX
+              value: {{ .Values.googlechatbot.statePool.max | quote }}
+            - name: GOOGLECHATBOT_STATE_POOL_IDLE_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.statePool.idleTimeoutMs | quote }}
+            - name: GOOGLECHATBOT_STATE_POOL_CONNECT_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.statePool.connectTimeoutMs | quote }}
+            - name: GOOGLECHATBOT_STATE_CONNECT_INITIAL_DELAY_MS
+              value: {{ .Values.googlechatbot.stateConnect.initialDelayMs | quote }}
+            - name: GOOGLECHATBOT_STATE_CONNECT_MAX_DELAY_MS
+              value: {{ .Values.googlechatbot.stateConnect.maxDelayMs | quote }}
+            - name: GOOGLECHATBOT_RECOVERY_MAX_OBLIGATION_AGE_MS
+              value: {{ .Values.googlechatbot.recovery.maxObligationAgeMs | quote }}
+            - name: GOOGLECHATBOT_RECOVERY_FAILURE_BUDGET
+              value: {{ .Values.googlechatbot.recovery.failureBudget | quote }}
+            - name: GOOGLECHATBOT_RECOVERY_SWEEP_INTERVAL_MS
+              value: {{ .Values.googlechatbot.recovery.sweepIntervalMs | quote }}
+            # Private api-rs -> googlechatbot credential. Never forwarded to a
+            # workflow or sandbox; NetworkPolicy admits api-rs only.
+            - name: GOOGLECHATBOT_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLECHATBOT_INTERNAL_API_KEY" .Values.secretManager.envPrefix }}
             - name: CHAT_EVENTS_PATH
               value: {{ .Values.googlechatbot.eventsPath | quote }}
+            - name: GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS
+              value: {{ .Values.googlechatbot.requireSignedRequests | quote }}
+            - name: GOOGLECHATBOT_INGRESS_MODE
+              value: {{ .Values.googlechatbot.ingressMode | quote }}
+            - name: GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS
+              value: {{ .Values.googlechatbot.signedRequestMaxAgeSeconds | quote }}
+{{- if .Values.googlechatbot.projectNumber }}
+            - name: GOOGLECHATBOT_PROJECT_NUMBER
+              value: {{ .Values.googlechatbot.projectNumber | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.webhookAudience }}
+            - name: GOOGLECHATBOT_WEBHOOK_AUDIENCE
+              value: {{ .Values.googlechatbot.webhookAudience | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.addonServiceAccountEmail }}
+            - name: GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL
+              value: {{ .Values.googlechatbot.addonServiceAccountEmail | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.addonOauthClientId }}
+            - name: GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID
+              value: {{ .Values.googlechatbot.addonOauthClientId | quote }}
+{{- end }}
 {{- if .Values.googlechatbot.allowedDomain }}
             - name: GOOGLECHATBOT_ALLOWED_DOMAIN
               value: {{ .Values.googlechatbot.allowedDomain | quote }}
@@ -68,6 +147,14 @@ spec:
 {{- if .Values.googlechatbot.uploadUser }}
             - name: GOOGLECHATBOT_UPLOAD_USER
               value: {{ .Values.googlechatbot.uploadUser | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.reactionReadUser }}
+            - name: GOOGLECHATBOT_REACTION_READ_USER
+              value: {{ .Values.googlechatbot.reactionReadUser | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.driveDownloadUser }}
+            - name: GOOGLECHATBOT_DRIVE_DOWNLOAD_USER
+              value: {{ .Values.googlechatbot.driveDownloadUser | quote }}
 {{- end }}
 {{- if .Values.googlechatbot.spaceDefaults }}
             # Per-space default harness / model / provider / reasoning, keyed by
@@ -129,12 +216,12 @@ spec:
               name: http
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health/ready
               port: 3002
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
-              path: /health
+              path: /health/live
               port: 3002
             timeoutSeconds: 5
           securityContext:

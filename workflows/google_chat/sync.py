@@ -1,20 +1,23 @@
 """Workflow: sync Google Chat space history into Postgres.
 
-Mirrors the Slack ETL: enumerate the spaces the Chat app is a member of, then
-page each space's message history into raw ``google_chat_sync_*`` tables. A
-per-space ``createTime`` watermark makes runs incremental; on first run (no
-watermark) it walks the full history oldest-first. A bounded page budget lets a
-large first backfill converge across several runs while staying current after.
+Mirrors the Slack ETL: enumerate spaces the Chat app is a member of, then page
+each space's message history into raw ``google_chat_sync_*`` tables. Scheduled
+runs rescan history because Chat's list filter is based on ``createTime`` and
+cannot select old messages edited later. Explicit manual ``since`` runs remain
+bounded by a per-space watermark. A page budget persists continuation tokens so
+large scans converge across several runs.
 
-Reads as the Chat app via GOOGLE_SERVICE_ACCOUNT_JSON + chat.app.messages.readonly
-(see workflows/google_chat/client.py), so coverage is limited to app-member
-spaces and requires the admin Marketplace install.
+Reads shared spaces as the Chat app through iron-proxy. Optional DM reads cross
+the WorkflowContext RPC to api-rs and then googlechatbot, which alone holds the
+DWD service-account credential.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -23,6 +26,17 @@ from workflows.etl_metrics import (
     record_etl_items_failed,
     record_etl_items_seen,
     record_etl_items_upserted,
+)
+from workflows.google_chat.metrics import (
+    observe_run_duration,
+    record_api_outcome,
+    record_items,
+    record_run,
+    record_space_failure,
+    set_continuation_age,
+    set_failed_spaces,
+    set_last_failure_time,
+    set_watermark_lag,
 )
 from api.workflow_engine import WorkflowContext
 from workflows.slack.shared import env_flag_enabled, positive_int
@@ -66,6 +80,7 @@ class Input:
     watermark_overlap_seconds: int = DEFAULT_WATERMARK_OVERLAP_SECONDS
     max_pages_per_run: int = DEFAULT_MAX_PAGES_PER_RUN
     space_ids: list[str] = field(default_factory=list)
+    dm_subjects: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -83,17 +98,55 @@ class GoogleChatSyncClient(Protocol):
         page_size: int,
         page_token: str | None = None,
         filter: str | None = None,
+        show_deleted: bool = False,
     ) -> dict[str, Any]: ...
 
     def list_members(
         self, space_name: str, *, page_size: int, page_token: str | None = None
     ) -> dict[str, Any]: ...
 
+    def list_reactions(
+        self,
+        message_name: str,
+        *,
+        page_size: int,
+        page_token: str | None = None,
+    ) -> dict[str, Any]: ...
 
-def _client() -> GoogleChatSyncClient:
+
+def _client(ctx: WorkflowContext) -> GoogleChatSyncClient:
     from workflows.google_chat.client import GoogleChatReadonlyClient
 
-    return GoogleChatReadonlyClient()
+    return GoogleChatReadonlyClient(ctx)
+
+
+def _delegated_client(ctx: WorkflowContext, subject: str) -> GoogleChatSyncClient:
+    from workflows.google_chat.client import GoogleChatDelegatedClient
+
+    return GoogleChatDelegatedClient(ctx, subject)
+
+
+async def _call_client(method: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    result = method(*args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result if isinstance(result, dict) else {}
+
+
+def _dm_subject_allowlist() -> set[str]:
+    if not env_flag_enabled("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", default=False):
+        return set()
+    return {
+        value.strip().lower()
+        for value in (os.getenv("GOOGLE_CHAT_DWD_DM_SUBJECTS") or "").split(",")
+        if value.strip()
+    }
+
+
+def _selected_dm_subjects(requested: list[str]) -> list[str]:
+    allowlisted = _dm_subject_allowlist()
+    selected = {value.strip().lower() for value in requested if value.strip()}
+    return sorted(allowlisted & selected if selected else allowlisted)
 
 
 def _parse_datetime(value: str | None) -> dt.datetime | None:
@@ -116,6 +169,11 @@ def _resource_id(resource_name: str) -> str:
     return resource_name.rsplit("/", 1)[-1] if resource_name else ""
 
 
+def _space_type(space: dict[str, Any]) -> str:
+    value = str(space.get("spaceType") or space.get("type") or "").upper()
+    return {"ROOM": "SPACE", "DM": "DIRECT_MESSAGE"}.get(value, value)
+
+
 def _workflow_run_id_to_sync_run_id(workflow_run_id: str) -> str:
     safe = "".join(char if char.isalnum() else "_" for char in workflow_run_id)
     return f"google_chat_sync_{safe}"
@@ -128,16 +186,66 @@ def _scope_ref(space_id: str, reason: str | None = None) -> dict[str, str]:
     return result
 
 
+def _safe_error(error: Exception) -> str:
+    message = str(error).lower()
+    if "429" in message or "rate limit" in message:
+        return "Google Chat API rate limited"
+    if "403" in message or "permission" in message or "denied" in message:
+        return "Google Chat API permission denied"
+    return "Google Chat API request failed"
+
+
 def _card_fallback_text(message: dict[str, Any]) -> str:
     """Plain-text stand-in for app messages whose content lives in cards.
 
     Chat apps (GitHub, alerting integrations, our own bots) often post with an
-    empty top-level `text` and put everything in `cardsV2` widgets — the Chat
-    analogue of Slack's legacy attachment-only app messages (upstream #887).
-    Collect the human-readable widget strings so the message is captured
-    instead of dropped.
+    empty top-level `text` and put everything in `cardsV2` (or deprecated
+    `cards`) widgets — the Chat analogue of Slack's legacy attachment-only app
+    messages (upstream #887). Collect documented rendered/default/accessibility
+    strings so the message is captured instead of dropped.
     """
     parts: list[str] = []
+
+    def _push(value: Any) -> None:
+        if isinstance(value, str) and (value := value.strip()):
+            parts.append(value)
+
+    def _push_fields(value: Any, fields: tuple[str, ...]) -> None:
+        if isinstance(value, dict):
+            for field in fields:
+                _push(value.get(field))
+
+    def _collect_icon(value: Any) -> None:
+        if isinstance(value, dict):
+            _push(value.get("altText"))
+
+    def _collect_text_paragraph(value: Any) -> None:
+        if isinstance(value, dict):
+            _push(value.get("text"))
+
+    def _collect_on_click(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        menu = value.get("overflowMenu")
+        if not isinstance(menu, dict) or not isinstance(menu.get("items"), list):
+            return
+        for item in menu["items"]:
+            if isinstance(item, dict):
+                _collect_icon(item.get("startIcon"))
+                _push(item.get("text"))
+
+    def _collect_button(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        _push(value.get("text"))
+        _collect_icon(value.get("icon"))
+        _push(value.get("altText"))
+        _collect_on_click(value.get("onClick"))
+
+    def _collect_buttons(value: Any) -> None:
+        if isinstance(value, dict) and isinstance(value.get("buttons"), list):
+            for button in value["buttons"]:
+                _collect_button(button)
 
     def _collect_widgets(widgets: Any) -> None:
         if not isinstance(widgets, list):
@@ -145,63 +253,186 @@ def _card_fallback_text(message: dict[str, Any]) -> str:
         for widget in widgets:
             if not isinstance(widget, dict):
                 continue
-            text_paragraph = widget.get("textParagraph")
-            if isinstance(text_paragraph, dict):
-                text = str(text_paragraph.get("text") or "").strip()
-                if text:
-                    parts.append(text)
+            _collect_text_paragraph(widget.get("textParagraph"))
+            image = widget.get("image")
+            if isinstance(image, dict):
+                _push(image.get("altText"))
+                _collect_on_click(image.get("onClick"))
+
             decorated = widget.get("decoratedText")
             if isinstance(decorated, dict):
-                pieces = [
-                    str(decorated.get(key) or "").strip()
-                    for key in ("topLabel", "text", "bottomLabel")
-                ]
-                joined = "\n".join(piece for piece in pieces if piece)
-                if joined:
-                    parts.append(joined)
+                _collect_icon(decorated.get("icon"))
+                _collect_icon(decorated.get("startIcon"))
+                _push(decorated.get("topLabel"))
+                _collect_text_paragraph(decorated.get("topLabelText"))
+                _push(decorated.get("text"))
+                _collect_text_paragraph(decorated.get("contentText"))
+                _push(decorated.get("bottomLabel"))
+                _collect_text_paragraph(decorated.get("bottomLabelText"))
+                _collect_button(decorated.get("button"))
+                _collect_icon(decorated.get("endIcon"))
+                _collect_on_click(decorated.get("onClick"))
+
+            _collect_buttons(widget.get("buttonList"))
+
+            text_input = widget.get("textInput")
+            if isinstance(text_input, dict):
+                _push_fields(
+                    text_input, ("label", "value", "hintText", "placeholderText")
+                )
+                suggestions = text_input.get("initialSuggestions")
+                if isinstance(suggestions, dict) and isinstance(
+                    suggestions.get("items"), list
+                ):
+                    for item in suggestions["items"]:
+                        if isinstance(item, dict):
+                            _push(item.get("text"))
+
+            selection = widget.get("selectionInput")
+            if isinstance(selection, dict):
+                _push_fields(selection, ("label", "hintText"))
+                if isinstance(selection.get("items"), list):
+                    for item in selection["items"]:
+                        _push_fields(item, ("text", "bottomText"))
+
+            _push_fields(widget.get("dateTimePicker"), ("label", "valueMsEpoch"))
+
+            grid = widget.get("grid")
+            if isinstance(grid, dict):
+                _push(grid.get("title"))
+                if isinstance(grid.get("items"), list):
+                    for item in grid["items"]:
+                        if not isinstance(item, dict):
+                            continue
+                        _push_fields(item, ("title", "subtitle"))
+                        _collect_icon(item.get("image"))
+                _collect_on_click(grid.get("onClick"))
+
             columns = widget.get("columns")
             if isinstance(columns, dict):
                 for item in columns.get("columnItems") or []:
                     if isinstance(item, dict):
                         _collect_widgets(item.get("widgets"))
 
+            carousel = widget.get("carousel")
+            if isinstance(carousel, dict):
+                for card in carousel.get("carouselCards") or []:
+                    if isinstance(card, dict):
+                        _collect_widgets(card.get("widgets"))
+                        _collect_widgets(card.get("footerWidgets"))
+
+            chip_list = widget.get("chipList")
+            if isinstance(chip_list, dict):
+                for chip in chip_list.get("chips") or []:
+                    if not isinstance(chip, dict):
+                        continue
+                    _push(chip.get("label"))
+                    _collect_icon(chip.get("icon"))
+                    _push(chip.get("altText"))
+                    _collect_on_click(chip.get("onClick"))
+
+    def _collect_header(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        title = str(value.get("title") or "").strip()
+        subtitle = str(value.get("subtitle") or "").strip()
+        joined = " — ".join(piece for piece in (title, subtitle) if piece)
+        if joined:
+            parts.append(joined)
+        _push(value.get("imageAltText"))
+
+    def _collect_card(card: Any) -> None:
+        if not isinstance(card, dict):
+            return
+        _collect_header(card.get("header"))
+        _collect_header(card.get("peekCardHeader"))
+        for action in card.get("cardActions") or []:
+            if isinstance(action, dict):
+                _push(action.get("actionLabel"))
+        for section in card.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            _push(section.get("header"))
+            collapse = section.get("collapseControl")
+            if isinstance(collapse, dict):
+                _collect_button(collapse.get("expandButton"))
+                _collect_button(collapse.get("collapseButton"))
+            _collect_widgets(section.get("widgets"))
+        footer = card.get("fixedFooter")
+        if isinstance(footer, dict):
+            _collect_button(footer.get("primaryButton"))
+            _collect_button(footer.get("secondaryButton"))
+
+    def _collect_legacy_button(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        text_button = value.get("textButton")
+        image_button = value.get("imageButton")
+        if isinstance(text_button, dict):
+            _push(text_button.get("text"))
+        if isinstance(image_button, dict):
+            _push(image_button.get("name"))
+
+    def _collect_legacy_card(card: Any) -> None:
+        if not isinstance(card, dict):
+            return
+        _collect_header(card.get("header"))
+        for action in card.get("cardActions") or []:
+            if isinstance(action, dict):
+                _push(action.get("actionLabel"))
+        for section in card.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            _push(section.get("header"))
+            for widget in section.get("widgets") or []:
+                if not isinstance(widget, dict):
+                    continue
+                _collect_text_paragraph(widget.get("textParagraph"))
+                key_value = widget.get("keyValue")
+                if isinstance(key_value, dict):
+                    _push_fields(key_value, ("topLabel", "content", "bottomLabel"))
+                    _collect_legacy_button(key_value.get("button"))
+                for button in widget.get("buttons") or []:
+                    _collect_legacy_button(button)
+
     for entry in message.get("cardsV2") or []:
         if not isinstance(entry, dict):
             continue
-        card = entry.get("card")
-        if not isinstance(card, dict):
-            continue
-        header = card.get("header")
-        if isinstance(header, dict):
-            pieces = [
-                str(header.get(key) or "").strip() for key in ("title", "subtitle")
-            ]
-            joined = " — ".join(piece for piece in pieces if piece)
-            if joined:
-                parts.append(joined)
-        for section in card.get("sections") or []:
-            if isinstance(section, dict):
-                header_text = str(section.get("header") or "").strip()
-                if header_text:
-                    parts.append(header_text)
-                _collect_widgets(section.get("widgets"))
+        _collect_card(entry.get("card"))
+    for card in message.get("cards") or []:
+        _collect_legacy_card(card)
     return "\n".join(parts)
 
 
 def _message_text(message: dict[str, Any]) -> str:
-    text = str(message.get("text") or message.get("formattedText") or "").strip()
+    text = str(
+        message.get("text")
+        or message.get("formattedText")
+        or message.get("fallbackText")
+        or ""
+    ).strip()
     if text:
         return text
-    return _card_fallback_text(message).strip()
+    card_text = _card_fallback_text(message).strip()
+    if card_text:
+        return card_text
+    return "\n".join(
+        str(gif.get("uri") or "").strip()
+        for gif in message.get("attachedGifs") or []
+        if isinstance(gif, dict) and str(gif.get("uri") or "").strip()
+    )
 
 
-def _member_display_names(client: GoogleChatSyncClient, space_name: str) -> dict[str, str]:
-    """Map 'users/<id>' -> display name. Best effort; empty on auth failure."""
+async def _member_directory(
+    client: GoogleChatSyncClient, space_name: str
+) -> dict[str, str]:
+    """Return canonical-user display names; Chat membership resources expose no email."""
     names: dict[str, str] = {}
     page_token: str | None = None
     try:
         while True:
-            page = client.list_members(
+            page = await _call_client(
+                client.list_members,
                 space_name, page_size=DEFAULT_PAGE_SIZE, page_token=page_token
             )
             for membership in page.get("memberships", []):
@@ -220,45 +451,69 @@ def _member_display_names(client: GoogleChatSyncClient, space_name: str) -> dict
     return names
 
 
-async def _load_checkpoint(pool, space_id: str) -> dict[str, Any] | None:
+async def _load_checkpoint(
+    pool, space_id: str, owner_email: str = ""
+) -> dict[str, Any] | None:
     row = await pool.fetchrow(
-        "SELECT watermark_time, last_error FROM google_chat_sync_checkpoints "
-        "WHERE space_id = $1",
+        "SELECT watermark_time, last_error, continuation_token, "
+        "continuation_filter, continuation_started_at, continuation_updated_at "
+        "FROM google_chat_sync_checkpoints WHERE owner_email = $1 AND space_id = $2",
+        owner_email,
         space_id,
     )
     return dict(row) if row else None
 
 
 async def _update_checkpoint_success(
-    pool, *, space_id: str, watermark_time: dt.datetime | None, run_id: str
+    pool,
+    *,
+    space_id: str,
+    owner_email: str,
+    watermark_time: dt.datetime | None,
+    run_id: str,
+    continuation_token: str = "",
+    continuation_filter: str = "",
+    continuation_started_at: dt.datetime | None = None,
 ) -> None:
     await pool.execute(
         "INSERT INTO google_chat_sync_checkpoints ("
-        "space_id, watermark_time, last_run_id, last_success_at, last_error, updated_at"
-        ") VALUES ($1, $2, $3, NOW(), '', NOW()) "
-        "ON CONFLICT (space_id) DO UPDATE SET "
+        "owner_email, space_id, watermark_time, last_run_id, last_success_at, last_error, "
+        "continuation_token, continuation_filter, continuation_started_at, "
+        "continuation_updated_at, updated_at"
+        ") VALUES ($1, $2, $3, $4, NOW(), '', $5, $6, $7, "
+        "CASE WHEN $5 = '' THEN NULL ELSE NOW() END, NOW()) "
+        "ON CONFLICT (owner_email, space_id) DO UPDATE SET "
         "watermark_time = COALESCE(EXCLUDED.watermark_time, google_chat_sync_checkpoints.watermark_time), "
         "last_run_id = EXCLUDED.last_run_id, "
         "last_success_at = NOW(), "
         "last_error = '', "
+        "continuation_token = EXCLUDED.continuation_token, "
+        "continuation_filter = EXCLUDED.continuation_filter, "
+        "continuation_started_at = EXCLUDED.continuation_started_at, "
+        "continuation_updated_at = EXCLUDED.continuation_updated_at, "
         "updated_at = NOW()",
+        owner_email,
         space_id,
         watermark_time,
         run_id,
+        continuation_token,
+        continuation_filter,
+        continuation_started_at,
     )
 
 
 async def _update_checkpoint_failure(
-    pool, *, space_id: str, run_id: str, error: str
+    pool, *, space_id: str, owner_email: str, run_id: str, error: str
 ) -> None:
     await pool.execute(
         "INSERT INTO google_chat_sync_checkpoints ("
-        "space_id, last_run_id, last_error, updated_at"
-        ") VALUES ($1, $2, $3, NOW()) "
-        "ON CONFLICT (space_id) DO UPDATE SET "
+        "owner_email, space_id, last_run_id, last_error, updated_at"
+        ") VALUES ($1, $2, $3, $4, NOW()) "
+        "ON CONFLICT (owner_email, space_id) DO UPDATE SET "
         "last_run_id = EXCLUDED.last_run_id, "
         "last_error = EXCLUDED.last_error, "
         "updated_at = NOW()",
+        owner_email,
         space_id,
         run_id,
         error,
@@ -323,26 +578,36 @@ async def _record_run_finish(
     )
 
 
-async def _upsert_space(pool, *, space: dict[str, Any], run_id: str) -> str:
+async def _upsert_space(
+    pool,
+    *,
+    space: dict[str, Any],
+    run_id: str,
+    owner_email: str = "",
+    participant_emails: list[str] | None = None,
+) -> str:
     space_id = _resource_id(str(space.get("name") or ""))
     await pool.execute(
         "INSERT INTO google_chat_sync_spaces ("
-        "space_id, space_name, display_name, space_type, raw_payload, "
-        "source_run_id, last_seen_at, last_error, updated_at"
-        ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, NOW(), '', NOW()) "
-        "ON CONFLICT (space_id) DO UPDATE SET "
+        "owner_email, space_id, space_name, display_name, space_type, participant_emails, "
+        "raw_payload, source_run_id, last_seen_at, last_error, updated_at"
+        ") VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, NOW(), '', NOW()) "
+        "ON CONFLICT (owner_email, space_id) DO UPDATE SET "
         "space_name = EXCLUDED.space_name, "
         "display_name = EXCLUDED.display_name, "
         "space_type = EXCLUDED.space_type, "
+        "participant_emails = EXCLUDED.participant_emails, "
         "raw_payload = EXCLUDED.raw_payload, "
         "source_run_id = EXCLUDED.source_run_id, "
         "last_seen_at = NOW(), "
         "last_error = '', "
         "updated_at = NOW()",
+        owner_email,
         space_id,
         str(space.get("name") or ""),
         str(space.get("displayName") or ""),
-        str(space.get("type") or space.get("spaceType") or ""),
+        _space_type(space),
+        participant_emails or [],
         canonical_json(space),
         run_id,
     )
@@ -356,13 +621,14 @@ async def _upsert_message(
     message: dict[str, Any],
     member_names: dict[str, str],
     run_id: str,
+    owner_email: str = "",
 ) -> bool:
     message_name = str(message.get("name") or "")
     message_id = _resource_id(message_name)
     if not message_id:
         return False
     text = _message_text(message)
-    if not text:
+    if not text and not message.get("attachment"):
         return False
 
     thread = message.get("thread") if isinstance(message.get("thread"), dict) else {}
@@ -378,13 +644,13 @@ async def _upsert_message(
 
     await pool.execute(
         "INSERT INTO google_chat_sync_messages ("
-        "space_id, message_id, message_name, thread_id, sender_id, sender_name, "
+        "owner_email, space_id, message_id, message_name, thread_id, sender_id, sender_name, "
         "sender_type, text_content, source_create_time, "
         "source_last_update_time, raw_payload, source_run_id, last_seen_at, "
         "last_error, updated_at"
         ") VALUES ("
-        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, NOW(), '', NOW()"
-        ") ON CONFLICT (space_id, message_id) DO UPDATE SET "
+        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW(), '', NOW()"
+        ") ON CONFLICT (owner_email, space_id, message_id) DO UPDATE SET "
         "message_name = EXCLUDED.message_name, "
         "thread_id = EXCLUDED.thread_id, "
         "sender_id = EXCLUDED.sender_id, "
@@ -398,6 +664,7 @@ async def _upsert_message(
         "last_seen_at = NOW(), "
         "last_error = '', "
         "updated_at = NOW()",
+        owner_email,
         space_id,
         message_id,
         message_name,
@@ -414,6 +681,148 @@ async def _upsert_message(
     return True
 
 
+async def _replace_attachments(
+    pool,
+    *,
+    owner_email: str,
+    space_id: str,
+    message_id: str,
+    message: dict[str, Any],
+    run_id: str,
+) -> int:
+    attachment_ids: list[str] = []
+    for index, attachment in enumerate(message.get("attachment") or []):
+        if not isinstance(attachment, dict):
+            continue
+        data_ref = attachment.get("attachmentDataRef")
+        drive_ref = attachment.get("driveDataRef")
+        data_ref = data_ref if isinstance(data_ref, dict) else {}
+        drive_ref = drive_ref if isinstance(drive_ref, dict) else {}
+        attachment_name = str(attachment.get("name") or data_ref.get("resourceName") or "")
+        attachment_id = (
+            _resource_id(attachment_name)
+            or str(drive_ref.get("driveFileId") or "")
+            or f"attachment-{index}"
+        )
+        attachment_ids.append(attachment_id)
+        await pool.execute(
+            "INSERT INTO google_chat_sync_attachments ("
+            "owner_email, space_id, message_id, attachment_id, attachment_name, "
+            "content_name, content_type, source_uri, download_uri, size_bytes, "
+            "content_text, raw_payload, source_run_id, last_seen_at, updated_at"
+            ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,NOW(),NOW()) "
+            "ON CONFLICT (owner_email, space_id, message_id, attachment_id) DO UPDATE SET "
+            "attachment_name=EXCLUDED.attachment_name, content_name=EXCLUDED.content_name, "
+            "content_type=EXCLUDED.content_type, source_uri=EXCLUDED.source_uri, "
+            "download_uri=EXCLUDED.download_uri, size_bytes=EXCLUDED.size_bytes, "
+            "content_text=EXCLUDED.content_text, raw_payload=EXCLUDED.raw_payload, "
+            "source_run_id=EXCLUDED.source_run_id, last_seen_at=NOW(), updated_at=NOW()",
+            owner_email,
+            space_id,
+            message_id,
+            attachment_id,
+            attachment_name,
+            str(attachment.get("contentName") or ""),
+            str(attachment.get("contentType") or ""),
+            "",
+            str(attachment.get("downloadUri") or ""),
+            None,
+            "",
+            canonical_json(attachment),
+            run_id,
+        )
+    await pool.execute(
+        "DELETE FROM google_chat_sync_attachments WHERE owner_email=$1 AND space_id=$2 "
+        "AND message_id=$3 AND NOT (attachment_id = ANY($4::text[]))",
+        owner_email,
+        space_id,
+        message_id,
+        attachment_ids,
+    )
+    return len(attachment_ids)
+
+
+async def _replace_reactions(
+    pool,
+    *,
+    client: GoogleChatSyncClient,
+    owner_email: str,
+    space_id: str,
+    message_id: str,
+    message_name: str,
+    run_id: str,
+) -> int:
+    reaction_ids: list[str] = []
+    page_token: str | None = None
+    while True:
+        page = await _call_client(
+            client.list_reactions,
+            message_name, page_size=DEFAULT_PAGE_SIZE, page_token=page_token
+        )
+        for reaction in page.get("emojiReactions") or page.get("reactions") or []:
+            if not isinstance(reaction, dict):
+                continue
+            reaction_name = str(reaction.get("name") or "")
+            user = reaction.get("user") if isinstance(reaction.get("user"), dict) else {}
+            emoji = reaction.get("emoji") if isinstance(reaction.get("emoji"), dict) else {}
+            custom = emoji.get("customEmoji") if isinstance(emoji.get("customEmoji"), dict) else {}
+            reaction_id = _resource_id(reaction_name)
+            if not reaction_id:
+                continue
+            reaction_ids.append(reaction_id)
+            await pool.execute(
+                "INSERT INTO google_chat_sync_reactions ("
+                "owner_email,space_id,message_id,reaction_id,user_id,emoji_unicode,"
+                "custom_emoji_uid,raw_payload,source_run_id,last_seen_at,updated_at"
+                ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,NOW(),NOW()) "
+                "ON CONFLICT (owner_email,space_id,message_id,reaction_id) DO UPDATE SET "
+                "user_id=EXCLUDED.user_id,emoji_unicode=EXCLUDED.emoji_unicode,"
+                "custom_emoji_uid=EXCLUDED.custom_emoji_uid,raw_payload=EXCLUDED.raw_payload,"
+                "source_run_id=EXCLUDED.source_run_id,last_seen_at=NOW(),updated_at=NOW()",
+                owner_email,
+                space_id,
+                message_id,
+                reaction_id,
+                str(user.get("name") or ""),
+                str(emoji.get("unicode") or ""),
+                str(custom.get("uid") or ""),
+                canonical_json(reaction),
+                run_id,
+            )
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+    await pool.execute(
+        "DELETE FROM google_chat_sync_reactions WHERE owner_email=$1 AND space_id=$2 "
+        "AND message_id=$3 AND NOT (reaction_id = ANY($4::text[]))",
+        owner_email,
+        space_id,
+        message_id,
+        reaction_ids,
+    )
+    return len(reaction_ids)
+
+
+async def _delete_message(
+    pool, *, owner_email: str, space_id: str, message_id: str
+) -> None:
+    """Remove retained content when a showDeleted tombstone arrives."""
+    for table in ("google_chat_sync_attachments", "google_chat_sync_reactions"):
+        await pool.execute(
+            f"DELETE FROM {table} WHERE owner_email=$1 AND space_id=$2 AND message_id=$3",
+            owner_email,
+            space_id,
+            message_id,
+        )
+    await pool.execute(
+        "DELETE FROM google_chat_sync_messages "
+        "WHERE owner_email=$1 AND space_id=$2 AND message_id=$3",
+        owner_email,
+        space_id,
+        message_id,
+    )
+
+
 async def _sync_space(
     pool,
     *,
@@ -425,49 +834,104 @@ async def _sync_space(
     max_pages: int,
     explicit_since: dt.datetime | None,
     counts: dict[str, int],
+    owner_email: str = "",
 ) -> dt.datetime | None:
     """Page one space's messages into the sync tables; return its new watermark."""
-    space_id = await _upsert_space(pool, space=space, run_id=run_id)
+    space_id = _resource_id(str(space.get("name") or ""))
     space_name = str(space.get("name") or f"spaces/{space_id}")
+    member_names = await _member_directory(client, space_name)
+    await _upsert_space(
+        pool,
+        space=space,
+        run_id=run_id,
+        owner_email=owner_email,
+        # Google exposes the verified delegated owner email, but not other
+        # members' emails. Canonical member names remain in message sender IDs.
+        participant_emails=[owner_email] if owner_email else [],
+    )
 
-    checkpoint = await _load_checkpoint(pool, space_id)
+    checkpoint = await _load_checkpoint(pool, space_id, owner_email)
     checkpoint_watermark: dt.datetime | None = None
     if checkpoint and checkpoint.get("watermark_time"):
         checkpoint_watermark = checkpoint["watermark_time"].astimezone(dt.timezone.utc)
-    watermark = explicit_since
-    if watermark is None:
-        watermark = checkpoint_watermark
-    effective = watermark
-    if effective is not None:
-        effective = effective - dt.timedelta(seconds=overlap_seconds)
-    msg_filter = f'createTime > "{_rfc3339(effective)}"' if effective else None
-
-    member_names = _member_display_names(client, space_name)
+    stored_token = str((checkpoint or {}).get("continuation_token") or "")
+    stored_filter = str((checkpoint or {}).get("continuation_filter") or "")
+    continuation_started_at = (checkpoint or {}).get("continuation_started_at")
+    watermark = explicit_since if explicit_since is not None else checkpoint_watermark
+    effective = watermark - dt.timedelta(seconds=overlap_seconds) if watermark else None
+    # Scheduled runs rescan history so old edits converge; createTime cannot
+    # select messages edited after their creation. Explicit `since` remains a
+    # bounded manual-backfill option.
+    msg_filter = stored_filter if stored_token else (
+        f'createTime > "{_rfc3339(effective)}"' if explicit_since and effective else ""
+    )
 
     successful_watermark: dt.datetime | None = None
-    page_token: str | None = None
+    page_token: str | None = stored_token or None
     pages = 0
     while True:
-        page = client.list_messages(
-            space_name,
-            page_size=page_size,
-            page_token=page_token,
-            filter=msg_filter,
-        )
+        try:
+            page = await _call_client(
+                client.list_messages,
+                space_name,
+                page_size=page_size,
+                page_token=page_token,
+                filter=msg_filter or None,
+                show_deleted=True,
+            )
+            record_api_outcome("list_messages", "success")
+        except Exception as exc:
+            outcome = "rate_limited" if "429" in str(exc) else "error"
+            record_api_outcome("list_messages", outcome)
+            raise
         messages = [m for m in page.get("messages", []) if isinstance(m, dict)]
         counts["messages_seen"] += len(messages)
         record_etl_items_seen("google_chat", "message", "message", len(messages))
+        record_items("message", len(messages))
         for message in messages:
+            message_id = _resource_id(str(message.get("name") or ""))
+            if message_id and (message.get("deleteTime") or message.get("deletionMetadata")):
+                await _delete_message(
+                    pool,
+                    owner_email=owner_email,
+                    space_id=space_id,
+                    message_id=message_id,
+                )
+                continue
             upserted = await _upsert_message(
                 pool,
                 space_id=space_id,
                 message=message,
                 member_names=member_names,
                 run_id=run_id,
+                owner_email=owner_email,
             )
             if upserted:
                 counts["messages_upserted"] += 1
                 record_etl_items_upserted("google_chat", "message", "message", 1)
+                attachment_count = await _replace_attachments(
+                    pool,
+                    owner_email=owner_email,
+                    space_id=space_id,
+                    message_id=message_id,
+                    message=message,
+                    run_id=run_id,
+                )
+                reaction_count = await _replace_reactions(
+                    pool,
+                    client=client,
+                    owner_email=owner_email,
+                    space_id=space_id,
+                    message_id=message_id,
+                    message_name=str(message.get("name") or ""),
+                    run_id=run_id,
+                )
+                counts["files_processed"] = counts.get("files_processed", 0) + attachment_count
+                counts["reactions_processed"] = (
+                    counts.get("reactions_processed", 0) + reaction_count
+                )
+                record_items("file", attachment_count)
+                record_items("reaction", reaction_count)
             created = _parse_datetime(str(message.get("createTime") or ""))
             if created and (
                 successful_watermark is None or created > successful_watermark
@@ -491,19 +955,41 @@ async def _sync_space(
         and successful_watermark < checkpoint_watermark
     ):
         successful_watermark = checkpoint_watermark
+    continuing = bool(page_token)
+    if continuing and continuation_started_at is None:
+        continuation_started_at = dt.datetime.now(dt.timezone.utc)
     await _update_checkpoint_success(
         pool,
         space_id=space_id,
+        owner_email=owner_email,
         watermark_time=successful_watermark,
         run_id=run_id,
+        continuation_token=str(page_token or ""),
+        continuation_filter=msg_filter if continuing else "",
+        continuation_started_at=continuation_started_at if continuing else None,
     )
+    if continuing and continuation_started_at:
+        set_continuation_age(
+            (dt.datetime.now(dt.timezone.utc) - continuation_started_at).total_seconds()
+        )
+    else:
+        set_continuation_age(0)
+    final_watermark = successful_watermark or checkpoint_watermark
+    if final_watermark:
+        set_watermark_lag(
+            (dt.datetime.now(dt.timezone.utc) - final_watermark).total_seconds()
+        )
     return successful_watermark
 
 
 async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     """Sync Google Chat space history into raw Chat sync tables."""
+    started_at = time.monotonic()
+    record_run("started")
     if not env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED", default=False):
         ctx.log("google_chat_sync_skipped_disabled")
+        record_run("skipped")
+        observe_run_duration("skipped", time.monotonic() - started_at)
         return {"status": "skipped", "reason": "google_chat_etl_disabled"}
 
     page_size = positive_int(inp.limit, DEFAULT_PAGE_SIZE)
@@ -517,7 +1003,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     include_types = _include_space_types()
     # Pinned spaces come from the input, falling back to GOOGLE_CHAT_SPACE_IDS
     # (comma-separated) so scheduled runs — which pass no input — still cover the
-    # spaces the app reads but is not a listed member of. _resource_id lets either
+    # known member spaces without relying on spaces.list. _resource_id lets either
     # a bare id or a full "spaces/<id>" resource name be configured.
     explicit_space_ids = {_resource_id(sid.strip()) for sid in inp.space_ids if sid.strip()}
     if not explicit_space_ids:
@@ -536,17 +1022,15 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         metadata={**inp.metadata, "page_size": page_size, "max_pages": max_pages},
     )
 
-    client = _client()
+    client = _client(ctx)
 
-    spaces: list[dict[str, Any]] = []
+    work: list[tuple[GoogleChatSyncClient, dict[str, Any], str]] = []
 
-    # Pinned spaces: sync them directly without spaces.list. An app only appears
-    # in spaces.list for spaces it is a formal *member* of; it can still read
-    # message history (with chat.app.messages.readonly) in spaces it was added to
-    # or @mentioned in. Pinning lets the ETL cover those without membership.
+    # Pinned spaces: sync configured spaces directly without spaces.list. Chat
+    # still requires the app to be a member of every space it reads.
     if explicit_space_ids:
-        spaces = [
-            {"name": f"spaces/{sid}", "type": "SPACE"}
+        work = [
+            (client, {"name": f"spaces/{sid}", "type": "SPACE"}, "")
             for sid in sorted(explicit_space_ids)
         ]
 
@@ -555,7 +1039,8 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     try:
         if not explicit_space_ids:
             while True:
-                page = client.list_spaces(
+                page = await _call_client(
+                    client.list_spaces,
                     page_size=DEFAULT_PAGE_SIZE, page_token=page_token
                 )
                 for space in page.get("spaces", []):
@@ -563,17 +1048,21 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                         continue
                     if not _resource_id(str(space.get("name") or "")):
                         continue
-                    space_type = str(
-                        space.get("type") or space.get("spaceType") or ""
-                    ).upper()
+                    space_type = _space_type(space)
                     if include_types and space_type not in include_types:
                         continue
-                    spaces.append(space)
+                    if space_type == "DIRECT_MESSAGE":
+                        continue
+                    work.append((client, space, ""))
                 page_token = page.get("nextPageToken")
                 if not page_token:
                     break
     except Exception as exc:
-        error = str(exc)
+        raw_error = str(exc)
+        error = _safe_error(exc)
+        record_api_outcome(
+            "list_spaces", "rate_limited" if "429" in raw_error else "error"
+        )
         record_etl_items_failed("google_chat", "message", "spaces", "api_error")
         await _record_run_finish(
             ctx._pool,
@@ -585,23 +1074,67 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             error_text=f"list_spaces failed: {error}",
         )
         ctx.log("google_chat_sync_list_spaces_failed", error=error)
+        record_run("failed")
+        set_last_failure_time(dt.datetime.now(dt.timezone.utc).timestamp())
+        observe_run_duration("failed", time.monotonic() - started_at)
         return {"status": "failed", "run_id": run_id, "error": error}
 
+    if not explicit_space_ids:
+        record_api_outcome("list_spaces", "success")
+
+    dm_subjects = _selected_dm_subjects(inp.dm_subjects)
+    enumeration_failures: list[dict[str, str]] = []
+    for subject in dm_subjects:
+        dm_client = _delegated_client(ctx, subject)
+        page_token = None
+        try:
+            while True:
+                page = await _call_client(
+                    dm_client.list_spaces,
+                    page_size=DEFAULT_PAGE_SIZE, page_token=page_token
+                )
+                for space in page.get("spaces", []):
+                    if not isinstance(space, dict):
+                        continue
+                    space_type = _space_type(space)
+                    if space_type == "DIRECT_MESSAGE" and _resource_id(
+                        str(space.get("name") or "")
+                    ):
+                        work.append((dm_client, space, subject))
+                page_token = page.get("nextPageToken")
+                if not page_token:
+                    break
+            record_api_outcome("list_dm_spaces", "success")
+        except Exception as exc:
+            raw_error = str(exc)
+            error = _safe_error(exc)
+            record_api_outcome(
+                "list_dm_spaces", "rate_limited" if "429" in raw_error else "error"
+            )
+            record_space_failure(
+                "rate_limited" if "429" in raw_error else "api_error"
+            )
+            set_last_failure_time(dt.datetime.now(dt.timezone.utc).timestamp())
+            enumeration_failures.append(_scope_ref("direct_messages", error))
+            ctx.log("google_chat_sync_dm_subject_failed", owner_email=subject, error=error)
+
     counts = {
-        "spaces_seen": len(spaces),
+        "spaces_seen": len(work),
         "spaces_synced": 0,
         "messages_seen": 0,
         "messages_upserted": 0,
+        "files_processed": 0,
+        "reactions_processed": 0,
     }
     synced: list[dict[str, str]] = []
-    failed: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = enumeration_failures
 
-    for space in spaces:
+    for space_client, space, owner_email in work:
         space_id = _resource_id(str(space.get("name") or ""))
         try:
             watermark = await _sync_space(
                 ctx._pool,
-                client=client,
+                client=space_client,
                 space=space,
                 run_id=run_id,
                 page_size=page_size,
@@ -609,6 +1142,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                 max_pages=max_pages,
                 explicit_since=explicit_since,
                 counts=counts,
+                owner_email=owner_email,
             )
             counts["spaces_synced"] += 1
             synced.append(_scope_ref(space_id))
@@ -620,18 +1154,32 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                 watermark=_rfc3339(watermark) if watermark else "",
             )
         except Exception as exc:
-            error = str(exc)
+            raw_error = str(exc)
+            error = _safe_error(exc)
             failed.append(_scope_ref(space_id, error))
             record_etl_items_failed(
                 "google_chat",
                 "message",
                 "space",
                 "permission_error"
-                if "403" in error or "permission" in error.lower()
+                if "403" in raw_error or "permission" in raw_error.lower()
                 else "api_error",
             )
+            failure_reason = (
+                "rate_limited"
+                if "429" in raw_error
+                else "permission_error"
+                if "403" in raw_error or "permission" in raw_error.lower()
+                else "api_error"
+            )
+            record_space_failure(failure_reason)
+            set_last_failure_time(dt.datetime.now(dt.timezone.utc).timestamp())
             await _update_checkpoint_failure(
-                ctx._pool, space_id=space_id, run_id=run_id, error=error
+                ctx._pool,
+                space_id=space_id,
+                owner_email=owner_email,
+                run_id=run_id,
+                error=error,
             )
             ctx.log("google_chat_sync_space_failed", space_id=space_id, error=error)
 
@@ -653,6 +1201,11 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         counts=counts,
         error_text=error_text,
     )
+    record_run(status)
+    set_failed_spaces(len(failed))
+    if not failed:
+        set_last_failure_time(0)
+    observe_run_duration(status, time.monotonic() - started_at)
 
     return {
         "status": status,

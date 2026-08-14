@@ -3,7 +3,11 @@ import { createGooglechatbot } from './index'
 import { logInfo } from './logging'
 
 const config = loadConfig()
-const { app } = createGooglechatbot(config)
+const { app, stateConnected } = createGooglechatbot(config)
+
+// Do not bind the webhook port before durable state is available. Kubernetes
+// readiness also reports state status after startup/reconnect.
+await stateConnected
 
 logInfo('googlechatbot_starting', {
   port: config.PORT,

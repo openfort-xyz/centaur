@@ -1,0 +1,128 @@
+{
+  "family": "legacy",
+  "authentication": {
+    "algorithm": "RS256",
+    "issuer": "chat@system.gserviceaccount.com",
+    "audience": "fixture-project"
+  },
+  "cases": [
+    {
+      "name": "named-space-mention",
+      "expect": "session",
+      "body": {
+        "type": "MESSAGE",
+        "eventTime": "2026-08-14T12:00:00Z",
+        "space": { "name": "spaces/MENTION", "spaceType": "SPACE" },
+        "message": {
+          "name": "spaces/MENTION/messages/M1",
+          "text": "<users/123456789> investigate",
+          "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" },
+          "annotations": [{ "type": "USER_MENTION", "userMention": { "user": { "name": "users/123456789", "type": "BOT" }, "type": "MENTION" } }]
+        },
+        "user": { "name": "users/U1", "displayName": "Fixture User" }
+      }
+    },
+    {
+      "name": "direct-message",
+      "expect": "session",
+      "body": {
+        "type": "MESSAGE",
+        "eventTime": "2026-08-14T12:00:01Z",
+        "space": { "name": "spaces/DM", "spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true },
+        "message": {
+          "name": "spaces/DM/messages/M2",
+          "text": "summarize this",
+          "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" }
+        },
+        "user": { "name": "users/U1", "displayName": "Fixture User" }
+      }
+    },
+    {
+      "name": "group-space-command",
+      "expect": "session",
+      "body": {
+        "type": "MESSAGE",
+        "eventTime": "2026-08-14T12:00:02Z",
+        "space": { "name": "spaces/GROUP", "spaceType": "GROUP_CHAT" },
+        "message": {
+          "name": "spaces/GROUP/messages/M3",
+          "text": "/centaur ship",
+          "argumentText": "ship",
+          "slashCommand": { "commandId": "1" },
+          "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" },
+          "annotations": [{ "type": "SLASH_COMMAND" }]
+        },
+        "user": { "name": "users/U1", "displayName": "Fixture User" }
+      }
+    },
+    {
+      "name": "stop-command",
+      "expect": "interrupt",
+      "body": {
+        "type": "MESSAGE",
+        "eventTime": "2026-08-14T12:00:03Z",
+        "space": { "name": "spaces/STOP", "spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true },
+        "message": {
+          "name": "spaces/STOP/messages/M4",
+          "text": "stop",
+          "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" }
+        },
+        "user": { "name": "users/U1", "displayName": "Fixture User" }
+      }
+    },
+    {
+      "name": "follow-up-attachment",
+      "expect": "attachment-session",
+      "body": {
+        "type": "MESSAGE",
+        "eventTime": "2026-08-14T12:00:04Z",
+        "space": { "name": "spaces/FILES", "spaceType": "SPACE" },
+        "thread": { "name": "spaces/FILES/threads/T5" },
+        "message": {
+          "name": "spaces/FILES/messages/T5.reply",
+          "text": "use this file",
+          "thread": { "name": "spaces/FILES/threads/T5" },
+          "threadReply": true,
+          "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" },
+          "attachment": [{
+            "name": "spaces/FILES/messages/T5.reply/attachments/A1",
+            "contentName": "fixture.txt",
+            "contentType": "text/plain",
+            "source": "UPLOADED_CONTENT",
+            "attachmentDataRef": { "resourceName": "media/fixture-A1" }
+          }]
+        },
+        "user": { "name": "users/U1", "displayName": "Fixture User" }
+      }
+    },
+    {
+      "name": "legacy-card-action",
+      "expect": "workflow",
+      "eventName": "google_chat.card_click.approve",
+      "body": {
+        "type": "CARD_CLICKED",
+        "eventTime": "2026-08-14T12:00:05Z",
+        "space": { "name": "spaces/ACTIONS", "spaceType": "SPACE" },
+        "message": { "name": "spaces/ACTIONS/messages/M6", "thread": { "name": "spaces/ACTIONS/threads/T6" } },
+        "user": { "name": "users/U1", "displayName": "Fixture User" },
+        "common": { "invokedFunction": "approve", "parameters": { "request_id": "fixture-1" } }
+      }
+    },
+    {
+      "name": "duplicate-delivery",
+      "expect": "session",
+      "repeat": 2,
+      "body": {
+        "type": "MESSAGE",
+        "eventTime": "2026-08-14T12:00:06Z",
+        "space": { "name": "spaces/DUPLICATE", "spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true },
+        "message": {
+          "name": "spaces/DUPLICATE/messages/M7",
+          "text": "run once",
+          "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" }
+        },
+        "user": { "name": "users/U1", "displayName": "Fixture User" }
+      }
+    }
+  ]
+}

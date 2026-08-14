@@ -5,6 +5,7 @@
 class ConsoleController < ApplicationController
   include SecretKinds
   include Console::SlackChannelPermissionManagement
+  include Console::GoogleChatPermissionManagement
 
   layout "console"
 
@@ -45,7 +46,10 @@ class ConsoleController < ApplicationController
   def principal
     @principal = Principal.find_by_oid!(params[:id])
     load_slack_channel_permission_form(@principal)
+    load_google_chat_permission_forms(@principal)
     @inherited_slack_channel_permissions = @principal.inherited_slack_channel_permissions_payload
+    @inherited_google_chat_space_permissions = @principal.inherited_google_chat_space_permissions_payload
+    @inherited_google_chat_dm_permissions = @principal.inherited_google_chat_dm_permissions_payload
     load_principal_roles
     effective_grant_relations = {
       "static" => @principal.granted_static_secrets,

@@ -1,5 +1,6 @@
 import { logWarn } from '../logging'
 import { INITIAL_STATUS } from '../renderer'
+import { cardFallbackText } from './card-text'
 import type {
   ChatListMessage,
   ChatSpaceType,
@@ -30,11 +31,22 @@ export interface ChatHistoryFetcher {
 // Same idea as ChatHistoryFetcher, for attachment content downloads.
 export interface ChatAttachmentDownloader {
   downloadAttachment(resourceName: string): Promise<ArrayBuffer>
+  downloadDriveAttachment?(input: {
+    driveFileId: string
+    expectedMimeType: string
+    declaredSize?: number
+  }): Promise<{
+    data?: ArrayBuffer
+    mimeType?: string
+    name?: string
+    size?: number
+    unavailableReason?: NormalizedBinaryPart['unavailable_reason']
+  }>
 }
 
 // Cap on how many thread messages we ship to the agent. A typical 4-5 turn
 // thread fits well under this; mega-threads would blow up the LLM context.
-const THREAD_HISTORY_LIMIT = 50
+export const DEFAULT_THREAD_HISTORY_LIMIT = 50
 
 // Largest attachment we buffer and inline as base64 into the agent turn. The
 // whole turn ships as ONE blocks-protocol input line, so this mirrors
@@ -42,7 +54,7 @@ const THREAD_HISTORY_LIMIT = 50
 // slackbotv2 stages bigger files as attachment.chunk lines, which googlechatbot
 // does not do yet. Over the cap we keep the part but drop the bytes, so the
 // agent still sees the placeholder text.
-const MAX_INLINE_ATTACHMENT_BYTES = 25 * 1024 * 1024
+export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 // Bound the fan-out of media downloads triggered by a single inbound message.
 const MAX_ATTACHMENTS_PER_MESSAGE = 10
@@ -50,13 +62,14 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 10
 export async function normalizeChatEnvelope(
   envelope: GoogleChatEnvelope,
   botUserName?: string,
-  client?: ChatAttachmentDownloader
+  client?: ChatAttachmentDownloader,
+  opts: { acceptFollowUpAttachments?: boolean } = {}
 ): Promise<NormalizedChatEvent | null> {
   if (!envelope.type) return null
   if (!envelope.space?.name) return null
 
   const spaceName = envelope.space.name
-  const spaceType = normalizeSpaceType(envelope.space.type)
+  const spaceType = normalizeSpaceType(envelope.space.spaceType ?? envelope.space.type)
   if (!spaceType) return null
 
   const eventTime = envelope.eventTime
@@ -69,10 +82,7 @@ export async function normalizeChatEnvelope(
     return null
   }
 
-  // APP_COMMAND, CARD_CLICKED, and SUBMIT_FORM are deliberately ignored: the
-  // workflow handler has no command-aware path, so propagating them would just
-  // ship synthetic prompts to the LLM. Re-enable here once the workflow side
-  // has a real command handler.
+  // Actions are normalized into workflow events by index.ts, never LLM turns.
   if (envelope.type !== 'MESSAGE') return null
 
   const message = envelope.message
@@ -81,36 +91,42 @@ export async function normalizeChatEnvelope(
   const senderName = message.sender.name
   if (!senderName) return null
 
-  // Skip bot's own messages (sender.name is a resource name like "users/123")
-  if (botUserName && senderName === botUserName) return null
+  // Never let bot-authored messages start an agent loop. The canonical resource
+  // catches older payloads that omit sender.type.
+  if (message.sender.type === 'BOT' || (botUserName && senderName === botUserName)) return null
 
   // A slash command (`/centaur …`) is addressed to the app: Google strips the
   // command token and puts the rest in argumentText, which is the cleanest
   // prompt. Treat it like a mention so it always starts a run.
-  const isSlashCommand = (message.annotations ?? []).some(a => a.type === 'SLASH_COMMAND')
+  const isSlashCommand = Boolean(message.slashCommand)
+    || (message.annotations ?? []).some(a => a.type === 'SLASH_COMMAND')
+  const botMentionId = botUserName?.replace(/^users\//, '')
   const text = isSlashCommand
-    ? normalizeChatText(message.argumentText ?? message.text ?? '', senderName)
-    : normalizeChatText(message.text ?? '', senderName)
+    ? normalizeChatText(message.argumentText ?? message.text ?? '', botMentionId)
+    : normalizeChatText(message.text ?? '', botMentionId)
   const formattedText = isSlashCommand ? '' : message.formattedText ?? ''
 
-  const displayName = message.sender.displayName ?? message.sender.email ?? senderName
-  // Requester email (same-workspace human senders carry it). Recorded in the
-  // session metadata so the Console can attribute the thread to the signed-in
-  // user — Openfort console logins are Google SSO, so the email IS the console
-  // identity (the Chat analogue of Slack's slack_user_id ownership, #875).
-  const userEmail = (message.sender.email ?? envelope.user?.email ?? '').trim()
+  const displayName = message.sender.displayName ?? senderName
 
   // Determine if the bot was @mentioned.
   // In Google Chat, mentions use <users/{botUserId}> syntax in message text.
   // In the bot's 1:1 DM every message is addressed to it, so no @ is needed.
-  const isMention =
-    isSlashCommand ||
-    Boolean(botUserName && (message.text ?? '').includes(botUserName)) ||
-    Boolean(botUserName && (message.text ?? '').includes('@')) ||
-    envelope.space.singleUserBotDm === true
+  const isExactMention = Boolean(
+    botUserName
+      && ((message.annotations ?? []).some(
+        annotation =>
+          annotation.type === 'USER_MENTION'
+          && annotation.userMention?.user?.name === botUserName
+      )
+        || (message.text ?? '').includes(`<${botUserName}>`)
+        || (message.formattedText ?? '').includes(`<${botUserName}>`))
+  )
+  const isMention = isSlashCommand || isExactMention || envelope.space.singleUserBotDm === true
 
   const parts: NormalizedPart[] = []
-  const textPart = [formattedText, text].filter(Boolean).join('\n').trim()
+  // formattedText is another representation of the same message, not an
+  // additional paragraph. Prefer plain/argument text so prompts are not doubled.
+  const textPart = (text || formattedText || cardFallbackText(message)).trim()
   if (textPart) parts.push({ type: 'text', text: textPart })
 
   // Only hydrate attachment bytes for a message that will actually start a run
@@ -119,15 +135,21 @@ export async function normalizeChatEnvelope(
   // be wasted work and an amplification vector on the unauthenticated webhook —
   // one forged envelope with a big `attachment` array would fan out to that many
   // authenticated media fetches. Bounded per message either way.
-  if (isMention) {
+  const threadField = envelope.thread || message.thread
+  const threadName = threadField?.name
+  const acceptedFollowUp = Boolean(
+    opts.acceptFollowUpAttachments
+      && message.threadReply === true
+      && threadName
+      && THREAD_NAME_PATTERN.test(threadName)
+  )
+  if (isMention || acceptedFollowUp) {
     for (const attachment of (message.attachment ?? []).slice(0, MAX_ATTACHMENTS_PER_MESSAGE)) {
       parts.push(await toAttachmentPart(attachment, client, spaceName))
     }
   }
 
   // Use the event-level thread if available, otherwise message.thread, otherwise message.name
-  const threadField = envelope.thread || message.thread
-  const threadName = threadField?.name
   const threadKey = buildThreadKey(spaceName, threadName ?? message.name)
 
   return {
@@ -137,13 +159,15 @@ export async function normalizeChatEnvelope(
     space_type: spaceType,
     user_id: senderName,
     user_name: displayName,
-    ...(userEmail ? { user_email: userEmail } : {}),
     is_mention: isMention,
     parts,
     chat: {
       event_time: eventTime,
       message_name: message.name,
-      thread_name: threadName
+      thread_name: threadName,
+      ...(typeof message.threadReply === 'boolean'
+        ? { thread_reply: message.threadReply }
+        : {})
     }
   }
 }
@@ -152,10 +176,8 @@ export async function normalizeChatEnvelope(
  * Turn a Google Chat Attachment into a NormalizedBinaryPart.
  *
  * UPLOADED_CONTENT is downloaded and inlined as base64 (up to
- * MAX_INLINE_ATTACHMENT_BYTES). DRIVE_FILE is never downloaded — we hold no
- * Drive scope — so the part carries name/mime only and downstream renders the
- * placeholder text. Any failure degrades the same way: the part survives
- * without bytes, the event never fails.
+ * MAX_ATTACHMENT_BYTES). Any failure degrades to metadata with a structured
+ * reason: attachment handling must never drop the inbound event.
  */
 async function toAttachmentPart(
   attachment: ChatAttachment,
@@ -164,49 +186,89 @@ async function toAttachmentPart(
 ): Promise<NormalizedBinaryPart> {
   const mimeType = attachment.contentType ?? 'application/octet-stream'
   const resourceName = attachment.attachmentDataRef?.resourceName
+  const driveFileId = attachment.driveDataRef?.driveFileId
   const name = attachment.contentName ?? resourceName ?? attachment.name ?? 'attachment'
-  const declaredSize = attachment.size ? Number(attachment.size) : undefined
   const partType: NormalizedBinaryPart['type'] =
     attachment.source !== 'DRIVE_FILE' && mimeType.startsWith('image/') ? 'image' : 'file'
   const stub: NormalizedBinaryPart = {
     type: partType,
     name,
     mime_type: mimeType,
-    size: declaredSize ?? 0
+    size: 0
   }
 
-  if (attachment.source === 'DRIVE_FILE' || !resourceName || !client) return stub
-  if (declaredSize !== undefined && declaredSize > MAX_INLINE_ATTACHMENT_BYTES) return stub
+  if (attachment.source === 'DRIVE_FILE') {
+    if (!driveFileId || !client?.downloadDriveAttachment) {
+      return {
+        ...stub,
+        unavailable_reason: driveFileId ? 'download_not_configured' : 'invalid_resource'
+      }
+    }
+    try {
+      const result = await client.downloadDriveAttachment({
+        driveFileId,
+        expectedMimeType: mimeType
+      })
+      if (!result.data) {
+        return { ...stub, unavailable_reason: result.unavailableReason ?? 'download_failed' }
+      }
+      const bytes = new Uint8Array(result.data)
+      if (bytes.byteLength > MAX_ATTACHMENT_BYTES || !result.mimeType) {
+        return { ...stub, size: bytes.byteLength, unavailable_reason: 'metadata_mismatch' }
+      }
+      return binaryPart({
+        ...stub,
+        name: result.name ?? stub.name,
+        mime_type: result.mimeType
+      }, bytes, result.mimeType)
+    } catch (error) {
+      logAttachmentFailure(error, spaceName, attachment.name)
+      return { ...stub, unavailable_reason: 'download_failed' }
+    }
+  }
+
+  if (!resourceName) return { ...stub, unavailable_reason: 'invalid_resource' }
+  if (!client) return { ...stub, unavailable_reason: 'download_not_configured' }
 
   try {
     const buffer = await client.downloadAttachment(resourceName)
     const bytes = new Uint8Array(buffer)
     // Envelopes don't always declare a size, so re-check after the download.
-    if (bytes.byteLength > MAX_INLINE_ATTACHMENT_BYTES) {
-      return { ...stub, size: bytes.byteLength }
+    if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+      return { ...stub, size: bytes.byteLength, unavailable_reason: 'declared_too_large' }
     }
-    return {
-      ...stub,
-      size: bytes.byteLength,
-      source: {
-        type: 'base64',
-        media_type: mimeType,
-        // Buffer instead of btoa(String.fromCharCode(...bytes)): spreading a
-        // multi-MB array as call arguments overflows the stack.
-        data: Buffer.from(bytes).toString('base64')
-      }
-    }
+    return binaryPart(stub, bytes, mimeType)
   } catch (error) {
-    logWarn('chat_attachment_download_failed', {
-      space: spaceName,
-      attachment: attachment.name,
-      error: error instanceof Error ? error.message : String(error)
-    })
-    return stub
+    logAttachmentFailure(error, spaceName, attachment.name)
+    return { ...stub, unavailable_reason: 'download_failed' }
   }
 }
 
-// thread.name = "spaces/<S>/threads/<T>" — strict shape, anything else is
+function binaryPart(
+  stub: NormalizedBinaryPart,
+  bytes: Uint8Array,
+  mimeType: string
+): NormalizedBinaryPart {
+  return {
+    ...stub,
+    size: bytes.byteLength,
+    source: {
+      type: 'base64',
+      media_type: mimeType,
+      data: Buffer.from(bytes).toString('base64')
+    }
+  }
+}
+
+function logAttachmentFailure(error: unknown, space: string, attachment: string | undefined): void {
+  logWarn('chat_attachment_download_failed', {
+    space,
+    attachment,
+    error: error instanceof Error ? error.message : String(error)
+  })
+}
+
+// thread.name = spaces/<S>/threads/<T> — strict shape, anything else is
 // either a Google API surface change or a forged envelope. Build the filter
 // only after passing this guard to keep the filter expression safe.
 const THREAD_NAME_PATTERN = /^spaces\/[A-Za-z0-9_-]+\/threads\/[A-Za-z0-9_.-]+$/
@@ -214,8 +276,8 @@ const THREAD_NAME_PATTERN = /^spaces\/[A-Za-z0-9_-]+\/threads\/[A-Za-z0-9_.-]+$/
 /**
  * Fetch prior messages in the thread the bot was @mentioned in.
  * Caller should post the user-visible ack BEFORE awaiting this (a slow Chat
- * backend on the listMessages call could otherwise blow the ~5s "bot not
- * responding" budget Google enforces).
+ * backend on the listMessages call could otherwise consume Google's 30-second
+ * synchronous response deadline).
  *
  * Returns [] when:
  *  - The thread is a fresh root (no prior context to fetch).
@@ -230,15 +292,16 @@ export async function collectThreadHistory(
     spaceName: string
     threadName: string | undefined
     currentMessageName: string
+    threadReply?: boolean
     botUserName?: string
     /** Requester email; used to read DM history as that user when app auth
      * (which cannot read DMs) is refused. */
     requesterEmail?: string
+    historyLimit?: number
   }
 ): Promise<ChatHistoryMessage[]> {
   // No thread, or this message *is* the thread root → nothing earlier exists.
-  if (!opts.threadName) return []
-  if (isThreadRoot(opts.threadName, opts.currentMessageName)) return []
+  if (!opts.threadName || opts.threadReply !== true) return []
 
   // Reject anything that doesn't match the canonical resource-name shape.
   // Prevents quote/backslash/newline injection into the filter expression
@@ -251,29 +314,30 @@ export async function collectThreadHistory(
     return []
   }
 
-  const filter = `thread.name = "${opts.threadName}"`
+  const filter = `thread.name = ${opts.threadName}`
 
+  const historyLimit = Math.max(1, Math.floor(opts.historyLimit ?? DEFAULT_THREAD_HISTORY_LIMIT))
   const collected: ChatListMessage[] = []
   let pageToken: string | undefined
   try {
     do {
       const page = await client.listMessages(opts.spaceName, {
-        pageSize: 100,
+        pageSize: Math.min(100, historyLimit - collected.length),
         pageToken,
         filter,
         ...(opts.requesterEmail ? { impersonateSubject: opts.requesterEmail } : {}),
         // Newest first so the cap drops the OLDEST messages — recency carries
         // the most context for a reply. Long threads will lose their head turn;
         // acceptable for an assistant in conversational use.
-        orderBy: 'createTime desc'
+        orderBy: 'createTime DESC'
       })
       for (const message of page.messages ?? []) {
         if (!message.name || message.name === opts.currentMessageName) continue
         if (isAckOrEmpty(message)) continue
         collected.push(message)
-        if (collected.length >= THREAD_HISTORY_LIMIT) break
+        if (collected.length >= historyLimit) break
       }
-      if (collected.length >= THREAD_HISTORY_LIMIT) break
+      if (collected.length >= historyLimit) break
       pageToken = page.nextPageToken
     } while (pageToken)
   } catch (error) {
@@ -303,26 +367,11 @@ export async function collectThreadHistory(
  * Used to gate follow-up runs that continue a thread without a re-@mention.
  */
 export function isThreadReply(event: NormalizedChatEvent): boolean {
-  const threadName = event.chat.thread_name
-  if (!threadName) return false
-  return !isThreadRoot(threadName, event.message_id)
-}
-
-function isThreadRoot(threadName: string, currentMessageName: string): boolean {
-  // Resource names live in different collections:
-  //   thread.name  = spaces/<S>/threads/<T>
-  //   message.name = spaces/<S>/messages/<T>           ← thread root (no suffix)
-  //   message.name = spaces/<S>/messages/<T>.<reply>   ← reply in thread
-  // A thread-root message has message-id EXACTLY equal to the thread id; any
-  // ".<reply>" suffix means it's a reply, not the root.
-  const threadId = threadName.split('/threads/')[1]
-  const messageId = currentMessageName.split('/messages/')[1]
-  if (!threadId || !messageId) return false
-  return threadId === messageId
+  return event.chat.thread_reply === true
 }
 
 function isAckOrEmpty(message: ChatListMessage): boolean {
-  const text = (message.argumentText ?? message.text ?? '').trim()
+  const text = messageText(message)
   if (!text) return true
   // The inline ack we post at the start of every mention — it would otherwise
   // show up as an "assistant said this" turn on every follow-up mention in the
@@ -384,7 +433,7 @@ export function normalizeChatText(input: string, senderResourceName?: string): s
     .trim()
 }
 
-function buildThreadKey(spaceName: string, resourceName: string): string {
+export function buildThreadKey(spaceName: string, resourceName: string): string {
   return `chat:${normalizeThreadSegment(spaceName)}:${normalizeThreadSegment(resourceName)}`
 }
 
@@ -409,7 +458,7 @@ function toHistoryMessage(
   // Prefer argumentText (mention pre-stripped by Google) for cleaner agent
   // prompts; fall back to text. Pass the bare bot id (sans "users/" prefix) so
   // user messages mentioning the bot don't carry the raw <users/...> tag.
-  const rawText = (message.argumentText ?? message.text ?? '').trim()
+  const rawText = messageText(message)
   const botMentionId = botUserName?.replace(/^users\//, '')
   const cleaned = normalizeChatText(rawText, botMentionId)
 
@@ -426,6 +475,21 @@ function toHistoryMessage(
     ...(senderName ? { user_id: senderName } : {}),
     ...(Object.keys(metadata).length ? { metadata } : {})
   }
+}
+
+function messageText(message: ChatListMessage): string {
+  for (const candidate of [
+    message.argumentText,
+    message.text,
+    message.formattedText,
+    message.fallbackText
+  ]) {
+    const value = candidate?.trim()
+    if (value) return value
+  }
+  const cardText = cardFallbackText(message).trim()
+  if (cardText) return cardText
+  return (message.attachedGifs ?? []).map(gif => gif.uri?.trim()).filter(Boolean).join('\n')
 }
 
 function escapeRegex(str: string): string {
