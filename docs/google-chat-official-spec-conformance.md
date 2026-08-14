@@ -196,16 +196,16 @@ seven rows below is a release blocker under the current parity scope.
 
 ### True blockers before calling this release “verified”
 
-1. **The code in this ledger is not the code running on the VPS.** Deploy it to a canary and run a redacted conformance script. At minimum, exercise all three configured ingress modes that will be supported, message/card creation, named-space threading, DM creation and send, app and delegated history, reaction reads, upload/download, Drive export, edit/delete, and a 429/retry case. Record method/status/enum/byte-count evidence only.
+1. **The current code ran on the VPS, but not against a dedicated Workspace test app.** Native candidate images passed the isolated K3s canary, internal auth, state, policy, recovery, and cleanup gates. The remaining live gate must use a non-production app/project and owned test data to exercise all three ingress modes, message/card creation, named-space threading, DM creation/send, app and delegated history, reaction reads, upload/download, Drive export, edit/delete, and a 429/retry case. Record method/status/enum/byte-count evidence only.
 2. **Source-deletion convergence has no live proof.** The official contract and current tree support `showDeleted=true` for app-auth shared-space scans and delegated DM scans. Release evidence still needs create→sync→delete→resync cases proving each tombstone removes its message, attachments, and reactions.
-3. **The next rollout’s API credential wiring has not been proved.** The live Secret uses `CHATBOT_API_KEY`; the current chart’s fallback to `CENTAUR_API_KEY` is local only. Render/lint the chart, roll out one canary, and prove readiness plus one session before replacing the old pod.
+3. **Canary internal API wiring passed, but production-key compatibility still needs a rollout proof.** The isolated key returned the expected unauthorized and authorized-validation statuses. The production Secret's `CHATBOT_API_KEY`/`CENTAUR_API_KEY` compatibility path was not mutated or disclosed; verify it during the actual rollout before replacing the old pod.
 4. **New privileged paths have no real Workspace proof.** Admin/DWD configuration and membership determine whether DM setup, DM history, reactions, upload, and Drive download actually work. Automated request-shape tests are necessary but cannot prove tenant policy. Run one allowlisted success and one denied case for each grant.
 5. **Native Drive exports still lack tenant-backed proof.** Local tests model the separate 10 MB `files.export` ceiling, correct MIME/extensions, and safe oversize classification. Prove one below-limit success and above-limit rejection live; the 100 MiB binary ceiling does not apply to native exports.
 6. **The 30-second ingress promise needs a live failure drill.** Stall Google lookups and downstream session startup while confirming Google receives `{}` before its deadline and the durable recovery completes later.
 
 These are release blockers because they concern source-data reconciliation,
 authentication/authorization, deployment viability, documented file limits, or
-the absence of evidence for code that is not yet running. They are not a claim
+the absence of tenant-backed evidence for code that is not yet production. They are not a claim
 that the locally automated request shapes are invalid.
 
 ### Not blockers unless the product scope includes them

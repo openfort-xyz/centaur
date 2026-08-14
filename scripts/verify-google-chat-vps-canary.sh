@@ -107,7 +107,7 @@ validate_inputs() {
   require_command kubectl
   require_command helm
   require_command jq
-  require_command ruby
+  require_command python3
   require_command sha256sum
 
   [[ "$(id -un)" == jaume ]] || die "run on centaur-vps as jaume"
@@ -236,8 +236,9 @@ assert_control() {
     ' "$json" >/dev/null || die "control $component is not Ready on sha-$CONTROL_SHA"
   done
   jq -e --arg sha "$CONTROL_SHA" '
-    any(.pods[]; any(.containers[]; .name == "iron-proxy" and (.image | contains("sha-" + $sha))))
-  ' "$json" >/dev/null || die "control iron-proxy pod is not on sha-$CONTROL_SHA"
+    any(.workloads[]; .desired > 0 and .ready == .desired and
+      any(.containers[]; .name == "iron-proxy" and (.image | contains("sha-" + $sha))))
+  ' "$json" >/dev/null || die "control iron-proxy workload is not Ready on sha-$CONTROL_SHA"
   jq -e 'all(.pods[].containers[]; (.image_id // "") | contains("@sha256:"))' "$json" >/dev/null ||
     die "control has a running container without an immutable image ID"
 }
@@ -265,27 +266,47 @@ validate_render() {
   jq -Rse --arg image "$digest_iron_proxy" 'contains($image)' <"$rendered" >/dev/null ||
     die "render does not pin the candidate iron-proxy image"
 
-  ruby -ryaml -e '
-    docs = YAML.load_stream(File.read(ARGV.fetch(0))).compact
-    prefix, repo_path = ARGV.fetch(1), ARGV.fetch(2)
-    abort "rendered a Secret" if docs.any? { |d| d["kind"] == "Secret" }
-    docs.each do |doc|
-      name = doc.dig("metadata", "name").to_s
-      abort "non-canary resource name: #{doc["kind"]}/#{name}" unless name.empty? || name.start_with?(prefix)
-    end
-    bot = docs.find { |d| d["kind"] == "Deployment" && d.dig("metadata", "labels", "app.kubernetes.io/component") == "googlechatbot" } or abort "bot missing"
-    abort "bot replica count is not two" unless bot.dig("spec", "replicas") == 2
-    paths = docs.flat_map { |d| d.dig("spec", "template", "spec", "volumes") || [] }.filter_map { |v| v.dig("hostPath", "path") }
-    abort "canary must not use node hostPath storage" unless paths.empty?
-    mounts = docs.flat_map { |d| d.dig("spec", "template", "spec", "containers") || [] }
-      .flat_map { |c| c["volumeMounts"] || [] }.filter_map { |v| v["mountPath"] }
-    abort "candidate repo mount path mismatch" unless mounts.include?(repo_path)
-    claims = docs.select { |d| d["kind"] == "PersistentVolumeClaim" }
-    abort "candidate repo and Postgres PVCs required" unless claims.length >= 2
-    abort "candidate PVC must use local-path" unless claims.all? { |p| p.dig("spec", "storageClassName") == "local-path" }
-    ingresses = docs.select { |d| d["kind"] == "Ingress" }
-    abort "centaur-vps canary must not render Kubernetes Ingress" unless ingresses.empty?
-  ' "$rendered" "$REQUIRED_CANARY" "$REPO_CACHE_PATH"
+  python3 - "$rendered" "$REQUIRED_CANARY" "$REPO_CACHE_PATH" <<'PY'
+import sys
+import yaml
+
+rendered, prefix, repo_path = sys.argv[1:]
+with open(rendered, encoding="utf-8") as stream:
+    docs = [doc for doc in yaml.safe_load_all(stream) if doc]
+if any(doc.get("kind") == "Secret" for doc in docs):
+    raise SystemExit("rendered a Secret")
+for doc in docs:
+    name = doc.get("metadata", {}).get("name", "")
+    if name and not name.startswith(prefix):
+        raise SystemExit(f"non-canary resource name: {doc.get('kind')}/{name}")
+bot = next((doc for doc in docs if doc.get("kind") == "Deployment" and
+            doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "googlechatbot"), None)
+if not bot:
+    raise SystemExit("bot missing")
+if bot.get("spec", {}).get("replicas") != 2:
+    raise SystemExit("bot replica count is not two")
+pod_specs = [doc.get("spec", {}).get("template", {}).get("spec", {}) for doc in docs]
+paths = [volume.get("hostPath", {}).get("path") for spec in pod_specs for volume in spec.get("volumes", [])]
+if any(path is not None for path in paths):
+    raise SystemExit("canary must not use node hostPath storage")
+api = next((doc for doc in docs if doc.get("kind") == "Deployment" and
+            doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "api-rs"), None)
+if not api:
+    raise SystemExit("api-rs missing")
+env = {entry["name"]: entry.get("value") for entry in api["spec"]["template"]["spec"]["containers"][0].get("env", [])}
+if env.get("REPOS_PATH") != repo_path:
+    raise SystemExit("candidate sandbox repo path mismatch")
+claims = [doc for doc in docs if doc.get("kind") == "PersistentVolumeClaim"]
+claim_specs = [claim.get("spec", {}) for claim in claims]
+claim_specs += [claim.get("spec", {}) for doc in docs if doc.get("kind") == "StatefulSet"
+                for claim in doc.get("spec", {}).get("volumeClaimTemplates", [])]
+if len(claim_specs) < 2:
+    raise SystemExit("candidate repo and Postgres persistent claims required")
+if any(claim.get("storageClassName") != "local-path" for claim in claim_specs):
+    raise SystemExit("candidate PVC must use local-path")
+if any(doc.get("kind") == "Ingress" for doc in docs):
+    raise SystemExit("centaur-vps canary must not render Kubernetes Ingress")
+PY
 }
 
 assert_candidate() {
@@ -450,8 +471,10 @@ cleanup_action() {
   "${H[@]}" uninstall "$release" -n "$namespace" --wait
   "${K[@]}" delete namespace "$namespace" --wait=true
   sanitized_snapshot "$CONTROL_NAMESPACE" "$output_dir/control-after-cleanup.json"
-  jq 'del(.captured_at)' "$output_dir/control-before-cleanup.json" >"$output_dir/.before.json"
-  jq 'del(.captured_at)' "$output_dir/control-after-cleanup.json" >"$output_dir/.after.json"
+  jq 'del(.captured_at, .image_counts) | .pods |= map(select(.phase != "Succeeded"))' \
+    "$output_dir/control-before-cleanup.json" >"$output_dir/.before.json"
+  jq 'del(.captured_at, .image_counts) | .pods |= map(select(.phase != "Succeeded"))' \
+    "$output_dir/control-after-cleanup.json" >"$output_dir/.after.json"
   cmp -s "$output_dir/.before.json" "$output_dir/.after.json" || die "protected production snapshot changed during cleanup"
   rm -f "$output_dir/.before.json" "$output_dir/.after.json"
   jq -cn --arg status pass --arg candidate_sha "$candidate_sha" \

@@ -85,6 +85,20 @@ ruby -ryaml -e '
       %w[sandbox workflow-run].include?(labels["app.kubernetes.io/component"])
   end
   abort "sandbox or workflow ingress selector admitted" if forbidden
+  egress = policy.dig("spec", "egress") || []
+  abort "postgres egress selector missing" unless egress.any? do |rule|
+    rule.fetch("to", []).any? { |target|
+      target.dig("podSelector", "matchLabels", "app.kubernetes.io/component") == "postgres"
+    } && rule.fetch("ports", []).any? { |port| port["protocol"] == "TCP" && port["port"] == 5432 }
+  end
+  postgres = docs.find do |doc|
+    doc["kind"] == "NetworkPolicy" &&
+      doc.dig("spec", "podSelector", "matchLabels", "app.kubernetes.io/component") == "postgres"
+  end or abort "postgres NetworkPolicy not rendered"
+  postgres_sources = postgres.dig("spec", "ingress").to_a.flat_map { |rule| rule.fetch("from", []) }
+  abort "googlechatbot postgres ingress selector missing" unless postgres_sources.any? do |source|
+    source.dig("podSelector", "matchLabels", "app.kubernetes.io/component") == "googlechatbot"
+  end
   deployment = docs.find do |doc|
     doc["kind"] == "Deployment" &&
       doc.dig("spec", "template", "metadata", "labels", "app.kubernetes.io/component") == "googlechatbot"
@@ -92,5 +106,5 @@ ruby -ryaml -e '
   env = deployment.dig("spec", "template", "spec", "containers", 0, "env")
     .to_h { |entry| [entry.fetch("name"), entry["value"]] }
   abort "explicit signed-request opt-out not rendered" unless env["GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS"] == "false"
-  puts "verified googlechatbot ingress admits api-rs and no sandbox/workflow selector"
+  puts "verified googlechatbot ingress isolation and bidirectional postgres policy"
 ' "$rendered"

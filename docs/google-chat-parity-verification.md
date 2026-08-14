@@ -37,9 +37,47 @@ be promoted to `Passed`.
 - **Live legacy**: the read-only Centaur VPS audit observed deployed image
   `sha-980e5e3b`, not this working tree. It confirms only retained legacy
   list/create/session/health behavior and contains no raw payloads.
-- **Live current branch**: required for Google-controlled wire formats, scopes,
-  DWD behavior, quotas, and the final release claim. None of the VPS evidence is
-  counted in this class.
+- **Live current-branch infrastructure**: candidate `04065be1` ran on
+  `centaur-vps` as native amd64 images in the isolated
+  `centaur-gchat-parity-canary` release. This proves deployment, state,
+  health, internal authentication, policy isolation, and replica replacement;
+  it does not prove Google-controlled wire formats or tenant authorization.
+- **Live current-branch Workspace**: still required for Google-signed ingress,
+  DWD behavior, quotas, and the final release claim. No production credential,
+  payload, or raw production log was reused for the canary.
+
+## 2026-08-14 centaur-vps canary result
+
+Candidate application commit: `04065be1163943f50880083a4ff135cf93cc78f9`.
+Production control commit: `bb37a15396bcc2e823b95ea26c523be993bf167d`.
+
+- Built and ran native amd64 candidate images pinned by `tag@sha256` for
+  googlechatbot, api-rs, Console, sandbox agent, and iron-proxy. OCI revision,
+  rendered spec, and K3s runtime image IDs matched the candidate evidence.
+- Two bot replicas became Ready with connected PostgreSQL state. Live and ready
+  probes, metrics, internal API `401/401/400` behavior, and replacement of a
+  deleted replica all passed.
+- The exact googlechatbot image passed 426 tests and type-checking on the VPS;
+  the exact agent image passed all 38 Google Chat CLI/client tests.
+- Live policy probes passed: bot and workflow traffic reached PostgreSQL,
+  api-rs reached the bot, and sandbox traffic was denied to both PostgreSQL and
+  the bot.
+- A 300-second production guard observed no readiness loss, restart increase,
+  or Google Chat rejection/failure counter increase. Cleanup removed the
+  canary release, namespace, PVCs, test pods, and exact candidate images.
+  Protected production snapshots before and after cleanup were identical;
+  only the expected rotation of completed two-minute reaper CronJob pods was
+  excluded.
+- The run found and fixed one product defect: the shared NetworkPolicy omitted
+  googlechatbot on both sides of its PostgreSQL connection. It also fixed VPS
+  verifier assumptions about Ruby availability, dynamic sandbox repository
+  mounts, StatefulSet claims, current workload images, and completed CronJob
+  churn.
+
+Result: VPS deployment/runtime verification passed. Final Workspace parity is
+still blocked on a dedicated non-production Google Chat app/project, DWD users,
+owned spaces/DMs/files, and the live TEST-015 through TEST-028 matrix. Reusing
+the working production app would not be isolated or safe release evidence.
 
 ## Evidence
 
