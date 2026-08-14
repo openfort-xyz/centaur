@@ -38,11 +38,20 @@ def send_message(
 def list_messages(
     space_name: str = typer.Argument(..., help="Google Chat space resource name"),
     page_size: int = typer.Option(20, "--page-size", "-n", help="Number of messages per page"),
+    page_token: str | None = typer.Option(None, "--page-token", help="Token from nextPageToken"),
+    filter: str | None = typer.Option(None, "--filter", help="Google Chat message filter"),
+    order_by: str | None = typer.Option(None, "--order-by", help="Message order: ASC or DESC"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """List messages in a Google Chat space."""
     client = _client()
-    result = client.list_messages(space_name, page_size=page_size)
+    result = client.list_messages(
+        space_name,
+        page_size=page_size,
+        page_token=page_token,
+        filter=filter,
+        order_by=order_by,
+    )
 
     if json_output:
         print(json.dumps(result, indent=2))
