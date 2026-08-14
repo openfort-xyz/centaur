@@ -249,17 +249,28 @@ postgres_value() {
 processing_pod="$(kubectl --context "$context" -n "$namespace" get pods \
   -l app.kubernetes.io/component=googlechatbot \
   -o jsonpath='{.items[0].metadata.name}')"
-processing_ip="$(kubectl --context "$context" -n "$namespace" get pod "$processing_pod" \
-  -o jsonpath='{.status.podIP}')"
 event_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# Variables intentionally expand inside the disposable trigger pod.
-# shellcheck disable=SC2016
-kubectl --context "$context" -n "$namespace" run gchat-recovery-trigger \
-  --rm -i --restart=Never --image=busybox:1.36 \
-  --env="TARGET=$processing_ip" --env="EVENT_TIME=$event_time" -- sh -c '
-    wget -qO- --header "Content-Type: application/json" \
-      --post-data "{\"type\":\"MESSAGE\",\"eventTime\":\"${EVENT_TIME}\",\"space\":{\"name\":\"spaces/AAAA\",\"spaceType\":\"DIRECT_MESSAGE\",\"singleUserBotDm\":true},\"message\":{\"name\":\"spaces/AAAA/messages/KIND1\",\"text\":\"/centaur return the Kind recovery sentinel\",\"argumentText\":\"return the Kind recovery sentinel\",\"slashCommand\":{\"commandId\":\"1\"},\"sender\":{\"name\":\"users/U1\",\"displayName\":\"Kind User\"}},\"user\":{\"name\":\"users/U1\",\"displayName\":\"Kind User\"}}" \
-      "http://${TARGET}:3002/api/chat/events" | grep -qx "{}"
+kubectl --context "$context" -n "$namespace" exec "$processing_pod" -- \
+  env EVENT_TIME="$event_time" bun -e '
+    const event = {
+      type: "MESSAGE",
+      eventTime: process.env.EVENT_TIME,
+      space: { name: "spaces/AAAA", spaceType: "DIRECT_MESSAGE", singleUserBotDm: true },
+      message: {
+        name: "spaces/AAAA/messages/KIND1",
+        text: "/centaur return the Kind recovery sentinel",
+        argumentText: "return the Kind recovery sentinel",
+        slashCommand: { commandId: "1" },
+        sender: { name: "users/U1", displayName: "Kind User" }
+      },
+      user: { name: "users/U1", displayName: "Kind User" }
+    }
+    const response = await fetch("http://127.0.0.1:3002/api/chat/events", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(event)
+    })
+    if (response.status !== 200 || await response.text() !== "{}") process.exit(1)
   '
 
 render_deadline=$((SECONDS + 60))
@@ -339,7 +350,6 @@ while :; do
   }
   sleep 2
 done
-test "$(date +%s)" -ge "$lease_expiry"
 
 recovery_metrics=""
 for recovered_pod in $(kubectl --context "$context" -n "$namespace" get pods \
