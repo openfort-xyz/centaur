@@ -235,8 +235,14 @@ kubectl --context "$context" -n "$namespace" run gchat-probe \
   '
 
 mock_stats() {
-  kubectl --context "$context" -n "$namespace" exec deployment/gchat-recovery-mock -- \
+  kubectl --context "$context" -n "$namespace" exec "$(mock_pod)" -- \
     bun -e "fetch('http://127.0.0.1:3000/control/stats').then(r => r.text()).then(console.log)"
+}
+
+mock_pod() {
+  kubectl --context "$context" -n "$namespace" get pods \
+    -l app=gchat-recovery-mock --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}'
 }
 
 postgres_value() {
@@ -322,7 +328,7 @@ while :; do
   }
   sleep 1
 done
-kubectl --context "$context" -n "$namespace" exec deployment/gchat-recovery-mock -- \
+kubectl --context "$context" -n "$namespace" exec "$(mock_pod)" -- \
   bun -e "fetch('http://127.0.0.1:3000/control/finish',{method:'POST'}).then(r => { if (!r.ok) process.exit(1) })"
 
 recovery_deadline=$((lease_expiry + 90))
