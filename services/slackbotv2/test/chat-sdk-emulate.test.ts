@@ -5697,7 +5697,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
   const idempotentExecutions = new Map<string, string>()
-  const streams = new Set<ServerResponse>()
+  const streams = new Map<ServerResponse, MockSessionEventRequest>()
   const workflowEvents: MockWorkflowEventRequest[] = []
   let autoRespond = true
   let executeHold: Promise<void> | null = null
@@ -5710,7 +5710,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   let resolvedHarnessType: string | undefined
   const port = await availablePort(4063)
   const closeStreams = () => {
-    for (const stream of streams) stream.end()
+    for (const stream of streams.keys()) stream.end()
     streams.clear()
   }
   const server = createServer((req, res) => {
@@ -5899,7 +5899,7 @@ async function handleMockCodexRequest(
     setFailNextEvents(value: boolean): void
     setFailNextExecute(value: boolean): void
     setFailNextExecuteAfterAccept(value: boolean): void
-    streams: Set<ServerResponse>
+    streams: Map<ServerResponse, MockSessionEventRequest>
     workflowEvents: MockWorkflowEventRequest[]
   }
 ): Promise<void> {
@@ -5955,7 +5955,9 @@ async function handleMockCodexRequest(
       connection: 'keep-alive',
       'content-type': 'text/event-stream'
     })
-    input.streams.add(res)
+    res.flushHeaders()
+    input.streams.set(res, { afterEventId, executionId, threadKey })
+    let terminalReplayed = false
     for (const event of input.events) {
       if (
         event.threadKey === threadKey
@@ -5963,9 +5965,14 @@ async function handleMockCodexRequest(
         && (!executionId || !event.executionId || event.executionId === executionId)
       ) {
         writeMockSseEvent(res, event)
+        if (isMockTerminalEvent(event)) terminalReplayed = true
       }
     }
-    req.once('close', () => {
+    if (terminalReplayed) {
+      input.streams.delete(res)
+      res.end()
+    }
+    res.once('close', () => {
       input.streams.delete(res)
     })
     return
@@ -6036,7 +6043,7 @@ function emitMockSessionEvent(input: {
   executionId?: string
   events: MockSessionEvent[]
   id: number
-  streams: Set<ServerResponse>
+  streams: Map<ServerResponse, MockSessionEventRequest>
   threadKey: string
 }): void {
   const event: MockSessionEvent = {
@@ -6047,16 +6054,46 @@ function emitMockSessionEvent(input: {
     threadKey: input.threadKey
   }
   input.events.push(event)
-  for (const stream of input.streams) writeMockSseEvent(stream, event)
+  for (const [stream, request] of input.streams) {
+    if (request.threadKey !== event.threadKey) continue
+    if (request.executionId && event.executionId && request.executionId !== event.executionId) {
+      continue
+    }
+    writeMockSseEvent(stream, event)
+    if (isMockTerminalEvent(event)) {
+      input.streams.delete(stream)
+      stream.end()
+    }
+  }
+}
+
+function isMockTerminalEvent(event: MockSessionEvent): boolean {
+  if (
+    event.event === 'session.execution_completed'
+    || event.event === 'session.execution_cancelled'
+    || event.event === 'session.execution_failed'
+    || event.event === 'session.stream_error'
+  ) return true
+  if (event.event !== 'session.output.line') return false
+  const data = parseMaybeJson(event.data)
+  return isRecord(data)
+    && (
+      data.method === 'turn/completed'
+      || data.method === 'turn/failed'
+      || data.type === 'turn.done'
+      || data.type === 'turn.completed'
+      || data.type === 'turn.failed'
+    )
 }
 
 function writeMockSseEvent(stream: ServerResponse, event: MockSessionEvent): void {
-  stream.write(`id: ${event.id}\n`)
-  stream.write(`event: ${event.event}\n`)
-  for (const line of event.data.split('\n')) {
-    stream.write(`data: ${line}\n`)
-  }
-  stream.write('\n')
+  stream.write([
+    `id: ${event.id}`,
+    `event: ${event.event}`,
+    ...event.data.split('\n').map(line => `data: ${line}`),
+    '',
+    ''
+  ].join('\n'))
 }
 
 type PatchedSlackApi = {
