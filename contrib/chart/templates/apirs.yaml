@@ -2,6 +2,7 @@
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $googleChatbotName := include "centaur.componentName" (dict "root" . "component" "googlechatbot") -}}
 {{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
 {{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
 {{- $repoCachePvcName := include "centaur.repoCachePvcName" . -}}
@@ -95,6 +96,17 @@
   (dict "name" "GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS" "value" (dig "googleDrive" "syncIntervalSeconds" 14400 $apiRsEtl))
   (dict "name" "GOOGLE_CALENDAR_ETL_ENABLED" "value" (dig "googleCalendar" "enabled" false $apiRsEtl))
   (dict "name" "GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS" "value" (dig "googleCalendar" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_ETL_ENABLED" "value" (dig "googleChat" "enabled" false $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_SYNC_INTERVAL_SECONDS" "value" (dig "googleChat" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_INCLUDE_SPACE_TYPES" "value" (dig "googleChat" "includeSpaceTypes" "SPACE" $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_MAX_PAGES_PER_RUN" "value" (dig "googleChat" "maxPagesPerRun" 0 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_SPACE_IDS" "value" (dig "googleChat" "spaceIds" "" $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_RETENTION_ENABLED" "value" (dig "googleChat" "retention" "enabled" true $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_RETENTION_INTERVAL_MINUTES" "value" (dig "googleChat" "retention" "intervalMinutes" 60 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_RETENTION_DAYS" "value" (dig "googleChat" "retention" "days" 0 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_RETENTION_BATCH_LIMIT" "value" (dig "googleChat" "retention" "batchLimit" 1000 $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_DWD_DM_SYNC_ENABLED" "value" (dig "googleChat" "dmSync" "enabled" false $apiRsEtl))
+  (dict "name" "GOOGLE_CHAT_DWD_DM_SUBJECTS" "value" (dig "googleChat" "dmSync" "subjects" "" $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_ENABLED" "value" (dig "companyContextDocuments" "enabled" true $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS" "value" (dig "companyContextDocuments" "intervalSeconds" 14400 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS" "value" (dig "companyContextDocuments" "maxWindowSeconds" 21600 $apiRsEtl))
@@ -229,6 +241,15 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACK_BOT_TOKEN" .Values.secretManager.envPrefix }}
                   optional: true
+{{- if .Values.googlechatbot.enabled }}
+            - name: GOOGLECHATBOT_INTERNAL_URL
+              value: {{ printf "http://%s:3002" $googleChatbotName | quote }}
+            - name: GOOGLECHATBOT_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLECHATBOT_INTERNAL_API_KEY" .Values.secretManager.envPrefix }}
+{{- end }}
 {{- if $mcpPublicUrl }}
             - name: CENTAUR_MCP_PUBLIC_URL
               value: {{ $mcpPublicUrl | quote }}

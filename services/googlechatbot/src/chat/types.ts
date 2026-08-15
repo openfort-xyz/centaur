@@ -15,6 +15,14 @@ export type NormalizedBinaryPart = {
     media_type: string
     data: string
   }
+  unavailable_reason?:
+    | 'download_not_configured'
+    | 'invalid_resource'
+    | 'declared_too_large'
+    | 'export_too_large'
+    | 'unsupported_native_file'
+    | 'download_failed'
+    | 'metadata_mismatch'
 }
 
 export type NormalizedPart = NormalizedTextPart | NormalizedBinaryPart
@@ -64,6 +72,7 @@ export type NormalizedChatEvent = {
     event_time?: string
     message_name?: string
     thread_name?: string
+    thread_reply?: boolean
   }
 }
 
@@ -72,8 +81,14 @@ export type NormalizedChatEvent = {
 export type GoogleChatEnvelope = {
   type?: string
   eventTime?: string
+  dialogEventType?: string
+  authorizationEventObject?: {
+    systemIdToken?: string
+    userIdToken?: string
+  }
   space?: {
     name?: string
+    spaceType?: string
     type?: string
     displayName?: string
     singleUserBotDm?: boolean
@@ -82,26 +97,52 @@ export type GoogleChatEnvelope = {
     name?: string
     text?: string
     thread?: { name?: string }
-    sender?: { name?: string; displayName?: string; email?: string }
+    sender?: {
+      name?: string
+      displayName?: string
+      domainId?: string
+      type?: 'HUMAN' | 'BOT'
+      isAnonymous?: boolean
+    }
     argumentText?: string
+    slashCommand?: { commandId?: string }
+    threadReply?: boolean
     attachment?: Array<{
       name?: string
       contentName?: string
       contentType?: string
-      size?: string
       source?: 'UPLOADED_CONTENT' | 'DRIVE_FILE'
+      thumbnailUri?: string
+      downloadUri?: string
       attachmentDataRef?: { resourceName?: string }
+      driveDataRef?: { driveFileId?: string }
     }>
-    annotations?: Array<{ type?: string }>
+    annotations?: Array<{
+      type?: string
+      userMention?: {
+        user?: { name?: string; type?: 'HUMAN' | 'BOT' }
+        type?: string
+      }
+    }>
     formattedText?: string
+    fallbackText?: string
+    attachedGifs?: Array<{ uri?: string }>
+    quotedMessageMetadata?: Record<string, unknown>
+    cardsV2?: Array<Record<string, unknown>>
   }
   user?: {
     name?: string
     displayName?: string
-    email?: string
+    domainId?: string
+    type?: 'HUMAN' | 'BOT'
+    isAnonymous?: boolean
   }
   thread?: {
     name?: string
+  }
+  action?: {
+    actionMethodName?: string
+    parameters?: Array<{ key?: string; value?: string }>
   }
   // CARD_CLICKED events: the invoked cardsV2 button (onClick.action.function)
   // and its parameters come back under `common`, per the modern Chat API
@@ -111,23 +152,35 @@ export type GoogleChatEnvelope = {
   // relying on it in production (see SLACK_PARITY.md 6.4).
   common?: {
     invokedFunction?: string
-    parameters?: Record<string, string>
+    parameters?: Record<string, unknown>
+    formInputs?: Record<string, unknown>
+  }
+  appCommandMetadata?: {
+    appCommandId?: string
+    appCommandType?: string
   }
 }
 
-// Payload dispatched to api-rs as a `google_chat.card_click.<invokedFunction>`
-// workflow event (parity with slackbotv2's SlackbotV2BlockActionPayload /
-// `slack.block_action.<action_id>`). See SLACK_PARITY.md 6.4 for the same
-// unverified-wire-format caveat as GoogleChatEnvelope.common above.
-export type GoogleChatCardClickPayload = {
+export type GoogleChatActionType = 'card_click' | 'app_command' | 'submit_form'
+
+// Typed payload dispatched to api-rs as
+// `google_chat.<event_type>.<invoked_function>`.
+export type GoogleChatActionPayload = {
+  event_type: GoogleChatActionType
   invoked_function: string
   message_name?: string
-  parameters?: Record<string, string>
+  parameters?: Record<string, unknown>
+  form_inputs?: Record<string, unknown>
   space_name: string
   thread_name?: string
   user_email?: string
   user_id?: string
   user_name?: string
+}
+
+export type GoogleChatWorkflowEvent = {
+  event_name: `google_chat.${GoogleChatActionType}.${string}`
+  payload: GoogleChatActionPayload
 }
 
 // Inbound message shape returned by spaces.messages.list / spaces.messages.get.
@@ -136,18 +189,37 @@ export type GoogleChatCardClickPayload = {
 export type ChatListMessage = {
   name?: string
   text?: string
+  formattedText?: string
   argumentText?: string
+  threadReply?: boolean
   createTime?: string
   sender?: {
     name?: string
     displayName?: string
+    domainId?: string
     type?: 'HUMAN' | 'BOT'
+    isAnonymous?: boolean
   }
+  fallbackText?: string
+  attachedGifs?: Array<{ uri?: string }>
+  quotedMessageMetadata?: Record<string, unknown>
+  cardsV2?: Array<Record<string, unknown>>
+  attachment?: Array<{
+    name?: string
+    contentName?: string
+    contentType?: string
+    source?: 'UPLOADED_CONTENT' | 'DRIVE_FILE'
+    thumbnailUri?: string
+    downloadUri?: string
+    attachmentDataRef?: { resourceName?: string }
+    driveDataRef?: { driveFileId?: string }
+  }>
 }
 
 export type GoogleChatMessage = {
   name?: string
   text?: string
+  fallbackText?: string
   cardsV2?: Array<{
     cardId?: string
     card: GoogleChatCard

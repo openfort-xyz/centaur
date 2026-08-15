@@ -1,0 +1,102 @@
+{
+  "family": "workspace-addons",
+  "authentication": {
+    "algorithm": "RS256",
+    "issuer": "https://accounts.google.com",
+    "audience": "https://chat.example.test/api/chat/events",
+    "email": "addon@example.iam.gserviceaccount.com",
+    "email_verified": true
+  },
+  "cases": [
+    {
+      "name": "addons-message",
+      "expect": "session",
+      "body": {
+        "chat": {
+          "eventTime": "2026-08-14T12:00:00Z",
+          "user": { "name": "users/U1", "displayName": "Fixture User" },
+          "messagePayload": {
+            "space": { "name": "spaces/ADDONS", "spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true },
+            "message": {
+              "name": "spaces/ADDONS/messages/A1",
+              "text": "add-ons message",
+              "sender": { "name": "users/U1", "displayName": "Fixture User", "type": "HUMAN" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "addons-card-action",
+      "expect": "workflow",
+      "eventName": "google_chat.card_click.approve",
+      "body": {
+        "commonEventObject": { "parameters": { "actionName": "approve", "request_id": "fixture-2" } },
+        "chat": {
+          "eventTime": "2026-08-14T12:00:01Z",
+          "user": { "name": "users/U1", "displayName": "Fixture User" },
+          "buttonClickedPayload": {
+            "space": { "name": "spaces/ADDONS", "spaceType": "SPACE" },
+            "message": { "name": "spaces/ADDONS/messages/A2" }
+          }
+        }
+      }
+    },
+    {
+      "name": "addons-app-command",
+      "expect": "workflow",
+      "eventName": "google_chat.app_command.42",
+      "body": {
+        "chat": {
+          "eventTime": "2026-08-14T12:00:02Z",
+          "user": { "name": "users/U1", "displayName": "Fixture User" },
+          "appCommandPayload": {
+            "space": { "name": "spaces/ADDONS", "spaceType": "SPACE" },
+            "message": { "name": "spaces/ADDONS/messages/A3" },
+            "appCommandMetadata": { "appCommandId": "42", "appCommandType": "QUICK_COMMAND" }
+          }
+        }
+      }
+    },
+    {
+      "name": "addons-form-submission",
+      "expect": "workflow",
+      "eventName": "google_chat.submit_form.save",
+      "body": {
+        "commonEventObject": {
+          "parameters": { "actionName": "save" },
+          "formInputs": { "title": { "stringInputs": { "value": ["fixture"] } } }
+        },
+        "chat": {
+          "eventTime": "2026-08-14T12:00:03Z",
+          "user": { "name": "users/U1", "displayName": "Fixture User" },
+          "buttonClickedPayload": {
+            "space": { "name": "spaces/ADDONS", "spaceType": "SPACE" },
+            "message": { "name": "spaces/ADDONS/messages/A4" },
+            "dialogEventType": "SUBMIT_DIALOG"
+          }
+        }
+      }
+    },
+    {
+      "name": "addons-domain-denial",
+      "expect": "denied",
+      "status": 403,
+      "userEmail": "denied@outside.example",
+      "body": {
+        "chat": {
+          "eventTime": "2026-08-14T12:00:04Z",
+          "user": { "name": "users/U2", "displayName": "Denied User" },
+          "messagePayload": {
+            "space": { "name": "spaces/ADDONS", "spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true },
+            "message": {
+              "name": "spaces/ADDONS/messages/A5",
+              "text": "must not run",
+              "sender": { "name": "users/U2", "displayName": "Denied User", "type": "HUMAN" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

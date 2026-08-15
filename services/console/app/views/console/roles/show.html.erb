@@ -29,6 +29,14 @@
            owner: @role,
            url: slack_channel_permissions_console_role_path(@role.oid) %>
 
+<%= render "console/shared/google_chat_space_permissions",
+           owner: @role,
+           url: google_chat_space_permissions_console_role_path(@role.oid) %>
+
+<%= render "console/shared/google_chat_dm_permissions",
+           owner: @role,
+           url: google_chat_dm_permissions_console_role_path(@role.oid) %>
+
 <section>
   <div class="mb-4 flex flex-wrap items-end justify-between gap-3">
     <div>

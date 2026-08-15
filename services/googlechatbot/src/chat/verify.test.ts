@@ -15,12 +15,12 @@ function configWith(overrides: Record<string, string>): AppConfig {
   return loadConfig({ ...process.env, ...overrides })
 }
 
-function envelopeAt(timestamp: string, userEmail?: string): GoogleChatEnvelope {
+function envelopeAt(timestamp: string): GoogleChatEnvelope {
   return {
     type: 'MESSAGE',
     eventTime: timestamp,
     space: { name: 'spaces/AAAA', type: 'SPACE' },
-    user: userEmail ? { name: 'users/U1', email: userEmail } : undefined
+    user: { name: 'users/U1' }
   }
 }
 
@@ -39,7 +39,8 @@ describe('verifyChatRequest', () => {
     const config = configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' })
     const out = verifyChatRequest({
       config,
-      envelope: envelopeAt('2026-01-01T00:00:00Z', 'attacker@evil.example'),
+      envelope: envelopeAt('2026-01-01T00:00:00Z'),
+      userEmail: 'attacker@evil.example',
       nowSeconds: Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
     })
     expect(out.ok).toBe(false)
@@ -49,14 +50,59 @@ describe('verifyChatRequest', () => {
     }
   })
 
+  test.each([undefined, '', 'missing-at.example', '@openfort.xyz', 'a@b@openfort.xyz'])(
+    'rejects a missing or malformed sender email when allowlist is configured: %s',
+    userEmail => {
+      const config = configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' })
+      const out = verifyChatRequest({
+        config,
+        envelope: envelopeAt('2026-01-01T00:00:00Z'),
+        userEmail,
+        nowSeconds: Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
+      })
+      expect(out).toEqual({ ok: false, status: 403, reason: 'domain_not_allowlisted' })
+    }
+  )
+
   test('accepts an allowlisted domain', () => {
     const config = configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz,other.example' })
     const out = verifyChatRequest({
       config,
-      envelope: envelopeAt('2026-01-01T00:00:00Z', 'me@openfort.xyz'),
+      envelope: envelopeAt('2026-01-01T00:00:00Z'),
+      userEmail: 'me@openfort.xyz',
       nowSeconds: Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
     })
     expect(out.ok).toBe(true)
+  })
+
+  test('uses a verified Add-on user email instead of the body email', () => {
+    const config = configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'example.com' })
+    const out = verifyChatRequest({
+      config,
+      envelope: {
+        ...envelopeAt('2026-01-01T00:00:00Z'),
+        user: { name: 'users/U1', email: 'attacker@evil.example' }
+      } as unknown as GoogleChatEnvelope,
+      userEmail: 'alice@example.com',
+      nowSeconds: Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
+    })
+    expect(out).toEqual({ ok: true })
+  })
+
+  test('binds a verified Add-on user token subject to the event user', () => {
+    const config = configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: '' })
+    expect(verifyChatRequest({
+      config,
+      envelope: { ...envelopeAt('2026-01-01T00:00:00Z'), user: { name: 'users/U1' } },
+      userId: 'U1',
+      nowSeconds: Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
+    })).toEqual({ ok: true })
+    expect(verifyChatRequest({
+      config,
+      envelope: { ...envelopeAt('2026-01-01T00:00:00Z'), user: { name: 'users/U2' } },
+      userId: 'U1',
+      nowSeconds: Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
+    })).toEqual({ ok: false, status: 401, reason: 'user_id_mismatch' })
   })
 
   test('rejects events older than CHAT_EVENT_MAX_AGE_SECONDS as stale', () => {
@@ -110,6 +156,27 @@ describe('verifyChatRequestToken', () => {
       claims: { iss: GOOGLE_CHAT_SA_ISSUER, aud: AUD, iat: NOW, exp: NOW + 300, ...overrides }
     })
     return `Bearer ${token}`
+  }
+
+  async function oidcBearer(
+    aud: string,
+    email: string,
+    overrides: Record<string, unknown> = {}
+  ): Promise<string> {
+    return `Bearer ${await signJwt({
+      privateKey: pair.privateKey,
+      kid: KID,
+      claims: {
+        iss: 'https://accounts.google.com',
+        aud,
+        email,
+        email_verified: true,
+        sub: 'U1',
+        iat: NOW,
+        exp: NOW + 300,
+        ...overrides
+      }
+    })}`
   }
 
   // The skip path is processable but NOT verified: nothing was authenticated,
@@ -166,15 +233,137 @@ describe('verifyChatRequestToken', () => {
     const url = 'https://chat-centaur.fort.dev/api/chat/events'
     const config = configWith({
       GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: 'true',
+      GOOGLECHATBOT_INGRESS_MODE: 'chat_api_url',
       GOOGLECHATBOT_WEBHOOK_AUDIENCE: url
     })
     const out = await verifyChatRequestToken({
       config,
-      authorization: await bearer({ aud: url }),
+      authorization: await oidcBearer(url, GOOGLE_CHAT_SA_ISSUER),
       resolveKey,
       nowSeconds: NOW
     })
     expect(out).toEqual({ ok: true, verified: true })
+  })
+
+  test.each([
+    [{ email_verified: false }, 'signer_email_not_verified'],
+    [{ email: 'other@example.iam.gserviceaccount.com' }, 'signer_email_mismatch']
+  ])('rejects URL-mode sender claim mismatch', async (overrides, reason) => {
+    const url = 'https://chat.example.test/api/chat/events'
+    const config = configWith({
+      GOOGLECHATBOT_INGRESS_MODE: 'chat_api_url',
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: url
+    })
+    const out = await verifyChatRequestToken({
+      config,
+      authorization: await oidcBearer(url, GOOGLE_CHAT_SA_ISSUER, overrides),
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(out).toEqual({ ok: false, status: 401, reason })
+  })
+
+  test('keeps issuer and audience paired across modes', async () => {
+    const url = 'https://chat.example.test/api/chat/events'
+    const projectWithUrlToken = await verifyChatRequestToken({
+      config: configWith({
+        GOOGLECHATBOT_INGRESS_MODE: 'chat_api_project',
+        GOOGLECHATBOT_PROJECT_NUMBER: AUD,
+        GOOGLECHATBOT_WEBHOOK_AUDIENCE: url
+      }),
+      authorization: await oidcBearer(AUD, GOOGLE_CHAT_SA_ISSUER),
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(projectWithUrlToken.ok).toBe(false)
+
+    const urlWithProjectToken = await verifyChatRequestToken({
+      config: configWith({
+        GOOGLECHATBOT_INGRESS_MODE: 'chat_api_url',
+        GOOGLECHATBOT_PROJECT_NUMBER: AUD,
+        GOOGLECHATBOT_WEBHOOK_AUDIENCE: url
+      }),
+      authorization: await bearer({ aud: url }),
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(urlWithProjectToken.ok).toBe(false)
+  })
+
+  test('verifies Add-on signer and optional user identity tokens', async () => {
+    const url = 'https://addon.example.test/events'
+    const signer = 'addon@example.iam.gserviceaccount.com'
+    const clientId = '123.apps.googleusercontent.com'
+    const userIdToken = (await oidcBearer(clientId, 'alice@example.com')).replace(/^Bearer /, '')
+    const out = await verifyChatRequestToken({
+      config: configWith({
+        GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+        GOOGLECHATBOT_WEBHOOK_AUDIENCE: url,
+        GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL: signer,
+        GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID: clientId
+      }),
+      authorization: await oidcBearer(url, signer),
+      userIdToken,
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(out).toEqual({
+      ok: true,
+      verified: true,
+      userEmail: 'alice@example.com',
+      userId: 'U1'
+    })
+  })
+
+  test('rejects an Add-on without its exact configured signer', async () => {
+    const url = 'https://addon.example.test/events'
+    const base = {
+      GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: url
+    }
+    const missing = await verifyChatRequestToken({
+      config: configWith(base),
+      authorization: await oidcBearer(url, 'addon@example.iam.gserviceaccount.com'),
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(missing).toEqual({
+      ok: false,
+      status: 401,
+      reason: 'addon_signer_email_not_configured'
+    })
+    const wrong = await verifyChatRequestToken({
+      config: configWith({
+        ...base,
+        GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL: 'expected@example.iam.gserviceaccount.com'
+      }),
+      authorization: await oidcBearer(url, 'other@example.iam.gserviceaccount.com'),
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(wrong).toEqual({ ok: false, status: 401, reason: 'signer_email_mismatch' })
+  })
+
+  test('rejects an Add-on user token without the configured OAuth audience', async () => {
+    const url = 'https://addon.example.test/events'
+    const signer = 'addon@example.iam.gserviceaccount.com'
+    const userIdToken = (await oidcBearer('client-id', 'alice@example.com')).replace(/^Bearer /, '')
+    const out = await verifyChatRequestToken({
+      config: configWith({
+        GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+        GOOGLECHATBOT_WEBHOOK_AUDIENCE: url,
+        GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL: signer
+      }),
+      authorization: await oidcBearer(url, signer),
+      userIdToken,
+      resolveKey,
+      nowSeconds: NOW
+    })
+    expect(out).toEqual({
+      ok: false,
+      status: 401,
+      reason: 'addon_oauth_client_id_not_configured'
+    })
   })
 })
 

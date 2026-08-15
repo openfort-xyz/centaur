@@ -4,7 +4,9 @@ import asyncio
 import datetime as dt
 import importlib
 import json
+import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -55,6 +57,8 @@ def _install_api_stubs() -> None:
 _install_api_stubs()
 projection = importlib.import_module("workflows.company_context_documents")
 chat_sync = importlib.import_module("workflows.google_chat.sync")
+chat_metrics = importlib.import_module("workflows.google_chat.metrics")
+chat_retention = importlib.import_module("workflows.google_chat.retention")
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +143,28 @@ def test_google_chat_thread_document_falls_back_to_sender_id_and_space_title():
     assert document["author_name"] == "users/9"
 
 
+def test_google_chat_attachment_document_is_company_context():
+    row = {
+        "space_id": "S1",
+        "message_id": "M1",
+        "attachment_id": "A1",
+        "content_name": "runbook.txt",
+        "content_text": "restart api-rs",
+        "content_type": "text/plain",
+        "source_uri": "https://example.invalid/source",
+        "download_uri": "",
+        "sender_id": "users/1",
+        "sender_name": "Alice",
+        "source_create_time": dt.datetime(2026, 6, 1, tzinfo=dt.UTC),
+        "updated_at": dt.datetime(2026, 6, 2, tzinfo=dt.UTC),
+    }
+    document = projection._google_chat_attachment_document(row)
+    assert document["document_id"] == "google_chat:attachment:S1:M1:A1"
+    assert document["source_type"] == "google_chat_attachment"
+    assert document["access_scope"] == "company"
+    assert document["body"] == "restart api-rs"
+
+
 def test_google_chat_registered_as_projection_source():
     assert "google_chat_thread" in projection.COMPANY_CONTEXT_SOURCE_TYPES["google_chat"]
     assert (
@@ -209,6 +235,19 @@ def test_message_text_falls_back_to_card_content_for_app_messages():
     assert chat_sync._message_text({"cardsV2": [{"card": {"sections": []}}]}) == ""
 
 
+def test_python_card_text_matches_shared_fixture():
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/google_chat_card_text.json"
+    for case in json.loads(fixture.read_text()):
+        assert chat_sync._message_text(case["message"]) == case["text"], case["name"]
+
+
+def test_message_text_uses_official_fallback_and_gif_fields():
+    assert chat_sync._message_text({"fallbackText": "Card summary"}) == "Card summary"
+    assert chat_sync._message_text({"attachedGifs": [{"uri": "https://example.test/a.gif"}]}) == (
+        "https://example.test/a.gif"
+    )
+
+
 def test_resource_id_strips_prefix():
     assert chat_sync._resource_id("spaces/S1/messages/m1") == "m1"
     assert chat_sync._resource_id("") == ""
@@ -216,6 +255,12 @@ def test_resource_id_strips_prefix():
     # _resource_id before being re-prefixed, so a full resource name in the env
     # cannot produce a "spaces/spaces/<id>" URL.
     assert f"spaces/{chat_sync._resource_id('spaces/S1')}" == "spaces/S1"
+
+
+def test_space_type_prefers_current_schema_and_maps_deprecated_values():
+    assert chat_sync._space_type({"spaceType": "SPACE", "type": "DM"}) == "SPACE"
+    assert chat_sync._space_type({"type": "ROOM"}) == "SPACE"
+    assert chat_sync._space_type({"type": "DM"}) == "DIRECT_MESSAGE"
 
 
 class _FakeTransport:
@@ -232,7 +277,7 @@ class _FakeTransport:
 def test_client_builds_space_scoped_urls():
     from workflows.google_chat.client import GoogleChatReadonlyClient
 
-    client = GoogleChatReadonlyClient()
+    client = GoogleChatReadonlyClient(None)
     client._http = transport = _FakeTransport()
 
     client.list_messages("spaces/S1", page_size=2, filter='createTime > "t"')
@@ -242,8 +287,132 @@ def test_client_builds_space_scoped_urls():
     assert messages_url.startswith("https://chat.googleapis.com/v1/spaces/S1/messages?")
     assert members_url.startswith("https://chat.googleapis.com/v1/spaces/S1/members?")
     # History is always walked oldest-first; the caller no longer passes order_by.
-    assert "orderBy=createTime+asc" in messages_url
+    assert "orderBy=createTime+ASC" in messages_url
     assert "/spaces/spaces/" not in messages_url + members_url
+
+
+def test_client_requests_deleted_messages_when_enabled():
+    from workflows.google_chat.client import GoogleChatReadonlyClient
+
+    client = GoogleChatReadonlyClient(None)
+    client._http = transport = _FakeTransport()
+    client.list_messages("spaces/DM1", show_deleted=True)
+    assert "showDeleted=true" in transport.urls[0]
+
+
+def test_client_retries_transient_reads_and_honors_retry_after(monkeypatch):
+    from workflows.google_chat import client as chat_client
+
+    class Response(dict):
+        def __init__(self, status, **headers):
+            super().__init__(headers)
+            self.status = status
+
+    class Transport:
+        def __init__(self):
+            self.responses = [
+                (Response(429, **{"retry-after": "0"}), b"rate limited"),
+                (Response(503), b"unavailable"),
+                (Response(200), b'{"spaces":[]}'),
+            ]
+
+        def request(self, _url, method="GET"):
+            assert method == "GET"
+            return self.responses.pop(0)
+
+    sleeps = []
+    monkeypatch.setattr(chat_client.time, "sleep", sleeps.append)
+    monkeypatch.setattr(chat_client.random, "random", lambda: 0)
+    client = chat_client.GoogleChatReadonlyClient(None)
+    client._http = Transport()
+    assert client.list_spaces() == {"spaces": []}
+    assert sleeps == [0.0, 0.0]
+
+
+def test_client_429_backoff_starts_after_a_full_quota_window(monkeypatch):
+    from workflows.google_chat import client as chat_client
+
+    class Response(dict):
+        status = 429
+
+    monkeypatch.setattr(chat_client.random, "random", lambda: 0.0)
+    assert chat_client._retry_delay_seconds(Response(), 0) == 1.0
+    assert chat_client._retry_delay_seconds(Response(), 1) == 2.0
+
+
+def test_delegated_client_uses_context_broker_without_google_credentials():
+    from workflows.google_chat.client import GoogleChatDelegatedClient
+
+    class Ctx:
+        def __init__(self):
+            self.requests = []
+
+        async def google_chat_dwd_read(self, subject, operation, **kwargs):
+            self.requests.append((subject, operation, kwargs))
+            return {"messages": []}
+
+    ctx = Ctx()
+    client = GoogleChatDelegatedClient(ctx, "alice@example.com")
+    result = asyncio.run(
+        client.list_messages(
+            "spaces/S1",
+            page_size=50,
+            page_token="next",
+            filter='createTime > "2026-08-01T00:00:00Z"',
+        )
+    )
+    assert result == {"messages": []}
+    assert ctx.requests == [
+        (
+            "alice@example.com",
+            "list_messages",
+            {
+                "resource_name": "spaces/S1",
+                "page_size": 50,
+                "page_token": "next",
+                "filter": 'createTime > "2026-08-01T00:00:00Z"',
+            },
+        )
+    ]
+
+
+def test_readonly_reactions_use_fixed_broker_identity():
+    from workflows.google_chat.client import GoogleChatReadonlyClient
+
+    class Ctx:
+        def __init__(self):
+            self.requests = []
+
+        async def google_chat_dwd_read(self, subject, operation, **kwargs):
+            self.requests.append((subject, operation, kwargs))
+            return {"emojiReactions": []}
+
+    ctx = Ctx()
+    result = asyncio.run(
+        GoogleChatReadonlyClient(ctx).list_reactions(
+            "spaces/S1/messages/M1", page_size=100, page_token="next"
+        )
+    )
+
+    assert result == {"emojiReactions": []}
+    assert ctx.requests == [
+        (
+            "",
+            "list_reactions",
+            {
+                "resource_name": "spaces/S1/messages/M1",
+                "page_size": 100,
+                "page_token": "next",
+            },
+        )
+    ]
+
+
+def test_incremental_filter_matches_the_broker_contract():
+    timestamp = dt.datetime(2026, 8, 1, 0, 0, 0, 123456, tzinfo=dt.UTC)
+    assert f'createTime > "{chat_sync._rfc3339(timestamp)}"' == (
+        'createTime > "2026-08-01T00:00:00.123456Z"'
+    )
 
 
 class FakeChatClient:
@@ -254,10 +423,27 @@ class FakeChatClient:
     def list_members(self, space_name, *, page_size, page_token=None):
         return {"memberships": []}
 
+    def list_reactions(self, message_name, *, page_size, page_token=None):
+        return {"emojiReactions": []}
+
     def list_messages(
-        self, space_name, *, page_size, page_token=None, filter=None, order_by="createTime asc"
+        self,
+        space_name,
+        *,
+        page_size,
+        page_token=None,
+        filter=None,
+        show_deleted=False,
+        order_by="createTime ASC",
     ):
-        self.calls.append({"page_token": page_token, "filter": filter, "order_by": order_by})
+        self.calls.append(
+            {
+                "page_token": page_token,
+                "filter": filter,
+                "show_deleted": show_deleted,
+                "order_by": order_by,
+            }
+        )
         index = 0 if page_token is None else int(page_token)
         return self._pages[index]
 
@@ -266,6 +452,8 @@ class FakeSyncPool:
     def __init__(self):
         self.executed = []
         self.checkpoint_watermark = None
+        self.continuation_token = None
+        self.continuation_filter = None
 
     async def fetchrow(self, query, *args):
         # _load_checkpoint -> no existing checkpoint (cold start)
@@ -274,8 +462,9 @@ class FakeSyncPool:
     async def execute(self, query, *args):
         self.executed.append((query, args))
         if "google_chat_sync_checkpoints" in query and "watermark_time" in query:
-            # capture watermark passed to _update_checkpoint_success ($2)
-            self.checkpoint_watermark = args[1]
+            self.checkpoint_watermark = args[2]
+            self.continuation_token = args[4]
+            self.continuation_filter = args[5]
         return "INSERT 0 1"
 
 
@@ -325,10 +514,11 @@ def test_sync_space_pages_skips_empty_and_advances_watermark():
     # Two pages walked (cold start: no createTime filter on the first call).
     assert len(client.calls) == 2
     assert client.calls[0]["filter"] is None
-    assert client.calls[0]["order_by"] == "createTime asc"
+    assert client.calls[0]["show_deleted"] is True
+    assert client.calls[0]["order_by"] == "createTime ASC"
 
 
-def test_sync_space_uses_overlapped_watermark_filter_when_checkpoint_exists():
+def test_scheduled_sync_rescans_old_messages_so_edits_converge():
     class CheckpointPool(FakeSyncPool):
         async def fetchrow(self, query, *args):
             return {
@@ -354,8 +544,67 @@ def test_sync_space_uses_overlapped_watermark_filter_when_checkpoint_exists():
         )
     )
 
-    # 12:00 watermark minus 60s overlap -> filter from 11:59.
-    assert client.calls[0]["filter"] == 'createTime > "2026-06-01T11:59:00Z"'
+    assert client.calls[0]["filter"] is None
+
+
+def test_deletion_cleanup_is_idempotent_and_removes_retained_content():
+    pool = FakeSyncPool()
+    for _ in range(2):
+        asyncio.run(
+            chat_sync._delete_message(
+                pool,
+                owner_email="alice@example.com",
+                space_id="DM1",
+                message_id="M1",
+            )
+        )
+    deletes = [(query, args) for query, args in pool.executed if query.startswith("DELETE")]
+    assert len(deletes) == 6
+    assert all(args == ("alice@example.com", "DM1", "M1") for _, args in deletes)
+    assert any("google_chat_sync_messages" in query for query, _ in deletes)
+
+
+def test_shared_space_tombstone_removes_retained_content_during_sync():
+    client = FakeChatClient(
+        [
+            {
+                "messages": [
+                    {
+                        "name": "spaces/S1/messages/M1",
+                        "deleteTime": "2026-08-14T10:00:00Z",
+                    }
+                ]
+            }
+        ]
+    )
+    pool = FakeSyncPool()
+    counts = {
+        "spaces_seen": 1,
+        "spaces_synced": 0,
+        "messages_seen": 0,
+        "messages_upserted": 0,
+    }
+
+    asyncio.run(
+        chat_sync._sync_space(
+            pool,
+            client=client,
+            space={"name": "spaces/S1", "displayName": "Eng", "type": "SPACE"},
+            run_id="run_1",
+            page_size=100,
+            overlap_seconds=60,
+            max_pages=0,
+            explicit_since=None,
+            counts=counts,
+        )
+    )
+
+    deletes = [(query, args) for query, args in pool.executed if query.startswith("DELETE")]
+    assert client.calls[0]["show_deleted"] is True
+    assert counts["messages_seen"] == 1
+    assert counts["messages_upserted"] == 0
+    assert len(deletes) == 3
+    assert all(args == ("", "S1", "M1") for _, args in deletes)
 
 
 def test_sync_space_never_regresses_watermark_below_checkpoint():
@@ -408,3 +657,445 @@ def test_sync_space_never_regresses_watermark_below_checkpoint():
     # …but the stored watermark stays clamped at the pre-run checkpoint.
     assert watermark == checkpoint_time
     assert pool.checkpoint_watermark == checkpoint_time
+
+
+def test_bounded_sync_persists_and_resumes_page_continuation():
+    created = dt.datetime(2026, 6, 1, 10, 0, tzinfo=dt.UTC)
+
+    def msg(mid):
+        return {
+            "name": f"spaces/S1/messages/{mid}",
+            "text": mid,
+            "thread": {"name": "spaces/S1/threads/T1"},
+            "sender": {"name": "users/1", "type": "HUMAN"},
+            "createTime": created.isoformat().replace("+00:00", "Z"),
+        }
+
+    pages = [
+        {"messages": [msg("m1")], "nextPageToken": "1"},
+        {"messages": [msg("m2")]},
+    ]
+    first_client = FakeChatClient(pages)
+    first_pool = FakeSyncPool()
+    counts = {"messages_seen": 0, "messages_upserted": 0}
+    asyncio.run(
+        chat_sync._sync_space(
+            first_pool,
+            client=first_client,
+            space={"name": "spaces/S1", "type": "SPACE"},
+            run_id="run_1",
+            page_size=1,
+            overlap_seconds=60,
+            max_pages=1,
+            explicit_since=None,
+            counts=counts,
+        )
+    )
+    assert first_pool.continuation_token == "1"
+
+    class ResumePool(FakeSyncPool):
+        async def fetchrow(self, query, *args):
+            return {
+                "watermark_time": created,
+                "last_error": "",
+                "continuation_token": "1",
+                "continuation_filter": "",
+                "continuation_started_at": created,
+            }
+
+    second_client = FakeChatClient(pages)
+    second_pool = ResumePool()
+    asyncio.run(
+        chat_sync._sync_space(
+            second_pool,
+            client=second_client,
+            space={"name": "spaces/S1", "type": "SPACE"},
+            run_id="run_2",
+            page_size=1,
+            overlap_seconds=60,
+            max_pages=1,
+            explicit_since=None,
+            counts={"messages_seen": 0, "messages_upserted": 0},
+        )
+    )
+    assert second_client.calls[0]["page_token"] == "1"
+    assert second_client.calls[0]["filter"] is None
+    assert second_pool.continuation_token == ""
+
+
+def test_dm_membership_failure_does_not_block_owner_scoped_sync():
+    class BrokenMembers(FakeChatClient):
+        def list_members(self, space_name, *, page_size, page_token=None):
+            raise RuntimeError("membership denied")
+
+    assert asyncio.run(chat_sync._member_directory(BrokenMembers([]), "spaces/DM")) == {}
+
+
+def test_malformed_reactions_are_skipped_without_page_index_ids():
+    class Reactions(FakeChatClient):
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            return {
+                "emojiReactions": [
+                    {"user": {"name": "users/1"}, "emoji": {"unicode": "👍"}},
+                    {
+                        "name": "spaces/S1/messages/M1/reactions/R1",
+                        "user": {"name": "users/2"},
+                        "emoji": {"unicode": "✅"},
+                    },
+                ]
+            }
+
+    pool = FakeSyncPool()
+    count = asyncio.run(
+        chat_sync._replace_reactions(
+            pool,
+            client=Reactions([]),
+            owner_email="",
+            space_id="S1",
+            message_id="M1",
+            message_name="spaces/S1/messages/M1",
+            run_id="run_1",
+        )
+    )
+    assert count == 1
+    inserts = [args for sql, args in pool.executed if "INSERT INTO google_chat_sync_reactions" in sql]
+    assert [args[3] for args in inserts] == ["R1"]
+
+
+def test_changed_chat_threads_exclude_owner_scoped_dms():
+    class Pool:
+        def __init__(self):
+            self.queries = []
+
+        async def fetch(self, query, *args):
+            self.queries.append(query)
+            return []
+
+        async def fetchrow(self, query, *args):
+            self.queries.append(query)
+            return {"changed_messages": 0, "max_updated_at": None}
+
+    pool = Pool()
+    asyncio.run(projection._load_changed_chat_threads(pool, None))
+    assert all("owner_email = ''" in query for query in pool.queries)
+
+
+def test_dm_sync_allowlist_defaults_off_and_intersects_requested(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", raising=False)
+    monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SUBJECTS", "alice@example.com")
+    assert chat_sync._dm_subject_allowlist() == set()
+    monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", "true")
+    assert chat_sync._dm_subject_allowlist() == {"alice@example.com"}
+    assert chat_sync._selected_dm_subjects(["alice@example.com", "mallory@example.com"]) == [
+        "alice@example.com"
+    ]
+    monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SUBJECTS", "")
+    assert chat_sync._selected_dm_subjects(["alice@example.com"]) == []
+
+
+def test_failing_dwd_subject_redacts_token_from_logs_and_result(monkeypatch):
+    sentinel = "Bearer sentinel-delegated-token"
+
+    class AppClient:
+        def list_spaces(self, *, page_size, page_token=None):
+            return {"spaces": []}
+
+    class DwdClient:
+        def list_spaces(self, *, page_size, page_token=None):
+            raise RuntimeError(f"upstream failed Authorization: {sentinel}")
+
+    class Pool:
+        async def execute(self, query, *args):
+            return "UPDATE 1"
+
+    class Ctx:
+        run_id = "workflow-1"
+        _pool = Pool()
+
+        def __init__(self):
+            self.logs = []
+
+        def log(self, event, **fields):
+            self.logs.append((event, fields))
+
+    monkeypatch.setenv("GOOGLE_CHAT_ETL_ENABLED", "true")
+    monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", "true")
+    monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SUBJECTS", "alice@example.com")
+    monkeypatch.setattr(chat_sync, "_client", lambda _ctx: AppClient())
+    monkeypatch.setattr(chat_sync, "_delegated_client", lambda _ctx, _subject: DwdClient())
+    ctx = Ctx()
+    result = asyncio.run(chat_sync.handler(chat_sync.Input(), ctx))
+    emitted = json.dumps({"result": result, "logs": ctx.logs})
+    assert result["status"] == "failed"
+    assert sentinel not in emitted
+    assert "sentinel-delegated-token" not in emitted
+    assert "Google Chat API request failed" in emitted
+
+
+def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
+    monkeypatch,
+):
+    database_url = os.getenv("SESSION_SQLX_TEST_DATABASE_URL")
+    if not database_url:
+        return
+
+    class AppClient:
+        def list_spaces(self, *, page_size, page_token=None):
+            return {"spaces": []}
+
+    class DwdClient:
+        def list_spaces(self, *, page_size, page_token=None):
+            return {
+                "spaces": [
+                    {
+                        "name": "spaces/DM1",
+                        "type": "DIRECT_MESSAGE",
+                    }
+                ]
+            }
+
+        def list_members(self, space_name, *, page_size, page_token=None):
+            return {
+                "memberships": [
+                    {"member": {"name": "users/1", "displayName": "Alice"}},
+                    {"member": {"name": "users/2", "displayName": "Bob"}},
+                ]
+            }
+
+        def list_messages(
+            self, space_name, *, page_size, page_token=None, filter=None, show_deleted=False
+        ):
+            assert show_deleted is True
+            return {
+                "messages": [
+                    {
+                        "name": "spaces/DM1/messages/M1",
+                        "text": "see the runbook",
+                        "sender": {"name": "users/1", "type": "HUMAN"},
+                        "createTime": "2026-08-14T10:00:00Z",
+                        "attachment": [
+                            {
+                                "name": "spaces/DM1/messages/M1/attachments/A1",
+                                "contentName": "runbook.txt",
+                                "contentType": "text/plain",
+                                "attachmentDataRef": {"resourceName": "attachments/A1"},
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            return {
+                "emojiReactions": [
+                    {
+                        "name": "spaces/DM1/messages/M1/reactions/R1",
+                        "user": {"name": "users/2"},
+                        "emoji": {"unicode": "✅"},
+                    }
+                ]
+            }
+
+    class Ctx:
+        def __init__(self, run_id, pool):
+            self.run_id = run_id
+            self._pool = pool
+
+        def log(self, _event, **_fields):
+            pass
+
+    async def run():
+        import asyncpg
+
+        admin = await asyncpg.connect(database_url)
+        database = f"centaur_google_chat_dwd_{os.getpid()}_{time.time_ns()}"
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        conn = None
+        try:
+            conn = await asyncpg.connect(database_url, database=database)
+            migration_dir = (
+                Path(__file__).resolve().parents[2]
+                / "services/api-rs/crates/centaur-session-sqlx/migrations"
+            )
+            for migration in sorted(migration_dir.glob("*.sql")):
+                await conn.execute(migration.read_text())
+
+            monkeypatch.setenv("GOOGLE_CHAT_ETL_ENABLED", "true")
+            monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", "true")
+            monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SUBJECTS", "alice@example.com")
+            monkeypatch.setattr(chat_sync, "_client", lambda _ctx: AppClient())
+            monkeypatch.setattr(
+                chat_sync, "_delegated_client", lambda _ctx, _subject: DwdClient()
+            )
+
+            for run_id in ("workflow-1", "workflow-2"):
+                result = await chat_sync.handler(
+                    chat_sync.Input(dm_subjects=["alice@example.com"]),
+                    Ctx(run_id, conn),
+                )
+                assert result["status"] == "completed"
+                assert result["files_processed"] == 1
+                assert result["reactions_processed"] == 1
+
+            space = await conn.fetchrow(
+                "SELECT owner_email, participant_emails FROM google_chat_sync_spaces"
+            )
+            assert dict(space) == {
+                "owner_email": "alice@example.com",
+                "participant_emails": ["alice@example.com"],
+            }
+            assert await conn.fetchval("SELECT COUNT(*) FROM google_chat_sync_messages") == 1
+            assert await conn.fetchval("SELECT COUNT(*) FROM google_chat_sync_attachments") == 1
+            assert await conn.fetchval("SELECT COUNT(*) FROM google_chat_sync_reactions") == 1
+            assert await conn.fetchval(
+                "SELECT content_text FROM google_chat_sync_attachments"
+            ) == ""
+            assert await conn.fetchval(
+                "SELECT emoji_unicode FROM google_chat_sync_reactions"
+            ) == "✅"
+        finally:
+            if conn is not None:
+                await conn.close()
+            await admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            await admin.close()
+
+    asyncio.run(run())
+
+
+def test_retention_modes_never_call_google_api():
+    class Pool:
+        def __init__(self):
+            self.queries = []
+
+        async def fetchval(self, query, *args):
+            self.queries.append(query)
+            return 2
+
+    for mode in ("dry_run", "count", "delete"):
+        pool = Pool()
+        counts = asyncio.run(
+            chat_retention.prune_google_chat(
+                pool, retention_days=30, mode=mode, batch_limit=10
+            )
+        )
+        assert set(counts) == {
+            "documents", "attachments", "reactions", "messages", "checkpoints", "spaces", "runs"
+        }
+        assert all("chat.googleapis.com" not in query for query in pool.queries)
+        assert all("LIMIT $2" in query for query in pool.queries)
+
+
+def test_retention_db_age_batch_cleanup_and_idempotency():
+    database_url = os.getenv("SESSION_SQLX_TEST_DATABASE_URL")
+    if not database_url:
+        return
+
+    async def run():
+        import asyncpg
+
+        admin = await asyncpg.connect(database_url)
+        database = f"centaur_google_chat_retention_{os.getpid()}_{time.time_ns()}"
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        conn = None
+        try:
+            conn = await asyncpg.connect(database_url, database=database)
+            migration_dir = (
+                Path(__file__).resolve().parents[2]
+                / "services/api-rs/crates/centaur-session-sqlx/migrations"
+            )
+            for migration in sorted(migration_dir.glob("*.sql")):
+                await conn.execute(migration.read_text())
+            await conn.execute(
+                "INSERT INTO google_chat_sync_runs "
+                "(run_id,status,started_at,finished_at) VALUES "
+                "('old','completed',NOW()-INTERVAL '40 days',NOW()-INTERVAL '40 days'),"
+                "('new','completed',NOW(),NOW())"
+            )
+            await conn.execute(
+                "INSERT INTO google_chat_sync_spaces "
+                "(owner_email,space_id,space_name,space_type,last_seen_at) VALUES "
+                "('','OLD','spaces/OLD','SPACE',NOW()-INTERVAL '40 days'),"
+                "('','NEW','spaces/NEW','SPACE',NOW())"
+            )
+            await conn.execute(
+                "INSERT INTO google_chat_sync_messages "
+                "(owner_email,space_id,message_id,message_name,text_content,source_create_time,updated_at) VALUES "
+                "('','OLD','OLD','spaces/OLD/messages/OLD','old',NOW()-INTERVAL '40 days',NOW()-INTERVAL '40 days'),"
+                "('','NEW','NEW','spaces/NEW/messages/NEW','new',NOW(),NOW())"
+            )
+            await conn.execute(
+                "INSERT INTO google_chat_sync_attachments "
+                "(owner_email,space_id,message_id,attachment_id,updated_at) VALUES "
+                "('','OLD','OLD','OLD',NOW()-INTERVAL '40 days'),"
+                "('','NEW','NEW','NEW',NOW())"
+            )
+            await conn.execute(
+                "INSERT INTO google_chat_sync_reactions "
+                "(owner_email,space_id,message_id,reaction_id,updated_at) VALUES "
+                "('','OLD','OLD','OLD',NOW()-INTERVAL '40 days'),"
+                "('','NEW','NEW','NEW',NOW())"
+            )
+            await conn.execute(
+                "INSERT INTO google_chat_sync_checkpoints "
+                "(owner_email,space_id,updated_at) VALUES "
+                "('','OLD',NOW()-INTERVAL '40 days'),('','NEW',NOW())"
+            )
+            await conn.execute(
+                "INSERT INTO company_context_documents "
+                "(document_id,source,source_type,source_document_id,occurred_at) VALUES "
+                "('google_chat:old','google_chat','google_chat_thread','OLD',NOW()-INTERVAL '40 days'),"
+                "('google_chat:new','google_chat','google_chat_thread','NEW',NOW())"
+            )
+            dry = await chat_retention.prune_google_chat(
+                conn, retention_days=30, mode="dry_run", batch_limit=1
+            )
+            counted = await chat_retention.prune_google_chat(
+                conn, retention_days=30, mode="count", batch_limit=1
+            )
+            assert dry == counted
+            assert counted == {
+                "documents": 1,
+                "attachments": 1,
+                "reactions": 1,
+                "messages": 1,
+                "checkpoints": 1,
+                "spaces": 0,
+                "runs": 1,
+            }
+            deleted = await chat_retention.prune_google_chat(
+                conn, retention_days=30, mode="delete", batch_limit=1
+            )
+            assert all(value == 1 for value in deleted.values())
+            repeated = await chat_retention.prune_google_chat(
+                conn, retention_days=30, mode="delete", batch_limit=1
+            )
+            assert all(value == 0 for value in repeated.values())
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM google_chat_sync_messages"
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM google_chat_sync_attachments"
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM google_chat_sync_reactions"
+            ) == 1
+        finally:
+            if conn is not None:
+                await conn.close()
+            await admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            await admin.close()
+
+    asyncio.run(run())
+
+
+def test_metrics_have_only_bounded_labels(monkeypatch):
+    calls = []
+    monkeypatch.setattr(chat_metrics, "increment_metric", lambda name, count, **labels: calls.append((name, labels)))
+    chat_metrics.record_api_outcome("spaces/secret", "429-raw-space-id")
+    chat_metrics.record_space_failure("spaces/secret")
+    chat_metrics.record_items("users/secret", 1)
+    assert calls == [
+        ("google_chat_etl_api_requests_total", {"operation": "list_messages", "outcome": "error"}),
+        ("google_chat_etl_space_failures_total", {"reason": "api_error"}),
+        ("google_chat_etl_items_processed_total", {"item_type": "message"}),
+    ]

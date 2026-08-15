@@ -45,7 +45,11 @@ describe('verifyGoogleSignedJwt', () => {
   })
 
   test('rejects an expired token', async () => {
-    const token = await signJwt({ privateKey: pair.privateKey, kid: KID, claims: claims({ exp: NOW - 600 }) })
+    const token = await signJwt({
+      privateKey: pair.privateKey,
+      kid: KID,
+      claims: claims({ iat: NOW - 300, exp: NOW - 31 })
+    })
     const out = await verifyGoogleSignedJwt({ token, audiences: [AUD], allowedIssuers: [GOOGLE_CHAT_SA_ISSUER], nowSeconds: NOW, resolveKey })
     expect(out).toEqual({ ok: false, reason: 'token_expired' })
   })
@@ -88,6 +92,45 @@ describe('verifyGoogleSignedJwt', () => {
     const token = await signJwt({ privateKey: pair.privateKey, kid: KID, claims: claims({ aud: url }) })
     const out = await verifyGoogleSignedJwt({ token, audiences: [AUD, url], allowedIssuers: [GOOGLE_CHAT_SA_ISSUER], nowSeconds: NOW, resolveKey })
     expect(out.ok).toBe(true)
+  })
+
+  test.each([
+    ['missing iat', { iat: undefined }, 'invalid_iat'],
+    ['nonnumeric iat', { iat: String(NOW) }, 'invalid_iat'],
+    ['missing exp', { exp: undefined }, 'invalid_exp'],
+    ['nonnumeric exp', { exp: String(NOW + 300) }, 'invalid_exp'],
+    ['inverted lifetime', { iat: NOW, exp: NOW }, 'invalid_token_lifetime'],
+    ['future token', { iat: NOW + 31, exp: NOW + 331 }, 'token_not_yet_valid'],
+    ['too-old token', { iat: NOW - 331, exp: NOW + 1 }, 'token_too_old']
+  ])('rejects %s with a specific reason', async (_name, overrides, reason) => {
+    const token = await signJwt({ privateKey: pair.privateKey, kid: KID, claims: claims(overrides) })
+    const out = await verifyGoogleSignedJwt({
+      token,
+      audiences: [AUD],
+      allowedIssuers: [GOOGLE_CHAT_SA_ISSUER],
+      maxAgeSeconds: 300,
+      nowSeconds: NOW,
+      resolveKey
+    })
+    expect(out).toEqual({ ok: false, reason })
+  })
+
+  test('accepts maximum age and future-time boundaries within clock skew', async () => {
+    for (const overrides of [
+      { iat: NOW - 330, exp: NOW + 1 },
+      { iat: NOW + 30, exp: NOW + 330 }
+    ]) {
+      const token = await signJwt({ privateKey: pair.privateKey, kid: KID, claims: claims(overrides) })
+      const out = await verifyGoogleSignedJwt({
+        token,
+        audiences: [AUD],
+        allowedIssuers: [GOOGLE_CHAT_SA_ISSUER],
+        maxAgeSeconds: 300,
+        nowSeconds: NOW,
+        resolveKey
+      })
+      expect(out.ok).toBe(true)
+    }
   })
 })
 

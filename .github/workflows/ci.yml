@@ -125,7 +125,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -139,7 +139,7 @@ jobs:
 
   harness-server-checks:
     name: Harness server fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -170,7 +170,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -370,7 +370,7 @@ jobs:
 
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -428,7 +428,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -462,13 +462,16 @@ jobs:
 
   googlechatbot-tests:
     name: Googlechatbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.googlechatbot_tests == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Start Test Postgres
+        run: .github/scripts/start-paradedb-postgres.sh centaur-googlechatbot-test-postgres 5432 postgres
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -490,11 +493,17 @@ jobs:
 
       - name: Googlechatbot tests
         working-directory: services/googlechatbot
+        env:
+          GOOGLECHATBOT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: bun run test
+
+      - name: Googlechatbot fixture smoke
+        working-directory: services/googlechatbot
+        run: bun run smoke
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -528,7 +537,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:

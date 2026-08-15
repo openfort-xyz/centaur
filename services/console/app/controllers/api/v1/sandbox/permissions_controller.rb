@@ -21,6 +21,8 @@ module Api
               principal: principal_payload(principal),
               capabilities: capabilities_payload(principal),
               slack_channel_permissions: principal.effective_slack_channel_permissions_payload,
+              google_chat_space_permissions: principal.effective_google_chat_space_permissions_payload,
+              google_chat_dm_permissions: principal.effective_google_chat_dm_permissions_payload,
               oauth_credentials: oauth_credentials_payload(principal),
               permissions: permissions
             }

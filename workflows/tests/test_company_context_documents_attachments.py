@@ -245,8 +245,11 @@ def test_coordinator_claims_google_chat_thread_scope_when_enabled(monkeypatch):
         )
     )
 
-    assert claimed_scopes == ["google_chat_thread"]
-    assert [child[1]["scope"] for child in ctx.children] == ["google_chat_thread"]
+    assert claimed_scopes == ["google_chat_thread", "google_chat_attachment"]
+    assert [child[1]["scope"] for child in ctx.children] == [
+        "google_chat_thread",
+        "google_chat_attachment",
+    ]
     assert result["started_scopes"]
 
 

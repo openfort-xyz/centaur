@@ -81,6 +81,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
 {{- end }}
+{{- if .Values.googlechatbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 14 }}
+{{- end }}
 {{- if .Values.teamsbot.enabled }}
         - podSelector:
             matchLabels:
@@ -594,6 +599,17 @@ spec:
       ports:
         - protocol: TCP
           port: 3002
+{{- if .Values.apiRs.enabled }}
+    # Internal Google Chat operations are accepted only from api-rs. Sandboxes
+    # call api-rs and are never admitted directly to this service.
+    - from:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
+{{- end }}
   egress:
 {{- if .Values.apiRs.enabled }}
     - to:
@@ -603,6 +619,15 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.apiRs.port }}
+{{- end }}
+{{- if .Values.postgres.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
 {{- end }}
     # Google Chat REST API + OAuth2 token endpoint (direct HTTPS).
     - ports:

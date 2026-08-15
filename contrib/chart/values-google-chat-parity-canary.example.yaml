@@ -1,0 +1,123 @@
+# Copy outside the repository, replace every CANDIDATE_* value, and keep the
+# resulting file non-secret. Secret values are provisioned separately in the
+# dedicated namespace.
+fullnameOverride: centaur-gchat-parity-canary
+
+secretManager:
+  existingSecretName: centaur-gchat-parity-canary-infra-env
+
+firewall:
+  existingCaSecretName: centaur-gchat-parity-canary-firewall-ca
+  existingCaKeySecretName: centaur-gchat-parity-canary-firewall-ca-key
+
+secrets:
+  bootstrapSecretName: centaur-gchat-parity-canary-bootstrap
+
+ironProxy:
+  image:
+    repository: CANDIDATE_REGISTRY/centaur-iron-proxy
+    tag: sha-CANDIDATE_SHA@sha256:CANDIDATE_IRON_PROXY_DIGEST
+    pullPolicy: IfNotPresent
+
+console:
+  image:
+    repository: CANDIDATE_REGISTRY/centaur-console
+    tag: sha-CANDIDATE_SHA@sha256:CANDIDATE_CONSOLE_DIGEST
+    pullPolicy: IfNotPresent
+  database:
+    name: iron_control_gchat_parity_canary
+  ingress:
+    enabled: false
+
+sandbox:
+  image:
+    repository: CANDIDATE_REGISTRY/centaur-agent
+    tag: sha-CANDIDATE_SHA@sha256:CANDIDATE_AGENT_DIGEST
+    pullPolicy: IfNotPresent
+
+repoCache:
+  hostPath: /var/lib/centaur/repos-gchat-parity-canary
+  storage:
+    type: persistentVolumeClaim
+    persistentVolumeClaim:
+      create: true
+      storageClassName: local-path
+      size: 20Gi
+      accessModes:
+        - ReadWriteOnce
+  githubToken:
+    existingSecretName: centaur-gchat-parity-canary-repo-cache-github-token
+
+toolServer:
+  ref: CANDIDATE_SHA
+
+# Reuse the already-installed cluster controller. The canary must not own
+# cluster-scoped CRDs or the production controller namespace.
+agentSandbox:
+  enabled: false
+
+apiRs:
+  image:
+    repository: CANDIDATE_REGISTRY/centaur-api-rs
+    tag: sha-CANDIDATE_SHA@sha256:CANDIDATE_API_RS_DIGEST
+    pullPolicy: IfNotPresent
+  syncInfraSecrets: false
+  sandboxWarmPoolSize: 0
+  etl:
+    slack:
+      enabled: false
+    linear:
+      enabled: false
+    googleDrive:
+      enabled: false
+    googleCalendar:
+      enabled: false
+    googleChat:
+      enabled: true
+
+slackbotv2:
+  enabled: false
+linearbot:
+  enabled: false
+githubbot:
+  enabled: false
+discordbot:
+  enabled: false
+teamsbot:
+  enabled: false
+
+googlechatbot:
+  enabled: true
+  replicaCount: 2
+  stateKeyPrefix: centaur-gchat-parity-canary-googlechatbot
+  image:
+    repository: CANDIDATE_REGISTRY/centaur-googlechatbot
+    tag: sha-CANDIDATE_SHA@sha256:CANDIDATE_GOOGLECHATBOT_DIGEST
+    pullPolicy: IfNotPresent
+  requireSignedRequests: true
+  ingressMode: chat_api_project
+  projectNumber: "CANDIDATE_GOOGLE_CLOUD_PROJECT_NUMBER"
+  uploadUser: upload-user@CANDIDATE_TEST_DOMAIN
+  reactionReadUser: reaction-reader@CANDIDATE_TEST_DOMAIN
+  driveDownloadUser: drive-reader@CANDIDATE_TEST_DOMAIN
+  ingress:
+    # centaur-vps has no Kubernetes IngressClass. Route a dedicated Cloudflare
+    # test hostname directly to the canary Service ClusterIP instead.
+    enabled: false
+
+postgres:
+  enabled: true
+  auth:
+    database: ai_v2_gchat_parity_canary
+    existingSecretName: centaur-gchat-parity-canary-infra-env
+    existingSecretKey: POSTGRES_PASSWORD
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClassName: local-path
+
+ingress:
+  enabled: false
+
+networkPolicy:
+  enabled: true

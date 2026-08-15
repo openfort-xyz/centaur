@@ -470,6 +470,17 @@ apiRs:
       # Comma-separated space IDs the Chat app reads but is not a listed
       # member of (spaces.list only returns member spaces).
       spaceIds: ""
+      retention:
+        enabled: true
+        intervalMinutes: 60
+        days: 0
+        batchLimit: 1000
+      # DWD DM history is opt-in and limited to these delegated user emails.
+      # api-rs receives only this allowlist and the internal bot key;
+      # GOOGLE_SERVICE_ACCOUNT_JSON remains in googlechatbot.
+      dmSync:
+        enabled: false
+        subjects: ""
     companyContextDocuments:
       enabled: true
       intervalSeconds: 14400
@@ -668,11 +679,23 @@ discordbot:
   resources: {}
 
 # Google Chat ingress — mirrors slackbotv2, forwards to the api-rs control plane (:8080) over the
-# session API. Off by default; needs a Google Chat app + service account JSON. Stateless (in-memory
-# dedup), so no Postgres. Webhooks arrive over HTTP, so enable the dedicated ingress below.
+# session API. Off by default; needs a Google Chat app + service account JSON and shared Postgres.
+# Webhooks arrive over HTTP, so enable the dedicated ingress below.
 googlechatbot:
   enabled: false
   replicaCount: 1
+  stateKeyPrefix: centaur-googlechatbot
+  statePool:
+    max: 10
+    idleTimeoutMs: 30000
+    connectTimeoutMs: 10000
+  stateConnect:
+    initialDelayMs: 250
+    maxDelayMs: 10000
+  recovery:
+    maxObligationAgeMs: 86400000
+    failureBudget: 5
+    sweepIntervalMs: 60000
   image:
     repository: centaur-googlechatbot
     tag: latest
@@ -682,15 +705,32 @@ googlechatbot:
   responseMetadataMode: first
   # Include the Codex service tier when response metadata is rendered.
   responseServiceTierEnabled: false
+  threadHistoryLimit: 50
+  attachmentAggregateMaxBytes: 104857600
   # Path Google Chat POSTs events to. Must match the Chat app config and the ingress route.
   eventsPath: /api/chat/events
-  # Comma/space-separated email-domain allowlist for inbound events. Empty = open to all domains.
+  # Verify Google's signed webhook JWT. Disable explicitly only for local development.
+  requireSignedRequests: true
+  # Keep each Google authentication contract paired. Existing Chat API apps use
+  # the project-number mode by default.
+  ingressMode: chat_api_project
+  projectNumber: ""
+  webhookAudience: ""
+  addonServiceAccountEmail: ""
+  addonOauthClientId: ""
+  signedRequestMaxAgeSeconds: 300
+  # Comma/space-separated verified-human email-domain allowlist. Only a
+  # workspace_addon userIdToken exposes an email; Chat API modes fail closed
+  # when this is non-empty. Empty = no domain filter and no identity emission.
   allowedDomain: ""
   # Workspace user the service account impersonates for attachment uploads
   # (Google Chat's media.upload rejects app auth). Requires a one-time admin
   # domain-wide-delegation grant of chat.messages.create to the SA's client ID.
   # Empty = the /api/chat/attachments route fails closed.
   uploadUser: ""
+  # Workspace user used only for reaction reads. Requires chat.messages.reactions.readonly.
+  reactionReadUser: ""
+  driveDownloadUser: ""
   # How inline harness/model/provider/reasoning overrides are resolved from a
   # message. "flags" (default) parses literal --flags; "llm" additionally asks
   # an OpenAI model to interpret natural-language requests. Mirrors

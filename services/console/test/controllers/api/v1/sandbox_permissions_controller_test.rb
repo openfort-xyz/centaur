@@ -100,6 +100,28 @@ module Api
         assert_equal true, permission.fetch("history_enabled")
       end
 
+      test "returns effective Google Chat permissions matching JWT claims" do
+        @proxy.principal.google_chat_space_permissions.create!(
+          space_name: "spaces/BBBB", send_enabled: true
+        )
+        roles(:acme_infra).google_chat_space_permissions.create!(
+          space_name: "spaces/AAAA", history_enabled: true
+        )
+        @proxy.principal.google_chat_dm_permissions.create!(
+          target_identity: "person@example.com", setup_enabled: true
+        )
+
+        with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+          get "/api/v1/sandbox/permissions", headers: auth_headers(token_for(@proxy))
+        end
+        assert_response :ok
+
+        data = json_body.fetch("data")
+        assert_equal %w[spaces/AAAA spaces/BBBB], data.fetch("google_chat_space_permissions").pluck("space_name")
+        assert_equal [ "person@example.com" ], data.fetch("google_chat_dm_permissions").pluck("target_identity")
+        refute_includes response.body, "test-secret"
+      end
+
       test "rejects requests without a sandbox token" do
         get "/api/v1/sandbox/permissions"
         assert_response :unauthorized

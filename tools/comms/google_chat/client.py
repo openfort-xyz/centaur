@@ -1,70 +1,195 @@
 from __future__ import annotations
 
-import json
-import os
+import base64
 import re
 from typing import Any
+from urllib.parse import quote
 
 from centaur_sdk import secret
 
-# In-cluster default for the googlechatbot outbound relay (send/update/delete).
-# Read from the environment, NOT secret(): in server mode the secret backend is
-# a stub that returns the KEY NAME for any key absent from the env and never
-# None, so `secret("CHATBOT_URL", default)` would return the literal
-# "CHATBOT_URL" and the default would be dead code (httpx then lowercases the
-# host to `chatbot_url`). os.environ.get honors a real override and falls back
-# to the real default.
-_DEFAULT_CHATBOT_URL = "http://centaur-centaur-googlechatbot:3002"
-
-# The real Google Chat API. Reads (list) and uploads go straight here, NOT
-# through the in-cluster bot relay: a sandbox's egress is a CONNECT/HTTPS-only
-# firewall (iron-proxy) that cannot reach the plain-HTTP relay, but CAN MITM
-# this real public host and INJECT credentials at the edge from its gcp_auth
-# grants (app-auth token on GET reads, a domain-wide-delegation token on POST
-# uploads). The tool therefore sends NO auth header of its own and never holds a
-# real credential. This mirrors the Slack tool (which talks to slack.com).
-_GOOGLE_CHAT_API_BASE = "https://chat.googleapis.com"
-
-_MIME_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$")
+_MESSAGE_NAME_RE = re.compile(r"^spaces/([^/]+)/messages/([^/]+)$")
+_THREAD_NAME_RE = re.compile(r"^spaces/([^/]+)/threads/([^/]+)$")
+_ATTACHMENT_NAME_RE = re.compile(
+    r"^spaces/([^/]+)/messages/([^/]+)/attachments/([^/]+)$"
+)
+_TARGET_RE = re.compile(r"^[^\s/@]+@[^\s/@]+$")
+_DEFAULT_DOWNLOAD_MAX_BYTES = 10 * 1024 * 1024
 
 
-def _safe_mime_type(value: str | None) -> str:
-    """A ``type/subtype`` token with no CR/LF, safe to place in a part header.
-
-    Falls back to a generic binary type for anything malformed or
-    injection-shaped, so a caller-supplied mime type can't smuggle extra
-    multipart headers into the request body.
-    """
-    return value if value and _MIME_TYPE_RE.match(value) else "application/octet-stream"
+class GoogleChatApiError(RuntimeError):
+    def __init__(self, status: int | None, category: str) -> None:
+        self.status = status
+        self.category = category
+        super().__init__(
+            f"Google Chat proxy request failed ({category}{f', HTTP {status}' if status else ''})"
+        )
 
 
 def _space_id(space_name: str) -> str:
-    """Strip the ``spaces/`` prefix, accepting bare ids or resource names."""
-    return space_name[len("spaces/") :] if space_name.startswith("spaces/") else space_name
+    value = space_name.removeprefix("spaces/").strip()
+    if not value or "/" in value:
+        raise ValueError("space_name must be a resource like spaces/AAAA")
+    return value
 
 
-def _base_url() -> str:
-    """Resolve CHATBOT_URL and guarantee an http(s) scheme.
+def _message_ids(message_name: str) -> tuple[str, str]:
+    match = _MESSAGE_NAME_RE.fullmatch(message_name.strip())
+    if not match:
+        raise ValueError("message_name must be a resource like spaces/AAAA/messages/BBBB")
+    return match.group(1), match.group(2)
 
-    A bare host like ``chatbot:3002`` makes httpx read ``chatbot`` as the URL
-    scheme and raise UnsupportedProtocol, so prepend ``http://`` when no
-    http(s) scheme is present.
-    """
 
-    url = (os.environ.get("CHATBOT_URL", _DEFAULT_CHATBOT_URL) or _DEFAULT_CHATBOT_URL).strip()
-    if not url.startswith(("http://", "https://")):
-        url = f"http://{url}"
-    return url.rstrip("/")
+def _thread_ids(thread_name: str) -> tuple[str, str]:
+    match = _THREAD_NAME_RE.fullmatch(thread_name.strip())
+    if not match:
+        raise ValueError("thread_name must be a resource like spaces/AAAA/threads/BBBB")
+    return match.group(1), match.group(2)
+
+
+def _target_identity(value: str) -> str:
+    target = value.strip().lower()
+    if not _TARGET_RE.fullmatch(target):
+        raise ValueError("target must be an email address")
+    return target
+
+
+def _attachment_ids(attachment_name: str) -> tuple[str, str, str]:
+    match = _ATTACHMENT_NAME_RE.fullmatch(attachment_name.strip())
+    if not match:
+        raise ValueError(
+            "attachment_name must be a resource like "
+            "spaces/AAAA/messages/BBBB/attachments/CCCC"
+        )
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _api_url() -> str:
+    return secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+
+
+def _headers() -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    # `secret()` returns the sentinel name in sandboxes; iron-proxy replaces the
+    # resulting header with the principal-scoped short-lived Console JWT.
+    bearer = secret("CENTAUR_API_BEARER_TOKEN", "").strip()
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    return headers
 
 
 class GoogleChatClient:
-    def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or secret("CHATBOT_API_KEY", "")
-        if not self.api_key:
-            raise RuntimeError(
-                "CHATBOT_API_KEY not set. Set it in your .env file "
-                "or inject it via the Centaur secrets system."
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        import httpx
+
+        response = httpx.request(
+            method,
+            f"{_api_url()}{path}",
+            headers={
+                **_headers(),
+                **({"Content-Type": "application/json"} if json is not None else {}),
+            },
+            params={key: value for key, value in (params or {}).items() if value is not None},
+            json=json,
+            timeout=timeout,
+        )
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            status = getattr(response, "status_code", None)
+            category = (
+                "unauthenticated"
+                if status == 401
+                else "permission_denied"
+                if status == 403
+                else "rate_limited"
+                if status == 429
+                else "upstream"
+                if status is not None and status >= 500
+                else "request"
             )
+            raise GoogleChatApiError(status, category) from exc
+        return response.json() if response.text else {}
+
+    def _download_request(
+        self,
+        path: str,
+        *,
+        max_bytes: int = _DEFAULT_DOWNLOAD_MAX_BYTES,
+    ) -> dict[str, Any]:
+        import httpx
+
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1")
+        with httpx.stream(
+            "GET",
+            f"{_api_url()}{path}",
+            headers=_headers(),
+            timeout=120.0,
+        ) as response:
+            try:
+                response.raise_for_status()
+            except Exception as exc:
+                status = getattr(response, "status_code", None)
+                category = (
+                    "unauthenticated"
+                    if status == 401
+                    else "permission_denied"
+                    if status == 403
+                    else "rate_limited"
+                    if status == 429
+                    else "upstream"
+                    if status is not None and status >= 500
+                    else "request"
+                )
+                raise GoogleChatApiError(status, category) from exc
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            if content_type.lower().startswith("text/html"):
+                raise GoogleChatApiError(response.status_code, "unexpected_content")
+            content = bytearray()
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if len(content) > max_bytes:
+                    raise GoogleChatApiError(response.status_code, "response_too_large")
+            disposition = response.headers.get("content-disposition", "")
+            filename_match = re.search(r'filename="([^"\\/]*)"', disposition)
+            filename = filename_match.group(1) if filename_match else "attachment"
+            return {
+                "filename": "attachment" if filename in {"", ".", ".."} else filename,
+                "content_type": content_type,
+                "size_bytes": len(content),
+                "content": bytes(content),
+            }
+
+    @staticmethod
+    def _page_token(result: dict[str, Any]) -> str | None:
+        return result.get("next_page_token") or result.get("nextPageToken")
+
+    @classmethod
+    def _with_page_token(cls, result: dict[str, Any]) -> dict[str, Any]:
+        token = cls._page_token(result)
+        return {**result, "next_page_token": token}
+
+    def list_spaces(self, *, page_size: int = 20, page_token: str | None = None) -> dict[str, Any]:
+        self._validate_page_size(page_size)
+        return self._with_page_token(
+            self._request(
+                "GET",
+                "/api/google-chat/spaces",
+                params={"page_size": page_size, "page_token": page_token},
+            )
+        )
+
+    def get_space(self, space_name: str) -> dict[str, Any]:
+        space = quote(_space_id(space_name), safe="")
+        return self._request("GET", f"/api/google-chat/spaces/{space}")
 
     def send_message(
         self,
@@ -73,27 +198,11 @@ class GoogleChatClient:
         *,
         thread_name: str | None = None,
     ) -> dict[str, Any]:
-        import httpx
-
-        base_url = _base_url()
-        body: dict[str, Any] = {
-            "space_name": space_name,
-            "text": text,
-        }
+        body: dict[str, Any] = {"text": text}
         if thread_name:
             body["thread_name"] = thread_name
-
-        response = httpx.post(
-            f"{base_url}/api/chat/messages",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        return response.json() if response.text else {}
+        space = quote(_space_id(space_name), safe="")
+        return self._request("POST", f"/api/google-chat/spaces/{space}/messages", json=body)
 
     def list_messages(
         self,
@@ -104,81 +213,440 @@ class GoogleChatClient:
         filter: str | None = None,
         order_by: str | None = None,
     ) -> dict[str, Any]:
-        """List messages in a space, reading the real Chat API directly.
-
-        Goes to chat.googleapis.com (NOT the bot relay, which a sandbox's
-        CONNECT-only egress firewall can't reach): iron-proxy MITMs this real
-        host and injects the app-auth read token from its gcp_auth GET grant, so
-        the tool sends NO auth header. App auth cannot read DM spaces (Google
-        returns 400 there) — DM history reaches the agent via the bot's session
-        context instead; this path serves multi-party SPACE reads.
-
-        Returns the Chat API `{messages, nextPageToken}` shape unchanged.
-        ``filter`` supports ``createTime`` and ``thread.name`` expressions.
-        Pass ``nextPageToken`` back as ``page_token`` without changing the
-        other query options.
-        """
-        import httpx
-
-        space_id = _space_id(space_name)
-        params: dict[str, Any] = {"pageSize": page_size}
-        if page_token:
-            params["pageToken"] = page_token
-        if filter:
-            params["filter"] = filter
-        if order_by:
-            params["orderBy"] = order_by
-        response = httpx.get(
-            f"{_GOOGLE_CHAT_API_BASE}/v1/spaces/{space_id}/messages",
-            params=params,
-            headers={"Content-Type": "application/json"},
-            timeout=30.0,
+        self._validate_page_size(page_size)
+        space = quote(_space_id(space_name), safe="")
+        return self._with_page_token(
+            self._request(
+                "GET",
+                f"/api/google-chat/spaces/{space}/messages",
+                params={
+                    "page_size": page_size,
+                    "page_token": page_token,
+                    "filter": filter,
+                    "order_by": order_by,
+                },
+            )
         )
-        response.raise_for_status()
-        return response.json() if response.text else {}
 
-    def update_message(
+    def list_members(
+        self, space_name: str, *, page_size: int = 20, page_token: str | None = None
+    ) -> dict[str, Any]:
+        self._validate_page_size(page_size)
+        space = quote(_space_id(space_name), safe="")
+        return self._with_page_token(
+            self._request(
+                "GET",
+                f"/api/google-chat/spaces/{space}/members",
+                params={"page_size": page_size, "page_token": page_token},
+            )
+        )
+
+    def list_thread_messages(
+        self, thread_name: str, *, page_size: int = 20, page_token: str | None = None
+    ) -> dict[str, Any]:
+        self._validate_page_size(page_size)
+        space_id, thread_id = _thread_ids(thread_name)
+        return self._with_page_token(
+            self._request(
+                "GET",
+                f"/api/google-chat/spaces/{quote(space_id, safe='')}/threads/{quote(thread_id, safe='')}",
+                params={"page_size": page_size, "page_token": page_token},
+            )
+        )
+
+    def list_message_reactions(
         self,
         message_name: str,
-        text: str,
+        *,
+        page_size: int = 20,
+        page_token: str | None = None,
     ) -> dict[str, Any]:
-        import httpx
-
-        base_url = _base_url()
-        response = httpx.patch(
-            f"{base_url}/api/chat/messages",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "message_name": message_name,
-                "text": text,
-            },
-            timeout=30.0,
+        self._validate_page_size(page_size)
+        space_id, message_id = _message_ids(message_name)
+        return self._with_page_token(
+            self._request(
+                "GET",
+                "/api/google-chat/spaces/{}/messages/{}/reactions".format(
+                    quote(space_id, safe=""), quote(message_id, safe="")
+                ),
+                params={"page_size": page_size, "page_token": page_token},
+            )
         )
-        response.raise_for_status()
-        return response.json() if response.text else {}
 
-    def delete_message(
+    def list_reactions(
         self,
-        message_name: str,
+        space_name: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
     ) -> dict[str, Any]:
-        import httpx
+        scan = self.scan_messages(space_name, page_size=page_size, max_pages=max_pages)
+        reactions: list[dict[str, Any]] = []
+        incomplete = scan["truncated"]
+        for message in scan["messages"]:
+            message_name = message.get("name")
+            if not isinstance(message_name, str):
+                continue
+            page = self.list_message_reactions(message_name, page_size=page_size)
+            reactions.extend(
+                {**item, "messageName": message_name} for item in page.get("reactions") or []
+            )
+            incomplete = incomplete or bool(self._page_token(page))
+        return {
+            "reactions": reactions,
+            "pages_scanned": scan["pages_scanned"],
+            "truncated": bool(incomplete),
+            "next_page_token": scan["next_page_token"],
+        }
 
-        base_url = _base_url()
-        response = httpx.request(
-            "DELETE",
-            f"{base_url}/api/chat/messages",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"message_name": message_name},
-            timeout=30.0,
+    def setup_dm(self, target_identity: str) -> dict[str, Any]:
+        target = _target_identity(target_identity)
+        return self._request(
+            "POST",
+            "/api/google-chat/dms/setup",
+            params={"target_identity": target},
+            json={},
         )
-        response.raise_for_status()
-        return response.json() if response.text else {}
+
+    def send_dm(self, target_identity: str, text: str) -> dict[str, Any]:
+        target = _target_identity(target_identity)
+        return self._request(
+            "POST",
+            "/api/google-chat/dms/messages",
+            params={"target_identity": target},
+            json={"text": text},
+        )
+
+    def list_files(
+        self,
+        space_name: str,
+        *,
+        page_size: int = 100,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        self._validate_page_size(page_size)
+        space = quote(_space_id(space_name), safe="")
+        return self._with_page_token(
+            self._request(
+                "GET",
+                f"/api/google-chat/spaces/{space}/files",
+                params={"page_size": page_size, "page_token": page_token},
+            )
+        )
+
+    def search_files(
+        self,
+        space_name: str,
+        query: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
+    ) -> dict[str, Any]:
+        if max_pages < 1:
+            raise ValueError("max_pages must be at least 1")
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        token: str | None = None
+        files: list[dict[str, Any]] = []
+        pages_scanned = 0
+        seen_tokens: set[str] = set()
+        for _ in range(max_pages):
+            pages_scanned += 1
+            page = self.list_files(space_name, page_size=page_size, page_token=token)
+            files.extend(page.get("files") or [])
+            token = self._page_token(page)
+            if not token:
+                break
+            if token in seen_tokens:
+                raise RuntimeError("Google Chat pagination token repeated")
+            seen_tokens.add(token)
+        needle = query.casefold()
+        matches = [
+            file
+            for file in files
+            if needle
+            in " ".join(
+                str(file.get(key) or "")
+                for key in ("contentName", "filename", "contentType", "attachment_id")
+            ).casefold()
+        ]
+        matches.sort(
+            key=lambda file: (
+                str(file.get("message_create_time") or ""),
+                str(file.get("attachment_id") or ""),
+            ),
+            reverse=True,
+        )
+        return {
+            "files": matches,
+            "query": query,
+            "pages_scanned": pages_scanned,
+            "truncated": bool(token),
+            "next_page_token": token,
+        }
+
+    def file_info(self, attachment_name: str) -> dict[str, Any]:
+        space_id, message_id, attachment_id = _attachment_ids(attachment_name)
+        return self._request(
+            "GET",
+            "/api/google-chat/spaces/{}/messages/{}/attachments/{}".format(
+                quote(space_id, safe=""),
+                quote(message_id, safe=""),
+                quote(attachment_id, safe=""),
+            ),
+        )
+
+    def download_file(
+        self,
+        attachment_name: str,
+        *,
+        max_bytes: int = _DEFAULT_DOWNLOAD_MAX_BYTES,
+    ) -> dict[str, Any]:
+        space_id, message_id, attachment_id = _attachment_ids(attachment_name)
+        return self._download_request(
+            "/api/google-chat/spaces/{}/messages/{}/attachments/{}/download".format(
+                quote(space_id, safe=""),
+                quote(message_id, safe=""),
+                quote(attachment_id, safe=""),
+            ),
+            max_bytes=max_bytes,
+        )
+
+    def scan_messages(
+        self,
+        space_name: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        if max_pages < 1:
+            raise ValueError("max_pages must be at least 1")
+        token: str | None = None
+        messages: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        pages_scanned = 0
+        for _ in range(max_pages):
+            pages_scanned += 1
+            page = self.list_messages(
+                space_name, page_size=page_size, page_token=token, filter=filter
+            )
+            messages.extend(page.get("messages") or [])
+            token = self._page_token(page)
+            if not token:
+                break
+            if token in seen_tokens:
+                raise RuntimeError("Google Chat pagination token repeated")
+            seen_tokens.add(token)
+        messages.sort(
+            key=lambda message: (
+                str(message.get("createTime") or ""),
+                str(message.get("name") or ""),
+            ),
+            reverse=True,
+        )
+        return {
+            "messages": messages,
+            "pages_scanned": pages_scanned,
+            "truncated": bool(token),
+            "next_page_token": token,
+        }
+
+    def search_messages(
+        self,
+        space_name: str,
+        query: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
+    ) -> dict[str, Any]:
+        scan = self.scan_messages(space_name, page_size=page_size, max_pages=max_pages)
+        needle = query.casefold()
+        return {
+            **scan,
+            "query": query,
+            "messages": [
+                self._normalize_message(space_name, message)
+                for message in scan["messages"]
+                if needle in str(message.get("text") or "").casefold()
+            ],
+        }
+
+    def questions(
+        self, space_name: str, *, page_size: int = 100, max_pages: int = 5
+    ) -> dict[str, Any]:
+        scan = self.scan_messages(space_name, page_size=page_size, max_pages=max_pages)
+        prefixes = (
+            "how",
+            "why",
+            "what",
+            "when",
+            "where",
+            "who",
+            "which",
+            "can ",
+            "could ",
+            "should ",
+            "is there",
+            "does anyone",
+            "has anyone",
+        )
+        questions = []
+        for message in scan["messages"]:
+            text = str(message.get("text") or "").strip()
+            lowered = text.casefold()
+            if len(text) > 10 and (text.endswith("?") or lowered.startswith(prefixes)):
+                questions.append(self._normalize_message(space_name, message))
+        return {**scan, "space": space_name, "messages": questions, "questions": questions}
+
+    def dump(
+        self,
+        space_name: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
+        max_threads: int = 50,
+    ) -> dict[str, Any]:
+        if max_threads < 0:
+            raise ValueError("max_threads cannot be negative")
+        space = self.get_space(space_name)
+        scan = self.scan_messages(space_name, page_size=page_size, max_pages=max_pages)
+        reactions = self.list_reactions(space_name, page_size=page_size, max_pages=max_pages)
+        by_message: dict[str, list[dict[str, Any]]] = {}
+        for reaction in reactions.get("reactions") or []:
+            by_message.setdefault(str(reaction.get("messageName") or ""), []).append(reaction)
+        messages = [
+            self._normalize_message(space_name, item, by_message) for item in scan["messages"]
+        ]
+        thread_names = list(
+            dict.fromkeys(
+                str(item.get("thread", {}).get("name"))
+                for item in scan["messages"]
+                if item.get("thread", {}).get("name")
+            )
+        )
+        expanded = 0
+        for thread_name in thread_names[:max_threads]:
+            thread_page = self.list_thread_messages(thread_name, page_size=page_size)
+            replies = [
+                self._normalize_message(space_name, item, by_message)
+                for item in thread_page.get("messages") or []
+            ]
+            for message in messages:
+                if message.get("thread_ts") == thread_name:
+                    message["replies"] = replies
+                    message["replies_has_more"] = bool(self._page_token(thread_page))
+            expanded += 1
+        incomplete = bool(
+            scan["truncated"] or reactions.get("truncated") or len(thread_names) > max_threads
+        )
+        return {
+            "channel": space.get("displayName") or space.get("name") or space_name,
+            "channel_id": space_name,
+            "messages": messages,
+            "has_more": scan["truncated"],
+            "next_cursor": scan["next_page_token"],
+            "continuation_available": incomplete,
+            "truncated": incomplete,
+            "limits": {
+                "message_pages": max_pages,
+                "page_size": page_size,
+                "thread_limit": max_threads,
+            },
+            "stats": {
+                "total_messages": len(messages),
+                "threads_expanded": expanded,
+                "threads_skipped_by_limit": max(0, len(thread_names) - max_threads),
+                "total_reactions": sum(len(items) for items in by_message.values()),
+            },
+        }
+
+    def feedback(
+        self, space_name: str, *, page_size: int = 100, max_pages: int = 5
+    ) -> dict[str, Any]:
+        dump = self.dump(space_name, page_size=page_size, max_pages=max_pages)
+        negative = ("wrong", "broken", "doesn't work", "failed", "error", "incorrect", "try again")
+        positive = ("thanks", "great", "perfect", "worked", "awesome")
+        items = []
+        for message in dump["messages"]:
+            text = str(message.get("text") or "")
+            lowered = text.casefold()
+            reaction_names = {
+                str(reaction.get("emoji", {}).get("unicode") or "")
+                for reaction in message.get("reactions") or []
+            }
+            category = (
+                "issue"
+                if any(word in lowered for word in negative) or "👎" in reaction_names
+                else "success"
+                if any(word in lowered for word in positive) or "👍" in reaction_names
+                else None
+            )
+            if category:
+                items.append(
+                    {
+                        "channel": dump["channel"],
+                        "channel_id": space_name,
+                        "thread_ts": message.get("thread_ts") or message.get("timestamp"),
+                        "permalink": message.get("permalink"),
+                        "category": category,
+                        "severity": "medium" if category == "issue" else "low",
+                        "summary": text[:200],
+                        "evidence": {"reactions": message.get("reactions") or []},
+                        "reporter_user": message.get("user"),
+                        "status": "new",
+                    }
+                )
+        return {
+            "channel": dump["channel"],
+            "channel_id": space_name,
+            "items": items,
+            "truncated": dump["truncated"],
+            "continuation_available": dump["continuation_available"],
+        }
+
+    @staticmethod
+    def _validate_page_size(page_size: int) -> None:
+        if not 1 <= page_size <= 1000:
+            raise ValueError("page_size must be between 1 and 1000")
+
+    @staticmethod
+    def _normalize_message(
+        space_name: str,
+        message: dict[str, Any],
+        reactions: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        sender = message.get("sender") or {}
+        name = str(message.get("name") or "")
+        thread_name = str((message.get("thread") or {}).get("name") or "") or None
+        message_id = name.rsplit("/", 1)[-1] if name else ""
+        return {
+            "user": sender.get("displayName") or sender.get("name") or "",
+            "user_id": sender.get("name") or "",
+            "text": message.get("text") or "",
+            "timestamp": message.get("createTime") or "",
+            "permalink": f"https://mail.google.com/chat/u/0/#chat/space/{_space_id(space_name)}/{message_id}",
+            "channel_id": space_name,
+            "thread_ts": thread_name,
+            "reply_count": 0,
+            "reactions": (reactions or {}).get(name, []),
+            "type": "message",
+            "subtype": None,
+        }
+
+    def update_message(self, message_name: str, text: str) -> dict[str, Any]:
+        space_id, message_id = _message_ids(message_name)
+        path = "/api/google-chat/spaces/{}/messages/{}".format(
+            quote(space_id, safe=""), quote(message_id, safe="")
+        )
+        return self._request("PATCH", path, json={"text": text})
+
+    def delete_message(self, message_name: str) -> dict[str, Any]:
+        space_id, message_id = _message_ids(message_name)
+        path = "/api/google-chat/spaces/{}/messages/{}".format(
+            quote(space_id, safe=""), quote(message_id, safe="")
+        )
+        return self._request("DELETE", path)
 
     def upload_attachment(
         self,
@@ -190,93 +658,25 @@ class GoogleChatClient:
         text: str | None = None,
         thread_name: str | None = None,
     ) -> dict[str, Any]:
-        """Upload a file into a space, posting directly to the real Google Chat API.
-
-        Two-call flow, ported from the bot's uploadAttachment/createAttachmentMessage:
-        1. multipart media upload to ``/upload/v1/.../attachments:upload``
-        2. message create referencing the returned attachment data ref
-
-        Both requests go to chat.googleapis.com with NO Authorization header —
-        iron-proxy's gcp_auth grant injects the domain-wide-delegation bearer at
-        the edge (Google's media.upload rejects app auth). Longer timeout
-        because uploads can be large.
-        """
-        import uuid
-        from urllib.parse import quote
-
-        import httpx
-
-        space_id = _space_id(space_name)
-
-        # 1. Upload the media. multipart/related: JSON metadata part (the
-        # required UploadAttachmentRequest `filename`) then the raw file bytes.
-        # filename is JSON-escaped and mime_type is validated to a token/token
-        # grammar so neither can inject CRLF or extra part headers into the body.
-        boundary = f"centaur-upload-{uuid.uuid4()}"
-        head = (
-            f"--{boundary}\r\n"
-            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-            f"{json.dumps({'filename': filename})}\r\n"
-            f"--{boundary}\r\n"
-            f"Content-Type: {_safe_mime_type(mime_type)}\r\n\r\n"
-        ).encode("utf-8")
-        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
-        upload_body = head + content + tail
-
-        upload_response = httpx.post(
-            f"{_GOOGLE_CHAT_API_BASE}/upload/v1/spaces/{quote(space_id, safe='')}"
-            "/attachments:upload?uploadType=multipart",
-            headers={"Content-Type": f"multipart/related; boundary={boundary}"},
-            content=upload_body,
+        space = quote(_space_id(space_name), safe="")
+        return self._request(
+            "POST",
+            f"/api/google-chat/spaces/{space}/attachments",
+            json={
+                "filename": filename,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "mime_type": mime_type or "application/octet-stream",
+                "text": text,
+                "thread_name": thread_name,
+            },
             timeout=120.0,
         )
-        upload_response.raise_for_status()
-        attachment = upload_response.json() if upload_response.text else {}
-
-        # 2. Post a message carrying the uploaded attachment. Must reference the
-        # whole UploadAttachmentResponse; runs on the same injected credential.
-        message_body: dict[str, Any] = {"attachment": [attachment]}
-        if text:
-            message_body["text"] = text
-        url = f"{_GOOGLE_CHAT_API_BASE}/v1/spaces/{space_id}/messages"
-        if thread_name:
-            message_body["thread"] = {"name": thread_name}
-            url += "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-
-        message_response = httpx.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json=message_body,
-            timeout=120.0,
-        )
-        message_response.raise_for_status()
-        return message_response.json() if message_response.text else {}
 
     def health(self) -> dict[str, Any]:
-        """Check the real read path end-to-end: a 1-message read of a known
-        SPACE via chat.googleapis.com, exercising edge credential injection.
-
-        The old relay /health is unreachable from a sandbox (CONNECT-only
-        firewall), so health now verifies the transport the tool actually uses.
-        Uses the first id in GOOGLE_CHAT_SPACE_IDS (the ETL's configured spaces);
-        without it, falls back to asserting the API host is reachable.
-        """
-        import httpx
-
-        space_ids = [s.strip() for s in os.environ.get("GOOGLE_CHAT_SPACE_IDS", "").split(",") if s.strip()]
-        if space_ids:
-            response = httpx.get(
-                f"{_GOOGLE_CHAT_API_BASE}/v1/spaces/{_space_id(space_ids[0])}/messages",
-                params={"pageSize": 1},
-                headers={"Content-Type": "application/json"},
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            return {"reachable": True, "space": space_ids[0], "via": "chat.googleapis.com"}
-        # No configured space to probe: a bare reachability check. A 4xx still
-        # proves we reached Google (transport + TLS MITM), just without a target.
-        response = httpx.get(f"{_GOOGLE_CHAT_API_BASE}/v1/spaces", timeout=10.0)
-        return {"reachable": True, "status": response.status_code, "via": "chat.googleapis.com"}
+        result = self._request(
+            "GET", "/api/google-chat/spaces", params={"page_size": 1}, timeout=10.0
+        )
+        return {"reachable": True, "via": "api-rs", "spaces": len(result.get("spaces", []))}
 
 
 def _client() -> GoogleChatClient:

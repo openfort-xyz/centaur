@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach } from 'bun:test'
-import { incr, renderMetrics, resetMetrics } from './metrics'
+import { addGauge, incr, renderMetrics, resetMetrics, setGauge } from './metrics'
 
 describe('metrics', () => {
   beforeEach(() => resetMetrics())
@@ -22,5 +22,34 @@ describe('metrics', () => {
   test('counts unlabelled counters', () => {
     incr('googlechatbot_render_resumes_total')
     expect(renderMetrics()).toContain('googlechatbot_render_resumes_total 1')
+  })
+
+  test('registers state, SSE, and obligation gauges once and updates them', () => {
+    setGauge('googlechatbot_state_connected', 1)
+    addGauge('googlechatbot_open_sse_connections', 1)
+    addGauge('googlechatbot_pending_render_obligations', 2)
+    const output = renderMetrics()
+    expect(output.match(/# TYPE googlechatbot_state_connected gauge/g)).toHaveLength(1)
+    expect(output).toContain('googlechatbot_state_connected 1')
+    expect(output).toContain('googlechatbot_open_sse_connections 1')
+    expect(output).toContain('googlechatbot_pending_render_obligations 2')
+  })
+
+  test('records dedupe, recovery, timeout, and delivery outcomes', () => {
+    incr('googlechatbot_dedupe_total', { outcome: 'duplicate' })
+    incr('googlechatbot_recovery_total', { outcome: 'failed', source: 'recovery' })
+    incr('googlechatbot_upstream_timeouts_total', { operation: 'create_session' })
+    incr('googlechatbot_delivery_total', { outcome: 'updated', source: 'live' })
+    const output = renderMetrics()
+    expect(output).toContain('googlechatbot_dedupe_total{outcome="duplicate"} 1')
+    expect(output).toContain(
+      'googlechatbot_recovery_total{outcome="failed",source="recovery"} 1'
+    )
+    expect(output).toContain(
+      'googlechatbot_upstream_timeouts_total{operation="create_session"} 1'
+    )
+    expect(output).toContain(
+      'googlechatbot_delivery_total{outcome="updated",source="live"} 1'
+    )
   })
 })

@@ -14,6 +14,8 @@ class Principal < ApplicationRecord
   has_many :principal_roles, dependent: :destroy
   has_many :roles, through: :principal_roles
   has_many :slack_channel_permissions, dependent: :destroy
+  has_many :google_chat_space_permissions, dependent: :destroy
+  has_many :google_chat_dm_permissions, dependent: :destroy
   has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
   has_many :mcp_oauth_authorization_codes, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
@@ -21,6 +23,8 @@ class Principal < ApplicationRecord
   belongs_to :console_user, class_name: "User", optional: true
 
   include SlackChannelPermissionOwner
+  include GoogleChatSpacePermissionOwner
+  include GoogleChatDmPermissionOwner
 
   after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
   after_create :assign_default_roles, if: :roles_blank_for_defaulting?
@@ -194,6 +198,72 @@ class Principal < ApplicationRecord
     end
   end
 
+  def effective_google_chat_space_permissions_payload
+    @effective_google_chat_space_permissions_payload ||=
+      merged_google_chat_space_permissions(effective_google_chat_space_permissions)
+  end
+
+  def inherited_google_chat_space_permissions_payload
+    @inherited_google_chat_space_permissions_payload ||= begin
+      permissions = if loaded_role_google_chat_permissions?(:google_chat_space_permissions)
+        roles.flat_map { |role| role.google_chat_space_permissions.to_a }
+      else
+        GoogleChatSpacePermission.where(role_id: role_ids)
+      end
+      merged_google_chat_space_permissions(permissions)
+    end
+  end
+
+  def effective_google_chat_dm_permissions_payload
+    @effective_google_chat_dm_permissions_payload ||=
+      merged_google_chat_dm_permissions(effective_google_chat_dm_permissions)
+  end
+
+  def inherited_google_chat_dm_permissions_payload
+    @inherited_google_chat_dm_permissions_payload ||= begin
+      permissions = if loaded_role_google_chat_permissions?(:google_chat_dm_permissions)
+        roles.flat_map { |role| role.google_chat_dm_permissions.to_a }
+      else
+        GoogleChatDmPermission.where(role_id: role_ids)
+      end
+      merged_google_chat_dm_permissions(permissions)
+    end
+  end
+
+  def google_chat_space_names_by_permission
+    @google_chat_space_names_by_permission ||= begin
+      initial = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h { |flag| [ flag.fetch(:claim), [] ] }
+      effective_google_chat_space_permissions_payload.each_with_object(initial) do |row, spaces|
+        GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag|
+          spaces[flag.fetch(:claim)] << row.fetch("space_name") if row.fetch(flag.fetch(:attribute).to_s)
+        end
+      end
+    end
+  end
+
+  def google_chat_dm_setup_targets
+    effective_google_chat_dm_permissions_payload.filter_map do |row|
+      row.fetch("target_identity") if row.fetch("setup_enabled")
+    end.sort
+  end
+
+  def google_chat_jwt_targets
+    google_chat_space_names_by_permission.values.flatten.concat(google_chat_dm_setup_targets).uniq
+  end
+
+  def reset_google_chat_permissions_cache!
+    %i[
+      @effective_google_chat_space_permissions_payload
+      @inherited_google_chat_space_permissions_payload
+      @effective_google_chat_dm_permissions_payload
+      @inherited_google_chat_dm_permissions_payload
+      @google_chat_space_names_by_permission
+      @google_chat_dm_setup_targets
+    ].each do |ivar|
+      remove_instance_variable(ivar) if instance_variable_defined?(ivar)
+    end
+  end
+
   def self.bump_sync_config_cache_versions(targets)
     scope = sync_config_cache_bump_scope(targets)
     return unless scope
@@ -280,6 +350,58 @@ class Principal < ApplicationRecord
   def loaded_role_slack_channel_permissions?
     association(:roles).loaded? &&
       roles.all? { |role| role.association(:slack_channel_permissions).loaded? }
+  end
+
+  def effective_google_chat_space_permissions
+    effective_google_chat_permissions_for(:google_chat_space_permissions, GoogleChatSpacePermission)
+  end
+
+  def effective_google_chat_dm_permissions
+    effective_google_chat_permissions_for(:google_chat_dm_permissions, GoogleChatDmPermission)
+  end
+
+  def effective_google_chat_permissions_for(association_name, model)
+    association_rows = public_send(association_name)
+    return association_rows.to_a unless persisted?
+
+    if association(association_name).loaded? && loaded_role_google_chat_permissions?(association_name)
+      return association_rows.to_a + roles.flat_map { |role| role.public_send(association_name).to_a }
+    end
+
+    model.where(principal_id: id).or(model.where(role_id: role_ids))
+  end
+
+  def loaded_role_google_chat_permissions?(association_name)
+    association(:roles).loaded? && roles.all? { |role| role.association(association_name).loaded? }
+  end
+
+  def merged_google_chat_space_permissions(permissions)
+    merged_permission_rows(
+      permissions,
+      target_attribute: :space_name,
+      permission_attributes: GoogleChatSpacePermission::PERMISSION_ATTRIBUTE_NAMES
+    )
+  end
+
+  def merged_google_chat_dm_permissions(permissions)
+    merged_permission_rows(
+      permissions,
+      target_attribute: :target_identity,
+      permission_attributes: %w[setup_enabled]
+    )
+  end
+
+  def merged_permission_rows(permissions, target_attribute:, permission_attributes:)
+    ordered = permissions.sort_by do |permission|
+      [ permission.principal_id.present? ? 0 : 1, permission.role_id || 0, permission.id || 0 ]
+    end
+
+    ordered.each_with_object({}) do |permission, rows|
+      target = permission.public_send(target_attribute)
+      row = rows[target] ||= { target_attribute.to_s => target }
+      permission_attributes.each { |flag| row[flag] = false unless row.key?(flag) }
+      permission_attributes.each { |flag| row[flag] ||= permission.public_send(flag) }
+    end.values.sort_by { |row| row.fetch(target_attribute.to_s) }
   end
 
   def merged_slack_channel_permissions(permissions)

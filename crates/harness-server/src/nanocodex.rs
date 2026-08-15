@@ -13,6 +13,7 @@ use nanocodex::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -166,7 +167,7 @@ async fn run_turn(
     events: &mut AgentEvents,
     turn: Turn,
     receiver: &mut mpsc::UnboundedReceiver<io::Result<String>>,
-    staged: &mut HashMap<String, PathBuf>,
+    staged: &mut HashMap<String, AttachmentStage>,
     stdout: &mut impl Write,
     subagents_enabled: bool,
 ) -> Result<()> {
@@ -240,6 +241,20 @@ enum BlocksCommand {
     Interrupt,
 }
 
+enum AttachmentStage {
+    Pending {
+        path: PathBuf,
+        next_chunk_index: u64,
+        chunk_count: u64,
+        byte_size: u64,
+        received_bytes: u64,
+        sha256: String,
+        hasher: Sha256,
+        verified_integrity: bool,
+    },
+    Complete(PathBuf),
+}
+
 #[derive(Deserialize)]
 struct BlocksLine {
     #[serde(rename = "type")]
@@ -262,6 +277,16 @@ struct BlocksLine {
     mime_type: Option<String>,
     #[serde(rename = "dataBase64", default)]
     data_base64: Option<String>,
+    #[serde(rename = "chunkIndex", default)]
+    chunk_index: Option<u64>,
+    #[serde(rename = "chunkCount", default)]
+    chunk_count: Option<u64>,
+    #[serde(rename = "byteSize", default)]
+    byte_size: Option<u64>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(rename = "final", default)]
+    final_chunk: bool,
 }
 
 #[derive(Deserialize)]
@@ -270,7 +295,10 @@ struct BlocksMessage {
     content: Option<Value>,
 }
 
-fn parse_blocks_line(line: &str, staged: &mut HashMap<String, PathBuf>) -> Result<BlocksCommand> {
+fn parse_blocks_line(
+    line: &str,
+    staged: &mut HashMap<String, AttachmentStage>,
+) -> Result<BlocksCommand> {
     let parsed: BlocksLine =
         serde_json::from_str(line).map_err(|source| HarnessServerError::InvalidBlocksInput {
             message: source.to_string(),
@@ -311,27 +339,117 @@ fn parse_blocks_line(line: &str, staged: &mut HashMap<String, PathBuf>) -> Resul
         "attachment.chunk" => {
             let id = required_string(parsed.attachment_id, "attachmentId")?;
             if let Some(path) = parsed.local_path {
-                staged.insert(id, path);
+                staged.insert(id, AttachmentStage::Complete(path));
                 return Ok(BlocksCommand::AttachmentChunk);
             }
-            let path = if let Some(path) = staged.get(&id) {
-                path.clone()
-            } else {
-                let path = temporary_attachment_path(parsed.name.as_deref());
-                staged.insert(id.clone(), path.clone());
-                path
-            };
-            if let Some(data) = parsed.data_base64.filter(|data| !data.is_empty()) {
-                let bytes = BASE64_STANDARD.decode(data).map_err(|source| {
-                    HarnessServerError::InvalidBlocksInput {
-                        message: format!("invalid attachment chunk for {id}: {source}"),
+            let chunk_index = required_u64(parsed.chunk_index, "chunkIndex")?;
+            let (chunk_count, byte_size, expected_sha256, verified_integrity) =
+                match (parsed.chunk_count, parsed.byte_size, parsed.sha256) {
+                    (None, None, None) => (0, 100 * 1024 * 1024, String::new(), false),
+                    (Some(count), Some(size), Some(hash))
+                        if count > 0
+                            && size <= 100 * 1024 * 1024
+                            && hash.len() == 64
+                            && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+                    {
+                        (count, size, hash.to_ascii_lowercase(), true)
                     }
-                })?;
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?
-                    .write_all(&bytes)?;
+                    _ => return invalid_chunk(&id, "invalid integrity metadata"),
+                };
+            if matches!(staged.get(&id), Some(AttachmentStage::Complete(_))) {
+                return invalid_chunk(&id, "duplicate finalized attachment");
+            }
+            if !staged.contains_key(&id) {
+                if chunk_index != 0 {
+                    return invalid_chunk(&id, "chunk sequence must start at 0");
+                }
+                staged.insert(
+                    id.clone(),
+                    AttachmentStage::Pending {
+                        path: temporary_attachment_path(parsed.name.as_deref()),
+                        next_chunk_index: 0,
+                        chunk_count,
+                        byte_size,
+                        received_bytes: 0,
+                        sha256: expected_sha256.clone(),
+                        hasher: Sha256::new(),
+                        verified_integrity,
+                    },
+                );
+            }
+            let valid = matches!(staged.get(&id), Some(AttachmentStage::Pending {
+                next_chunk_index,
+                chunk_count: saved_count,
+                byte_size: saved_size,
+                sha256: saved_hash,
+                verified_integrity: saved_integrity,
+                ..
+            }) if *next_chunk_index == chunk_index
+                && *saved_integrity == verified_integrity
+                && (!verified_integrity || (*saved_count == chunk_count
+                    && *saved_size == byte_size
+                    && *saved_hash == expected_sha256
+                    && parsed.final_chunk == (chunk_index + 1 == chunk_count))));
+            if !valid {
+                discard_nanocodex_stage(staged, &id);
+                return invalid_chunk(&id, "invalid chunk sequence");
+            }
+            let Some(data) = parsed.data_base64.filter(|data| !data.is_empty()) else {
+                discard_nanocodex_stage(staged, &id);
+                return invalid_chunk(&id, "missing dataBase64");
+            };
+            let bytes = match BASE64_STANDARD.decode(data) {
+                Ok(bytes) => bytes,
+                Err(source) => {
+                    discard_nanocodex_stage(staged, &id);
+                    return invalid_chunk(&id, &format!("invalid base64: {source}"));
+                }
+            };
+            let stage = staged.get_mut(&id).expect("stage exists");
+            let AttachmentStage::Pending {
+                path,
+                next_chunk_index,
+                received_bytes,
+                hasher,
+                ..
+            } = stage
+            else {
+                unreachable!()
+            };
+            *received_bytes += bytes.len() as u64;
+            if *received_bytes > byte_size {
+                discard_nanocodex_stage(staged, &id);
+                return invalid_chunk(&id, "chunks exceed declared byteSize");
+            }
+            hasher.update(&bytes);
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?
+                .write_all(&bytes)?;
+            *next_chunk_index += 1;
+            if parsed.final_chunk {
+                let AttachmentStage::Pending {
+                    path,
+                    received_bytes,
+                    sha256,
+                    hasher,
+                    verified_integrity,
+                    ..
+                } = staged.remove(&id).expect("stage exists")
+                else {
+                    unreachable!()
+                };
+                let actual_sha256 = hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if verified_integrity && (received_bytes != byte_size || actual_sha256 != sha256) {
+                    let _ = std::fs::remove_file(path);
+                    return invalid_chunk(&id, "attachment size or hash mismatch");
+                }
+                staged.insert(id, AttachmentStage::Complete(path));
             }
             let _mime_type = parsed.mime_type;
             Ok(BlocksCommand::AttachmentChunk)
@@ -340,6 +458,24 @@ fn parse_blocks_line(line: &str, staged: &mut HashMap<String, PathBuf>) -> Resul
         kind => Err(HarnessServerError::InvalidBlocksInput {
             message: format!("unsupported blocks input type `{kind}`"),
         }),
+    }
+}
+
+fn required_u64(value: Option<u64>, name: &str) -> Result<u64> {
+    value.ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+        message: format!("attachment chunk missing {name}"),
+    })
+}
+
+fn invalid_chunk<T>(id: &str, message: &str) -> Result<T> {
+    Err(HarnessServerError::InvalidBlocksInput {
+        message: format!("invalid attachment chunk for {id}: {message}"),
+    })
+}
+
+fn discard_nanocodex_stage(staged: &mut HashMap<String, AttachmentStage>, id: &str) {
+    if let Some(AttachmentStage::Pending { path, .. }) = staged.remove(id) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -411,7 +547,10 @@ fn strip_standalone_flag(text: &mut String, flag: &str) -> bool {
     found
 }
 
-fn parse_content(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<Vec<UserInput>> {
+fn parse_content(
+    value: &Value,
+    staged: &HashMap<String, AttachmentStage>,
+) -> Result<Vec<UserInput>> {
     if let Some(text) = value.as_str() {
         return Ok(vec![UserInput::Text {
             text: text.to_owned(),
@@ -425,7 +564,7 @@ fn parse_content(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<Vec
     items.iter().map(|item| parse_input(item, staged)).collect()
 }
 
-fn parse_input(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<UserInput> {
+fn parse_input(value: &Value, staged: &HashMap<String, AttachmentStage>) -> Result<UserInput> {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("text");
     match kind {
         "text" | "input_text" => Ok(UserInput::Text {
@@ -455,7 +594,7 @@ fn parse_input(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<UserI
     }
 }
 
-fn attachment_input(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<UserInput> {
+fn attachment_input(value: &Value, staged: &HashMap<String, AttachmentStage>) -> Result<UserInput> {
     let path = value
         .get("localPath")
         .or_else(|| value.get("path"))
@@ -465,7 +604,10 @@ fn attachment_input(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<
             value
                 .get("stagedAttachmentId")
                 .and_then(Value::as_str)
-                .and_then(|id| staged.get(id).cloned())
+                .and_then(|id| match staged.get(id) {
+                    Some(AttachmentStage::Complete(path)) => Some(path.clone()),
+                    _ => None,
+                })
         });
     let path = match path {
         Some(path) => path,
@@ -601,6 +743,38 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn validates_staged_attachment_sequence_before_nanocodex_turn() {
+        let mut staged = HashMap::new();
+        let second_without_first = r#"{"type":"attachment.chunk","attachmentId":"missing","chunkIndex":1,"chunkCount":2,"byteSize":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","final":true,"dataBase64":"bG8="}"#;
+        assert!(parse_blocks_line(second_without_first, &mut staged).is_err());
+
+        let first = r#"{"type":"attachment.chunk","attachmentId":"partial","name":"a.txt","chunkIndex":0,"chunkCount":2,"byteSize":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","final":false,"dataBase64":"aGU="}"#;
+        parse_blocks_line(first, &mut staged).expect("first chunk");
+        let user = r#"{"type":"user","message":{"content":[{"type":"attachment","stagedAttachmentId":"partial","name":"a.txt"}]}}"#;
+        assert!(parse_blocks_line(user, &mut staged).is_err());
+        assert!(parse_blocks_line(first, &mut staged).is_err());
+
+        let wrong_hash = r#"{"type":"attachment.chunk","attachmentId":"bad-hash","name":"a.txt","chunkIndex":0,"chunkCount":1,"byteSize":5,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","final":true,"dataBase64":"aGVsbG8="}"#;
+        assert!(parse_blocks_line(wrong_hash, &mut staged).is_err());
+        let bad_user = r#"{"type":"user","message":{"content":[{"type":"attachment","stagedAttachmentId":"bad-hash","name":"a.txt"}]}}"#;
+        assert!(parse_blocks_line(bad_user, &mut staged).is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_staged_chunk_metadata() {
+        let mut staged = HashMap::new();
+        let chunk = r#"{"type":"attachment.chunk","attachmentId":"legacy","name":"a.txt","chunkIndex":0,"final":true,"dataBase64":"aGVsbG8="}"#;
+        assert!(matches!(
+            parse_blocks_line(chunk, &mut staged).expect("legacy chunk"),
+            BlocksCommand::AttachmentChunk
+        ));
+        let Some(AttachmentStage::Complete(path)) = staged.get("legacy") else {
+            panic!("legacy attachment not staged");
+        };
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
     }
 
     #[test]

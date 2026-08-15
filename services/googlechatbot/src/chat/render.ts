@@ -1,11 +1,16 @@
 import type { GoogleChatCard, GoogleChatCardSection, GoogleChatCardWidget } from './types'
 import { chatReplyLimits } from '../constants'
 
-const MAX_TEXT_CHARS = chatReplyLimits.card.textParagraphChars
-const MAX_CARDS = chatReplyLimits.card.maxCards
+const MAX_TEXT_BYTES = chatReplyLimits.card.textParagraphBytes
 const MAX_HEADER_CHARS = chatReplyLimits.card.headerTitleChars
 const MAX_WIDGETS_PER_CARD = chatReplyLimits.card.maxWidgetsPerCard
-const MAX_CARD_BYTES = chatReplyLimits.card.maxCardBytes
+
+export const CARD_FALLBACK_TEXT = 'Centaur response with rich content.'
+
+/** Exact wire-size guard used by both card packing and final delivery. */
+export function messageUtf8Bytes(message: unknown): number {
+  return Buffer.byteLength(JSON.stringify(message), 'utf8')
+}
 
 /** Google Chat renders Markdown in card text only when textSyntax is MARKDOWN. */
 const MARKDOWN = 'MARKDOWN' as const
@@ -33,13 +38,13 @@ export function markdownToChatMessage(markdown: string): {
   // and flatten inline markup in card prose, which cards would otherwise
   // fragment onto separate lines (see flattenCardProseInline).
   const cards = splitMarkdownToCards(flattenCardProseInline(normalizeCardBreaks(fenced)))
-  const cardsV2 = cards.slice(0, MAX_CARDS).map((card, index) => ({
+  const cardsV2 = cards.map((card, index) => ({
     cardId: `card-${index}`,
     card: { sections: card }
   }))
 
   return {
-    text: clampText(toChatTextMarkup(fenced), chatReplyLimits.message.maxPlainTextChars),
+    text: toChatTextMarkup(fenced),
     cardsV2
   }
 }
@@ -121,13 +126,84 @@ function expandBreaksOutsideFences(markdown: string): string[] {
 
 /** Strip inline markdown that a card section `header` (plain text only) can't render. */
 export function stripInlineMarkdown(text: string): string {
-  return text
-    .replace(/!?\[([^\]]+)\]\([^)\s]+\)/g, '$1') // [label](url) / ![alt](url) → label
-    .replace(/(\*\*|__)(.+?)\1/g, '$2') // **bold** / __bold__ → bold
-    .replace(/(\*|_)(.+?)\1/g, '$2') // *italic* / _italic_ → italic
+  let plain = stripMarkdownLinkTargets(text)
+  for (const marker of ['**', '__', '*', '_']) plain = stripPairedMarker(plain, marker)
+  return plain
     .replace(/~~(.+?)~~/g, '$1') // ~~strike~~ → strike
     .replace(/`([^`]+)`/g, '$1') // `code` → code
     .trim()
+}
+
+function stripPairedMarker(text: string, marker: string): string {
+  const out: string[] = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const start = text.indexOf(marker, cursor)
+    if (start < 0) break
+    const end = text.indexOf(marker, start + marker.length)
+    if (end < 0) break
+    out.push(text.slice(cursor, start), text.slice(start + marker.length, end))
+    cursor = end + marker.length
+  }
+  out.push(text.slice(cursor))
+  return out.join('')
+}
+
+function stripMarkdownLinkTargets(text: string): string {
+  const out: string[] = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const labelStart = text.indexOf('[', cursor)
+    if (labelStart < 0) break
+    const markerStart = labelStart > cursor && text[labelStart - 1] === '!'
+      ? labelStart - 1
+      : labelStart
+    const labelEnd = text.indexOf(']', labelStart + 1)
+    if (labelEnd < 0) break
+    if (text[labelEnd + 1] !== '(') {
+      out.push(text.slice(cursor, labelEnd + 1))
+      cursor = labelEnd + 1
+      continue
+    }
+    const targetEnd = text.indexOf(')', labelEnd + 2)
+    if (targetEnd < 0) break
+    const label = text.slice(labelStart + 1, labelEnd)
+    const target = text.slice(labelEnd + 2, targetEnd)
+    if (label && target && ![...target].some(char => char.trim() === '')) {
+      out.push(text.slice(cursor, markerStart), label)
+    } else {
+      out.push(text.slice(cursor, targetEnd + 1))
+    }
+    cursor = targetEnd + 1
+  }
+  out.push(text.slice(cursor))
+  return out.join('')
+}
+
+function headingText(line: string): string | null {
+  let index = 0
+  while (index < 6 && line[index] === '#') index += 1
+  if (index === 0 || line[index] === '#' || line[index]?.trim() !== '') return null
+  while (line[index]?.trim() === '') index += 1
+  return index < line.length ? line.slice(index) : null
+}
+
+function standaloneImage(line: string): { altText: string; imageUrl: string } | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('![') || !trimmed.endsWith(')')) return null
+  const labelEnd = trimmed.indexOf('](', 2)
+  if (labelEnd < 0) return null
+  const imageUrl = trimmed.slice(labelEnd + 2, -1)
+  if (
+    !(imageUrl.startsWith('https://') || imageUrl.startsWith('http://'))
+    || imageUrl.includes(')')
+    || [...imageUrl].some(char => char.trim() === '')
+  ) return null
+  return { altText: trimmed.slice(2, labelEnd).trim(), imageUrl }
+}
+
+export function hasStandaloneImage(markdown: string): boolean {
+  return markdown.split('\n').some(line => standaloneImage(line) !== null)
 }
 
 /**
@@ -157,9 +233,9 @@ export function toChatTextMarkup(text: string): string {
     }
     // `# Heading` → a bold line (`*Heading*`), the closest Chat-markup analog.
     // Inner markers are stripped first so `## **X**` nests to `*X*`, not `***X***`.
-    const heading = line.match(/^#{1,6}\s+(.+)$/)
+    const heading = headingText(line)
     if (heading) {
-      out.push(`*${stripInlineMarkdown(heading[1]!)}*`)
+      out.push(`*${stripInlineMarkdown(heading)}*`)
       continue
     }
     out.push(
@@ -232,31 +308,49 @@ function splitMarkdownToCards(markdown: string): GoogleChatCardSection[][] {
 
   let sections: GoogleChatCardSection[] = []
   let widgetCount = 0
-  let byteCount = 0
   let currentText = ''
+  let pendingHeader: string | undefined
 
   const startNewCard = () => {
     if (sections.length) cards.push(sections)
     sections = []
     widgetCount = 0
-    byteCount = 0
   }
 
   const pushSection = (section: GoogleChatCardSection) => {
-    // A header-only section still consumes layout budget; count it as one.
-    const widgets = (section.widgets?.length ?? 0) + (section.header ? 1 : 0)
-    const bytes = sectionBytes(section)
-    // A heading section followed by its body must not split a card mid-thought
-    // unless we genuinely overflow; honour the hard limits with margin.
-    if (
-      sections.length &&
-      (widgetCount + widgets > MAX_WIDGETS_PER_CARD || byteCount + bytes > MAX_CARD_BYTES)
-    ) {
+    const widgets = section.widgets?.length ?? 0
+    if (widgets === 0) throw new Error('Google Chat card sections require at least one widget')
+    const candidate = [...sections, section]
+    const candidateBody = {
+      fallbackText: CARD_FALLBACK_TEXT,
+      cardsV2: [{ cardId: 'card-0', card: { sections: candidate } }]
+    }
+    if (sections.length && (
+      widgetCount + widgets > MAX_WIDGETS_PER_CARD
+      || messageUtf8Bytes(candidateBody) > chatReplyLimits.message.maxBytes
+    )) {
       startNewCard()
     }
     sections.push(section)
     widgetCount += widgets
-    byteCount += bytes
+  }
+
+  const pushWidget = (widget: GoogleChatCardWidget) => {
+    pushSection({
+      ...(pendingHeader ? { header: pendingHeader } : {}),
+      widgets: [widget]
+    })
+    pendingHeader = undefined
+  }
+
+  const flushPendingHeader = () => {
+    if (!pendingHeader) return
+    const header = pendingHeader
+    pendingHeader = undefined
+    // Section headers are useful content, but Google still requires a widget.
+    // A zero-width paragraph satisfies that structural rule without echoing the
+    // heading visibly a second time.
+    pushSection({ header, widgets: [{ textParagraph: { text: '\u200b' } }] })
   }
 
   const flushText = () => {
@@ -265,47 +359,76 @@ function splitMarkdownToCards(markdown: string): GoogleChatCardSection[][] {
       return
     }
     for (const widget of buildTextWidgets(currentText.trim())) {
-      pushSection({ widgets: [widget] })
+      pushWidget(widget)
     }
     currentText = ''
   }
 
   for (const line of markdown.split('\n')) {
-    const headingMatch = line.match(/^#{1,6}\s+(.+)/)
-    if (headingMatch) {
+    const heading = headingText(line)
+    if (heading) {
       flushText()
-      pushSection({
-        header: stripInlineMarkdown(headingMatch[1]!).slice(0, MAX_HEADER_CHARS),
-        widgets: []
-      })
+      flushPendingHeader()
+      pendingHeader = stripInlineMarkdown(heading).slice(0, MAX_HEADER_CHARS)
       continue
     }
 
     // Standalone Markdown image: Google Chat's card Markdown can't render
     // ![](), so emit a real image widget (public URL) instead of literal text.
-    const imageMatch = line.match(/^\s*!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)\s*$/)
-    if (imageMatch) {
+    const image = standaloneImage(line)
+    if (image) {
       flushText()
-      const altText = imageMatch[1]!.trim()
-      pushSection({
-        widgets: [{ image: { imageUrl: imageMatch[2]!, ...(altText ? { altText } : {}) } }]
+      pushWidget({
+        image: {
+          imageUrl: image.imageUrl,
+          ...(image.altText ? { altText: image.altText } : {})
+        }
       })
       continue
     }
 
     currentText += line + '\n'
-    if (currentText.length > MAX_TEXT_CHARS) flushText()
+    if (Buffer.byteLength(currentText, 'utf8') > MAX_TEXT_BYTES) flushText()
   }
   flushText()
+  flushPendingHeader()
 
   if (sections.length) cards.push(sections)
   return cards
 }
 
 function buildTextWidgets(text: string): GoogleChatCardWidget[] {
-  return splitMarkdownText(text, MAX_TEXT_CHARS).map((part) => ({
-    textParagraph: { text: part.slice(0, MAX_TEXT_CHARS), textSyntax: MARKDOWN }
+  return splitUtf8Text(text, MAX_TEXT_BYTES).map((part) => ({
+    textParagraph: { text: part, textSyntax: MARKDOWN }
   }))
+}
+
+/** Split without cutting a Unicode code point; concatenating the result is lossless. */
+export function splitUtf8Text(input: string, maxBytes: number): string[] {
+  if (maxBytes <= 0) throw new Error('maxBytes must be positive')
+  if (!input) return []
+  const codePoints = Array.from(input)
+  const chunks: string[] = []
+  let start = 0
+  while (start < codePoints.length) {
+    let low = start + 1
+    let high = codePoints.length
+    let end = start
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2)
+      const candidate = codePoints.slice(start, middle).join('')
+      if (Buffer.byteLength(candidate, 'utf8') <= maxBytes) {
+        end = middle
+        low = middle + 1
+      } else {
+        high = middle - 1
+      }
+    }
+    if (end === start) throw new Error('maxBytes is too small for one Unicode code point')
+    chunks.push(codePoints.slice(start, end).join(''))
+    start = end
+  }
+  return chunks
 }
 
 /** A monospace fence wider than this wraps (never scrolls) on a Chat card. */
@@ -436,36 +559,4 @@ function splitTableRow(line: string): string[] {
 function isTableSeparator(line: string): boolean {
   const trimmed = line.trim()
   return trimmed.includes('-') && trimmed.includes('|') && /^[\s|:-]+$/.test(trimmed)
-}
-
-function splitMarkdownText(input: string, maxChars: number): string[] {
-  const chunks: string[] = []
-  let remaining = input
-  while (remaining.length > maxChars) {
-    const hard = remaining.slice(0, maxChars)
-    const paragraphBoundary = hard.lastIndexOf('\n\n')
-    const lineBoundary = hard.lastIndexOf('\n')
-    const spaceBoundary = hard.lastIndexOf(' ')
-    const boundary = Math.max(paragraphBoundary, lineBoundary, spaceBoundary)
-    const delimiterLength = boundary === paragraphBoundary ? 2 : boundary >= 0 ? 1 : 0
-    const take = boundary > maxChars * 0.5 ? boundary + delimiterLength : maxChars
-    chunks.push(remaining.slice(0, take))
-    remaining = remaining.slice(take)
-  }
-  if (remaining) chunks.push(remaining)
-  return chunks
-}
-
-/** Truncate to `maxChars`, marking the cut with an ellipsis. */
-export function clampText(text: string, maxChars: number): string {
-  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text
-}
-
-/** Rough serialized size of a section, used to keep a card under 32 KB. */
-function sectionBytes(section: GoogleChatCardSection): number {
-  let bytes = section.header ? section.header.length + 16 : 0
-  for (const widget of section.widgets ?? []) {
-    bytes += (widget.textParagraph?.text.length ?? 0) + 48
-  }
-  return bytes
 }

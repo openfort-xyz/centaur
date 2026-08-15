@@ -2,10 +2,17 @@ module Api
   module V1
     class PrincipalsController < Api::BaseController
       include SlackChannelPermissionApi
+      include GoogleChatPermissionApi
 
       def index
         records, meta = paginated_label_search(
-          Principal.includes(:console_user, :slack_channel_permissions, roles: :slack_channel_permissions)
+          Principal.includes(
+            :console_user,
+            :slack_channel_permissions,
+            :google_chat_space_permissions,
+            :google_chat_dm_permissions,
+            roles: %i[slack_channel_permissions google_chat_space_permissions google_chat_dm_permissions]
+          )
         )
         render json: { data: records.map { |p| record_payload(p) }, meta: meta }
       end
@@ -30,6 +37,7 @@ module Api
           principal.apply_default_sandbox_capabilities!(principal_params)
           principal.save!
           replace_slack_channel_permissions!(principal) if data_params.key?(:slack_channel_permissions)
+          replace_google_chat_permissions!(principal)
         end
         render status: :created, json: { data: record_payload(principal) }
       rescue ActiveRecord::RecordInvalid => e
@@ -46,6 +54,7 @@ module Api
           principal.apply_default_sandbox_capabilities!(principal_params) if was_new
           principal.save!
           replace_slack_channel_permissions!(principal) if data_params.key?(:slack_channel_permissions)
+          replace_google_chat_permissions!(principal)
         end
         render status: (was_new ? :created : :ok), json: { data: record_payload(principal) }
       rescue ActiveRecord::RecordInvalid => e
@@ -82,6 +91,10 @@ module Api
           labels: principal.labels_with_sandbox_capabilities,
           slack_channel_permissions: principal.slack_channel_permissions_payload,
           effective_slack_channel_permissions: principal.effective_slack_channel_permissions_payload,
+          google_chat_space_permissions: principal.google_chat_space_permissions_payload,
+          effective_google_chat_space_permissions: principal.effective_google_chat_space_permissions_payload,
+          google_chat_dm_permissions: principal.google_chat_dm_permissions_payload,
+          effective_google_chat_dm_permissions: principal.effective_google_chat_dm_permissions_payload,
           sandbox_repo_cache: principal.sandbox_repo_cache,
           sandbox_observability_enabled: principal.sandbox_observability_enabled,
           sandbox_api_server_enabled: principal.sandbox_api_server_enabled,
@@ -110,6 +123,8 @@ module Api
       def slack_channel_permission_owner
         Principal.find_by_oid!(params[:id])
       end
+
+      alias_method :google_chat_permission_owner, :slack_channel_permission_owner
     end
   end
 end

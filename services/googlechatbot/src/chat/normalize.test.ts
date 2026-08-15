@@ -74,28 +74,18 @@ describe('normalizeChatEnvelope', () => {
     expect(room!.is_mention).toBe(false)
   })
 
-  test('captures the sender email for Console thread attribution', async () => {
+  test('does not invent an email from the official User resource', async () => {
     const normalized = await normalizeChatEnvelope(
       messageEnvelope({
         message: {
           name: 'spaces/AAAA/messages/M1',
           text: '<users/bot-account> hello',
-          sender: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' }
+          sender: { name: 'users/U1', displayName: 'Alice' }
         }
       }),
       BOT_USER
     )
-    expect(normalized!.user_email).toBe('alice@openfort.xyz')
-  })
-
-  test('falls back to the envelope user email when the sender has none', async () => {
-    const normalized = await normalizeChatEnvelope(
-      messageEnvelope({
-        user: { name: 'users/U1', displayName: 'Alice', email: 'alice@openfort.xyz' }
-      }),
-      BOT_USER
-    )
-    expect(normalized!.user_email).toBe('alice@openfort.xyz')
+    expect(normalized!.user_email).toBeUndefined()
   })
 
   test('treats a slash command as a mention and uses argumentText as the prompt', async () => {
@@ -115,7 +105,41 @@ describe('normalizeChatEnvelope', () => {
     expect(normalized!.parts[0]).toMatchObject({ type: 'text', text: 'ship the feature' })
   })
 
-  test('isThreadReply distinguishes a reply from a thread root', async () => {
+  test('accepts official spaceType and message.slashCommand fields', async () => {
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        space: { name: 'spaces/AAAA', spaceType: 'GROUP_CHAT' },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: '/centaur ship',
+          argumentText: 'ship',
+          slashCommand: { commandId: '1' },
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(normalized?.space_type).toBe('GROUP_CHAT')
+    expect(normalized?.is_mention).toBe(true)
+    expect(normalized?.parts[0]).toMatchObject({ type: 'text', text: 'ship' })
+  })
+
+  test('does not duplicate text when formattedText is also present', async () => {
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: '<users/bot-account> hello',
+          formattedText: '<users/bot-account> hello',
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(normalized?.parts).toEqual([{ type: 'text', text: 'hello' }])
+  })
+
+  test('isThreadReply uses the official threadReply discriminator only', async () => {
     const root = await normalizeChatEnvelope(
       messageEnvelope({
         thread: { name: 'spaces/AAAA/threads/M1' },
@@ -123,6 +147,7 @@ describe('normalizeChatEnvelope', () => {
           name: 'spaces/AAAA/messages/M1',
           text: 'hi',
           thread: { name: 'spaces/AAAA/threads/M1' },
+          threadReply: false,
           sender: { name: 'users/U1', displayName: 'Alice' }
         }
       }),
@@ -135,6 +160,7 @@ describe('normalizeChatEnvelope', () => {
           name: 'spaces/AAAA/messages/M1.R2',
           text: 'follow up',
           thread: { name: 'spaces/AAAA/threads/M1' },
+          threadReply: true,
           sender: { name: 'users/U1', displayName: 'Alice' }
         }
       }),
@@ -142,6 +168,23 @@ describe('normalizeChatEnvelope', () => {
     )
     expect(isThreadReply(root!)).toBe(false)
     expect(isThreadReply(reply!)).toBe(true)
+  })
+
+  test('message.threadReply overrides resource-name inference', async () => {
+    const declaredReply = await normalizeChatEnvelope(
+      messageEnvelope({
+        thread: { name: 'spaces/AAAA/threads/M1' },
+        message: {
+          name: 'spaces/AAAA/messages/M1',
+          text: 'reply',
+          thread: { name: 'spaces/AAAA/threads/M1' },
+          threadReply: true,
+          sender: { name: 'users/U1', displayName: 'Alice' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(isThreadReply(declaredReply!)).toBe(true)
   })
 
   test('does not include the dropped vaporware fields', async () => {
@@ -200,6 +243,62 @@ describe('normalizeChatEnvelope', () => {
       BOT_USER
     )
     expect(own).toBeNull()
+  })
+
+  test('skips every BOT sender, including another bot', async () => {
+    const otherBot = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M3',
+          text: '<users/bot-account> loop me',
+          sender: { name: 'users/999999', displayName: 'Other bot', type: 'BOT' }
+        }
+      }),
+      BOT_USER
+    )
+    expect(otherBot).toBeNull()
+  })
+
+  test('only an exact bot annotation/resource counts as a mention', async () => {
+    const ordinaryAt = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M4',
+          text: 'please ask @alice',
+          sender: { name: 'users/U1', type: 'HUMAN' }
+        }
+      }),
+      'users/123456789'
+    )
+    expect(ordinaryAt?.is_mention).toBe(false)
+
+    const exact = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M5',
+          text: 'please help',
+          sender: { name: 'users/U1', type: 'HUMAN' },
+          annotations: [{
+            type: 'USER_MENTION',
+            userMention: { user: { name: 'users/123456789', type: 'BOT' }, type: 'MENTION' }
+          }]
+        }
+      }),
+      'users/123456789'
+    )
+    expect(exact?.is_mention).toBe(true)
+
+    const wrong = await normalizeChatEnvelope(
+      messageEnvelope({
+        message: {
+          name: 'spaces/AAAA/messages/M6',
+          text: '<users/1234567890> similar prefix',
+          sender: { name: 'users/U1', type: 'HUMAN' }
+        }
+      }),
+      'users/123456789'
+    )
+    expect(wrong?.is_mention).toBe(false)
   })
 })
 
@@ -302,7 +401,43 @@ describe('normalizeChatEnvelope (attachments)', () => {
       type: 'file',
       name: 'roadmap.png',
       mime_type: 'image/png',
-      size: 0
+      size: 0,
+      unavailable_reason: 'invalid_resource'
+    })
+  })
+
+  test('uses the exported Drive filename and MIME type for Google-native content', async () => {
+    const client: ChatAttachmentDownloader = {
+      async downloadAttachment() {
+        throw new Error('must not use Chat media download for Drive files')
+      },
+      async downloadDriveAttachment() {
+        return {
+          data: new TextEncoder().encode('# Roadmap').buffer,
+          mimeType: 'text/markdown',
+          name: 'Roadmap.md',
+          size: 9
+        }
+      }
+    }
+    const normalized = await normalizeChatEnvelope(
+      attachmentEnvelope([{
+        name: 'spaces/AAAA/messages/M1/attachments/2',
+        contentName: 'Roadmap',
+        contentType: 'application/vnd.google-apps.document',
+        source: 'DRIVE_FILE',
+        driveDataRef: { driveFileId: 'doc-1' }
+      }]),
+      BOT_USER,
+      client
+    )
+
+    expect(normalized?.parts[1]).toMatchObject({
+      type: 'file',
+      name: 'Roadmap.md',
+      mime_type: 'text/markdown',
+      size: 9,
+      source: { type: 'base64', media_type: 'text/markdown' }
     })
   })
 
@@ -316,28 +451,12 @@ describe('normalizeChatEnvelope (attachments)', () => {
       type: 'image',
       name: 'diagram.png',
       mime_type: 'image/png',
-      size: 0
+      size: 0,
+      unavailable_reason: 'download_failed'
     })
   })
 
-  test('declared size over the inline cap → download skipped, part without data', async () => {
-    const client = downloader(new TextEncoder().encode('never'))
-    const declaredSize = 26 * 1024 * 1024
-    const normalized = await normalizeChatEnvelope(
-      attachmentEnvelope([{ ...uploadedImage, size: String(declaredSize) }]),
-      BOT_USER,
-      client
-    )
-    expect(client.calls).toEqual([])
-    expect(normalized!.parts[1]).toEqual({
-      type: 'image',
-      name: 'diagram.png',
-      mime_type: 'image/png',
-      size: declaredSize
-    })
-  })
-
-  test('downloaded bytes over the inline cap → data dropped, real size kept', async () => {
+  test('downloaded bytes over the inline cap remain available for session chunk staging', async () => {
     const normalized = await normalizeChatEnvelope(
       attachmentEnvelope([uploadedImage]),
       BOT_USER,
@@ -345,7 +464,7 @@ describe('normalizeChatEnvelope (attachments)', () => {
     )
     const part = normalized!.parts[1] as { size: number; source?: unknown }
     expect(part.size).toBe(25 * 1024 * 1024 + 1)
-    expect(part.source).toBeUndefined()
+    expect(part.source).toBeDefined()
   })
 
   test('no attachments → text-only parts, unchanged behavior', async () => {
@@ -373,6 +492,29 @@ describe('normalizeChatEnvelope (attachments)', () => {
     expect(normalized!.is_mention).toBe(false)
     expect(client.calls).toEqual([])
     expect(normalized!.parts.every(p => p.type === 'text')).toBe(true)
+  })
+
+  test('accepted unmentioned follow-up hydrates its attachments', async () => {
+    const client = downloader(new TextEncoder().encode('follow-up-file'))
+    const normalized = await normalizeChatEnvelope(
+      messageEnvelope({
+        thread: { name: 'spaces/AAAA/threads/T1' },
+        message: {
+          name: 'spaces/AAAA/messages/T1.R2',
+          text: 'more detail',
+          thread: { name: 'spaces/AAAA/threads/T1' },
+          threadReply: true,
+          sender: { name: 'users/U1', displayName: 'Alice' },
+          attachment: [uploadedImage]
+        }
+      }),
+      BOT_USER,
+      client,
+      { acceptFollowUpAttachments: true }
+    )
+    expect(normalized?.is_mention).toBe(false)
+    expect(client.calls).toEqual(['media-resource-1'])
+    expect(normalized?.parts[1]).toMatchObject({ source: {} })
   })
 
   test('caps the number of attachments downloaded per message', async () => {
@@ -425,6 +567,7 @@ describe('collectThreadHistory', () => {
     spaceName: 'spaces/AAAA',
     threadName: 'spaces/AAAA/threads/T1',
     currentMessageName: 'spaces/AAAA/messages/T1.M3',
+    threadReply: true,
     botUserName: BOT_USER
   }
 
@@ -465,14 +608,15 @@ describe('collectThreadHistory', () => {
 
     expect(captured).toHaveLength(1)
     expect(captured[0]?.spaceName).toBe('spaces/AAAA')
-    expect(captured[0]?.filter).toBe('thread.name = "spaces/AAAA/threads/T1"')
-    expect(captured[0]?.orderBy).toBe('createTime desc')
+    expect(captured[0]?.filter).toBe('thread.name = spaces/AAAA/threads/T1')
+    expect(captured[0]?.orderBy).toBe('createTime DESC')
   })
 
-  test('returns [] without an API call when the message *is* the thread root', async () => {
+  test('returns [] without an API call when threadReply is false', async () => {
     const captured: CapturedCall[] = []
     const out = await collectThreadHistory(fetcher([], captured), {
       ...baseOpts,
+      threadReply: false,
       // Real Google shape: thread.name uses /threads/<T>, message.name uses /messages/<T>
       threadName: 'spaces/AAAA/threads/r23TZL4dpqk',
       currentMessageName: 'spaces/AAAA/messages/r23TZL4dpqk'
@@ -481,7 +625,7 @@ describe('collectThreadHistory', () => {
     expect(captured).toHaveLength(0)
   })
 
-  test('treats /messages/<T>.<reply> as inside thread <T>, not the root', async () => {
+  test('reads history when threadReply is true regardless of opaque IDs', async () => {
     const captured: CapturedCall[] = []
     await collectThreadHistory(fetcher([{ messages: [] }], captured), {
       ...baseOpts,
@@ -553,14 +697,14 @@ describe('collectThreadHistory', () => {
     expect(out[0]?.role).toBe('assistant')
   })
 
-  test('drops the bot’s own "_Condor is thinking…_" ack messages from history', async () => {
+  test('drops the bot’s own "_Centaur is thinking…_" ack messages from history', async () => {
     const out = await collectThreadHistory(
       fetcher([
         {
           messages: [
             {
               name: 'spaces/AAAA/messages/T1.M2',
-              text: '_Condor is thinking…_',
+              text: '_Centaur is thinking…_',
               sender: { name: 'users/bot', type: 'BOT' }
             },
             {
@@ -577,12 +721,18 @@ describe('collectThreadHistory', () => {
     expect(out[0]?.message_id).toBe('spaces/AAAA/messages/T1.M1')
   })
 
-  test('drops content-less messages (card-only or empty)', async () => {
+  test('preserves card-only prior messages and drops truly empty ones', async () => {
     const out = await collectThreadHistory(
       fetcher([
         {
           messages: [
-            { name: 'spaces/AAAA/messages/T1.M2', text: '', sender: { name: 'users/U1' } },
+            {
+              name: 'spaces/AAAA/messages/T1.M2',
+              text: '',
+              sender: { name: 'users/U1' },
+              cardsV2: [{ card: { sections: [{ widgets: [{ textParagraph: { text: 'card result' } }] }] } }]
+            },
+            { name: 'spaces/AAAA/messages/T1.EMPTY', text: '', sender: { name: 'users/U1' } },
             {
               name: 'spaces/AAAA/messages/T1.M1',
               text: 'hello',
@@ -593,8 +743,22 @@ describe('collectThreadHistory', () => {
       ]),
       baseOpts
     )
-    expect(out).toHaveLength(1)
+    expect(out).toHaveLength(2)
     expect(out[0]?.message_id).toBe('spaces/AAAA/messages/T1.M1')
+    expect(out[1]?.parts[0]).toEqual({ type: 'text', text: 'card result' })
+  })
+
+  test('uses the configured history cap', async () => {
+    const captured: CapturedCall[] = []
+    const out = await collectThreadHistory(fetcher([{
+      messages: Array.from({ length: 10 }, (_, index) => ({
+        name: `spaces/AAAA/messages/T1.M${index}`,
+        text: String(index),
+        sender: { name: 'users/U1' }
+      }))
+    }], captured), { ...baseOpts, historyLimit: 3 })
+    expect(out).toHaveLength(3)
+    expect(captured).toHaveLength(1)
   })
 
   test('returns [] on Chat API 503', async () => {
@@ -666,6 +830,11 @@ describe('normalizeChatText', () => {
   test('rewrites user mentions to a friendly @handle form', () => {
     const out = normalizeChatText('hello <users/u-1>', undefined)
     expect(out).toBe('hello @u-1')
+  })
+
+  test('handles long invalid mention prefixes without pathological matching', () => {
+    const input = '<users/='.repeat(10_000)
+    expect(normalizeChatText(input)).toBe(input)
   })
 
   test('preserves links and decodes HTML entities', () => {

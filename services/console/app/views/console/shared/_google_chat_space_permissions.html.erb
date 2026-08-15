@@ -1,0 +1,123 @@
+<% owner = local_assigns.fetch(:owner) %>
+<% url = local_assigns.fetch(:url) %>
+<% inherited_permissions = local_assigns.fetch(:inherited_permissions, []) %>
+<% permissions = @google_chat_space_permissions || [] %>
+<% checkbox_class = "h-4 w-4 rounded border-ink-500 bg-ink-800 text-centaur-500 focus:ring-centaur-500" %>
+
+<section class="mb-8">
+  <div class="mb-4">
+    <h2 class="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Google Chat Space Permissions</h2>
+  </div>
+  <div class="console-panel">
+    <%= form_with model: owner, url: url, method: :patch, data: { turbo: false } do |form| %>
+      <% if permissions.any? %>
+        <div class="overflow-x-auto">
+          <table class="console-table min-w-max">
+            <thead class="console-table-head">
+              <tr>
+                <th class="console-th">Space</th>
+                <% GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag| %>
+                  <th class="console-th"><%= flag.fetch(:label) %></th>
+                <% end %>
+                <th class="console-th">Remove</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-ink-700">
+              <% permissions.each do |permission| %>
+                <%= form.fields_for :google_chat_space_permissions, permission do |permission_fields| %>
+                  <tr>
+                    <td class="console-td min-w-56">
+                      <%= permission_fields.hidden_field :id %>
+                      <span class="text-sm text-zinc-100"><%= permission.space_name %></span>
+                    </td>
+                    <% GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag| %>
+                      <td class="console-td text-center">
+                        <%= permission_fields.check_box flag.fetch(:attribute),
+                                                        class: checkbox_class,
+                                                        aria: { label: "#{flag.fetch(:label)} for #{permission.space_name}" } %>
+                      </td>
+                    <% end %>
+                    <td class="console-td">
+                      <%= button_tag type: "submit",
+                                     name: nil,
+                                     form: "delete_google_chat_space_permission_#{permission.oid}",
+                                     class: "grid size-8 place-items-center rounded text-zinc-500 hover:bg-red-500/10 hover:text-red-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-400",
+                                     aria: { label: "Delete #{permission.space_name}" },
+                                     title: "Delete #{permission.space_name}" do %>
+                        <%= console_icon("trash", classes: "size-4") %>
+                      <% end %>
+                    </td>
+                  </tr>
+                <% end %>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+      <% else %>
+        <div class="p-4"><div class="empty-state">No Google Chat spaces selected.</div></div>
+      <% end %>
+
+      <% new_permission = GoogleChatSpacePermission.new(GoogleChatSpacePermission::DEFAULT_ENABLED_ATTRIBUTES) %>
+      <%= form.fields_for :google_chat_space_permissions, new_permission do |permission_fields| %>
+        <div class="grid gap-4 border-t border-ink-700 p-5 sm:grid-cols-2 xl:grid-cols-[minmax(14rem,1fr)_repeat(8,auto)]">
+          <label class="block sm:col-span-2 xl:col-span-1">
+            <span class="form-label">Add Space</span>
+            <%= permission_fields.text_field :space_name,
+                                             class: "form-input",
+                                             placeholder: "spaces/AAAA",
+                                             autocomplete: "off" %>
+          </label>
+          <% GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag| %>
+            <label class="flex items-center gap-2 xl:pt-7">
+              <%= permission_fields.check_box flag.fetch(:attribute), class: checkbox_class %>
+              <span class="text-sm font-medium text-zinc-100"><%= flag.fetch(:label) %></span>
+            </label>
+          <% end %>
+        </div>
+      <% end %>
+
+      <div class="px-5 pb-5">
+        <%= submit_tag "Save Google Chat space permissions", class: "btn-primary" %>
+      </div>
+    <% end %>
+
+    <% permissions.each do |permission| %>
+      <%= form_with url: console_google_chat_space_permission_path(permission),
+                    method: :delete,
+                    id: "delete_google_chat_space_permission_#{permission.oid}",
+                    data: { turbo: false },
+                    class: "hidden" do %>
+      <% end %>
+    <% end %>
+  </div>
+
+  <% if inherited_permissions.present? %>
+    <div class="mb-3 mt-6"><h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Inherited From Roles</h3></div>
+    <div class="console-panel overflow-x-auto">
+      <table class="console-table min-w-max">
+        <thead class="console-table-head">
+          <tr>
+            <th class="console-th">Space</th>
+            <% GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag| %>
+              <th class="console-th"><%= flag.fetch(:label) %></th>
+            <% end %>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-ink-700">
+          <% inherited_permissions.each do |permission| %>
+            <tr>
+              <td class="console-td"><%= permission.fetch("space_name") %></td>
+              <% GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag| %>
+                <td class="console-td text-center">
+                  <%= check_box_tag nil, "1", permission.fetch(flag.fetch(:attribute).to_s),
+                                    disabled: true, class: checkbox_class,
+                                    aria: { label: "Inherited #{flag.fetch(:label)} for #{permission.fetch("space_name")}" } %>
+                </td>
+              <% end %>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </div>
+  <% end %>
+</section>

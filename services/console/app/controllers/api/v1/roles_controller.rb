@@ -2,9 +2,12 @@ module Api
   module V1
     class RolesController < Api::BaseController
       include SlackChannelPermissionApi
+      include GoogleChatPermissionApi
 
       def index
-        records, meta = paginated_label_search(Role.includes(:slack_channel_permissions))
+        records, meta = paginated_label_search(
+          Role.includes(:slack_channel_permissions, :google_chat_space_permissions, :google_chat_dm_permissions)
+        )
         render json: { data: records.map { |r| record_payload(r) }, meta: meta }
       end
 
@@ -24,6 +27,7 @@ module Api
           role.assign_attributes(data_params.permit(:name, labels: {}))
           role.save!
           replace_slack_channel_permissions!(role) if data_params.key?(:slack_channel_permissions)
+          replace_google_chat_permissions!(role)
         end
         render status: :created, json: { data: record_payload(role) }
       rescue ActiveRecord::RecordInvalid => e
@@ -39,6 +43,7 @@ module Api
           role.assign_attributes(data_params.permit(:name, labels: {}))
           role.save!
           replace_slack_channel_permissions!(role) if data_params.key?(:slack_channel_permissions)
+          replace_google_chat_permissions!(role)
         end
         render status: (was_new ? :created : :ok), json: { data: record_payload(role) }
       rescue ActiveRecord::RecordInvalid => e
@@ -60,6 +65,8 @@ module Api
           name: role.name,
           labels: role.labels,
           slack_channel_permissions: role.slack_channel_permissions_payload,
+          google_chat_space_permissions: role.google_chat_space_permissions_payload,
+          google_chat_dm_permissions: role.google_chat_dm_permissions_payload,
           created_at: role.created_at,
           updated_at: role.updated_at
         }
@@ -68,6 +75,8 @@ module Api
       def slack_channel_permission_owner
         Role.find_by_oid!(params[:id])
       end
+
+      alias_method :google_chat_permission_owner, :slack_channel_permission_owner
     end
   end
 end

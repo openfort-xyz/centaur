@@ -4,13 +4,24 @@ import {
 } from '@centaur/rendering'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { ChatEdgeClient } from './chat/client'
-import { markdownToChatMessage } from './chat/render'
+import {
+  CARD_FALLBACK_TEXT,
+  hasStandaloneImage,
+  markdownToChatMessage,
+  messageUtf8Bytes
+} from './chat/render'
 import { chatReplyLimits } from './constants'
 import { logError, logWarn } from './logging'
-import type { GoogleChatCard, GoogleChatCardWidget, GoogleChatMessage } from './chat/types'
+import type {
+  ChatSpaceType,
+  GoogleChatCard,
+  GoogleChatCardWidget,
+  GoogleChatMessage
+} from './chat/types'
 
-export const INITIAL_STATUS = '_Condor is thinking…_'
+export const INITIAL_STATUS = '_Centaur is thinking…_'
 const STATUS_FLUSH_INTERVAL_MS = 1_000
+const WRITE_INTERVAL_MS = 1_000
 const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 
 // A message with both `text` and `cardsV2` renders the text as a bubble ABOVE
@@ -28,15 +39,15 @@ const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 // toChatTextMarkup translates the agent's GFM (**bold**, [label](url),
 // # headings) into that markup.
 //
-// Cards remain for what the text surface genuinely cannot carry:
-//   - standalone image embeds (`![alt](https://…)`) → image widgets;
-//   - answers over the 4096-char `text` cap (the card envelope is ~32 KB).
-// Notification preview is not a factor: the answer is delivered by PATCHing the
-// already-posted "thinking" ack, and the ack's create already fired the push.
-const NEEDS_CARD_RE = /(^|\n)\s*!\[[^\]]*\]\(https?:\/\/[^\s)]+\)\s*(?=\n|$)/
-
+// Cards remain for what the text surface genuinely cannot carry: standalone
+// image embeds (`![alt](https://…)`) become image widgets. Long text remains on
+// the text surface and is split into complete <=32,000-byte Messages.
+// Text answers replace the already-posted "thinking" ack. Card answers must be
+// created (fallbackText is create-only), then the ack is removed.
 export type RenderTarget = {
   spaceName: string
+  /** Official Google space discriminator; reply options only apply to SPACE. */
+  spaceType?: ChatSpaceType
   /** Resource name of the pre-posted "thinking" message we PATCH with the answer. */
   ackMessageName: string
   /** Thread to fall back into if the ack PATCH fails and we must post fresh. */
@@ -46,7 +57,52 @@ export type RenderTarget = {
   consoleSessionWidget?: GoogleChatCardWidget
   /** Prompt asked for plain text — deliver via the `text` surface, no cards. */
   plainTextOnly?: boolean
+  /** Stable custom message ID makes fallback creation retry-safe after crashes. */
+  fallbackMessageId?: string
+  /** Test seam; production uses one per-client, per-space write scheduler. */
+  writeScheduler?: RendererWriteScheduler
 }
+
+type FinalMessageBody = Partial<GoogleChatMessage> & { fallbackText?: string }
+
+export type RendererWriteScheduler = {
+  run: <T>(spaceName: string, write: () => Promise<T>) => Promise<T>
+}
+
+/** Serialize writes per space and leave one full quota window between starts. */
+export function createRendererWriteScheduler(opts: {
+  now?: () => number
+  sleep?: (milliseconds: number) => Promise<void>
+  intervalMs?: number
+} = {}): RendererWriteScheduler {
+  const now = opts.now ?? Date.now
+  const sleep = opts.sleep
+    ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)))
+  const intervalMs = opts.intervalMs ?? WRITE_INTERVAL_MS
+  const tails = new Map<string, Promise<void>>()
+  const nextStart = new Map<string, number>()
+
+  return {
+    run<T>(spaceName: string, write: () => Promise<T>): Promise<T> {
+      const previous = tails.get(spaceName) ?? Promise.resolve()
+      const scheduled = previous.catch(() => undefined).then(async () => {
+        const delay = Math.max(0, (nextStart.get(spaceName) ?? 0) - now())
+        if (delay) await sleep(delay)
+        const result = await write()
+        nextStart.set(spaceName, now() + intervalMs)
+        return result
+      })
+      const tail = scheduled.then(() => undefined, () => undefined)
+      tails.set(spaceName, tail)
+      void tail.finally(() => {
+        if (tails.get(spaceName) === tail) tails.delete(spaceName)
+      })
+      return scheduled
+    }
+  }
+}
+
+const clientWriteSchedulers = new WeakMap<ChatEdgeClient, RendererWriteScheduler>()
 
 /**
  * Consume the api-rs SSE stream for one turn and deliver the result to Google
@@ -112,9 +168,9 @@ export async function finalizeRender(
   client: ChatEdgeClient,
   target: RenderTarget,
   state: RenderState
-): Promise<void> {
+): Promise<'updated' | 'created'> {
   await applyRendererEvents(client, target, state, state.mapper.flush())
-  await deliverFinal(client, target, state)
+  return deliverFinal(client, target, state)
 }
 
 async function applyRendererEvents(
@@ -157,7 +213,7 @@ async function applyRendererEvents(
 }
 
 /**
- * Edit the "thinking" bubble with a single compact `_Condor · <activity>…_`
+ * Edit the "thinking" bubble with a single compact `_Centaur · <activity>…_`
  * line. The agent's reasoning and tool calls arrive as task updates; we DON'T
  * render them — they're noise that eats space — and only surface the current
  * activity. Deduped and rate-limited to 1 Hz for the 1-write/second-per-space cap.
@@ -171,7 +227,7 @@ async function pulse(
   // Strip `_`/`*` from the agent-supplied status so a token like `test_foo`
   // doesn't prematurely close the `_…_` italic wrapper.
   const status = state.statusLine.slice(0, 80).replace(/[_*]/g, '')
-  const text = `_Condor · ${status}…_`
+  const text = `_Centaur · ${status}…_`
   if (text === state.lastSignature) return
   const now = Date.now()
   if (now - state.lastFlushAt < STATUS_FLUSH_INTERVAL_MS) return
@@ -179,7 +235,9 @@ async function pulse(
   state.lastSignature = text
 
   try {
-    await client.updateMessage(target.ackMessageName, { text })
+    await rendererWrite(client, target).run(target.spaceName, () =>
+      client.updateMessage(target.ackMessageName, { text })
+    )
   } catch (error) {
     logWarn('googlechatbot_status_pulse_failed', error)
   }
@@ -189,60 +247,207 @@ async function deliverFinal(
   client: ChatEdgeClient,
   target: RenderTarget,
   state: RenderState
-): Promise<void> {
+): Promise<'updated' | 'created'> {
   const text = finalText(state)
-  const rendered = markdownToChatMessage(text)
-  // Trailer widget appended after the answer: the first-message
-  // "Open chat in Console · …" line.
   const trailers = target.consoleSessionWidget ? [target.consoleSessionWidget] : []
-  // Use the card (no `text`) only when the text surface cannot carry the
-  // answer: image embeds (need image widgets) or overflow past Google Chat's
-  // 4096-char `text` cap — the card envelope is ~32 KB, so routing long answers
-  // there avoids a 400 (and a silent truncation). Everything else goes plain:
-  // the whole answer in `text`, no card (plus a button-only card for the link)
-  // — cards fragment inline formatting (see NEEDS_CARD_RE above).
-  // `rendered.text` is clamped to the 4096 cap; hitting it means the plain answer
-  // overflowed and must go to the (larger) card to avoid truncation / a 400.
-  const plainOverflows = rendered.text.length >= chatReplyLimits.message.maxPlainTextChars
-  // A "plain text only" prompt (same phrases slackbotv2 honors) forces the
-  // `text` surface even for image embeds — unless the answer overflows the
-  // 4096-char cap, where the card is the only surface that fits it whole.
-  const needsCard = plainOverflows || (!target.plainTextOnly && NEEDS_CARD_RE.test(text))
-  const body: Partial<GoogleChatMessage> = needsCard
-    ? { cardsV2: withTrailers(rendered.cardsV2, trailers) }
-    : { text: rendered.text, cardsV2: trailers.length ? [trailerCard(trailers)] : [] }
+  const bodies = finalMessageBodies(text, {
+    plainTextOnly: target.plainTextOnly,
+    threadName: target.threadName,
+    trailers
+  })
+  let outcome: 'updated' | 'created' = 'created'
+  const mustCreateFirst = Boolean(bodies[0]?.cardsV2?.length)
 
-  if (target.ackMessageName) {
-    try {
-      await client.updateMessage(target.ackMessageName, body)
-      return
-    } catch (error) {
-      logError('googlechatbot_final_patch_failed_falling_back_to_create', error)
+  for (let index = 0; index < bodies.length; index += 1) {
+    const body = bodies[index]!
+    assertMessageSize(
+      body,
+      index === 0 && target.ackMessageName && !mustCreateFirst ? undefined : target.threadName
+    )
+    if (index === 0 && target.ackMessageName && !mustCreateFirst) {
+      try {
+        await rendererWrite(client, target).run(target.spaceName, () =>
+          client.updateMessage(target.ackMessageName, body)
+        )
+        outcome = 'updated'
+        continue
+      } catch (error) {
+        logError('googlechatbot_final_patch_failed_falling_back_to_create', error)
+      }
     }
+    await createFinalPart(client, target, body, index)
   }
+  if (mustCreateFirst && target.ackMessageName) await removeAckMessage(client, target)
+  return outcome
+}
 
+async function createFinalPart(
+  client: ChatEdgeClient,
+  target: RenderTarget,
+  body: FinalMessageBody,
+  index: number
+): Promise<void> {
+  const messageId = stablePartMessageId(target, index)
   try {
-    await client.createMessage(target.spaceName, body, { threadName: target.threadName })
+    await rendererWrite(client, target).run(target.spaceName, () =>
+      client.createMessage(target.spaceName, body, {
+        messageId,
+        threadName: target.threadName,
+        spaceType: target.spaceType
+      })
+    )
   } catch (error) {
-    logError('googlechatbot_final_create_failed', error)
+    const message = error instanceof Error ? error.message : String(error)
+    if (!/\b409\b|ALREADY_EXISTS/i.test(message)) throw error
   }
 }
 
-/** Append trailer widgets to the last card's sections, or make a card if there are none. */
-function withTrailers(
-  cards: Array<{ cardId: string; card: GoogleChatCard }> | undefined,
-  trailers: GoogleChatCardWidget[]
-): Array<{ cardId: string; card: GoogleChatCard }> {
-  if (trailers.length === 0) return cards ?? []
-  if (!cards || cards.length === 0) return [trailerCard(trailers)]
-  const last = cards[cards.length - 1]!
-  const sections = [...(last.card.sections ?? []), { widgets: trailers }]
-  const updated = { cardId: last.cardId, card: { ...last.card, sections } }
-  return [...cards.slice(0, -1), updated]
+async function removeAckMessage(client: ChatEdgeClient, target: RenderTarget): Promise<void> {
+  try {
+    await rendererWrite(client, target).run(target.spaceName, () =>
+      client.deleteMessage(target.ackMessageName)
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!/\b404\b|NOT_FOUND/i.test(message)) {
+      logWarn('googlechatbot_completed_ack_delete_failed', error)
+    }
+  }
+}
+
+export function finalMessageBodies(
+  markdown: string,
+  opts: { plainTextOnly?: boolean; threadName?: string; trailers?: GoogleChatCardWidget[] } = {}
+): FinalMessageBody[] {
+  const rendered = markdownToChatMessage(markdown)
+  const trailers = opts.trailers ?? []
+  const needsCard = !opts.plainTextOnly && hasStandaloneImage(markdown)
+  if (!needsCard) return textMessageBodies(rendered.text, trailers, opts.threadName)
+
+  const cards = [...(rendered.cardsV2 ?? [])]
+  if (trailers.length) cards.push(trailerCard(trailers))
+  const bodies: FinalMessageBody[] = []
+  let current: Array<{ cardId: string; card: GoogleChatCard }> = []
+  for (const card of cards) {
+    const candidate: FinalMessageBody = {
+      fallbackText: CARD_FALLBACK_TEXT,
+      cardsV2: [...current, card]
+    }
+    if (messageFits(candidate, opts.threadName)) {
+      current.push(card)
+      continue
+    }
+    if (!current.length) {
+      // An extreme URL can make a single image card exceed the API envelope.
+      // Preserve the source exactly by falling back to ordered text messages.
+      return textMessageBodies(rendered.text, trailers, opts.threadName)
+    }
+    bodies.push({ fallbackText: CARD_FALLBACK_TEXT, cardsV2: current })
+    current = [card]
+    assertMessageSize({ fallbackText: CARD_FALLBACK_TEXT, cardsV2: current }, opts.threadName)
+  }
+  if (current.length) bodies.push({ fallbackText: CARD_FALLBACK_TEXT, cardsV2: current })
+  return bodies.length ? bodies : textMessageBodies(rendered.text, trailers, opts.threadName)
 }
 
 function trailerCard(trailers: GoogleChatCardWidget[]): { cardId: string; card: GoogleChatCard } {
   return { cardId: 'actions', card: { sections: [{ widgets: trailers }] } }
+}
+
+function textMessageBodies(
+  text: string,
+  trailers: GoogleChatCardWidget[],
+  threadName?: string
+): FinalMessageBody[] {
+  const trailerCards = trailers.length ? [trailerCard(trailers)] : []
+  const codePoints = Array.from(text)
+  const bodies: FinalMessageBody[] = []
+  let start = 0
+  while (start < codePoints.length) {
+    const cardsV2 = bodies.length === 0 ? trailerCards : []
+    let low = start + 1
+    let high = codePoints.length
+    let end = start
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2)
+      const body: FinalMessageBody = {
+        text: codePoints.slice(start, middle).join(''),
+        ...(cardsV2.length ? { fallbackText: CARD_FALLBACK_TEXT } : {}),
+        cardsV2
+      }
+      if (messageFits(body, threadName)) {
+        end = middle
+        low = middle + 1
+      } else {
+        high = middle - 1
+      }
+    }
+    if (end === start) {
+      if (cardsV2.length) {
+        const trailerOnly = { fallbackText: CARD_FALLBACK_TEXT, cardsV2 }
+        assertMessageSize(trailerOnly, threadName)
+        bodies.push(trailerOnly)
+        continue
+      }
+      throw new Error('Google Chat message limit is too small for one Unicode code point')
+    }
+    bodies.push({
+      text: codePoints.slice(start, end).join(''),
+      ...(cardsV2.length ? { fallbackText: CARD_FALLBACK_TEXT } : {}),
+      cardsV2
+    })
+    start = end
+  }
+  return bodies.length ? bodies : [{
+    text: ' ',
+    ...(trailerCards.length ? { fallbackText: CARD_FALLBACK_TEXT } : {}),
+    cardsV2: trailerCards
+  }]
+}
+
+function assertMessageSize(body: FinalMessageBody, threadName?: string): void {
+  const bytes = messageUtf8Bytes(withThread(body, threadName))
+  if (bytes > chatReplyLimits.message.maxBytes) {
+    throw new Error(
+      `Google Chat Message is ${bytes} bytes; maximum is ${chatReplyLimits.message.maxBytes}`
+    )
+  }
+}
+
+function messageFits(body: FinalMessageBody, threadName?: string): boolean {
+  return messageUtf8Bytes(withThread(body, threadName)) <= chatReplyLimits.message.maxBytes
+}
+
+function withThread(body: FinalMessageBody, threadName?: string): FinalMessageBody {
+  return threadName ? { ...body, thread: { name: threadName } } : body
+}
+
+function rendererWrite(client: ChatEdgeClient, target: RenderTarget): RendererWriteScheduler {
+  if (target.writeScheduler) return target.writeScheduler
+  let scheduler = clientWriteSchedulers.get(client)
+  if (!scheduler) {
+    scheduler = createRendererWriteScheduler()
+    clientWriteSchedulers.set(client, scheduler)
+  }
+  return scheduler
+}
+
+function stablePartMessageId(target: RenderTarget, index: number): string {
+  const base = target.fallbackMessageId ?? `client-centaur-${stableHash(
+    target.ackMessageName || `${target.spaceName}:${target.threadName ?? ''}`
+  )}`
+  if (index === 0) return base
+  const suffix = `-part-${index + 1}`
+  return `${base.slice(0, Math.max(1, 63 - suffix.length))}${suffix}`
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(36)
 }
 
 function finalText(state: RenderState): string {

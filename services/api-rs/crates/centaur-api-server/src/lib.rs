@@ -1,6 +1,7 @@
 mod api_jwt;
 pub mod client;
 mod error;
+mod google_chat_proxy;
 mod mcp;
 mod routes;
 mod slack_proxy;

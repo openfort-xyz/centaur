@@ -1,6 +1,11 @@
 import type { AppConfig } from '../config'
 import type { SpaceDmConfirmation } from './space-verify'
-import { GOOGLE_REQUEST_ISSUERS, verifyGoogleSignedJwt, type KeyResolver } from './token'
+import {
+  GOOGLE_CHAT_SA_ISSUER,
+  GOOGLE_OIDC_ISSUERS,
+  verifyGoogleSignedJwt,
+  type KeyResolver
+} from './token'
 import type { ChatSpaceType, GoogleChatEnvelope } from './types'
 
 type ChatVerificationFailure = { ok: false; status: 400 | 401 | 403; reason: string }
@@ -15,7 +20,9 @@ type ChatVerificationFailure = { ok: false; status: 400 | 401 | 403; reason: str
  * metadata, and through it the requester's OAuth credentials) MUST read
  * `verified`; deriving trust from `ok` treats a skipped check as a passed one.
  */
-export type ChatVerification = { ok: true; verified: boolean } | ChatVerificationFailure
+export type ChatVerification =
+  | { ok: true; verified: boolean; userEmail?: string; userId?: string }
+  | ChatVerificationFailure
 
 /**
  * Outcome of the envelope-shape checks (domain allowlist, event freshness).
@@ -24,15 +31,6 @@ export type ChatVerification = { ok: true; verified: boolean } | ChatVerificatio
  * that could be mistaken for one.
  */
 export type ChatEnvelopeCheck = { ok: true } | ChatVerificationFailure
-
-/** Audiences a signed request token's `aud` claim may match (project number
- *  and/or endpoint URL, whichever the app is configured with). */
-export function chatRequestAudiences(config: AppConfig): string[] {
-  const audiences: string[] = []
-  if (config.GOOGLECHATBOT_PROJECT_NUMBER) audiences.push(config.GOOGLECHATBOT_PROJECT_NUMBER)
-  if (config.GOOGLECHATBOT_WEBHOOK_AUDIENCE) audiences.push(config.GOOGLECHATBOT_WEBHOOK_AUDIENCE)
-  return audiences
-}
 
 /**
  * Authenticate an inbound webhook request by verifying Google Chat's signed
@@ -44,6 +42,7 @@ export function chatRequestAudiences(config: AppConfig): string[] {
 export async function verifyChatRequestToken(opts: {
   config: AppConfig
   authorization: string | undefined
+  userIdToken?: string
   resolveKey: KeyResolver
   nowSeconds?: number
 }): Promise<ChatVerification> {
@@ -52,11 +51,21 @@ export async function verifyChatRequestToken(opts: {
   // authenticated, so it can never source identity metadata.
   if (!config.GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS) return { ok: true, verified: false }
 
-  const audiences = chatRequestAudiences(config)
-  if (audiences.length === 0) {
-    // Enforcement requested but no audience to validate `aud` against: fail
-    // closed rather than accept a token minted for someone else's endpoint.
-    return { ok: false, status: 401, reason: 'audience_not_configured' }
+  const mode = config.GOOGLECHATBOT_INGRESS_MODE
+  const audience = mode === 'chat_api_project'
+    ? config.GOOGLECHATBOT_PROJECT_NUMBER
+    : config.GOOGLECHATBOT_WEBHOOK_AUDIENCE
+  if (!audience) return { ok: false, status: 401, reason: 'audience_not_configured' }
+  const allowedIssuers = mode === 'chat_api_project'
+    ? [GOOGLE_CHAT_SA_ISSUER]
+    : GOOGLE_OIDC_ISSUERS
+  const expectedSignerEmail = mode === 'chat_api_url'
+    ? GOOGLE_CHAT_SA_ISSUER
+    : mode === 'workspace_addon'
+      ? config.GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL
+      : undefined
+  if (mode === 'workspace_addon' && !expectedSignerEmail) {
+    return { ok: false, status: 401, reason: 'addon_signer_email_not_configured' }
   }
 
   const match = /^Bearer\s+(.+)$/i.exec((opts.authorization ?? '').trim())
@@ -67,8 +76,9 @@ export async function verifyChatRequestToken(opts: {
   try {
     result = await verifyGoogleSignedJwt({
       token,
-      audiences,
-      allowedIssuers: GOOGLE_REQUEST_ISSUERS,
+      audiences: [audience],
+      allowedIssuers,
+      maxAgeSeconds: config.GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS,
       nowSeconds: opts.nowSeconds,
       resolveKey: opts.resolveKey
     })
@@ -76,18 +86,75 @@ export async function verifyChatRequestToken(opts: {
     return { ok: false, status: 401, reason: 'key_resolution_failed' }
   }
   if (!result.ok) return { ok: false, status: 401, reason: result.reason }
-  return { ok: true, verified: true }
+  if (expectedSignerEmail) {
+    if (result.claims.email_verified !== true) {
+      return { ok: false, status: 401, reason: 'signer_email_not_verified' }
+    }
+    if (result.claims.email !== expectedSignerEmail) {
+      return { ok: false, status: 401, reason: 'signer_email_mismatch' }
+    }
+  }
+
+  if (mode !== 'workspace_addon' || !opts.userIdToken) {
+    return { ok: true, verified: true }
+  }
+  if (!config.GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID) {
+    return { ok: false, status: 401, reason: 'addon_oauth_client_id_not_configured' }
+  }
+  let userResult: Awaited<ReturnType<typeof verifyGoogleSignedJwt>>
+  try {
+    userResult = await verifyGoogleSignedJwt({
+      token: opts.userIdToken,
+      audiences: [config.GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID],
+      allowedIssuers: GOOGLE_OIDC_ISSUERS,
+      maxAgeSeconds: config.GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS,
+      nowSeconds: opts.nowSeconds,
+      resolveKey: opts.resolveKey
+    })
+  } catch {
+    return { ok: false, status: 401, reason: 'user_token_key_resolution_failed' }
+  }
+  if (!userResult.ok) {
+    return { ok: false, status: 401, reason: `user_token_${userResult.reason}` }
+  }
+  if (userResult.claims.email_verified !== true || typeof userResult.claims.email !== 'string') {
+    return { ok: false, status: 401, reason: 'user_email_not_verified' }
+  }
+  if (typeof userResult.claims.sub !== 'string' || !userResult.claims.sub.trim()) {
+    return { ok: false, status: 401, reason: 'user_id_not_verified' }
+  }
+  return {
+    ok: true,
+    verified: true,
+    userEmail: userResult.claims.email,
+    userId: userResult.claims.sub
+  }
 }
 
 export function verifyChatRequest(opts: {
   config: AppConfig
   envelope: GoogleChatEnvelope
+  userEmail?: string
+  userId?: string
   nowSeconds?: number
 }): ChatEnvelopeCheck {
+  if (opts.userId) {
+    const envelopeUser = opts.envelope.message?.sender?.name ?? opts.envelope.user?.name
+    if (envelopeUser !== opts.userId && envelopeUser !== `users/${opts.userId}`) {
+      return { ok: false, status: 401, reason: 'user_id_mismatch' }
+    }
+  }
   const allowedDomains = opts.config.GOOGLECHATBOT_ALLOWED_DOMAIN
-  if (allowedDomains.length > 0 && opts.envelope.user?.email) {
-    const domain = opts.envelope.user.email.split('@')[1]
-    if (domain && !allowedDomains.includes(domain.toLowerCase())) {
+  if (allowedDomains.length > 0) {
+    // Chat Event User resources have no email. Only a separately verified
+    // Workspace Add-on userIdToken can satisfy an email-domain policy.
+    const emailParts = (opts.userEmail ?? '').trim().split('@')
+    const domain = emailParts.length === 2 ? emailParts[1]?.toLowerCase() : undefined
+    if (
+      !emailParts[0]
+      || !domain
+      || !allowedDomains.some(allowed => allowed.toLowerCase() === domain)
+    ) {
       return { ok: false, status: 403, reason: 'domain_not_allowlisted' }
     }
   }
@@ -143,9 +210,8 @@ export type IdentityEmission =
  * An empty allowlist is a suppression reason, never a wildcard: the default is
  * '' (off), and "unset" must not mean "any domain may claim any identity".
  *
- * Note this validates the SENDER email the identity is built from, which is not
- * necessarily the `envelope.user.email` verifyChatRequest hard-rejects on — the
- * two fields differ, and only this one reaches the session metadata.
+ * The email must come from the verified Add-on userIdToken. Chat Event User
+ * resources do not expose email addresses.
  */
 export function resolveIdentityEmission(opts: {
   config: AppConfig

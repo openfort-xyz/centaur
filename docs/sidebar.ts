@@ -15,6 +15,7 @@ export const sidebar = [
     text: 'Operate',
     items: [
       { text: 'Slack ETL', link: '/operate/slack-etl' },
+      { text: 'Google Chat ETL', link: '/operate/google-chat-etl' },
       { text: 'Expose Slackbot with Tailscale Funnel', link: '/operate/tailscale-funnel' },
     ],
   },
@@ -47,6 +48,7 @@ export const sidebar = [
     text: 'Reference',
     items: [
       { text: 'Configuration', link: '/reference/configuration' },
+      { text: 'Google Chat', link: '/reference/google-chat' },
       { text: 'Tool Directory', link: '/reference/tool-directory' },
     ],
   },
