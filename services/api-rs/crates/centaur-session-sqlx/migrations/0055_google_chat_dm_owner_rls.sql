@@ -36,28 +36,28 @@ alter table google_chat_sync_reactions
         references google_chat_sync_messages(owner_email, space_id, message_id)
         on delete cascade;
 
-drop policy centaur_google_chat_spaces_reader_select on google_chat_sync_spaces;
+drop policy if exists centaur_google_chat_spaces_reader_select on google_chat_sync_spaces;
 create policy centaur_google_chat_spaces_reader_select
     on google_chat_sync_spaces for select to centaur_slack_reader
     using (
         (owner_email = '' and space_id = centaur_current_google_chat_space_id())
         or lower(owner_email) = centaur_current_slack_user_email()
     );
-drop policy centaur_google_chat_messages_reader_select on google_chat_sync_messages;
+drop policy if exists centaur_google_chat_messages_reader_select on google_chat_sync_messages;
 create policy centaur_google_chat_messages_reader_select
     on google_chat_sync_messages for select to centaur_slack_reader
     using (
         (owner_email = '' and space_id = centaur_current_google_chat_space_id())
         or lower(owner_email) = centaur_current_slack_user_email()
     );
-drop policy centaur_google_chat_attachments_reader_select on google_chat_sync_attachments;
+drop policy if exists centaur_google_chat_attachments_reader_select on google_chat_sync_attachments;
 create policy centaur_google_chat_attachments_reader_select
     on google_chat_sync_attachments for select to centaur_slack_reader
     using (
         (owner_email = '' and space_id = centaur_current_google_chat_space_id())
         or lower(owner_email) = centaur_current_slack_user_email()
     );
-drop policy centaur_google_chat_reactions_reader_select on google_chat_sync_reactions;
+drop policy if exists centaur_google_chat_reactions_reader_select on google_chat_sync_reactions;
 create policy centaur_google_chat_reactions_reader_select
     on google_chat_sync_reactions for select to centaur_slack_reader
     using (
@@ -65,23 +65,23 @@ create policy centaur_google_chat_reactions_reader_select
         or lower(owner_email) = centaur_current_slack_user_email()
     );
 
-drop policy centaur_readonly_google_chat_sync_spaces_select on google_chat_sync_spaces;
+drop policy if exists centaur_readonly_google_chat_sync_spaces_select on google_chat_sync_spaces;
 create policy centaur_readonly_google_chat_sync_spaces_select
     on google_chat_sync_spaces for select to centaur_readonly
     using (owner_email = '' or lower(owner_email) = centaur_current_slack_user_email());
-drop policy centaur_readonly_google_chat_sync_messages_select on google_chat_sync_messages;
+drop policy if exists centaur_readonly_google_chat_sync_messages_select on google_chat_sync_messages;
 create policy centaur_readonly_google_chat_sync_messages_select
     on google_chat_sync_messages for select to centaur_readonly
     using (owner_email = '' or lower(owner_email) = centaur_current_slack_user_email());
-drop policy centaur_readonly_google_chat_sync_attachments_select on google_chat_sync_attachments;
+drop policy if exists centaur_readonly_google_chat_sync_attachments_select on google_chat_sync_attachments;
 create policy centaur_readonly_google_chat_sync_attachments_select
     on google_chat_sync_attachments for select to centaur_readonly
     using (owner_email = '' or lower(owner_email) = centaur_current_slack_user_email());
-drop policy centaur_readonly_google_chat_sync_reactions_select on google_chat_sync_reactions;
+drop policy if exists centaur_readonly_google_chat_sync_reactions_select on google_chat_sync_reactions;
 create policy centaur_readonly_google_chat_sync_reactions_select
     on google_chat_sync_reactions for select to centaur_readonly
     using (owner_email = '' or lower(owner_email) = centaur_current_slack_user_email());
-drop policy centaur_readonly_google_chat_sync_checkpoints_select on google_chat_sync_checkpoints;
+drop policy if exists centaur_readonly_google_chat_sync_checkpoints_select on google_chat_sync_checkpoints;
 create policy centaur_readonly_google_chat_sync_checkpoints_select
     on google_chat_sync_checkpoints for select to centaur_readonly
     using (owner_email = '' or lower(owner_email) = centaur_current_slack_user_email());
