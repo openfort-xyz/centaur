@@ -135,6 +135,8 @@ describe('markdownToChatMessage', () => {
     expect(stripInlineMarkdown('~~old~~ _new_')).toBe('old new')
     const invalid = '[\\'.repeat(10_000)
     expect(stripInlineMarkdown(invalid)).toBe(invalid)
+    const adversarial = '__' + '**a'.repeat(10_000)
+    expect(stripInlineMarkdown(adversarial).length).toBeLessThanOrEqual(adversarial.length)
   })
 
   test('card headings strip inline markdown from the section header title', () => {

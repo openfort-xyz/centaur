@@ -126,12 +126,27 @@ function expandBreaksOutsideFences(markdown: string): string[] {
 
 /** Strip inline markdown that a card section `header` (plain text only) can't render. */
 export function stripInlineMarkdown(text: string): string {
-  return stripMarkdownLinkTargets(text)
-    .replace(/(\*\*|__)(.+?)\1/g, '$2') // **bold** / __bold__ → bold
-    .replace(/(\*|_)(.+?)\1/g, '$2') // *italic* / _italic_ → italic
+  let plain = stripMarkdownLinkTargets(text)
+  for (const marker of ['**', '__', '*', '_']) plain = stripPairedMarker(plain, marker)
+  return plain
     .replace(/~~(.+?)~~/g, '$1') // ~~strike~~ → strike
     .replace(/`([^`]+)`/g, '$1') // `code` → code
     .trim()
+}
+
+function stripPairedMarker(text: string, marker: string): string {
+  const out: string[] = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const start = text.indexOf(marker, cursor)
+    if (start < 0) break
+    const end = text.indexOf(marker, start + marker.length)
+    if (end < 0) break
+    out.push(text.slice(cursor, start), text.slice(start + marker.length, end))
+    cursor = end + marker.length
+  }
+  out.push(text.slice(cursor))
+  return out.join('')
 }
 
 function stripMarkdownLinkTargets(text: string): string {
