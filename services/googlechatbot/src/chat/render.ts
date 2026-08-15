@@ -126,13 +126,69 @@ function expandBreaksOutsideFences(markdown: string): string[] {
 
 /** Strip inline markdown that a card section `header` (plain text only) can't render. */
 export function stripInlineMarkdown(text: string): string {
-  return text
-    .replace(/!?\[([^\]]+)\]\([^)\s]+\)/g, '$1') // [label](url) / ![alt](url) → label
+  return stripMarkdownLinkTargets(text)
     .replace(/(\*\*|__)(.+?)\1/g, '$2') // **bold** / __bold__ → bold
     .replace(/(\*|_)(.+?)\1/g, '$2') // *italic* / _italic_ → italic
     .replace(/~~(.+?)~~/g, '$1') // ~~strike~~ → strike
     .replace(/`([^`]+)`/g, '$1') // `code` → code
     .trim()
+}
+
+function stripMarkdownLinkTargets(text: string): string {
+  const out: string[] = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const labelStart = text.indexOf('[', cursor)
+    if (labelStart < 0) break
+    const markerStart = labelStart > cursor && text[labelStart - 1] === '!'
+      ? labelStart - 1
+      : labelStart
+    const labelEnd = text.indexOf(']', labelStart + 1)
+    if (labelEnd < 0) break
+    if (text[labelEnd + 1] !== '(') {
+      out.push(text.slice(cursor, labelEnd + 1))
+      cursor = labelEnd + 1
+      continue
+    }
+    const targetEnd = text.indexOf(')', labelEnd + 2)
+    if (targetEnd < 0) break
+    const label = text.slice(labelStart + 1, labelEnd)
+    const target = text.slice(labelEnd + 2, targetEnd)
+    if (label && target && ![...target].some(char => char.trim() === '')) {
+      out.push(text.slice(cursor, markerStart), label)
+    } else {
+      out.push(text.slice(cursor, targetEnd + 1))
+    }
+    cursor = targetEnd + 1
+  }
+  out.push(text.slice(cursor))
+  return out.join('')
+}
+
+function headingText(line: string): string | null {
+  let index = 0
+  while (index < 6 && line[index] === '#') index += 1
+  if (index === 0 || line[index] === '#' || line[index]?.trim() !== '') return null
+  while (line[index]?.trim() === '') index += 1
+  return index < line.length ? line.slice(index) : null
+}
+
+function standaloneImage(line: string): { altText: string; imageUrl: string } | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('![') || !trimmed.endsWith(')')) return null
+  const labelEnd = trimmed.indexOf('](', 2)
+  if (labelEnd < 0) return null
+  const imageUrl = trimmed.slice(labelEnd + 2, -1)
+  if (
+    !(imageUrl.startsWith('https://') || imageUrl.startsWith('http://'))
+    || imageUrl.includes(')')
+    || [...imageUrl].some(char => char.trim() === '')
+  ) return null
+  return { altText: trimmed.slice(2, labelEnd).trim(), imageUrl }
+}
+
+export function hasStandaloneImage(markdown: string): boolean {
+  return markdown.split('\n').some(line => standaloneImage(line) !== null)
 }
 
 /**
@@ -162,9 +218,9 @@ export function toChatTextMarkup(text: string): string {
     }
     // `# Heading` → a bold line (`*Heading*`), the closest Chat-markup analog.
     // Inner markers are stripped first so `## **X**` nests to `*X*`, not `***X***`.
-    const heading = line.match(/^#{1,6}\s+(.+)$/)
+    const heading = headingText(line)
     if (heading) {
-      out.push(`*${stripInlineMarkdown(heading[1]!)}*`)
+      out.push(`*${stripInlineMarkdown(heading)}*`)
       continue
     }
     out.push(
@@ -294,21 +350,25 @@ function splitMarkdownToCards(markdown: string): GoogleChatCardSection[][] {
   }
 
   for (const line of markdown.split('\n')) {
-    const headingMatch = line.match(/^#{1,6}\s+(.+)/)
-    if (headingMatch) {
+    const heading = headingText(line)
+    if (heading) {
       flushText()
       flushPendingHeader()
-      pendingHeader = stripInlineMarkdown(headingMatch[1]!).slice(0, MAX_HEADER_CHARS)
+      pendingHeader = stripInlineMarkdown(heading).slice(0, MAX_HEADER_CHARS)
       continue
     }
 
     // Standalone Markdown image: Google Chat's card Markdown can't render
     // ![](), so emit a real image widget (public URL) instead of literal text.
-    const imageMatch = line.match(/^\s*!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)\s*$/)
-    if (imageMatch) {
+    const image = standaloneImage(line)
+    if (image) {
       flushText()
-      const altText = imageMatch[1]!.trim()
-      pushWidget({ image: { imageUrl: imageMatch[2]!, ...(altText ? { altText } : {}) } })
+      pushWidget({
+        image: {
+          imageUrl: image.imageUrl,
+          ...(image.altText ? { altText: image.altText } : {})
+        }
+      })
       continue
     }
 

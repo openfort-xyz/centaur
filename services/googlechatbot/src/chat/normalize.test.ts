@@ -832,6 +832,11 @@ describe('normalizeChatText', () => {
     expect(out).toBe('hello @u-1')
   })
 
+  test('handles long invalid mention prefixes without pathological matching', () => {
+    const input = '<users/='.repeat(10_000)
+    expect(normalizeChatText(input)).toBe(input)
+  })
+
   test('preserves links and decodes HTML entities', () => {
     const out = normalizeChatText('see <https://example.com|the docs> &lt;here&gt;', undefined)
     expect(out).toBe('see the docs (https://example.com) <here>')

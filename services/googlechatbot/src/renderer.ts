@@ -6,6 +6,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { ChatEdgeClient } from './chat/client'
 import {
   CARD_FALLBACK_TEXT,
+  hasStandaloneImage,
   markdownToChatMessage,
   messageUtf8Bytes
 } from './chat/render'
@@ -43,8 +44,6 @@ const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 // the text surface and is split into complete <=32,000-byte Messages.
 // Text answers replace the already-posted "thinking" ack. Card answers must be
 // created (fallbackText is create-only), then the ack is removed.
-const NEEDS_CARD_RE = /(^|\n)\s*!\[[^\]]*\]\(https?:\/\/[^\s)]+\)\s*(?=\n|$)/
-
 export type RenderTarget = {
   spaceName: string
   /** Official Google space discriminator; reply options only apply to SPACE. */
@@ -322,7 +321,7 @@ export function finalMessageBodies(
 ): FinalMessageBody[] {
   const rendered = markdownToChatMessage(markdown)
   const trailers = opts.trailers ?? []
-  const needsCard = !opts.plainTextOnly && NEEDS_CARD_RE.test(markdown)
+  const needsCard = !opts.plainTextOnly && hasStandaloneImage(markdown)
   if (!needsCard) return textMessageBodies(rendered.text, trailers, opts.threadName)
 
   const cards = [...(rendered.cardsV2 ?? [])]

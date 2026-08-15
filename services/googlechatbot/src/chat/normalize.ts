@@ -422,7 +422,7 @@ export function normalizeChatText(input: string, senderResourceName?: string): s
   }
 
   return text
-    .replace(/<users\/([^>]+)>/gi, '@$1')
+    .replace(/<users\/([^>]{1,320})>/gi, '@$1')
     .replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/gi, '$2 ($1)')
     .replace(/<(https?:\/\/[^>]+)>/gi, '$1')
     .replace(/&amp;/g, '&')

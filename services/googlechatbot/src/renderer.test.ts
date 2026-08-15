@@ -105,6 +105,15 @@ describe('finalizeRender surface selection', () => {
     expect(capture.deletes).toEqual(['spaces/AAAA/messages/M1'])
   })
 
+  test('invalid image prefixes stay on the text surface', async () => {
+    const capture: Capture = {}
+    const answer = '!['.repeat(10_000)
+
+    await finalizeRender(stubClient(capture), target(), settledState(answer))
+
+    expect(capture.body?.cardsV2).toEqual([])
+  })
+
   test('long plain answers stay on the text surface until the whole-message byte limit', async () => {
     const capture: { body?: Partial<GoogleChatMessage> } = {}
     const state = settledState('word '.repeat(1_500))

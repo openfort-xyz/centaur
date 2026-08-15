@@ -133,6 +133,8 @@ describe('markdownToChatMessage', () => {
     expect(stripInlineMarkdown('**Q2** results')).toBe('Q2 results')
     expect(stripInlineMarkdown('[Docs](https://x/y) and `code`')).toBe('Docs and code')
     expect(stripInlineMarkdown('~~old~~ _new_')).toBe('old new')
+    const invalid = '[\\'.repeat(10_000)
+    expect(stripInlineMarkdown(invalid)).toBe(invalid)
   })
 
   test('card headings strip inline markdown from the section header title', () => {
