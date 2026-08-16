@@ -136,6 +136,7 @@ class GoogleChatDelegatedClient:
         page_size: int,
         page_token: str | None = None,
         filter: str | None = None,
+        show_deleted: bool = False,
     ) -> dict[str, Any]:
         result = await self._ctx.google_chat_dwd_read(
             self._subject,
@@ -144,6 +145,7 @@ class GoogleChatDelegatedClient:
             page_size=page_size,
             page_token=page_token,
             filter=filter,
+            **({"show_deleted": True} if show_deleted else {}),
         )
         return result if isinstance(result, dict) else {}
 
@@ -169,7 +171,7 @@ class GoogleChatDelegatedClient:
             page_size=page_size,
             page_token=page_token,
             filter=filter,
-            **({"show_deleted": True} if show_deleted else {}),
+            show_deleted=show_deleted,
         )
 
     async def list_members(
