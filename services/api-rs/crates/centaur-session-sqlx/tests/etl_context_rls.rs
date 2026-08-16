@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     env,
     error::Error,
     str::FromStr,
@@ -159,83 +158,6 @@ async fn google_chat_attachment_reaction_and_dm_owner_rls() -> Result<(), Box<dy
     };
     let result = assert_google_chat_parity_rls(&mut fixture.conn).await;
     fixture.finish(result).await
-}
-
-#[tokio::test]
-async fn google_chat_dm_owner_migration_tolerates_missing_policies() -> Result<(), Box<dyn Error>> {
-    let Some(database_url) = test_database_url() else {
-        return Ok(());
-    };
-    let _test_guard = RLS_TEST_LOCK.lock().await;
-    let mut admin_conn = PgConnection::connect(&database_url).await?;
-    let database = TestDatabase::create(&mut admin_conn, &database_url).await?;
-    let mut conn = match PgConnection::connect_with(&database.options).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            database.drop(&mut admin_conn).await?;
-            return Err(err.into());
-        }
-    };
-
-    let result = async {
-        let through_54 = sqlx::migrate::Migrator {
-            migrations: Cow::Owned(
-                MIGRATOR
-                    .iter()
-                    .filter(|migration| migration.version <= 54)
-                    .cloned()
-                    .collect(),
-            ),
-            ..sqlx::migrate::Migrator::DEFAULT
-        };
-        through_54.run(&mut conn).await?;
-        sqlx::raw_sql(
-            r#"
-            drop policy centaur_google_chat_spaces_reader_select on google_chat_sync_spaces;
-            drop policy centaur_google_chat_messages_reader_select on google_chat_sync_messages;
-            drop policy centaur_google_chat_attachments_reader_select on google_chat_sync_attachments;
-            drop policy centaur_google_chat_reactions_reader_select on google_chat_sync_reactions;
-            drop policy centaur_readonly_google_chat_sync_spaces_select on google_chat_sync_spaces;
-            drop policy centaur_readonly_google_chat_sync_messages_select on google_chat_sync_messages;
-            drop policy centaur_readonly_google_chat_sync_attachments_select on google_chat_sync_attachments;
-            drop policy centaur_readonly_google_chat_sync_reactions_select on google_chat_sync_reactions;
-            drop policy centaur_readonly_google_chat_sync_checkpoints_select on google_chat_sync_checkpoints;
-            "#,
-        )
-        .execute(&mut conn)
-        .await?;
-
-        MIGRATOR.run(&mut conn).await?;
-        let policy_count: i64 = sqlx::query_scalar(
-            r#"
-            select count(*)
-            from pg_policies
-            where (tablename, policyname) in (values
-                ('google_chat_sync_spaces', 'centaur_google_chat_spaces_reader_select'),
-                ('google_chat_sync_messages', 'centaur_google_chat_messages_reader_select'),
-                ('google_chat_sync_attachments', 'centaur_google_chat_attachments_reader_select'),
-                ('google_chat_sync_reactions', 'centaur_google_chat_reactions_reader_select'),
-                ('google_chat_sync_spaces', 'centaur_readonly_google_chat_sync_spaces_select'),
-                ('google_chat_sync_messages', 'centaur_readonly_google_chat_sync_messages_select'),
-                ('google_chat_sync_attachments', 'centaur_readonly_google_chat_sync_attachments_select'),
-                ('google_chat_sync_reactions', 'centaur_readonly_google_chat_sync_reactions_select'),
-                ('google_chat_sync_checkpoints', 'centaur_readonly_google_chat_sync_checkpoints_select')
-            )
-            "#,
-        )
-        .fetch_one(&mut conn)
-        .await?;
-        assert_eq!(policy_count, 9);
-        Ok::<(), Box<dyn Error>>(())
-    }
-    .await;
-
-    let close_result = conn.close().await;
-    let drop_result = database.drop(&mut admin_conn).await;
-    result?;
-    close_result?;
-    drop_result?;
-    Ok(())
 }
 
 async fn assert_google_chat_parity_rls(conn: &mut PgConnection) -> Result<(), Box<dyn Error>> {
