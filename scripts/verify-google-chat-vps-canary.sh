@@ -3,7 +3,6 @@ set -euo pipefail
 
 readonly CONTROL_NAMESPACE=centaur
 readonly CONTROL_RELEASE=centaur
-readonly CONTROL_SHA=bb37a15396bcc2e823b95ea26c523be993bf167d
 readonly REQUIRED_CANARY=centaur-gchat-parity-canary
 readonly REPO_CACHE_PATH=/var/lib/centaur/repos-gchat-parity-canary
 
@@ -19,6 +18,7 @@ COMMON_ARGS (all required):
   --context CONTEXT
   --namespace centaur-gchat-parity-canary
   --release centaur-gchat-parity-canary
+  --control-sha 40_HEX_COMMIT
   --candidate-sha 40_HEX_COMMIT
   --digest googlechatbot=REGISTRY/IMAGE:sha-COMMIT@sha256:64_HEX
   --digest api-rs=REGISTRY/IMAGE:sha-COMMIT@sha256:64_HEX
@@ -47,6 +47,7 @@ context=""
 namespace=""
 release=""
 candidate_sha=""
+control_sha=""
 output_dir=""
 values_file=""
 guard_seconds=86400
@@ -71,7 +72,7 @@ digest_for() {
 
 while (($#)); do
   case "$1" in
-    --kubeconfig|--context|--namespace|--release|--candidate-sha|--output-dir|--values|--guard-seconds|--digest)
+    --kubeconfig|--context|--namespace|--release|--control-sha|--candidate-sha|--output-dir|--values|--guard-seconds|--digest)
       (($# >= 2)) || die "$1 requires a value"
       key="$1" value="$2"; shift 2
       case "$key" in
@@ -79,6 +80,7 @@ while (($#)); do
         --context) context="$value" ;;
         --namespace) namespace="$value" ;;
         --release) release="$value" ;;
+        --control-sha) control_sha="$value" ;;
         --candidate-sha) candidate_sha="$value" ;;
         --output-dir) output_dir="$value" ;;
         --values) values_file="$value" ;;
@@ -118,8 +120,8 @@ validate_inputs() {
     die "namespace must be $REQUIRED_CANARY (never $CONTROL_NAMESPACE)"
   [[ "$release" == "$REQUIRED_CANARY" && "$release" != "$CONTROL_RELEASE" ]] ||
     die "release must be $REQUIRED_CANARY (never $CONTROL_RELEASE)"
+  [[ "$control_sha" =~ ^[0-9a-f]{40}$ ]] || die "control SHA must be 40 lowercase hex characters"
   [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]] || die "candidate SHA must be 40 lowercase hex characters"
-  [[ "$candidate_sha" != "$CONTROL_SHA" ]] || die "candidate SHA must differ from the control SHA"
   [[ -n "$output_dir" ]] || die "explicit --output-dir is required"
   if ! [[ "$guard_seconds" =~ ^[0-9]+$ ]] || ((guard_seconds == 0 || guard_seconds > 86400)); then
     die "guard duration must be 1..86400 seconds"
@@ -230,15 +232,15 @@ release_snapshot() {
 assert_control() {
   local json="$1" component
   for component in googlechatbot api-rs console; do
-    jq -e --arg c "$component" --arg sha "$CONTROL_SHA" '
+    jq -e --arg c "$component" --arg sha "$control_sha" '
       [.workloads[] | select(.component == $c and .desired > 0 and .ready == .desired and
         any(.containers[]; .image | contains("sha-" + $sha)))] | length > 0
-    ' "$json" >/dev/null || die "control $component is not Ready on sha-$CONTROL_SHA"
+    ' "$json" >/dev/null || die "control $component is not Ready on sha-$control_sha"
   done
-  jq -e --arg sha "$CONTROL_SHA" '
+  jq -e --arg sha "$control_sha" '
     any(.workloads[]; .desired > 0 and .ready == .desired and
       any(.containers[]; .name == "iron-proxy" and (.image | contains("sha-" + $sha))))
-  ' "$json" >/dev/null || die "control iron-proxy workload is not Ready on sha-$CONTROL_SHA"
+  ' "$json" >/dev/null || die "control iron-proxy workload is not Ready on sha-$control_sha"
   jq -e 'all(.pods[].containers[]; (.image_id // "") | contains("@sha256:"))' "$json" >/dev/null ||
     die "control has a running container without an immutable image ID"
 }
@@ -418,7 +420,7 @@ verify_action() {
   live="$(workloads_json "$namespace")"
   assert_candidate "$output_dir/candidate.json" "$live"
   probe_candidate
-  jq -cn --arg status pass --arg sha "$candidate_sha" --arg control_sha "$CONTROL_SHA" \
+  jq -cn --arg status pass --arg sha "$candidate_sha" --arg control_sha "$control_sha" \
     --arg googlechatbot "$digest_googlechatbot" --arg api_rs "$digest_api_rs" \
     --arg console "$digest_console" --arg agent "$digest_agent" \
     --arg iron_proxy "$digest_iron_proxy" \
