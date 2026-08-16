@@ -241,8 +241,11 @@ assert_control() {
     any(.workloads[]; .desired > 0 and .ready == .desired and
       any(.containers[]; .name == "iron-proxy" and (.image | contains("sha-" + $sha))))
   ' "$json" >/dev/null || die "control iron-proxy workload is not Ready on sha-$control_sha"
-  jq -e 'all(.pods[].containers[]; (.image_id // "") | contains("@sha256:"))' "$json" >/dev/null ||
-    die "control has a running container without an immutable image ID"
+  jq -e 'all(.pods[].containers[];
+    ((.image_id // "") | contains("@sha256:")) or
+    (.ready != true and (.image_id // "") == ""))
+  ' "$json" >/dev/null ||
+    die "control has a ready container without an immutable image ID"
 }
 
 validate_render() {
