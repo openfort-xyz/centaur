@@ -47,6 +47,7 @@ ruby -ryaml -e '
   abort "unexpected webhook audience in project model" if project.key?("GOOGLECHATBOT_WEBHOOK_AUDIENCE")
   abort "signed requests not enabled for project model" unless project["GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS"] == "true"
   abort "project mode not rendered" unless project["GOOGLECHATBOT_INGRESS_MODE"] == "chat_api_project"
+  abort "empty domain allowlist not rendered explicitly" unless project["GOOGLECHATBOT_ALLOWED_DOMAIN"] == ""
 
   webhook = env(ARGV.fetch(1))
   expected = "https://chat.example.test/api/chat/events"
