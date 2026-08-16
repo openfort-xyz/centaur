@@ -58,8 +58,8 @@ The remaining differences are primarily platform-native:
    are not cloned into Google Chat.
 6. Google Chat's DWD, upload/download, reaction, Drive, mutation, and shared/DM
    ETL paths now have production Workspace evidence. Google-signed interaction
-   ingress remains externally blocked at the Chat API connection/audience
-   configuration.
+   ingress still requires a real Chat UI message; the API-authored probe is not
+   specified as an interaction-event trigger.
 7. The current ETL requests `showDeleted=true` for both app-authenticated shared
    spaces and delegated DMs. Automated tombstone cleanup exists, but both paths
    still need live create→sync→delete→resync evidence.
@@ -271,9 +271,10 @@ following external gates still block an exhaustive parity claim:
 
 1. Real Google-signed project-number or endpoint-URL ingress, followed by live
    legacy message/mention/self/bot checks and Add-ons action/command/form payloads.
-   The authentic DWD-authored message test produced no observable webhook, so
-   the Chat API connection/authentication-audience setting must be corrected in
-   Google Cloud Console first.
+   The DWD-authored API message test produced no observable webhook, but Google
+   documents interaction events for Chat UI user actions and does not promise
+   that API-created messages invoke the app. Send a real UI message first; only
+   if it produces no event, inspect the Chat API connection/audience setting.
 2. File boundaries at 25 MiB, 25 MiB + 1, 100 MiB, and 100 MiB + 1 with staged
    reconstruction and SHA-256 verification.
 3. Actual narrow/wide keyboard-only Console grant workflows with screenshots.
@@ -291,8 +292,8 @@ following external gates still block an exhaustive parity claim:
 The production release implements most required Google Chat outcomes without
 copying Slack-only abstractions. DWD setup/history, mutations, reactions,
 uploaded files, Drive XLSX export, and owner-scoped ETL are now live-proven.
-The remaining work is narrower release evidence: Google-signed inbound after
-the external Console fix, the listed size/deletion/removal/negative scenarios,
+The remaining work is narrower release evidence: Google-signed inbound from a
+real Chat UI interaction, the listed size/deletion/removal/negative scenarios,
 and the final same-immutable-evidence quality gate. Slack remains the fully
 production-proven reference until those gates pass.
 
