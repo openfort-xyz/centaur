@@ -42,9 +42,11 @@ be promoted to `Passed`.
   `centaur-gchat-parity-canary` release. This proves deployment, state,
   health, internal authentication, policy isolation, and replica replacement;
   it does not prove Google-controlled wire formats or tenant authorization.
-- **Live current-branch Workspace**: still required for Google-signed ingress,
-  DWD behavior, quotas, and the final release claim. No production credential,
-  payload, or raw production log was reused for the canary.
+- **Live current-release Workspace**: production release `c8f1df8…` and VPS
+  GitOps release `6f55ddea…` now prove DWD setup/history/mutations, attachment
+  upload/download, reactions, Drive export, and shared/DM ETL. Google-signed
+  ingress is still unproved because the external Chat API connection/audience
+  setting could not be changed without an available signed-in browser.
 
 ## 2026-08-14 centaur-vps canary result
 
@@ -78,6 +80,43 @@ Result: VPS deployment/runtime verification passed. Final Workspace parity is
 still blocked on a dedicated non-production Google Chat app/project, DWD users,
 owned spaces/DMs/files, and the live TEST-015 through TEST-028 matrix. Reusing
 the working production app would not be isolated or safe release evidence.
+
+## 2026-08-16 production release result
+
+Application commit: `c8f1df8bf10e5e337e854fa71154c7f4a781ee32`.
+VPS GitOps commit: `6f55ddea2472bdf1cffedc3de6fa750ede96dded`.
+
+- Centaur CI, Rust/API integration CI, CodeQL, workflow tests, and the six-image
+  production build passed. Helm lint passed; strict kubeconform validated 33
+  chart resources and 21 Argo source-2 resources. Argo resolved both sources to
+  the VPS commit and became `Synced`, `Healthy`, and `Succeeded`.
+- `deploy/verify.sh --full` passed 9/9, including the workflow hosts and a real
+  sandbox/harness/Parallel API turn. Googlechatbot live/ready returned 200 and
+  an unsigned event returned 401.
+- A bounded live `google_chat_sync` completed all 13 requested scopes with zero
+  failures and no ETL error, reading/upserting 109 messages. Sanitized owner
+  aggregates proved 11 DMs, 90 messages, 13 attachments, 11 reactions, and 11
+  checkpoints, separate from the shared-space corpus.
+- Live DWD setup, membership/history, upload, update, delete, reactions, and
+  Drive access passed. The Drive proof exported a 75,979-byte XLSX with exact
+  MIME/bytes and safe internal headers; Chat-uploaded content also returned
+  exact bytes and content type.
+- Two live-only defects were found and fixed at the shared roots: delegated
+  message reads now forward `show_deleted`, and owner-scoped DM reaction reads
+  now use the exact allowlisted DWD owner while shared scans retain the fixed
+  reader. The latter has focused Rust broker checks, Python ETL checks, strict
+  clippy/formatting, and the 99-test combined workflow suite.
+- An authentic DWD-authored DM message was created and cleaned up, but Google
+  emitted no observable interaction event. The production counter remained at
+  zero accepted events. The remaining ingress blocker is external Chat API
+  connection/authentication-audience configuration; the supported browser
+  runtime reported no available browser, so this Console-only change was not
+  made or guessed.
+
+Result: the outbound, permission, file, DWD, and ETL parity paths are production
+verified. TEST-031 remains pending because signed ingress, browser UI evidence,
+explicit deletion/removal cycles, several size boundaries, and the remaining
+named live scenarios have not all passed on this release.
 
 ## Evidence
 

@@ -1,11 +1,10 @@
 # Slack vs Google Chat: current N-to-N integration comparison
 
-Audit date: 2026-08-14
+Audit date: 2026-08-16
 
 Repository: Centaur
-Baseline: `e143b10ff0a5850b73b6e82f412686de75229fdc`
-(`sync/upstream-2026-08-12`) plus the uncommitted parity implementation in this
-working tree.
+Production release: `c8f1df8bf10e5e337e854fa71154c7f4a781ee32`
+VPS GitOps release: `6f55ddea2472bdf1cffedc3de6fa750ede96dded`
 
 ## Scope and status
 
@@ -28,9 +27,10 @@ Status terms:
 - **Implemented; live pending** — code and deterministic checks exist, but a
   Google-controlled, Kubernetes, or browser acceptance gate is still missing.
 
-Google Chat parity is **not achieved**. The current implementation closes the
-previous code gaps, but real Workspace and browser evidence has not all
-been recorded on one commit. The release truth is
+Google Chat parity is **not yet exhaustively verified**. The current production
+release closes the identified code gaps and passes real Workspace DWD, file,
+reaction, Drive, and ETL checks, but signed inbound and several explicit
+boundary/convergence/browser scenarios remain. The release truth is
 `docs/google-chat-parity-verification.md`; a pending row is not a pass.
 
 ## Executive comparison
@@ -56,8 +56,10 @@ The remaining differences are primarily platform-native:
 5. Slack has user groups, export-ZIP ingestion, Slack Connect delayed-file
    repair, and a broad workspace user directory. These are Slack-specific and
    are not cloned into Google Chat.
-6. Google Chat's new live and ETL paths still need external verification. Slack
-   remains the production-proven reference until those gates pass.
+6. Google Chat's DWD, upload/download, reaction, Drive, mutation, and shared/DM
+   ETL paths now have production Workspace evidence. Google-signed interaction
+   ingress remains externally blocked at the Chat API connection/audience
+   configuration.
 7. The current ETL requests `showDeleted=true` for both app-authenticated shared
    spaces and delegated DMs. Automated tombstone cleanup exists, but both paths
    still need live create→sync→delete→resync evidence.
@@ -121,7 +123,7 @@ titles, email-rich Chat directory resources, and Slack-only objects are
 | List rooms | Authorized channels plus direct variants and access flags. | Authorized `spaces` with pagination and access limited by JWT claims. | Parity for authorized discovery. |
 | Room metadata | Channel name/topic/purpose/privacy/member count. | `space-info` returns Chat resource metadata/type. | Platform field differences only. |
 | Members | Proxied/direct channel members and email-oriented helpers. | Paginated authorized space memberships. | Core parity; Slack has richer workspace-profile resolution. |
-| Start/reuse DM | `slack dm` resolves user and opens/reuses a conversation. | `google-chat dm` accepts an exact granted email, impersonates that target for `spaces.setup`, creates/reuses the single-user bot DM, and sends the first message. | Parity implemented; live DWD participant check pending. |
+| Start/reuse DM | `slack dm` resolves user and opens/reuses a conversation. | `google-chat dm` accepts an exact granted email, impersonates that target for `spaces.setup`, creates/reuses the single-user bot DM, and sends the first message. | Parity; live DWD setup/reuse and user-authored create/delete passed. |
 | Threads | Read/reply, stable thread key, refreshed context. | Read/reply by `spaces/.../threads/...`; fallback creates thread; every execution carries refreshed context. | Parity. |
 | Thread history cap | Slack adapter/history policy. | Configurable 1–1000 messages, default 50; newest-biased execution context is capped at 24,000 characters. | Google has explicit documented caps. |
 | Card/rich history | Slack blocks/attachments converted to context. | One shared fixture verifies exhaustive text extraction across the Cards v2 text-bearing union (including accessibility text, controls, grids, columns, carousels, chips, and footers) plus deprecated Cards v1 in both live and ETL paths. | Parity implemented for the discovery revision covered by the fixture; future schema revisions require fixture review. |
@@ -139,7 +141,7 @@ titles, email-rich Chat directory resources, and Slack-only objects are
 | Interactive action | Block Kit action becomes durable `slack.block_action.<id>` workflow event. | Legacy card/Add-ons button becomes durable `google_chat.card_click.<function>` event with canonical parameters. | Parity implemented; live Add-ons button pending. |
 | Form submission | No separate generic Slack workflow beyond adapter/action paths. | Add-ons form submission becomes a typed durable workflow event. | Google-native extension; live form pending. |
 | Reaction event | No turn handler. | No turn handler. | Parity: neither treats reactions as agent turns. |
-| Reaction reads | Present in history/feedback analysis. | Message-qualified reaction API, summaries, dump, and feedback analysis via dedicated read-only subject. | Parity implemented; live user-auth check pending. |
+| Reaction reads | Present in history/feedback analysis. | Message-qualified reaction API, summaries, dump, and feedback analysis. Shared scans use a fixed read-only subject; private-DM scans use the exact allowlisted DWD owner. | Parity; live shared/DM reads and zero-failure ETL persistence passed. |
 | Add/remove reaction | No agent command. | No agent command. | Parity: intentionally absent. |
 | Send | `slack send`, with channel/user resolution and optional thread. | Scoped `send-message`, exact space and optional thread through api-rs. | Parity. |
 | Update | Renderer updates its own Slack response; no generic agent CLI. | Scoped `update-message` for app-owned messages. | Google-native extension, not a Slack parity requirement. |
@@ -156,7 +158,7 @@ titles, email-rich Chat directory resources, and Slack-only objects are
 
 | Capability | Slack | Google Chat | Current difference |
 | --- | --- | --- | --- |
-| Inbound file hydration | Slack files downloaded and typed. | `UPLOADED_CONTENT` downloaded through Chat media API; Drive files through a separate DWD Drive reader. | Parity implemented; Drive live gate pending. |
+| Inbound file hydration | Slack files downloaded and typed. | `UPLOADED_CONTENT` downloaded through Chat media API; Drive files through a separate DWD Drive reader. | Parity; exact uploaded-content bytes/MIME and a live 75,979-byte XLSX Drive export passed. |
 | Count per message | First 20. | First 10. | Slack higher; Google bound limits API fan-out. |
 | File ceiling | 100 MiB. | 100 MiB decoded per file. | Parity. |
 | Inline ceiling | Small files inline; large staged. | Inline through 25 MiB. | Implementation detail. |
@@ -226,7 +228,7 @@ unreachable plain-HTTP relay design are removed from the agent boundary.
 | Archive import | Slack export ZIP importer/API/Console. | None. | Accepted Slack platform advantage; Workspace/Vault export is a different product flow. |
 | Retention | Count/dry-run/delete for shared/private corpora. | Count/dry-run/delete for documents, attachments, reactions, messages, finished checkpoints, empty spaces, and terminal runs. | Parity implemented. |
 | Metrics | Run, API/rate-limit, backfill, lag, retention, archive. | Run/duration, API/rate-limit, items, failures, continuation age, watermark lag, last failure, retention. | Parity for operational signals. |
-| RLS/readonly grants | Slack channel/private policies. | Shared space and owner-email policies across spaces/messages/attachments/reactions/checkpoints. | DB-backed owner isolation and the subject-aware DM auth broker pass; live Workspace cross-owner evidence remains pending. |
+| RLS/readonly grants | Slack channel/private policies. | Shared space and owner-email policies across spaces/messages/attachments/reactions/checkpoints. | DB-backed owner isolation and the subject-aware DM broker pass; live ETL persisted nonzero owner-keyed messages, attachments, reactions, and checkpoints separately from shared rows. Cross-owner negative evidence remains pending. |
 
 ## 7. Reliability, deployment, observability, and tests
 
@@ -243,7 +245,7 @@ unreachable plain-HTTP relay design are removed from the agent boundary.
 | Metrics | Broad bot and recovery families. | Events/runs/identity/session API/dedupe/recovery/timeouts/delivery plus state/SSE/obligation gauges. | Parity for required operations. |
 | Prometheus wiring | Service annotations/probes. | Service annotations and distinct probes. | Parity; live Kind scrape passes. |
 | Network policy | Restricted service topology. | api-rs-only internal bot ingress verified by rendered-manifest script. | Automated and live Kind enforcement pass. |
-| CI | Typecheck and repeated Slack suites. | Typecheck/full suite, signed fixture smoke, CLI, Rust, Rails, workflow, Helm/schema gates planned in the final matrix. | Fixture CI exists; final all-suites-on-one-SHA gate pending. |
+| CI | Typecheck and repeated Slack suites. | Typecheck/full suite, signed fixture smoke, CLI, Rust, Rails, workflow, Helm/schema, image-build, Argo, and production verification gates. | Release CI, CodeQL, 99 workflow tests, six image builds, strict 33/33 + 21/21 manifests, Argo health, and the 9/9 production verifier passed; TEST-031 remains pending for the uncompleted external scenarios. |
 | Signed developer fixture | Slack signed request tooling. | `pnpm --filter googlechatbot run smoke` covers signed legacy/Add-ons mention, DM, group, stop, follow-up attachment, actions/commands/forms, duplicate, restart render, internal mutations/files/denial. | Parity in deterministic tooling. |
 | Operator docs | Slack setup, ETL, permissioning. | Google Chat reference and ETL pages now cover scopes, DWD, permissions, files, recovery, smoke, rollback. | Documentation parity implemented; docs build passes. |
 
@@ -264,41 +266,34 @@ platform differences, not Google defects.
 
 ## 9. Verification still required
 
-Automated checks exercise the implementation, including signed deterministic
-fixtures. The following external gates still block parity:
+Automated checks and the production Workspace exercise the implementation. The
+following external gates still block an exhaustive parity claim:
 
-1. Real Workspace project-number and endpoint-audience JWTs, legacy events, and
-   Add-ons button/app-command/form payloads.
-2. Live canonical app identity, mention/self/bot suppression, DMs, thread
-   history, reactions, send/update/delete, upload/download, Drive, and DWD
-   credential rotation/denial.
-3. File boundaries at 25 MiB, 25 MiB + 1, 100 MiB, and 100 MiB + 1 with staged
+1. Real Google-signed project-number or endpoint-URL ingress, followed by live
+   legacy message/mention/self/bot checks and Add-ons action/command/form payloads.
+   The authentic DWD-authored message test produced no observable webhook, so
+   the Chat API connection/authentication-audience setting must be corrected in
+   Google Cloud Console first.
+2. File boundaries at 25 MiB, 25 MiB + 1, 100 MiB, and 100 MiB + 1 with staged
    reconstruction and SHA-256 verification.
-4. Actual narrow/wide keyboard-only Console grant workflows with screenshots.
-5. Live ETL continuation, attachment/reaction projection, private-DM RLS
-   isolation, rate-limit/permission recovery, and retention.
-6. The complete TEST-031 command matrix passing on the same commit as every
-   TEST-001 through TEST-030 row.
-7. Live shared-space and delegated-DM deletion convergence using
-   `showDeleted=true`, including derived attachment/reaction cleanup.
-8. Native Drive export behavior below and above the official 10 MB exported-
-   content limit; local boundary/error tests pass, but tenant-backed proof remains.
-
-The read-only Centaur VPS audit on 2026-08-14 observed the older deployed image
-`sha-980e5e3b`, not this working tree. Retained logs confirm only legacy
-`spaces.list`, `members.list`, `messages.list`, message creation, session
-create/execute/SSE, health and final visibility. They contain no raw payloads
-and no evidence for the new auth modes, scoped proxy, `spaces.setup`, reactions,
-DWD broker, upload/download/Drive export, rendering limits, or deletion paths.
+3. Actual narrow/wide keyboard-only Console grant workflows with screenshots.
+4. Explicit live ETL continuation, cross-owner negative RLS, rate-limit/
+   permission recovery, and retention scenarios.
+5. Live shared-space and delegated-DM deletion convergence using
+   `showDeleted=true`, plus reaction-removal convergence and derived-row cleanup.
+6. The remaining Google-native Drive export types and above-10-MB error path;
+   the live XLSX below-limit path passed.
+7. The complete TEST-031 matrix passing on the same immutable release evidence
+   as every TEST-001 through TEST-030 row.
 
 ## Bottom line
 
-The current working tree implements most required Google Chat outcomes without
-copying Slack-only abstractions. The remaining parity work is release evidence:
-live verification of the current branch, including Drive's locally enforced
-native-export boundary, and a final same-immutable-evidence quality gate.
-Shared-space deletion is no longer classified as an auth/platform gap, but its
-live convergence still blocks a verified claim. Slack remains the
+The production release implements most required Google Chat outcomes without
+copying Slack-only abstractions. DWD setup/history, mutations, reactions,
+uploaded files, Drive XLSX export, and owner-scoped ETL are now live-proven.
+The remaining work is narrower release evidence: Google-signed inbound after
+the external Console fix, the listed size/deletion/removal/negative scenarios,
+and the final same-immutable-evidence quality gate. Slack remains the fully
 production-proven reference until those gates pass.
 
 Google Chat retains two useful platform differences: scoped generic
