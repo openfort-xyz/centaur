@@ -359,6 +359,7 @@ def test_delegated_client_uses_context_broker_without_google_credentials():
             page_size=50,
             page_token="next",
             filter='createTime > "2026-08-01T00:00:00Z"',
+            show_deleted=True,
         )
     )
     assert result == {"messages": []}
@@ -371,6 +372,7 @@ def test_delegated_client_uses_context_broker_without_google_credentials():
                 "page_size": 50,
                 "page_token": "next",
                 "filter": 'createTime > "2026-08-01T00:00:00Z"',
+                "show_deleted": True,
             },
         )
     ]
