@@ -45,8 +45,8 @@ be promoted to `Passed`.
 - **Live current-release Workspace**: production release `c8f1df8…` and VPS
   GitOps release `6f55ddea…` now prove DWD setup/history/mutations, attachment
   upload/download, reactions, Drive export, and shared/DM ETL. Google-signed
-  ingress is still unproved because the external Chat API connection/audience
-  setting could not be changed without an available signed-in browser.
+  ingress is still unproved because a real Chat UI interaction could not be
+  performed without an available signed-in browser.
 
 ## 2026-08-14 centaur-vps canary result
 
@@ -106,12 +106,12 @@ VPS GitOps commit: `6f55ddea2472bdf1cffedc3de6fa750ede96dded`.
   now use the exact allowlisted DWD owner while shared scans retain the fixed
   reader. The latter has focused Rust broker checks, Python ETL checks, strict
   clippy/formatting, and the 99-test combined workflow suite.
-- An authentic DWD-authored DM message was created and cleaned up, but Google
-  emitted no observable interaction event. The production counter remained at
-  zero accepted events. The remaining ingress blocker is external Chat API
-  connection/authentication-audience configuration; the supported browser
-  runtime reported no available browser, so this Console-only change was not
-  made or guessed.
+- A DWD user-authored DM message was created through the Chat API and cleaned
+  up, but Google emitted no observable interaction event. The production
+  counter remained at zero accepted events. Official documentation does not
+  promise that API-created messages invoke a Chat app, so a real Chat UI message
+  is required before attributing the result to connection or audience settings.
+  The supported browser runtime reported no available browser.
 
 Result: the outbound, permission, file, DWD, and ETL parity paths are production
 verified. TEST-031 remains pending because signed ingress, browser UI evidence,
