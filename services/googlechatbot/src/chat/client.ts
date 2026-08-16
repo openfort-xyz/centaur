@@ -1220,7 +1220,7 @@ function safeMimeType(value: string): string {
 }
 
 function validAttachmentDataResource(value: string): boolean {
-  return /^[A-Za-z0-9._/-]{1,512}$/.test(value) && !value.includes('..')
+  return /^[A-Za-z0-9._/=-]{1,512}$/.test(value) && !value.includes('..')
 }
 
 function validDriveFileId(value: string): boolean {

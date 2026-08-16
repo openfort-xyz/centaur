@@ -578,7 +578,10 @@ describe('ChatEdgeClient conversation resources', () => {
 
   test('retries transient Chat media download failures', async () => {
     let calls = 0
-    globalThis.fetch = (async () => {
+    let url = ''
+    const opaqueResource = `${'A'.repeat(127)}=`
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      url = String(input)
       calls += 1
       if (calls === 1) {
         return new Response('retry', { status: 503, headers: { 'retry-after': '0' } })
@@ -589,12 +592,29 @@ describe('ChatEdgeClient conversation resources', () => {
     }) as unknown as typeof fetch
 
     const data = await new ChatEdgeClient(loadConfig({})).downloadAttachment(
-      'media/F1',
+      opaqueResource,
       'application/pdf',
       3
     )
     expect(new Uint8Array(data)).toEqual(new Uint8Array([1, 2, 3]))
     expect(calls).toBe(2)
+    expect(url).toEndWith(`/v1/media/${opaqueResource}?alt=media`)
+  })
+
+  test('rejects uploaded attachment resource path injection before fetch', async () => {
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls += 1
+      return new Response()
+    }) as unknown as typeof fetch
+    const client = new ChatEdgeClient(loadConfig({}))
+
+    for (const resource of ['opaque?alt=media', 'opaque#fragment', '../attachment']) {
+      await expect(client.downloadAttachment(resource)).rejects.toThrow(
+        'invalid Google Chat attachment resource ID'
+      )
+    }
+    expect(calls).toBe(0)
   })
 
   test('uses only the reaction-read scope and subject for reaction reads', async () => {
