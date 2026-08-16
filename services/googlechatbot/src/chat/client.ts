@@ -854,7 +854,10 @@ export class ChatEdgeClient {
     }
 
     const mimeType = response.headers.get('content-type')?.split(';', 1)[0]?.trim()
-    if (isHtmlContentType(mimeType) || (expectedMimeType && mimeType !== expectedMimeType)) {
+    if (
+      isHtmlContentType(mimeType)
+      || (expectedMimeType && mimeType !== expectedMimeType && mimeType !== 'application/octet-stream')
+    ) {
       throw new ChatConfigurationError('Google Chat attachment MIME type mismatch')
     }
     const declared = contentLength(response)

@@ -574,6 +574,13 @@ describe('ChatEdgeClient conversation resources', () => {
     await expect(client.downloadAttachment('media/F1', 'application/pdf', 4)).rejects.toThrow(
       'size mismatch'
     )
+
+    globalThis.fetch = (async () => new Response(new Uint8Array([1, 2, 3]).buffer, {
+      headers: { 'content-type': 'image/png', 'content-length': '3' }
+    })) as unknown as typeof fetch
+    await expect(client.downloadAttachment('media/F1', 'application/pdf', 3)).rejects.toThrow(
+      'MIME type mismatch'
+    )
   })
 
   test('retries transient Chat media download failures', async () => {
@@ -587,7 +594,7 @@ describe('ChatEdgeClient conversation resources', () => {
         return new Response('retry', { status: 503, headers: { 'retry-after': '0' } })
       }
       return new Response(new Uint8Array([1, 2, 3]), {
-        headers: { 'content-type': 'application/pdf', 'content-length': '3' }
+        headers: { 'content-type': 'application/octet-stream', 'content-length': '3' }
       })
     }) as unknown as typeof fetch
 
