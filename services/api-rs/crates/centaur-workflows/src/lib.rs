@@ -4011,16 +4011,12 @@ fn parse_google_chat_dwd_read(
 ) -> Result<GoogleChatDwdReadRequest, WorkflowRuntimeError> {
     let operation = required_python_string(message, "operation", "ctx.google_chat_dwd_read")?;
     let reaction_read = operation == "list_reactions";
-    let subject = if reaction_read {
-        if message
+    let subject = if reaction_read
+        && message
             .get("subject")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return Err(WorkflowRuntimeError::BadRequest(
-                "Google Chat reaction reads cannot select a DWD subject".to_owned(),
-            ));
-        }
+            .is_some_and(str::is_empty)
+    {
         String::new()
     } else {
         if !config.enabled {
@@ -4890,7 +4886,18 @@ mod tests {
                 "page_size": 100,
             }),
             json!({
-                "subject": "alice@example.com",
+                "subject": "mallory@example.com",
+                "operation": "list_reactions",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+            json!({
+                "subject": " ",
+                "operation": "list_reactions",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+            json!({
                 "operation": "list_reactions",
                 "resource_name": "spaces/A/messages/M",
                 "page_size": 100,
@@ -4910,7 +4917,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -4947,22 +4954,37 @@ mod tests {
         .await
         .unwrap();
         let reaction = json!({
+            "subject": "alice@example.com",
+            "operation": "list_reactions",
+            "resource_name": "spaces/A/messages/M",
+            "page_size": 100,
+        });
+        let reaction_value = google_chat_dwd_read_with_config(
+            &reaction,
+            &dwd_broker_config(format!("http://{address}")),
+        )
+        .await
+        .unwrap();
+        let fixed_reaction = json!({
             "subject": "",
             "operation": "list_reactions",
             "resource_name": "spaces/A/messages/M",
             "page_size": 100,
         });
-        let mut reaction_config = dwd_broker_config(format!("http://{address}"));
-        reaction_config.enabled = false;
-        let reaction_value = google_chat_dwd_read_with_config(&reaction, &reaction_config)
-            .await
-            .unwrap();
+        let mut fixed_reaction_config = dwd_broker_config(format!("http://{address}"));
+        fixed_reaction_config.enabled = false;
+        let fixed_reaction_value =
+            google_chat_dwd_read_with_config(&fixed_reaction, &fixed_reaction_config)
+                .await
+                .unwrap();
         let requests = server.join().unwrap();
         let request = requests[0].to_ascii_lowercase();
         let reaction_request = requests[1].to_ascii_lowercase();
+        let fixed_reaction_request = requests[2].to_ascii_lowercase();
 
         assert_eq!(value, json!({"messages": []}));
         assert_eq!(reaction_value, json!({"messages": []}));
+        assert_eq!(fixed_reaction_value, json!({"messages": []}));
         assert!(request.starts_with("get /api/chat/spaces/a/messages?"));
         assert!(request.contains("page_size=100"));
         assert!(request.contains("page_token=next%2fpage"));
@@ -4971,7 +4993,10 @@ mod tests {
         assert!(request.contains("x-centaur-google-chat-dwd-subject: alice@example.com"));
         assert!(reaction_request.starts_with("get /api/chat/spaces/a/messages/m/reactions?"));
         assert!(reaction_request.contains("authorization: bearer internal-test-key"));
-        assert!(!reaction_request.contains("x-centaur-google-chat-dwd-subject:"));
+        assert!(reaction_request.contains("x-centaur-google-chat-dwd-subject: alice@example.com"));
+        assert!(fixed_reaction_request.starts_with("get /api/chat/spaces/a/messages/m/reactions?"));
+        assert!(fixed_reaction_request.contains("authorization: bearer internal-test-key"));
+        assert!(!fixed_reaction_request.contains("x-centaur-google-chat-dwd-subject:"));
     }
 
     #[test]
