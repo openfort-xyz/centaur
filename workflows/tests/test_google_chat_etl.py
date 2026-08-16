@@ -362,7 +362,11 @@ def test_delegated_client_uses_context_broker_without_google_credentials():
             show_deleted=True,
         )
     )
+    reaction_result = asyncio.run(
+        client.list_reactions("spaces/S1/messages/M1", page_size=100)
+    )
     assert result == {"messages": []}
+    assert reaction_result == {"messages": []}
     assert ctx.requests == [
         (
             "alice@example.com",
@@ -374,7 +378,17 @@ def test_delegated_client_uses_context_broker_without_google_credentials():
                 "filter": 'createTime > "2026-08-01T00:00:00Z"',
                 "show_deleted": True,
             },
-        )
+        ),
+        (
+            "alice@example.com",
+            "list_reactions",
+            {
+                "resource_name": "spaces/S1/messages/M1",
+                "page_size": 100,
+                "page_token": None,
+                "filter": None,
+            },
+        ),
     ]
 
 
