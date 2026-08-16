@@ -140,10 +140,8 @@ spec:
             - name: GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID
               value: {{ .Values.googlechatbot.addonOauthClientId | quote }}
 {{- end }}
-{{- if .Values.googlechatbot.allowedDomain }}
             - name: GOOGLECHATBOT_ALLOWED_DOMAIN
               value: {{ .Values.googlechatbot.allowedDomain | quote }}
-{{- end }}
 {{- if .Values.googlechatbot.uploadUser }}
             - name: GOOGLECHATBOT_UPLOAD_USER
               value: {{ .Values.googlechatbot.uploadUser | quote }}
