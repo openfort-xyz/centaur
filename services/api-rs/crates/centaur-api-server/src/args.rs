@@ -1687,6 +1687,13 @@ struct IronProxyArgs {
         value_delimiter = ','
     )]
     upstream_deny_cidrs: Vec<String>,
+    #[arg(
+        long = "kubernetes-iron-proxy-extra-https-egress-cidrs",
+        env = "KUBERNETES_IRON_PROXY_EXTRA_HTTPS_EGRESS_CIDRS",
+        value_delimiter = ',',
+        value_parser = parse_cidr_arg
+    )]
+    extra_https_egress_cidrs: Vec<String>,
     /// Per-sandbox iron-proxy container resources as a JSON Kubernetes
     /// `ResourceRequirements` object.
     #[arg(
@@ -1728,6 +1735,12 @@ impl IronProxyArgs {
         )?;
         config.upstream_deny_cidrs = self
             .upstream_deny_cidrs
+            .iter()
+            .filter_map(|cidr| non_empty(Some(cidr.as_str())))
+            .map(ToOwned::to_owned)
+            .collect();
+        config.extra_https_egress_cidrs = self
+            .extra_https_egress_cidrs
             .iter()
             .filter_map(|cidr| non_empty(Some(cidr.as_str())))
             .map(ToOwned::to_owned)
@@ -2102,6 +2115,24 @@ fn parse_label_selector_arg(value: &str) -> Result<BTreeMap<String, String>, Str
         labels.insert(key.to_owned(), value.to_owned());
     }
     Ok(labels)
+}
+
+fn parse_cidr_arg(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let Some((address, prefix)) = trimmed.split_once('/') else {
+        return Err(format!("CIDR {trimmed:?} must include a prefix length"));
+    };
+    let address: std::net::IpAddr = address
+        .parse()
+        .map_err(|_| format!("CIDR {trimmed:?} has an invalid IP address"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("CIDR {trimmed:?} has an invalid prefix length"))?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    if prefix > maximum {
+        return Err(format!("CIDR {trimmed:?} prefix exceeds {maximum}"));
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -3022,6 +3053,41 @@ mod tests {
                 "10.42.0.0/16".to_owned(),
                 "10.43.0.0/16".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn iron_proxy_extra_https_egress_cidrs_are_validated() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-firewall-ca-secret-name",
+            "centaur-firewall-ca",
+            "--kubernetes-firewall-ca-key-secret-name",
+            "centaur-firewall-ca-key",
+            "--kubernetes-iron-proxy-extra-https-egress-cidrs",
+            "100.122.73.35/32",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.sandbox
+                .iron_proxy
+                .to_config()
+                .unwrap()
+                .extra_https_egress_cidrs,
+            vec!["100.122.73.35/32"]
+        );
+
+        assert!(
+            Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--kubernetes-iron-proxy-extra-https-egress-cidrs",
+                "100.122.73.35/33",
+            ])
+            .is_err()
         );
     }
 

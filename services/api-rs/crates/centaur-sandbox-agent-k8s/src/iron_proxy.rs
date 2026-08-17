@@ -87,6 +87,7 @@ pub struct IronProxyConfig {
     pub env_from_secret_names: Vec<String>,
     pub extra_env: BTreeMap<String, String>,
     pub upstream_deny_cidrs: Vec<String>,
+    pub extra_https_egress_cidrs: Vec<String>,
     pub op_connect_app_name: String,
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
@@ -110,6 +111,7 @@ impl IronProxyConfig {
             env_from_secret_names: Vec::new(),
             extra_env: BTreeMap::new(),
             upstream_deny_cidrs: Vec::new(),
+            extra_https_egress_cidrs: Vec::new(),
             op_connect_app_name: "onepassword-connect".to_owned(),
             op_connect_port: 8080,
             api_pod_labels: BTreeMap::from([(
@@ -1607,6 +1609,16 @@ fn proxy_egress_rules(
         vec![network_port(PG_LISTENER_PORT)],
     ));
     rules.push(egress_to(vec![public_ipv4_peer()], upstream_ports));
+    if !iron_proxy.extra_https_egress_cidrs.is_empty() {
+        rules.push(egress_to(
+            iron_proxy
+                .extra_https_egress_cidrs
+                .iter()
+                .map(|cidr| ip_block_peer(cidr))
+                .collect(),
+            vec![network_port(443)],
+        ));
+    }
     if observability_enabled {
         rules.push(egress_to(
             vec![pod_peer(iron_proxy.api_pod_labels.clone())],
@@ -1689,6 +1701,16 @@ fn public_ipv4_peer() -> NetworkPolicyPeer {
                 "224.0.0.0/4".to_owned(),
                 "240.0.0.0/4".to_owned(),
             ]),
+        }),
+        ..Default::default()
+    }
+}
+
+fn ip_block_peer(cidr: &str) -> NetworkPolicyPeer {
+    NetworkPolicyPeer {
+        ip_block: Some(IPBlock {
+            cidr: cidr.to_owned(),
+            except: None,
         }),
         ..Default::default()
     }
@@ -2364,6 +2386,43 @@ mod tests {
                 .iter()
                 .any(|policy_port| policy_port.port == Some(IntOrString::Int(i32::from(port))))
         })
+    }
+
+    fn rule_allows_cidr_port(rule: &NetworkPolicyEgressRule, cidr: &str, port: u16) -> bool {
+        rule.to.as_ref().is_some_and(|peers| {
+            peers.iter().any(|peer| {
+                peer.ip_block
+                    .as_ref()
+                    .is_some_and(|block| block.cidr == cidr)
+            })
+        }) && rule.ports.as_ref().is_some_and(|ports| {
+            ports
+                .iter()
+                .any(|policy_port| policy_port.port == Some(IntOrString::Int(i32::from(port))))
+        })
+    }
+
+    #[test]
+    fn proxy_private_https_egress_is_opt_in_and_port_scoped() {
+        let id = SandboxId::new("asbx-test");
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let target = control_target();
+        let allows = |config: &IronProxyConfig, port| {
+            build_iron_proxy_network_policies(&id, &resolved(), config, &target, None, false)[1]
+                .spec
+                .as_ref()
+                .unwrap()
+                .egress
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|rule| rule_allows_cidr_port(rule, "100.122.73.35/32", port))
+        };
+
+        assert!(!allows(&iron_proxy, 443));
+        iron_proxy.extra_https_egress_cidrs = vec!["100.122.73.35/32".to_owned()];
+        assert!(allows(&iron_proxy, 443));
+        assert!(!allows(&iron_proxy, 22));
     }
 
     #[test]

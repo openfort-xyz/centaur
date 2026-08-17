@@ -397,6 +397,10 @@ spec:
               value: {{ .Values.ironProxy.image.pullPolicy | quote }}
             - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
               value: {{ join "," .Values.ironProxy.upstreamDenyCidrs | quote }}
+{{- if .Values.ironProxy.extraHttpsEgressCidrs }}
+            - name: KUBERNETES_IRON_PROXY_EXTRA_HTTPS_EGRESS_CIDRS
+              value: {{ join "," .Values.ironProxy.extraHttpsEgressCidrs | quote }}
+{{- end }}
 {{- if and .Values.ironProxy.resources (not (hasKey .Values.apiRs.extraEnv "KUBERNETES_IRON_PROXY_RESOURCES")) }}
             - name: KUBERNETES_IRON_PROXY_RESOURCES
               value: {{ toJson .Values.ironProxy.resources | quote }}
