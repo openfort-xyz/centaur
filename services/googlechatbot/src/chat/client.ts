@@ -64,10 +64,8 @@ export type DownloadedAttachment = {
 export class ChatEdgeClient {
   private accessToken: string | null = null
   private tokenExpiry = 0
-  private uploadUserToken: string | null = null
-  private uploadUserTokenExpiry = 0
-  private delegatedMutationToken: string | null = null
-  private delegatedMutationTokenExpiry = 0
+  private readonly uploadUserTokens = new Map<string, { token: string | null; expiry: number }>()
+  private readonly delegatedMutationTokens = new Map<string, { token: string | null; expiry: number }>()
   private readonly dmSetupTokens = new Map<string, { token: string | null; expiry: number }>()
   private reactionReadToken: string | null = null
   private reactionReadTokenExpiry = 0
@@ -177,42 +175,37 @@ export class ChatEdgeClient {
    * a Workspace user (`sub` claim) with the chat.messages.create scope, so the
    * upload AND the message referencing it both run as that user.
    */
-  private async getUploadUserToken(): Promise<string | null> {
-    if (!this.canUploadAttachments()) return null
-
-    if (this.uploadUserToken && Date.now() < this.uploadUserTokenExpiry - 60_000) {
-      return this.uploadUserToken
-    }
+  private async getUploadUserToken(subject = this.uploadUser): Promise<string | null> {
+    if (!this.canUploadAttachments(subject)) return null
+    const cached = this.uploadUserTokens.get(subject)
+    if (cached?.token && Date.now() < cached.expiry - 60_000) return cached.token
 
     const grant = await this.exchangeJwtForToken(
       'https://www.googleapis.com/auth/chat.messages.create',
-      this.uploadUser
+      subject
     )
-    this.uploadUserToken = grant.token
-    this.uploadUserTokenExpiry = grant.expiry
-    return this.uploadUserToken
+    this.uploadUserTokens.set(subject, grant)
+    return grant.token
   }
 
-  private async getDelegatedMutationToken(): Promise<string | null> {
-    if (!this.canUploadAttachments()) return null
-    if (this.delegatedMutationToken && Date.now() < this.delegatedMutationTokenExpiry - 60_000) {
-      return this.delegatedMutationToken
-    }
+  private async getDelegatedMutationToken(subject = this.uploadUser): Promise<string | null> {
+    if (!this.canUploadAttachments(subject)) return null
+    const cached = this.delegatedMutationTokens.get(subject)
+    if (cached?.token && Date.now() < cached.expiry - 60_000) return cached.token
     const grant = await this.exchangeJwtForToken(
       [
         'https://www.googleapis.com/auth/chat.messages',
         'https://www.googleapis.com/auth/chat.memberships.readonly'
       ].join(' '),
-      this.uploadUser
+      subject
     )
-    this.delegatedMutationToken = grant.token
-    this.delegatedMutationTokenExpiry = grant.expiry
+    this.delegatedMutationTokens.set(subject, grant)
     return grant.token
   }
 
   /** True when uploads are configured: SA credentials + a user to impersonate. */
-  canUploadAttachments(): boolean {
-    return Boolean(this.serviceAccountEmail && this.privateKey && this.uploadUser)
+  canUploadAttachments(subject = this.uploadUser): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey && subject)
   }
 
   canSetupDm(): boolean {
@@ -532,9 +525,10 @@ export class ChatEdgeClient {
   async updateOwnedMessage(
     spaceName: string,
     messageName: string,
-    update: Partial<GoogleChatMessage>
+    update: Partial<GoogleChatMessage>,
+    readerSubject?: string
   ): Promise<GoogleChatMessage> {
-    const owner = await this.ownedMessageCredential(spaceName, messageName)
+    const owner = await this.ownedMessageCredential(spaceName, messageName, readerSubject)
     return this.request(
       'PATCH',
       `${messageName}?updateMask=${encodeURIComponent(
@@ -545,14 +539,19 @@ export class ChatEdgeClient {
     )
   }
 
-  async deleteOwnedMessage(spaceName: string, messageName: string): Promise<Record<string, never>> {
-    const owner = await this.ownedMessageCredential(spaceName, messageName)
+  async deleteOwnedMessage(
+    spaceName: string,
+    messageName: string,
+    readerSubject?: string
+  ): Promise<Record<string, never>> {
+    const owner = await this.ownedMessageCredential(spaceName, messageName, readerSubject)
     return this.request('DELETE', messageName, undefined, { token: owner.token })
   }
 
   private async ownedMessageCredential(
     spaceName: string,
-    messageName: string
+    messageName: string,
+    readerSubject?: string
   ): Promise<{ kind: 'app' | 'delegated'; token: string }> {
     const botToken = await this.getAccessToken()
     if (!botToken) throw new ChatOwnershipError('Google Chat app credentials are not configured')
@@ -564,19 +563,36 @@ export class ChatEdgeClient {
       return { kind: 'app', token: botToken }
     }
 
-    const delegatedToken = await this.getDelegatedMutationToken()
+    if (botUserName && !message && readerSubject) {
+      const readerToken = await this.getUserEtlReadToken(readerSubject)
+      const readerView = readerToken
+        ? await this.request<ChatListMessage>('GET', messageName, undefined, {
+            token: readerToken
+          })
+        : null
+      if (readerView?.sender?.name === botUserName) {
+        return { kind: 'app', token: botToken }
+      }
+    }
+
+    const mutationSubject = readerSubject || this.uploadUser
+    const delegatedToken = await this.getDelegatedMutationToken(mutationSubject)
     if (delegatedToken) {
       const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
       const membership = await this.request<ChatMembership>(
         'GET',
-        `spaces/${encodeURIComponent(id)}/members/${encodeURIComponent(this.uploadUser)}`,
+        `spaces/${encodeURIComponent(id)}/members/${encodeURIComponent(mutationSubject)}`,
         undefined,
         { token: delegatedToken }
       )
       const delegatedView = await this.request<ChatListMessage>('GET', messageName, undefined, {
         token: delegatedToken
       })
-      if (membership.member?.name && delegatedView.sender?.name === membership.member.name) {
+      if (
+        membership.member?.name
+        && delegatedView.sender?.name === membership.member.name
+        && centaurGeneratedMessage(delegatedView.clientAssignedMessageId)
+      ) {
         return { kind: 'delegated', token: delegatedToken }
       }
     }
@@ -1062,9 +1078,10 @@ export class ChatEdgeClient {
     spaceName: string,
     fileName: string,
     contentType: string,
-    data: Uint8Array
+    data: Uint8Array,
+    subject?: string
   ): Promise<UploadAttachmentResponse> {
-    const token = await this.getUploadUserToken()
+    const token = await this.getUploadUserToken(subject)
     if (!token) {
       throw new Error(
         'attachment uploads are not configured: set GOOGLECHATBOT_UPLOAD_USER '
@@ -1124,9 +1141,9 @@ export class ChatEdgeClient {
   async createAttachmentMessage(
     spaceName: string,
     attachment: UploadAttachmentResponse,
-    opts: { text?: string; threadName?: string; spaceType?: ChatSpaceType } = {}
+    opts: { text?: string; threadName?: string; spaceType?: ChatSpaceType; subject?: string } = {}
   ): Promise<GoogleChatMessage> {
-    const token = await this.getUploadUserToken()
+    const token = await this.getUploadUserToken(opts.subject)
     if (!token) {
       throw new Error('attachment uploads are not configured: set GOOGLECHATBOT_UPLOAD_USER')
     }
@@ -1246,6 +1263,10 @@ function spaceFromMessageName(name: string): string | undefined {
 
 function generatedMessageId(): string {
   return `client-centaur-${crypto.randomUUID().replaceAll('-', '')}`
+}
+
+function centaurGeneratedMessage(clientAssignedMessageId: string | undefined): boolean {
+  return Boolean(clientAssignedMessageId?.match(/^client-centaur-[A-Za-z0-9._-]+$/))
 }
 
 function parseByteSize(value: string | undefined): number | undefined {
