@@ -267,6 +267,13 @@ class Principal < ApplicationRecord
         subjects[space] << subject if space && subject
       end
     configured = labels["google_chat_reader_subjects"]
+    if configured.is_a?(String)
+      begin
+        configured = JSON.parse(configured)
+      rescue JSON::ParserError
+        configured = {}
+      end
+    end
     if configured.is_a?(Hash)
       configured.each do |space, email|
         email = email.to_s.strip.downcase
