@@ -390,12 +390,20 @@ mod tests {
     async fn local_backend_exposes_only_explicit_environment() {
         let backend = Arc::new(LocalSandboxBackend::new());
         let manager = SandboxManager::new(backend);
+        // The child blocks on stdin after printing so it is still Running when
+        // open_io runs. A command that exits immediately races the status
+        // refresh and makes open_io report NotReady on a slow machine.
         let spec = SandboxSpec::new("/bin/sh")
             .command(["/bin/sh", "-c"])
-            .args(["printf '%s|%s' \"${CARGO_MANIFEST_DIR-unset}\" \"$EXPLICIT_ENV\""])
+            .args([
+                "printf '%s|%s' \"${CARGO_MANIFEST_DIR-unset}\" \"$EXPLICIT_ENV\"; cat >/dev/null",
+            ])
             .env("EXPLICIT_ENV", "visible");
         let handle = manager.create_running(spec).await.unwrap();
         let mut io = manager.open_io(&handle.id).await.unwrap().into_parts();
+        // Closing the write half is what lets `cat` see EOF and exit; tokio's
+        // ChildStdin only closes the pipe on drop, not on shutdown().
+        drop(io.stdin);
         let mut output = Vec::new();
         io.stdout.read_to_end(&mut output).await.unwrap();
 
