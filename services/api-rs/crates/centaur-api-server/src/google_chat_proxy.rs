@@ -273,15 +273,16 @@ async fn get_attachment(
     headers: HeaderMap,
     Path((space_id, message_id, attachment_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Download)?;
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Download)?;
     validate_resource_id(&message_id, "message")?;
     validate_resource_id(&attachment_id, "attachment")?;
-    forward(
+    forward_as(
         Method::GET,
         &format!("/api/chat/{space}/messages/{message_id}/attachments/{attachment_id}"),
         None,
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await
 }
@@ -289,9 +290,10 @@ async fn get_attachment(
 async fn list_files(
     headers: HeaderMap,
     Path(space_id): Path<String>,
-    Query(query): Query<PageQuery>,
+    Query(mut query): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Download)?;
+    query.order_by = Some("createTime DESC".to_owned());
     let page = forward_json_as(
         Method::GET,
         &format!("/api/chat/{space}/messages"),
@@ -313,17 +315,18 @@ async fn download_attachment(
     headers: HeaderMap,
     Path((space_id, message_id, attachment_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Download)?;
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Download)?;
     validate_resource_id(&message_id, "message")?;
     validate_resource_id(&attachment_id, "attachment")?;
     let path = format!("/api/chat/{space}/messages/{message_id}/attachments/{attachment_id}");
-    let metadata = forward_json(Method::GET, &path, None, None).await?;
-    let response = forward(
+    let metadata = forward_json_as(Method::GET, &path, None, None, subject.as_deref()).await?;
+    let response = forward_as(
         Method::GET,
         &format!("{path}/download"),
         None,
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await?;
     download_response(response, &metadata, &attachment_id)
@@ -1356,6 +1359,13 @@ mod tests {
             json!({"history_spaces": ["spaces/S"]}),
             time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
         );
+        let invalid_download_reader = jwt(
+            json!({
+                "reader_subjects": {"spaces/S": "not-an-email"},
+                "download_spaces": ["spaces/S"]
+            }),
+            time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        );
         let expired = jwt(json!({}), 1);
         let no_grants = jwt(
             json!({}),
@@ -1422,6 +1432,20 @@ mod tests {
                 Some(history_only.as_str()),
                 Body::empty(),
                 StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::GET,
+                "/api/google-chat/spaces/S/messages/M/attachments/A",
+                Some(invalid_download_reader.as_str()),
+                Body::empty(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/api/google-chat/spaces/S/messages/M/attachments/A/download",
+                Some(invalid_download_reader.as_str()),
+                Body::empty(),
+                StatusCode::BAD_REQUEST,
             ),
             (
                 Method::POST,
@@ -1694,7 +1718,7 @@ mod tests {
             ),
             (
                 Method::GET,
-                "/api/google-chat/spaces/S/files?page_size=8",
+                "/api/google-chat/spaces/S/files?page_size=8&page_token=file-next&order_by=createTime%20ASC",
                 "",
             ),
             (
@@ -1781,24 +1805,27 @@ mod tests {
                 ),
                 observed_as(
                     Method::GET,
-                    "/api/chat/spaces/S/messages?page_size=8",
+                    "/api/chat/spaces/S/messages?page_size=8&page_token=file-next&order_by=createTime%20DESC",
                     "",
                     "reader@example.com"
                 ),
-                observed(
+                observed_as(
                     Method::GET,
                     "/api/chat/spaces/S/messages/M/attachments/A",
-                    ""
+                    "",
+                    "reader@example.com"
                 ),
-                observed(
+                observed_as(
                     Method::GET,
                     "/api/chat/spaces/S/messages/M/attachments/A",
-                    ""
+                    "",
+                    "reader@example.com"
                 ),
-                observed(
+                observed_as(
                     Method::GET,
                     "/api/chat/spaces/S/messages/M/attachments/A/download",
-                    ""
+                    "",
+                    "reader@example.com"
                 ),
                 observed(
                     Method::POST,

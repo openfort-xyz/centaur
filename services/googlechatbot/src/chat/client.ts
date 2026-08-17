@@ -54,6 +54,11 @@ export type ChatReactionPage = {
   incomplete?: boolean
 }
 export type ChatAttachmentResource = NonNullable<ChatListMessage['attachment']>[number]
+export type AttachmentReadCredential = 'app' | { kind: 'delegated-reader'; subject: string }
+export type ResolvedChatAttachment = {
+  attachment: ChatAttachmentResource
+  credential: AttachmentReadCredential
+}
 export type DownloadedAttachment = {
   data: ArrayBuffer
   mimeType: string
@@ -753,11 +758,49 @@ export class ChatEdgeClient {
     return scheduled
   }
 
-  async getAttachment(messageName: string, attachmentId: string): Promise<ChatAttachmentResource> {
-    return this.request<ChatAttachmentResource>(
-      'GET',
-      `${messageName}/attachments/${encodeURIComponent(attachmentId)}`
-    )
+  async getAttachment(
+    messageName: string,
+    attachmentId: string,
+    readerSubject?: string
+  ): Promise<ChatAttachmentResource> {
+    return (await this.resolveAttachment(messageName, attachmentId, readerSubject)).attachment
+  }
+
+  async resolveAttachment(
+    messageName: string,
+    attachmentId: string,
+    readerSubject?: string
+  ): Promise<ResolvedChatAttachment> {
+    const expectedName = `${messageName}/attachments/${attachmentId}`
+    // attachments.get is app-auth only. For a user-authored upload, resolve
+    // metadata from the exact parent message and keep that delegated credential
+    // for media.download rather than crossing credential boundaries.
+    if (!readerSubject) {
+      const attachment = await this.request<ChatAttachmentResource>(
+        'GET',
+        `${messageName}/attachments/${encodeURIComponent(attachmentId)}`
+      )
+      if (attachment.name !== expectedName) {
+        throw new ChatConfigurationError('Google Chat attachment resource mismatch')
+      }
+      return { attachment, credential: 'app' }
+    }
+
+    if (!validEmail(readerSubject)) {
+      throw new ChatConfigurationError('Google Chat attachment reader must be an email address')
+    }
+    const credential = { kind: 'delegated-reader', subject: readerSubject } as const
+    const message = await this.request<ChatListMessage>('GET', messageName, undefined, {
+      credential
+    })
+    if (message.name !== messageName) {
+      throw new ChatConfigurationError('Google Chat attachment parent message mismatch')
+    }
+    const attachment = message.attachment?.find(candidate => candidate.name === expectedName)
+    if (!attachment) {
+      throw new ChatConfigurationError('Google Chat attachment resource mismatch')
+    }
+    return { attachment, credential }
   }
 
   async setupDm(targetIdentity: string): Promise<ChatSpaceResource> {
@@ -798,12 +841,13 @@ export class ChatEdgeClient {
   async downloadAttachment(
     resourceName: string,
     expectedMimeType?: string,
-    expectedSize?: number
+    expectedSize?: number,
+    credential: AttachmentReadCredential = 'app'
   ): Promise<ArrayBuffer> {
     if (!validAttachmentDataResource(resourceName)) {
       throw new ChatConfigurationError('invalid Google Chat attachment resource ID')
     }
-    const token = await this.getAccessToken()
+    const token = await this.tokenForCredential(credential)
     const url = `${CHAT_API_BASE}/media/${resourceName.replace(/^\//, '')}?alt=media`
 
     const response = await fetchWithRetry(url, {
@@ -968,7 +1012,10 @@ export class ChatEdgeClient {
     }
   }
 
-  async downloadAttachmentResource(attachment: ChatAttachmentResource): Promise<DownloadedAttachment> {
+  async downloadAttachmentResource(
+    attachment: ChatAttachmentResource,
+    credential: AttachmentReadCredential = 'app'
+  ): Promise<DownloadedAttachment> {
     const name = attachment.contentName ?? 'attachment'
     const mimeType = attachment.contentType ?? 'application/octet-stream'
     if (safeMimeType(mimeType) !== mimeType) {
@@ -990,7 +1037,7 @@ export class ChatEdgeClient {
     }
     const resourceName = attachment.attachmentDataRef?.resourceName
     if (!resourceName) throw new ChatConfigurationError('invalid Google Chat attachment resource')
-    const data = await this.downloadAttachment(resourceName, mimeType)
+    const data = await this.downloadAttachment(resourceName, mimeType, undefined, credential)
     return { data, mimeType, name, size: data.byteLength }
   }
 
