@@ -41,7 +41,7 @@ See `.env.example` and the `googlechatbot` Helm values. Important settings:
 | --- | --- |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Service-account key for bot identity and scoped Google OAuth tokens. |
 | `CENTAUR_API_URL` | api-rs base URL. |
-| `GOOGLECHATBOT_API_KEY` / `CENTAUR_API_KEY` | Bot bearer for api-rs session operations. |
+| `GOOGLECHATBOT_API_KEY` / `CENTAUR_API_KEY` | Required. Bot bearer for api-rs session operations; api-rs authenticates every `/api` route, and this key is what registers the bot as a `chat:`-scoped ingress caller. |
 | `GOOGLECHATBOT_DATABASE_URL` / `DATABASE_URL` | Required durable state database. Production has no memory fallback. |
 | `GOOGLECHATBOT_INTERNAL_API_KEY` | Private api-rs-to-googlechatbot credential. Never inject it into a sandbox. |
 | `GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS` | Verify Google's webhook JWT; defaults to `true`. |

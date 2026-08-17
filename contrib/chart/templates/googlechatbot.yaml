@@ -69,23 +69,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sGOOGLE_SERVICE_ACCOUNT_JSON" .Values.secretManager.envPrefix }}
-            # api-rs bearer token. Optional: api-rs is internal, so a deployment
-            # without this key still starts and calls api-rs unauthenticated.
+            # api-rs ingress bearer token. Required, like slackbotv2's: api-rs
+            # authenticates every /api route, so an unset key means 401 on
+            # every session call rather than a working unauthenticated bot.
             - name: GOOGLECHATBOT_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sGOOGLECHATBOT_API_KEY" .Values.secretManager.envPrefix }}
-                  optional: true
-            # Backward-compatible rollout path for existing Centaur Secrets,
-            # where api-rs uses CHATBOT_API_KEY. Config prefers the dedicated
-            # GOOGLECHATBOT_API_KEY above when both keys exist.
-            - name: CENTAUR_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sCHATBOT_API_KEY" .Values.secretManager.envPrefix }}
-                  optional: true
             - name: GOOGLECHATBOT_DATABASE_URL
               valueFrom:
                 secretKeyRef:

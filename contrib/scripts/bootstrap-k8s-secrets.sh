@@ -20,11 +20,6 @@ set to onepassword-connect in the Helm values):
                                creates Secret centaur-onepassword-connect-credentials
   OP_CONNECT_TOKEN             Connect API token; added to centaur-infra-env
 
-Optional local-dev admin key:
-  LOCAL_DEV_API_KEY            seeded as the admin bearer for the API service
-                               (envFrom centaur-infra-env). Re-run with --force
-                               or kubectl patch to rotate.
-
 Optional repo-cache GitHub token:
   GITHUB_TOKEN                 added to centaur-infra-env when present; the
                                repo-cache DaemonSet reads it (repoCache.githubToken
@@ -203,17 +198,20 @@ if secret_exists centaur-infra-env; then
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
   fi
+  # Google Chat ingress (googlechatbot) keys: added when GOOGLE_SERVICE_ACCOUNT_JSON is in the
+  # env. The service account is overwritten on each run (so rotation works); the api-rs ingress
+  # bearer and the api-rs -> googlechatbot internal key are generated once if absent.
   if [[ -n "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]]; then
     patch_data+=("\"GOOGLE_SERVICE_ACCOUNT_JSON\":\"$(printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" | base64 | tr -d '\n')\"")
+    if ! secret_key_present GOOGLECHATBOT_API_KEY; then
+      patch_data+=("\"GOOGLECHATBOT_API_KEY\":\"$(printf '%s' "${GOOGLECHATBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
   fi
   # Top-up IRON_BROKER_TOKEN for clusters bootstrapped before iron-token-broker
   # support landed. Only generated when absent so we don't rotate it out from
   # under cached iron-proxy access tokens on every script run.
   if ! secret_key_present IRON_BROKER_TOKEN; then
     patch_data+=("\"IRON_BROKER_TOKEN\":\"$(rand_hex | base64 | tr -d '\n')\"")
-  fi
-  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
-    patch_data+=("\"LOCAL_DEV_API_KEY\":\"$(printf '%s' "$LOCAL_DEV_API_KEY" | base64 | tr -d '\n')\"")
   fi
   # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
   # rotated; harmless when repoCache is disabled.
@@ -371,9 +369,7 @@ else
   fi
   if [[ -n "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]]; then
     secret_args+=(--from-literal=GOOGLE_SERVICE_ACCOUNT_JSON="$GOOGLE_SERVICE_ACCOUNT_JSON")
-  fi
-  if [[ -n "${LOCAL_DEV_API_KEY:-}" ]]; then
-    secret_args+=(--from-literal=LOCAL_DEV_API_KEY="$LOCAL_DEV_API_KEY")
+    secret_args+=(--from-literal=GOOGLECHATBOT_API_KEY="${GOOGLECHATBOT_API_KEY:-$(rand_hex)}")
   fi
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=GITHUB_TOKEN="$GITHUB_TOKEN")

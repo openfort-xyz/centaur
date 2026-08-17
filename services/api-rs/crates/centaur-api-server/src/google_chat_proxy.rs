@@ -1291,7 +1291,9 @@ mod tests {
 
     #[tokio::test]
     async fn routes_reject_missing_jwt_before_upstream_configuration() {
-        let app = google_chat_proxy_router().with_state(AppState::unready());
+        let app = google_chat_proxy_router().with_state(AppState::unready(
+            crate::ApiAuthConfig::testing("test-secret"),
+        ));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1353,7 +1355,9 @@ mod tests {
             ("GOOGLE_CHAT_PROXY_MAX_UPLOAD_BYTES", "64"),
             ("GOOGLE_CHAT_PROXY_READ_TIMEOUT_MS", "20"),
         ]);
-        let app = google_chat_proxy_router().with_state(AppState::unready());
+        let app = google_chat_proxy_router().with_state(AppState::unready(
+            crate::ApiAuthConfig::testing("test-secret"),
+        ));
         let allowed = authorized_jwt();
         let history_only = jwt(
             json!({"history_spaces": ["spaces/S"]}),
@@ -1675,7 +1679,9 @@ mod tests {
             ("GOOGLECHATBOT_INTERNAL_URL", &format!("http://{address}")),
             ("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-test-key"),
         ]);
-        let app = google_chat_proxy_router().with_state(AppState::unready());
+        let app = google_chat_proxy_router().with_state(AppState::unready(
+            crate::ApiAuthConfig::testing("test-secret"),
+        ));
         let token = authorized_jwt();
         for (method, uri, body) in [
             (Method::GET, "/api/google-chat/spaces?page_size=3", ""),
@@ -1884,7 +1890,9 @@ mod tests {
             ("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-test-key"),
             ("GOOGLE_CHAT_PROXY_MAX_JSON_RESPONSE_BYTES", "4"),
         ]);
-        let app = google_chat_proxy_router().with_state(AppState::unready());
+        let app = google_chat_proxy_router().with_state(AppState::unready(
+            crate::ApiAuthConfig::testing("test-secret"),
+        ));
         let token = jwt(
             json!({"history_spaces": ["spaces/DECLARED", "spaces/CHUNKED"]}),
             time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
@@ -1950,7 +1958,9 @@ mod tests {
             ("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-test-key"),
             ("GOOGLE_CHAT_PROXY_MAX_DOWNLOAD_BYTES", "4"),
         ]);
-        let app = google_chat_proxy_router().with_state(AppState::unready());
+        let app = google_chat_proxy_router().with_state(AppState::unready(
+            crate::ApiAuthConfig::testing("test-secret"),
+        ));
         let token = jwt(
             json!({"download_spaces": ["spaces/S"]}),
             time::OffsetDateTime::now_utc().unix_timestamp() + 3600,

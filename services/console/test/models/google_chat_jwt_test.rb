@@ -104,7 +104,7 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
     end
   end
 
-  test "JWT exists for Chat-only grants, rotates every 15 minutes and is nil without either platform" do
+  test "JWT rotates every 15 minutes and revoking Chat grants empties the Chat claims" do
     principal = principals(:acme_user_bob)
     principal.google_chat_dm_permissions.create!(target_identity: "person@example.com", setup_enabled: true)
     window = ApiServer::Jwt::DEFAULT_WINDOW_SECONDS
@@ -116,11 +116,16 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
       third = ApiServer::Jwt.encode_for_principal(principal, now: Time.zone.at(boundary + window))
       assert_equal first, second
       refute_equal first, third
-      assert_nil jwt_payload(first)["slack"]
+      assert_empty jwt_payload(first).dig("slack", "upload_channels")
 
+      # A token is always minted now that api-rs authenticates every route;
+      # revocation empties the grant lists rather than withholding the token,
+      # matching how Slack channel revocation behaves.
       principal.google_chat_dm_permissions.destroy_all
       principal.reset_google_chat_permissions_cache!
-      assert_nil ApiServer::Jwt.encode_for_principal(principal)
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_empty claims.dig("google_chat", "dm_setup_targets")
+      assert_empty claims.dig("google_chat", "send_spaces")
     end
   end
 

@@ -1,6 +1,6 @@
 # Google Chat ↔ Slack parity status
 
-Status date: 2026-08-14
+Status date: 2026-08-17
 
 Google Chat parity is **implemented but not yet verified as achieved**. The
 automated feature work is present in the current Centaur working tree; the
@@ -27,9 +27,10 @@ Do not mark parity complete from fixture or unit tests alone.
 | Interactive events | Durable Slack block-action workflow events. | Legacy card clicks and Add-ons buttons, app commands, and forms become typed durable workflow events; dedupe includes user/function/parameters. | Automated pass; live button/form/command pending. |
 | Conversation permissions | Exact channel lists for upload/download/history. | Exact space lists for send/update/delete/upload/download/history/members/reactions, plus exact DM setup targets. Direct and role grants merge. | Model/API/proxy tests pass; sandbox-JWT live smoke pending. |
 | Credential topology | Slack proxy/direct APIs use scoped secrets and bot tokens. | Sandboxes call api-rs with a scoped Console JWT. Only api-rs can call googlechatbot's private API with a separate key; Google credentials remain at the bot/ETL edge. | Static, route, and live Kind NetworkPolicy/internal-auth checks pass. |
+| api-rs ingress auth | `SLACKBOT_API_KEY` authenticates slackbotv2 as an ingress caller scoped to `slack:` thread keys; `/api/slack/*` requires a principal. | `GOOGLECHATBOT_API_KEY` authenticates googlechatbot as an ingress caller scoped to `chat:` thread keys, with workflow-event capability; `/api/google-chat/*` requires a principal. | Route-policy unit test passes; live 401/403 smoke pending. |
 | DMs | Open/reuse DM by user; separate user-scoped private ingestion. | Create/reuse and send by exact email grant. Resource-name targets are rejected. Live DM identity/history uses a verified Add-on requester. ETL DMs are opt-in and owner-scoped. | Automated DM and cross-owner RLS checks pass; live DWD checks pending. |
 | Conversation discovery | Channels, metadata, members, threads, users. | Spaces, metadata, members, threads, and paginated history. A broad Workspace user directory is intentionally excluded. | Automated pass; scoped live reads pending. |
-| Search and analysis | Search, questions, dump, feedback, reactions. | Bounded authorized scans for search, questions, dump, feedback, and message-qualified reaction reads. | Automated pass; live reaction scope/rate-limit pending. |
+| Search and analysis | Search, questions, dump, reactions. Upstream removed Slack's stateful feedback subsystem with the personas API. | Bounded authorized scans for search, questions, dump, feedback, and message-qualified reaction reads. `feedback` is a stateless derived view over `dump`, not the removed Slack subsystem, so it stays. | Automated pass; live reaction scope/rate-limit pending. |
 | Send/update/delete | Slack tool sends; renderer owns its updates. No generic delete CLI. | Scoped send, app-owned update, and app-owned delete through api-rs. | Automated pass; live ownership/denial smoke pending. |
 | Inbound files | Up to 100 MiB; large content uses staging; delayed Slack Connect repair. | Up to 10 files, 100 MiB each/aggregate by default; inline through 25 MiB, then hashed `attachment.chunk` staging. Uploaded and Drive-backed content supported. | Boundary/hash fixtures pass; live Workspace files pending. |
 | Agent file tooling | List/search/info/download/upload through channel authorization. | List/search/info/raw download/upload through exact space authorization. Proxy ceiling 100 MiB; CLI download default 10 MiB. | Automated route/client tests pass; live file path pending. |
@@ -195,6 +196,26 @@ rendering limits, or deletion tombstones.
 Run `pnpm --filter googlechatbot run smoke` for deterministic fixtures, then
 follow `docs/pages/reference/google-chat.mdx` for the live procedure and record
 artifacts in `docs/google-chat-parity-verification.md`.
+
+## Upstream sync windows
+
+### 2026-08-17 — 25 upstream commits, `1b60f619..0e58fe86`
+
+Slack-touching upstream work and its Google Chat disposition.
+
+| Upstream | Slack change | Google Chat disposition |
+| --- | --- | --- |
+| #1374 authenticate api-rs routes | Every `/api` route requires a caller; `SLACKBOT_API_KEY` registers slackbotv2 as an ingress caller; `/api/slack/*` maps to principal-only. | **Ported.** `GOOGLECHATBOT_API_KEY` registered as an ingress caller with prefix `chat:` and workflow-event capability; `/api/google-chat/*` mapped to principal-only. Without both, the Chat proxy would 403 and the bot would 401 on every session call. Chart passes the key to api-rs; bootstrap generates it; the bot's key is now required, and the dead `CHATBOT_API_KEY` fallback is removed. |
+| #1394 sandbox API JWT capabilities | Console always mints a principal JWT and adds a `capabilities` claim; the empty-grant short-circuits are gone. | **Ported.** `google_chat` claims are now always emitted alongside `slack`; revoking Chat grants empties the lists instead of withholding the token. |
+| #1378 link Slack DM principals to console users | `slack_dm` principals link to a Console user by `slack_email` at the API upsert boundary, with a backfill migration. | **Ported.** `gchat_dm` principals link by the `google_email` label — the verified-requester address api-rs stamps only for signed 1:1 DMs — plus the matching backfill. |
+| #1391 prevent task phrasing from selecting amp | Two extra classifier rules in the LLM override strategy. | **Ported** verbatim into the Chat strategy prompt. |
+| #1389 log Slack webhook receipt metadata | Receipt is logged before the allow filter so ignored deliveries stay visible. | **Ported in spirit.** Chat must authenticate before reading an attacker-sized body, so receipt is logged immediately after the body read; the previously silent oversize/unparseable 400s now emit a reject log and counter. |
+| #1376 remove Slack feedback tool | Removed a 1,053-line stateful feedback/triage/personas subsystem. | **Not applicable.** `google_chat feedback` is a stateless derived view over `dump` with no tables, personas, or loop. Kept. |
+| #1372 stabilize Slack DM sync ingestion | Advisory locks serialize overlapping conversations inside the api-rs batch transaction. | **Not applicable.** The Chat ETL writes single-statement upserts keyed on `(owner_email, space_id)` directly from the workflow; there is no batch endpoint or shared transaction to serialize. |
+| #1395 give console worker the Slack bot token | The worker runs Slack channel-catalog refresh jobs. | **Not applicable.** Console has no Google Chat catalog job; Chat grants take exact space names. |
+
+Remaining commits in the window (skills, MCP argument validation, DocSend,
+investigator, session cleanup, docs, CI) are platform-agnostic.
 
 ## Rollback
 
