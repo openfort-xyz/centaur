@@ -4,31 +4,18 @@ module ApiServer
     DEFAULT_ISSUER = "centaur-console".freeze
     DEFAULT_WINDOW_SECONDS = 15.minutes.to_i
     DEFAULT_TTL_SECONDS = 1.hour.to_i
+    CONSOLE_SERVICE_SUBJECT = "centaur-console".freeze
 
     module_function
 
     def encode_for_principal(principal, now: Time.current)
       channels = principal.slack_channel_ids_by_permission
       google_chat_spaces = principal.google_chat_space_names_by_permission
-      dm_setup_targets = principal.google_chat_dm_setup_targets
-      return nil if channels.values.all?(&:empty?) && google_chat_spaces.values.all?(&:empty?) && dm_setup_targets.empty?
-
-      claims = { "sub" => principal.oid }
-      unless channels.values.all?(&:empty?)
-        claims["slack"] = {
-          "upload_channels" => channels.fetch(:upload).sort,
-          "download_channels" => channels.fetch(:download).sort,
-          "history_channels" => channels.fetch(:history).sort
-        }
-      end
-      unless google_chat_spaces.values.all?(&:empty?) && dm_setup_targets.empty?
-        google_chat_claims = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h do |flag|
-          [ flag.fetch(:claim).to_s, google_chat_spaces.fetch(flag.fetch(:claim)).sort ]
-        end.merge("dm_setup_targets" => dm_setup_targets.sort)
-        reader_subjects = principal.google_chat_reader_subjects_by_space
-        google_chat_claims["reader_subjects"] = reader_subjects unless reader_subjects.empty?
-        claims["google_chat"] = google_chat_claims
-      end
+      google_chat_claims = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h do |flag|
+        [ flag.fetch(:claim).to_s, google_chat_spaces.fetch(flag.fetch(:claim)).sort ]
+      end.merge("dm_setup_targets" => principal.google_chat_dm_setup_targets.sort)
+      reader_subjects = principal.google_chat_reader_subjects_by_space
+      google_chat_claims["reader_subjects"] = reader_subjects unless reader_subjects.empty?
 
       CentaurJwt::WindowedToken.encode(
         subject_oid: principal.oid,
@@ -37,7 +24,35 @@ module ApiServer
         window_seconds: DEFAULT_WINDOW_SECONDS,
         ttl_seconds: DEFAULT_TTL_SECONDS,
         now: now,
-        claims: claims
+        claims: {
+          "sub" => principal.oid,
+          "capabilities" => {
+            "sessions_read" => principal.sandbox_sessions_read_enabled,
+            "workflows_read" => principal.sandbox_workflows_read_enabled,
+            "workflows_write" => principal.sandbox_workflows_write_enabled
+          },
+          "slack" => {
+            "upload_channels" => channels.fetch(:upload).sort,
+            "download_channels" => channels.fetch(:download).sort,
+            "history_channels" => channels.fetch(:history).sort
+          },
+          "google_chat" => google_chat_claims
+        }
+      )
+    end
+
+    def encode_for_console_service(now: Time.current)
+      CentaurJwt::WindowedToken.encode(
+        subject_oid: CONSOLE_SERVICE_SUBJECT,
+        audience: audience,
+        issuer: issuer,
+        window_seconds: DEFAULT_WINDOW_SECONDS,
+        ttl_seconds: DEFAULT_TTL_SECONDS,
+        now: now,
+        claims: {
+          "sub" => CONSOLE_SERVICE_SUBJECT,
+          "token_use" => "console_service"
+        }
       )
     end
 

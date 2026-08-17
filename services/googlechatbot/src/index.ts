@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import type { StateAdapter } from 'chat'
@@ -219,9 +220,23 @@ export function createGooglechatbot(
     }
 
     const body = await readBodyText(c, MAX_CHAT_EVENT_BODY_BYTES)
-    if (body instanceof InputError) return c.json({}, body.status)
+    if (body instanceof InputError) {
+      incr('googlechatbot_events_total', { outcome: 'rejected' })
+      logWarn('googlechatbot_event_rejected', { reason: 'body_limit', status: body.status })
+      return c.json({}, body.status)
+    }
+    // Receipt is logged before parsing so oversized/unparseable deliveries are
+    // still visible; the shape log below only covers envelopes we accepted.
+    logInfo('googlechatbot_webhook_received', {
+      body_bytes: Buffer.byteLength(body, 'utf8'),
+      route: c.req.path
+    })
     const envelope = parseChatBody(body)
-    if (!envelope) return c.json({}, 400)
+    if (!envelope) {
+      incr('googlechatbot_events_total', { outcome: 'rejected' })
+      logWarn('googlechatbot_event_rejected', { reason: 'unparseable_body' })
+      return c.json({}, 400)
+    }
 
     const tokenCheck = envelope.authorizationEventObject?.userIdToken
       ? await verifyChatRequestToken({

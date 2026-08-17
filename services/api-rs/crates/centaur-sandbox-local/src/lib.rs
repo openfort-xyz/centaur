@@ -5,7 +5,7 @@
 //! the shared sandbox trait.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     process::Stdio,
     sync::{
         Arc,
@@ -40,6 +40,7 @@ struct LocalSandbox {
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     status: SandboxStatus,
+    labels: BTreeMap<String, String>,
 }
 
 impl LocalSandboxBackend {
@@ -104,6 +105,7 @@ impl SandboxBackend for LocalSandboxBackend {
                 stdout,
                 stderr,
                 status: SandboxStatus::Running,
+                labels: spec.labels,
             })),
         );
 
@@ -149,11 +151,11 @@ impl SandboxBackend for LocalSandboxBackend {
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
-        Ok(ObservedSandbox::new(
-            id.clone(),
-            self.name(),
-            self.status(id).await?,
-        ))
+        let sandbox = self.sandbox(id).await?;
+        let mut sandbox = sandbox.lock().await;
+        let status = refresh_status(&mut sandbox).await?;
+        Ok(ObservedSandbox::new(id.clone(), self.name(), status)
+            .with_labels(sandbox.labels.clone()))
     }
 
     async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
@@ -295,6 +297,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_backend_preserves_observation_labels() {
+        let backend = Arc::new(LocalSandboxBackend::new());
+        let manager = SandboxManager::new(backend);
+        let spec = cat_spec().label("centaur.ai/component", "workflow-run");
+        let handle = manager.create_running(spec).await.unwrap();
+
+        let observed = manager.observe(&handle.id).await.unwrap();
+        assert_eq!(
+            observed
+                .labels
+                .get("centaur.ai/component")
+                .map(String::as_str),
+            Some("workflow-run")
+        );
+
+        manager.stop(&handle.id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn local_backend_open_io_write_is_not_blocked_by_pending_stdout_read() {
         let backend = Arc::new(LocalSandboxBackend::new());
         let manager = SandboxManager::new(backend);
@@ -369,12 +390,20 @@ mod tests {
     async fn local_backend_exposes_only_explicit_environment() {
         let backend = Arc::new(LocalSandboxBackend::new());
         let manager = SandboxManager::new(backend);
+        // The child blocks on stdin after printing so it is still Running when
+        // open_io runs. A command that exits immediately races the status
+        // refresh and makes open_io report NotReady on a slow machine.
         let spec = SandboxSpec::new("/bin/sh")
             .command(["/bin/sh", "-c"])
-            .args(["printf '%s|%s' \"${CARGO_MANIFEST_DIR-unset}\" \"$EXPLICIT_ENV\""])
+            .args([
+                "printf '%s|%s' \"${CARGO_MANIFEST_DIR-unset}\" \"$EXPLICIT_ENV\"; cat >/dev/null",
+            ])
             .env("EXPLICIT_ENV", "visible");
         let handle = manager.create_running(spec).await.unwrap();
         let mut io = manager.open_io(&handle.id).await.unwrap().into_parts();
+        // Closing the write half is what lets `cat` see EOF and exit; tokio's
+        // ChildStdin only closes the pipe on drop, not on shutdown().
+        drop(io.stdin);
         let mut output = Vec::new();
         io.stdout.read_to_end(&mut output).await.unwrap();
 
