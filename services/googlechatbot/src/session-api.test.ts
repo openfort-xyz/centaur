@@ -571,6 +571,41 @@ describe('executeSession', () => {
     })
   })
 
+  test('delivers image bytes through the harness attachment path, not a data URL', async () => {
+    const pngBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Xc8WAAAAAElFTkSuQmCC'
+    const pngSize = Buffer.from(pngBase64, 'base64').byteLength
+    const { execute } = turnMessagesFromEvent({
+      ...baseEvent,
+      parts: [
+        { type: 'text', text: 'describe this' },
+        {
+          type: 'image',
+          name: 'pixel.png',
+          mime_type: 'image/png',
+          size: pngSize,
+          source: { type: 'base64', media_type: 'image/png', data: pngBase64 }
+        }
+      ]
+    })
+
+    const line = JSON.parse(
+      toCodexInputLines(loadConfig({}), baseEvent.thread_key, execute).at(-1)!
+    ) as { message: { content: Array<Record<string, unknown>> } }
+    const attachment = line.message.content.find(c => c.type === 'attachment')
+
+    expect(attachment).toMatchObject({
+      type: 'attachment',
+      attachment_type: 'image',
+      mimeType: 'image/png',
+      name: 'pixel.png',
+      size: pngSize,
+      dataBase64: pngBase64
+    })
+    expect(line.message.content.some(c => c.type === 'image')).toBe(false)
+    expect(JSON.stringify(line)).not.toContain('data:image/')
+  })
+
   test('flattens a newline-laden display name in the requester block', async () => {
     let captured: string | undefined
     globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {

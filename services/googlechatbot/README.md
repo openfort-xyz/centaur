@@ -27,11 +27,11 @@ unmentioned messages, and durably stores accepted messages or action events
 before returning `{}`.
 
 Google Chat has no streaming primitive. The bot creates one thinking message,
-applies bounded status edits while SSE is open, then PATCHes a text final or
-creates a retry-safe rich final and deletes the acknowledgement (Google PATCH
-does not support `fallbackText`). A Postgres-backed recovery sweep
-leases unfinished obligations after disconnects or restarts and delivers one
-canonical final answer.
+applies bounded status edits while SSE is open, then PATCHes the canonical final
+onto that same acknowledgement, including rich `cardsV2` output. Only overflow
+or a definitively missing acknowledgement uses a stable create. A Postgres-backed
+recovery sweep leases unfinished obligations after disconnects or restarts and
+delivers one canonical final answer.
 
 ## Configuration
 
