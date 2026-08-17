@@ -126,18 +126,30 @@ export class ChatEdgeClient {
 
   /** Resolve the calling app alias through its membership and cache Google's
    * canonical numeric `users/<id>` resource name. */
-  async getBotUserName(spaceName: string): Promise<string | undefined> {
+  async getBotUserName(
+    spaceName: string,
+    readerSubject?: string
+  ): Promise<string | undefined> {
     if (!this.serviceAccountEmail || !this.privateKey) return undefined
     if (!this.botUserNamePromise) {
       const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
-      this.botUserNamePromise = this.request<{
-        member?: { name?: string; type?: 'HUMAN' | 'BOT' }
-      }>('GET', `spaces/${encodeURIComponent(id)}/members/app`)
-        .then(membership => {
-          const name = membership.member?.name
-          return membership.member?.type === 'BOT' && /^users\/\d+$/.test(name ?? '')
-            ? name
-            : undefined
+      const path = `spaces/${encodeURIComponent(id)}/members/app`
+      this.botUserNamePromise = (async () => {
+        let membership = await this.request<ChatMembership>('GET', path).catch(() => null)
+        if (!canonicalBotName(membership)) {
+          const subject = readerSubject || this.uploadUser
+          const readerToken = validEmail(subject)
+            ? await this.getUserEtlReadToken(subject)
+            : null
+          membership = readerToken
+            ? await this.request<ChatMembership>('GET', path, undefined, { token: readerToken })
+            : null
+        }
+        return canonicalBotName(membership)
+      })()
+        .then(name => {
+          if (!name) this.botUserNamePromise = null
+          return name
         })
         .catch(error => {
           this.botUserNamePromise = null
@@ -558,7 +570,7 @@ export class ChatEdgeClient {
     const message = await this.request<ChatListMessage>('GET', messageName, undefined, {
       token: botToken
     }).catch(() => null)
-    const botUserName = await this.getBotUserName(spaceName).catch(() => undefined)
+    const botUserName = await this.getBotUserName(spaceName, readerSubject).catch(() => undefined)
     if (botUserName && message?.sender?.name === botUserName) {
       return { kind: 'app', token: botToken }
     }
@@ -1267,6 +1279,13 @@ function generatedMessageId(): string {
 
 function centaurGeneratedMessage(clientAssignedMessageId: string | undefined): boolean {
   return Boolean(clientAssignedMessageId?.match(/^client-centaur-[A-Za-z0-9._-]+$/))
+}
+
+function canonicalBotName(membership: ChatMembership | null): string | undefined {
+  const name = membership?.member?.name
+  return membership?.member?.type === 'BOT' && /^users\/\d+$/.test(name ?? '')
+    ? name
+    : undefined
 }
 
 function parseByteSize(value: string | undefined): number | undefined {
