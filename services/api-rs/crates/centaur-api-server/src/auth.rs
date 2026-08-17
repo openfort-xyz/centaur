@@ -154,13 +154,16 @@ impl ApiAuthConfig {
                 platform_prefix: "teams:",
                 workflow_events: false,
             },
-            // Google Chat thread keys are `chat:spaces:<space_id>:<thread...>`,
-            // and the bot dispatches card/command/form interactions as durable
-            // workflow events the same way slackbot dispatches block actions.
+            // googlechatbot builds every thread key as
+            // `chat:spaces:<space_id>:<thread resource…>`. The prefix includes
+            // `spaces:` on purpose: bare `chat:C…` keys are the legacy
+            // Slack-compatible adapter shape, and this caller must not reach
+            // them. It dispatches card/command/form interactions as durable
+            // workflow events the way slackbot dispatches block actions.
             IngressSpec {
                 env_var: "GOOGLECHATBOT_API_KEY",
                 identity: "googlechatbot",
-                platform_prefix: "chat:",
+                platform_prefix: "chat:spaces:",
                 workflow_events: true,
             },
         ] {
