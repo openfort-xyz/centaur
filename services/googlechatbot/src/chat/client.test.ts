@@ -502,6 +502,71 @@ describe('ChatEdgeClient owned message mutation', () => {
     ])
   })
 
+  test('uses the configured uploader when app auth cannot read its attachment', async () => {
+    const assertions: Array<Record<string, string>> = []
+    const requests: Array<{ url: string; authorization: string }> = []
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        const payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString())
+        assertions.push(payload)
+        return Response.json({
+          access_token: payload.sub ? 'uploader-reader-token' : 'app-token',
+          expires_in: 3600
+        })
+      }
+      requests.push({
+        url,
+        authorization: String(new Headers(init?.headers).get('authorization'))
+      })
+      if (url.includes('/attachments/')) {
+        return Response.json({ error: 'forbidden' }, { status: 403 })
+      }
+      if (url.endsWith('/spaces/A/messages/M1')) {
+        return Response.json({
+          name: 'spaces/A/messages/M1',
+          attachment: [{
+            name: 'spaces/A/messages/M1/attachments/F1',
+            contentName: 'report.txt',
+            contentType: 'text/plain',
+            source: 'UPLOADED_CONTENT',
+            attachmentDataRef: { resourceName: 'media/F1' }
+          }]
+        })
+      }
+      return new Response('hello', { headers: { 'content-type': 'text/plain' } })
+    }) as typeof fetch)
+
+    const resolved = await client.resolveAttachment('spaces/A/messages/M1', 'F1')
+    expect(await client.downloadAttachmentResource(
+      resolved.attachment,
+      resolved.credential
+    )).toMatchObject({ name: 'report.txt', mimeType: 'text/plain', size: 5 })
+
+    expect(assertions).toEqual([
+      expect.not.objectContaining({ sub: expect.anything() }),
+      expect.objectContaining({
+        sub: 'uploader@example.com',
+        scope: 'https://www.googleapis.com/auth/chat.messages.readonly'
+      })
+    ])
+    expect(requests).toEqual([
+      {
+        url: 'https://chat.googleapis.com/v1/spaces/A/messages/M1/attachments/F1',
+        authorization: 'Bearer app-token'
+      },
+      {
+        url: 'https://chat.googleapis.com/v1/spaces/A/messages/M1',
+        authorization: 'Bearer uploader-reader-token'
+      },
+      {
+        url: 'https://chat.googleapis.com/v1/media/media/F1?alt=media',
+        authorization: 'Bearer uploader-reader-token'
+      }
+    ])
+  })
+
   test.each([
     ['parent message', {
       name: 'spaces/OTHER/messages/M1',

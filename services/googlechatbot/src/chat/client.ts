@@ -776,14 +776,21 @@ export class ChatEdgeClient {
     // metadata from the exact parent message and keep that delegated credential
     // for media.download rather than crossing credential boundaries.
     if (!readerSubject) {
-      const attachment = await this.request<ChatAttachmentResource>(
-        'GET',
-        `${messageName}/attachments/${encodeURIComponent(attachmentId)}`
-      )
-      if (attachment.name !== expectedName) {
-        throw new ChatConfigurationError('Google Chat attachment resource mismatch')
+      try {
+        const attachment = await this.request<ChatAttachmentResource>(
+          'GET',
+          `${messageName}/attachments/${encodeURIComponent(attachmentId)}`
+        )
+        if (attachment.name !== expectedName) {
+          throw new ChatConfigurationError('Google Chat attachment resource mismatch')
+        }
+        return { attachment, credential: 'app' }
+      } catch (error) {
+        if (!(error instanceof ChatApiError) || error.status !== 403 || !validEmail(this.uploadUser)) {
+          throw error
+        }
+        readerSubject = this.uploadUser
       }
-      return { attachment, credential: 'app' }
     }
 
     if (!validEmail(readerSubject)) {
