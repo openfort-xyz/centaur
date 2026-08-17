@@ -8,7 +8,7 @@ import {
   type RenderTarget,
   type RendererWriteScheduler
 } from './renderer'
-import type { ChatEdgeClient } from './chat/client'
+import { ChatApiError, type ChatEdgeClient } from './chat/client'
 import type { GoogleChatMessage } from './chat/types'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import { markdownToChatMessage, messageUtf8Bytes } from './chat/render'
@@ -93,16 +93,17 @@ describe('finalizeRender surface selection', () => {
     expect(capture.body?.cardsV2).toEqual([])
   })
 
-  test('standalone image embeds go to the card surface', async () => {
+  test('standalone image embeds replace the thinking message with cards', async () => {
     const capture: Capture = {}
     const state = settledState('Look:\n![diagram](https://example.com/x.png)')
 
-    await finalizeRender(stubClient(capture), target(), state)
+    await expect(finalizeRender(stubClient(capture), target(), state)).resolves.toBe('updated')
 
-    expect(capture.body).toBeUndefined()
-    expect(capture.creates?.[0]?.body.text).toBeUndefined()
-    expect(capture.creates?.[0]?.body.cardsV2?.length).toBeGreaterThan(0)
-    expect(capture.deletes).toEqual(['spaces/AAAA/messages/M1'])
+    expect(capture.body?.text).toBe('')
+    expect(capture.body?.fallbackText).toBeUndefined()
+    expect(capture.body?.cardsV2?.length).toBeGreaterThan(0)
+    expect(capture.creates).toBeUndefined()
+    expect(capture.deletes).toBeUndefined()
   })
 
   test('invalid image prefixes stay on the text surface', async () => {
@@ -134,7 +135,7 @@ describe('finalizeRender surface selection', () => {
     expect(capture.body?.cardsV2).toEqual([])
   })
 
-  test('card messages include fallbackText and no empty sections', async () => {
+  test('card PATCH omits create-only fallbackText and keeps valid sections', async () => {
     const capture: Capture = {}
     const state = settledState('# Result\n![diagram](https://example.com/x.png)')
 
@@ -148,19 +149,32 @@ describe('finalizeRender surface selection', () => {
       state
     )
 
-    const created = capture.creates?.[0]
-    const body = created?.body as Partial<GoogleChatMessage> & { fallbackText?: string }
-    expect(capture.body).toBeUndefined()
-    expect(created?.messageId).toBe('client-centaur-card')
-    expect(created?.threadName).toBe('spaces/AAAA/threads/T1')
-    expect(created?.spaceType).toBe('DIRECT_MESSAGE')
-    expect(body.fallbackText).toBeTruthy()
+    const body = capture.body as Partial<GoogleChatMessage> & { fallbackText?: string }
+    expect(capture.creates).toBeUndefined()
+    expect(body.fallbackText).toBeUndefined()
     expect((body.cardsV2 ?? []).every(card =>
       (card.card.sections ?? []).every(section => (section.widgets?.length ?? 0) > 0)
     )).toBe(true)
-    expect(messageUtf8Bytes({ ...body, thread: { name: created?.threadName } }))
+    expect(messageUtf8Bytes(body))
       .toBeLessThanOrEqual(chatReplyLimits.message.maxBytes)
-    expect(capture.deletes).toEqual(['spaces/AAAA/messages/M1'])
+    expect(capture.deletes).toBeUndefined()
+  })
+
+  test('plain answer and Console card replace the thinking message together', async () => {
+    const capture: Capture = {}
+    const trailer = { buttonList: { buttons: [{ text: 'Open Console' }] } }
+
+    await expect(finalizeRender(
+      stubClient(capture),
+      target({ consoleSessionWidget: trailer }),
+      settledState('group mention path works')
+    )).resolves.toBe('updated')
+
+    expect(capture.body?.text).toBe('group mention path works')
+    expect(capture.body?.cardsV2).toHaveLength(1)
+    expect(capture.body?.fallbackText).toBeUndefined()
+    expect(capture.creates).toBeUndefined()
+    expect(capture.deletes).toBeUndefined()
   })
 
   test('plain answers with a trailer also describe their card fallback', () => {
@@ -237,19 +251,20 @@ describe('finalizeRender surface selection', () => {
     expect(secondIds).toEqual(firstIds)
   })
 
-  test('treats an existing deterministic card part as a successful replay', async () => {
+  test('falls back to deterministic create only when the ack is definitively gone', async () => {
     const creates: string[] = []
-    const deletes: string[] = []
     const client = {
+      updateMessage: async () => {
+        throw new ChatApiError('PATCH', 'spaces/AAAA/messages/M1', 404, 'NOT_FOUND')
+      },
       createMessage: async (
         _space: string,
         _body: Partial<GoogleChatMessage>,
         opts: { messageId?: string } = {}
       ) => {
         creates.push(opts.messageId ?? '')
-        throw new Error('409 ALREADY_EXISTS')
-      },
-      deleteMessage: async (name: string) => { deletes.push(name) }
+        throw new ChatApiError('POST', 'spaces/AAAA/messages', 409, 'ALREADY_EXISTS')
+      }
     } as unknown as ChatEdgeClient
 
     await expect(finalizeRender(
@@ -259,7 +274,23 @@ describe('finalizeRender surface selection', () => {
     )).resolves.toBe('created')
 
     expect(creates).toEqual(['client-centaur-replay'])
-    expect(deletes).toEqual(['spaces/AAAA/messages/M1'])
+  })
+
+  test('propagates ambiguous PATCH failures without creating a duplicate', async () => {
+    let creates = 0
+    const error = new ChatApiError('PATCH', 'spaces/AAAA/messages/M1', 503, 'unavailable')
+    const client = {
+      updateMessage: async () => { throw error },
+      createMessage: async () => { creates += 1; return {} }
+    } as unknown as ChatEdgeClient
+
+    await expect(finalizeRender(
+      client,
+      target({ fallbackMessageId: 'client-centaur-ambiguous' }),
+      settledState('answer')
+    )).rejects.toBe(error)
+
+    expect(creates).toBe(0)
   })
 })
 

@@ -886,26 +886,16 @@ function codexInputContent(
       continue
     }
     if (part.source?.data && part.mime_type) {
-      if (part.type === 'image') {
-        content.push({
-          type: 'image',
-          url: `data:${part.mime_type};base64,${part.source.data}`,
-          detail: 'auto',
-          name: part.name
-        })
-      } else {
-        // Non-image files reach the agent as an attachment block carrying the
-        // bytes, matching slackbotv2's codexAttachmentInput shape — otherwise a
-        // CSV/PDF would arrive as a name-only placeholder the agent can't read.
-        content.push({
-          type: 'attachment',
-          attachment_type: part.type,
-          dataBase64: part.source.data,
-          mimeType: part.mime_type,
-          name: part.name,
-          size: part.size
-        })
-      }
+      // Byte-bearing files use the shared harness attachment path so images
+      // are materialized locally instead of becoming literal data URLs.
+      content.push({
+        type: 'attachment',
+        attachment_type: part.type,
+        dataBase64: part.source.data,
+        mimeType: part.mime_type,
+        name: part.name,
+        size: part.size
+      })
       continue
     }
     // No bytes (Drive file, oversized, or a failed download): a descriptive

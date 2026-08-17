@@ -3,7 +3,7 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
-import type { ChatEdgeClient } from './chat/client'
+import { ChatApiError, type ChatEdgeClient } from './chat/client'
 import {
   CARD_FALLBACK_TEXT,
   hasStandaloneImage,
@@ -42,15 +42,15 @@ const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 // Cards remain for what the text surface genuinely cannot carry: standalone
 // image embeds (`![alt](https://…)`) become image widgets. Long text remains on
 // the text surface and is split into complete <=32,000-byte Messages.
-// Text answers replace the already-posted "thinking" ack. Card answers must be
-// created (fallbackText is create-only), then the ack is removed.
+// The final answer replaces the already-posted "thinking" ack. `fallbackText`
+// is create-only, so PATCH omits it while updating both text and cardsV2.
 export type RenderTarget = {
   spaceName: string
   /** Official Google space discriminator; reply options only apply to SPACE. */
   spaceType?: ChatSpaceType
   /** Resource name of the pre-posted "thinking" message we PATCH with the answer. */
   ackMessageName: string
-  /** Thread to fall back into if the ack PATCH fails and we must post fresh. */
+  /** Thread to fall back into if the ack no longer exists and we must post fresh. */
   threadName?: string
   /** Optional "Open chat in Console · MODEL · Harness" trailer widget, set on
    * the first assistant message of a thread (see console-session-link.ts). */
@@ -256,28 +256,28 @@ async function deliverFinal(
     trailers
   })
   let outcome: 'updated' | 'created' = 'created'
-  const mustCreateFirst = Boolean(bodies[0]?.cardsV2?.length)
 
   for (let index = 0; index < bodies.length; index += 1) {
     const body = bodies[index]!
     assertMessageSize(
       body,
-      index === 0 && target.ackMessageName && !mustCreateFirst ? undefined : target.threadName
+      index === 0 && target.ackMessageName ? undefined : target.threadName
     )
-    if (index === 0 && target.ackMessageName && !mustCreateFirst) {
+    if (index === 0 && target.ackMessageName) {
+      const update = { text: body.text ?? '', cardsV2: body.cardsV2 ?? [] }
       try {
         await rendererWrite(client, target).run(target.spaceName, () =>
-          client.updateMessage(target.ackMessageName, body)
+          client.updateMessage(target.ackMessageName, update)
         )
         outcome = 'updated'
         continue
       } catch (error) {
-        logError('googlechatbot_final_patch_failed_falling_back_to_create', error)
+        if (!(error instanceof ChatApiError) || error.status !== 404) throw error
+        logWarn('googlechatbot_final_ack_not_found_creating_replacement', error)
       }
     }
     await createFinalPart(client, target, body, index)
   }
-  if (mustCreateFirst && target.ackMessageName) await removeAckMessage(client, target)
   return outcome
 }
 
@@ -297,21 +297,7 @@ async function createFinalPart(
       })
     )
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (!/\b409\b|ALREADY_EXISTS/i.test(message)) throw error
-  }
-}
-
-async function removeAckMessage(client: ChatEdgeClient, target: RenderTarget): Promise<void> {
-  try {
-    await rendererWrite(client, target).run(target.spaceName, () =>
-      client.deleteMessage(target.ackMessageName)
-    )
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (!/\b404\b|NOT_FOUND/i.test(message)) {
-      logWarn('googlechatbot_completed_ack_delete_failed', error)
-    }
+    if (!(error instanceof ChatApiError) || error.status !== 409) throw error
   }
 }
 

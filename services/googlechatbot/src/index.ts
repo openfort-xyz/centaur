@@ -2,7 +2,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import type { StateAdapter } from 'chat'
 import type { AppConfig } from './config'
-import { ChatEdgeClient, ChatOwnershipError } from './chat/client'
+import { ChatApiError, ChatEdgeClient, ChatOwnershipError } from './chat/client'
 import { EventDeduper, chatDedupKey } from './chat/dedup'
 import {
   buildThreadKey,
@@ -847,12 +847,18 @@ export async function processWorkObligation(
     }
 
     if (!work.ackMessageName) {
-      const ack = await client.createMessage(
-        event.space_name,
-        { text: INITIAL_STATUS },
-        { threadName: event.chat.thread_name, spaceType: event.space_type }
-      )
-      work.ackMessageName = ack.name ?? ''
+      const messageId = `client-centaur-ack-${work.workId.replace(/-/g, '')}`
+      try {
+        const ack = await client.createMessage(
+          event.space_name,
+          { text: INITIAL_STATUS },
+          { messageId, threadName: event.chat.thread_name, spaceType: event.space_type }
+        )
+        work.ackMessageName = ack.name ?? `${event.space_name}/messages/${messageId}`
+      } catch (error) {
+        if (!(error instanceof ChatApiError) || error.status !== 409) throw error
+        work.ackMessageName = `${event.space_name}/messages/${messageId}`
+      }
       work.stage = 'thinking'
       await persistWork(state, work)
     }

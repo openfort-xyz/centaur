@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createGooglechatbot } from './index'
 import { loadConfig } from './config'
+import { ChatApiError } from './chat/client'
 import { renderMetrics, resetMetrics } from './metrics'
 import { createMemoryState } from '@chat-adapter/state-memory'
 import { WORK_INDEX_KEY, persistWork, workKey, type GoogleChatWorkObligation } from './state'
@@ -164,6 +165,66 @@ describe('googlechatbot webhook e2e', () => {
       c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url)
     )
     expect(createSessionCall).toBeTruthy()
+    const ackCall = mock.calls.find(c =>
+      c.method === 'POST'
+      && new URL(c.url).hostname === 'chat.googleapis.com'
+      && (c.body as { text?: string })?.text?.includes('thinking')
+    )
+    expect(new URL(ackCall!.url).searchParams.get('messageId'))
+      .toMatch(/^client-centaur-ack-[a-f0-9]{32}$/)
+  })
+
+  test('recovers a crash after deterministic thinking creation without duplicating it', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    const work: GoogleChatWorkObligation = {
+      acceptedAt: new Date().toISOString(),
+      dedupeKey: 'message:ack-create-crash',
+      event: {
+        thread_key: 'thread-ack-create-crash',
+        message_id: 'message-ack-create-crash',
+        space_name: 'spaces/AAAA',
+        space_type: 'DIRECT_MESSAGE',
+        user_id: 'users/U1',
+        user_name: 'Alice',
+        is_mention: true,
+        parts: [{ type: 'text', text: 'recover me' }],
+        chat: {}
+      },
+      failures: 0,
+      identityVerified: false,
+      lastEventId: 0,
+      stage: 'accepted',
+      workId: crypto.randomUUID()
+    }
+    await persistWork(state, work)
+    await state.disconnect()
+
+    const realConnect = state.connect.bind(state)
+    let release!: () => void
+    state.connect = async () => {
+      await new Promise<void>(resolve => { release = resolve })
+      await realConnect()
+    }
+    const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })
+    const messageId = `client-centaur-ack-${work.workId.replace(/-/g, '')}`
+    let ackCreates = 0
+    let finalUpdateName = ''
+    runtime.client.createMessage = async (_space, _body, opts) => {
+      ackCreates += 1
+      expect(opts?.messageId).toBe(messageId)
+      throw new ChatApiError('POST', 'spaces/AAAA/messages', 409, 'ALREADY_EXISTS')
+    }
+    runtime.client.updateMessage = async name => {
+      finalUpdateName = name
+      return {}
+    }
+    release()
+    await runtime.stateConnected
+    await waitFor(async () => (await state.get(workKey(work.workId))) === null)
+
+    expect(ackCreates).toBe(1)
+    expect(finalUpdateName).toBe(`spaces/AAAA/messages/${messageId}`)
   })
 
   test('durably ACKs before hanging media work', async () => {
@@ -453,7 +514,9 @@ describe('googlechatbot webhook e2e', () => {
       const creates: Array<{ messageId?: string }> = []
       runtime.client.updateMessage = async () => {
         updates += 1
-        if (!updateWorks) throw new Error('update unavailable')
+        if (!updateWorks) {
+          throw new ChatApiError('PATCH', 'spaces/AAAA/messages/ACK1', 404, 'NOT_FOUND')
+        }
         return {}
       }
       runtime.client.createMessage = async (_space, _body, opts) => {

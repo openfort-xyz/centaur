@@ -184,10 +184,11 @@ the scopes above to one convenience account.
   download default is 10 MiB and refuses to overwrite an existing file.
 - A complete serialized Google `Message` is capped at 32,000 UTF-8 bytes.
   Longer answers are split losslessly into ordered, retry-safe messages.
-- Card v2 output never exceeds 100 widgets per card, never emits an empty
-  section, and includes `fallbackText`. Because Google does not permit
-  `fallbackText` in a PATCH mask, a rich final is created with a stable client
-  ID and the thinking acknowledgement is then deleted.
+- Card v2 output never exceeds 100 widgets per card and never emits an empty
+  section. The first final part PATCHes `text` and `cardsV2` onto the durable
+  thinking acknowledgement, so Chat never leaves a deletion tombstone. Created
+  replacement or overflow parts use stable client IDs and include
+  `fallbackText`; the in-place PATCH omits that create-only field.
 - Named-space writes use Google threading options; direct and group chats omit
   the unsupported `messageReplyOption` and thread body.
 - Drive downloads validate metadata, size, and downloadable capability. Missing
@@ -210,9 +211,10 @@ production fallback.
 Accepted events, action dedupe, sticky harness/model/provider selection,
 forwarded/executed message IDs, active execution state, and final-render
 obligations are durable. A recurring sweep leases unfinished work, resumes SSE
-from the last event ID, and either updates the thinking message with one
-canonical final answer or creates one replacement. Old obligations and repeated
-failures are bounded by the configured age and failure budget.
+from the last event ID and updates the thinking message with one canonical final
+answer. Only a definitive missing acknowledgement creates a stable replacement;
+ambiguous PATCH failures remain durable retry obligations. Old obligations and
+repeated failures are bounded by the configured age and failure budget.
 
 | Endpoint | Meaning |
 | --- | --- |

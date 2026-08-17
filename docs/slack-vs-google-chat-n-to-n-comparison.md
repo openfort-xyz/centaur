@@ -147,7 +147,7 @@ titles, email-rich Chat directory resources, and Slack-only objects are
 | Update | Renderer updates its own Slack response; no generic agent CLI. | Scoped `update-message` for app-owned messages. | Google-native extension, not a Slack parity requirement. |
 | Delete | No generic agent command. | Scoped `delete-message` for app-owned messages. | Google-native extension, not a Slack parity requirement. |
 | Dynamic widget suggestions | No equivalent agent/event surface. | Official Add-on `widgetUpdatedPayload` exists, but Centaur only recognizes the enum for safe logging and does not unwrap, dispatch, or answer it. | Google-native unimplemented capability; explicitly unsupported in this release. |
-| Response streaming | Native progressive Slack stream, plans/tasks, continuation, reconciliation. | Thinking message + at most 1 Hz status edits. Text finals PATCH the acknowledgement; rich finals are created with a stable ID and fallback text, then the acknowledgement is deleted. | Different by design; Chat has no equivalent streaming primitive and does not allow `fallbackText` in a PATCH mask. |
+| Response streaming | Native progressive Slack stream, plans/tasks, continuation, reconciliation. | Thinking message + at most 1 Hz status edits. The first text or rich final part PATCHes that same acknowledgement; only overflow or a definitively missing acknowledgement uses a stable create. | Different by design because Chat has no equivalent streaming primitive, but both integrations retain a single canonical first response without a deletion tombstone. |
 | Long response | Slack continuation/segments and fallback clipping. | Complete serialized Chat messages stay within 32,000 UTF-8 bytes and overflow is split losslessly into ordered retry-safe parts; cards stay within 100 widgets and non-empty sections. | Equivalent outcome, different presentation. |
 | Plain-text escape | Prompt can request plain text. | Same. | Parity. |
 | Activity summary/status | Slack assistant status and detailed rendering. | Activity summary/status line; reasoning/task internals intentionally not exposed. | Slack richer presentation; no missing core outcome. |
@@ -158,7 +158,7 @@ titles, email-rich Chat directory resources, and Slack-only objects are
 
 | Capability | Slack | Google Chat | Current difference |
 | --- | --- | --- | --- |
-| Inbound file hydration | Slack files downloaded and typed. | `UPLOADED_CONTENT` downloaded through Chat media API; Drive files through a separate DWD Drive reader. | Parity; exact uploaded-content bytes/MIME and a live 75,979-byte XLSX Drive export passed. |
+| Inbound file hydration | Slack files downloaded and typed through the shared attachment input. | `UPLOADED_CONTENT` downloaded through Chat media API and passed through the same materialized attachment input; Drive files use a separate DWD Drive reader. | Parity; images no longer become literal data URLs in provider prompts. Exact uploaded-content bytes/MIME and a live 75,979-byte XLSX Drive export passed. |
 | Count per message | First 20. | First 10. | Slack higher; Google bound limits API fan-out. |
 | File ceiling | 100 MiB. | 100 MiB decoded per file. | Parity. |
 | Inline ceiling | Small files inline; large staged. | Inline through 25 MiB. | Implementation detail. |
