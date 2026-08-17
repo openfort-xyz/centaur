@@ -22,9 +22,12 @@ module ApiServer
         }
       end
       unless google_chat_spaces.values.all?(&:empty?) && dm_setup_targets.empty?
-        claims["google_chat"] = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h do |flag|
+        google_chat_claims = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h do |flag|
           [ flag.fetch(:claim).to_s, google_chat_spaces.fetch(flag.fetch(:claim)).sort ]
         end.merge("dm_setup_targets" => dm_setup_targets.sort)
+        reader_subjects = principal.google_chat_reader_subjects_by_space
+        google_chat_claims["reader_subjects"] = reader_subjects unless reader_subjects.empty?
+        claims["google_chat"] = google_chat_claims
       end
 
       CentaurJwt::WindowedToken.encode(

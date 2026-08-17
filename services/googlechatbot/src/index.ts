@@ -502,6 +502,8 @@ export function createGooglechatbot(
   app.patch('/api/chat/spaces/:spaceId/messages/:messageId', async c => {
     const denied = requireInternalAuth(c)
     if (denied) return denied
+    const subject = delegatedSubject(c)
+    if (subject instanceof InputError) return c.json({ error: subject.message }, subject.status)
     const spaceName = spaceResource(c.req.param('spaceId'))
     const messageName = messageResource(c.req.param('spaceId'), c.req.param('messageId'))
     if (!spaceName || !messageName) return c.json({ error: 'invalid Google Chat resource ID' }, 400)
@@ -511,7 +513,7 @@ export function createGooglechatbot(
     if (body instanceof InputError) return c.json({ error: body.message }, body.status)
     if (typeof body?.text !== 'string') return c.json({ error: 'text is required' }, 400)
     try {
-      return c.json(await client.updateOwnedMessage(spaceName, messageName, { text: body.text }))
+      return c.json(await client.updateOwnedMessage(spaceName, messageName, { text: body.text }, subject))
     } catch (error) {
       return internalFailure(c, 'googlechatbot_outbound_update_failed', error)
     }
@@ -520,11 +522,13 @@ export function createGooglechatbot(
   app.delete('/api/chat/spaces/:spaceId/messages/:messageId', async c => {
     const denied = requireInternalAuth(c)
     if (denied) return denied
+    const subject = delegatedSubject(c)
+    if (subject instanceof InputError) return c.json({ error: subject.message }, subject.status)
     const spaceName = spaceResource(c.req.param('spaceId'))
     const messageName = messageResource(c.req.param('spaceId'), c.req.param('messageId'))
     if (!spaceName || !messageName) return c.json({ error: 'invalid Google Chat resource ID' }, 400)
     try {
-      await client.deleteOwnedMessage(spaceName, messageName)
+      await client.deleteOwnedMessage(spaceName, messageName, subject)
       return c.json({})
     } catch (error) {
       return internalFailure(c, 'googlechatbot_outbound_delete_failed', error)
@@ -538,9 +542,11 @@ export function createGooglechatbot(
   app.post('/api/chat/spaces/:spaceId/attachments', async c => {
     const denied = requireInternalAuth(c)
     if (denied) return denied
+    const subject = delegatedSubject(c)
+    if (subject instanceof InputError) return c.json({ error: subject.message }, subject.status)
     const spaceName = spaceResource(c.req.param('spaceId'))
     if (!spaceName) return c.json({ error: 'invalid Google Chat space resource ID' }, 400)
-    if (!client.canUploadAttachments()) {
+    if (!client.canUploadAttachments(subject)) {
       return c.json(
         {
           error:
@@ -582,10 +588,12 @@ export function createGooglechatbot(
         spaceName,
         body.filename,
         body.mime_type ?? 'application/octet-stream',
-        data
+        data,
+        subject
       )
       const sent = await client.createAttachmentMessage(spaceName, uploaded, {
         ...(body.text ? { text: body.text } : {}),
+        ...(subject ? { subject } : {}),
         ...thread
       })
       return c.json(sent)

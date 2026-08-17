@@ -247,6 +247,38 @@ class Principal < ApplicationRecord
     end.sort
   end
 
+  def google_chat_reader_subject
+    email = labels&.fetch("google_email", nil) if kind == "gchat_dm"
+    email = email.to_s.strip.downcase
+    email if email.match?(URI::MailTo::EMAIL_REGEXP)
+  end
+
+  def google_chat_reader_subjects_by_space
+    spaces_by_id = google_chat_space_names_by_permission.values.flatten.uniq.to_h do |space|
+      [ space.delete_prefix("spaces/"), space ]
+    end
+    return {} if spaces_by_id.empty?
+
+    subjects = Hash.new { |hash, space| hash[space] = [] }
+    Principal.where("labels ->> 'gchat_space_id' IN (?)", spaces_by_id.keys)
+      .find_each do |space_principal|
+        space = spaces_by_id[space_principal.labels["gchat_space_id"]]
+        subject = space_principal.google_chat_reader_subject
+        subjects[space] << subject if space && subject
+      end
+    configured = labels["google_chat_reader_subjects"]
+    if configured.is_a?(Hash)
+      configured.each do |space, email|
+        email = email.to_s.strip.downcase
+        subjects[space] << email if spaces_by_id.value?(space) && email.match?(URI::MailTo::EMAIL_REGEXP)
+      end
+    end
+    subjects.filter_map do |space, emails|
+      unique = emails.uniq
+      [ space, unique.first ] if unique.one?
+    end.to_h
+  end
+
   def google_chat_jwt_targets
     google_chat_space_names_by_permission.values.flatten.concat(google_chat_dm_setup_targets).uniq
   end

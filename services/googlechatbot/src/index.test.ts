@@ -328,6 +328,27 @@ describe('api-rs-only /api/chat routes', () => {
     expect(res.status).toBe(403)
   })
 
+  test('passes only the trusted internal delegated subject to ownership checks', async () => {
+    const bot = appWith({ GOOGLECHATBOT_INTERNAL_API_KEY: 'secret' })
+    let received: string | undefined
+    bot.client.updateOwnedMessage = (async (_space, _message, _update, subject) => {
+      received = subject
+      return { name: 'spaces/A/messages/M1', text: 'changed' }
+    }) as typeof bot.client.updateOwnedMessage
+    const res = await bot.app.request('/api/chat/spaces/A/messages/M1', {
+      method: 'PATCH',
+      headers: {
+        Authorization: 'Bearer secret',
+        'content-type': 'application/json',
+        'x-centaur-google-chat-dwd-subject': 'reader@example.com'
+      },
+      body: JSON.stringify({ text: 'changed' })
+    })
+
+    expect(res.status).toBe(200)
+    expect(received).toBe('reader@example.com')
+  })
+
   test('requires text when authenticated', async () => {
     const bot = appWith({ GOOGLECHATBOT_INTERNAL_API_KEY: 'secret' })
     const res = await post(bot, { Authorization: 'Bearer secret' }, {})
@@ -444,11 +465,13 @@ describe('outbound /api/chat/attachments', () => {
       GOOGLECHATBOT_INTERNAL_API_KEY: 'secret'
     }), { state: createMemoryState() })
     let options: unknown
+    let uploadSubject: string | undefined
     bot.client.canUploadAttachments = () => true
     bot.client.getSpace = async () => ({ name: 'spaces/A', spaceType: 'SPACE' })
-    bot.client.uploadAttachment = async () => ({
-      attachmentDataRef: { resourceName: 'media/F1' }
-    })
+    bot.client.uploadAttachment = (async (_space, _name, _type, _data, subject) => {
+      uploadSubject = subject
+      return { attachmentDataRef: { resourceName: 'media/F1' } }
+    }) as typeof bot.client.uploadAttachment
     bot.client.createAttachmentMessage = (async (_space, _attachment, opts) => {
       options = opts
       return { name: 'spaces/A/messages/M1' }
@@ -458,7 +481,8 @@ describe('outbound /api/chat/attachments', () => {
       method: 'POST',
       headers: {
         Authorization: 'Bearer secret',
-        'content-type': 'application/json'
+        'content-type': 'application/json',
+        'x-centaur-google-chat-dwd-subject': 'arnau@example.com'
       },
       body: JSON.stringify({
         filename: 'a.txt',
@@ -468,9 +492,11 @@ describe('outbound /api/chat/attachments', () => {
     })
 
     expect(response.status).toBe(200)
+    expect(uploadSubject).toBe('arnau@example.com')
     expect(options).toEqual({
       threadName: 'spaces/A/threads/T1',
-      spaceType: 'SPACE'
+      spaceType: 'SPACE',
+      subject: 'arnau@example.com'
     })
   })
 })

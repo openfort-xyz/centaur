@@ -97,6 +97,72 @@ describe('ChatEdgeClient owned message mutation', () => {
     expect(mutations).toEqual(['Bearer bot-token'])
   })
 
+  test('uses a trusted DM reader only to prove bot ownership before app mutation', async () => {
+    const mutations: string[] = []
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const authorization = String(new Headers(init?.headers).get('authorization'))
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        const payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString())
+        return Response.json({
+          access_token: payload.sub === 'reader@example.com' ? 'reader-token' : 'bot-token',
+          expires_in: 3600
+        })
+      }
+      if (url.endsWith('/members/app')) {
+        return Response.json({ member: { name: 'users/123', type: 'BOT' } })
+      }
+      if (init?.method === 'GET') {
+        return authorization === 'Bearer reader-token'
+          ? Response.json({ sender: { name: 'users/123', type: 'BOT' } })
+          : Response.json({ error: 'DMs are not supported' }, { status: 400 })
+      }
+      mutations.push(authorization)
+      return Response.json({ name: 'spaces/DM/messages/M1', text: 'changed' })
+    }) as typeof fetch)
+
+    await client.updateOwnedMessage(
+      'spaces/DM',
+      'spaces/DM/messages/M1',
+      { text: 'changed' },
+      'reader@example.com'
+    )
+    expect(mutations).toEqual(['Bearer bot-token'])
+  })
+
+  test('trusted DM reader cannot authorize mutation of a human message', async () => {
+    let mutated = false
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        const payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString())
+        return Response.json({ access_token: payload.sub ? 'delegated-token' : 'bot-token', expires_in: 3600 })
+      }
+      if (url.endsWith('/members/app')) {
+        return Response.json({ member: { name: 'users/123', type: 'BOT' } })
+      }
+      if (url.endsWith('/spaces/DM/members/reader%40example.com')) {
+        return Response.json({ member: { name: 'users/U1', type: 'HUMAN' } })
+      }
+      if (init?.method === 'GET') {
+        return new Headers(init.headers).get('authorization') === 'Bearer bot-token'
+          ? Response.json({ error: 'DMs are not supported' }, { status: 400 })
+          : Response.json({ sender: { name: 'users/U1', type: 'HUMAN' } })
+      }
+      mutated = true
+      return Response.json({})
+    }) as typeof fetch)
+
+    await expect(client.deleteOwnedMessage(
+      'spaces/DM',
+      'spaces/DM/messages/M1',
+      'reader@example.com'
+    )).rejects.toThrow('not owned')
+    expect(mutated).toBe(false)
+  })
+
   test('uses the delegated token only for a message authored by that user and accepts empty DELETE', async () => {
     let tokenExchanges = 0
     const mutations: string[] = []
@@ -105,11 +171,15 @@ describe('ChatEdgeClient owned message mutation', () => {
       const url = String(input)
       if (url.includes('oauth2.googleapis.com/token')) {
         tokenExchanges += 1
-        if (tokenExchanges === 2) {
-          const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
-          delegatedAssertion = JSON.parse(
-            Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString()
-          )
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        const payload = JSON.parse(
+          Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString()
+        ) as Record<string, string>
+        if (payload.scope === [
+          'https://www.googleapis.com/auth/chat.messages',
+          'https://www.googleapis.com/auth/chat.memberships.readonly'
+        ].join(' ')) {
+          delegatedAssertion = payload
         }
         return Response.json({
           access_token: tokenExchanges === 1 ? 'bot-token' : 'delegated-token',
@@ -119,23 +189,30 @@ describe('ChatEdgeClient owned message mutation', () => {
       if (url.endsWith('/members/app')) {
         return Response.json({ member: { name: 'users/123', type: 'BOT' } })
       }
-      if (url.endsWith('/spaces/A/members/uploader%40example.com')) {
+      if (url.endsWith('/spaces/A/members/arnau%40example.com')) {
         return Response.json({ member: { name: 'users/U1', type: 'HUMAN' } })
       }
       if (init?.method === 'GET') {
         const token = new Headers(init.headers).get('authorization')
         return token === 'Bearer delegated-token'
-          ? Response.json({ sender: { name: 'users/U1', type: 'HUMAN' } })
+          ? Response.json({
+              sender: { name: 'users/U1', type: 'HUMAN' },
+              clientAssignedMessageId: 'client-centaur-upload-1'
+            })
           : Response.json({ error: 'app cannot read this message' }, { status: 403 })
       }
       mutations.push(String(new Headers(init?.headers).get('authorization')))
       return new Response(null, { status: 204 })
     }) as typeof fetch)
 
-    expect(await client.deleteOwnedMessage('spaces/A', 'spaces/A/messages/M1')).toEqual({})
+    expect(await client.deleteOwnedMessage(
+      'spaces/A',
+      'spaces/A/messages/M1',
+      'arnau@example.com'
+    )).toEqual({})
     expect(mutations).toEqual(['Bearer delegated-token'])
     expect(delegatedAssertion).toMatchObject({
-      sub: 'uploader@example.com',
+      sub: 'arnau@example.com',
       scope: [
         'https://www.googleapis.com/auth/chat.messages',
         'https://www.googleapis.com/auth/chat.memberships.readonly'
@@ -164,7 +241,10 @@ describe('ChatEdgeClient owned message mutation', () => {
       }
       if (init?.method === 'GET') {
         return new Headers(init.headers).get('authorization') === 'Bearer delegated-token'
-          ? Response.json({ sender: { name: 'users/U1', type: 'HUMAN' } })
+          ? Response.json({
+              sender: { name: 'users/U1', type: 'HUMAN' },
+              clientAssignedMessageId: 'client-centaur-upload-2'
+            })
           : Response.json({}, { status: 403 })
       }
       return Response.json({ name: 'spaces/A/messages/M1', text: 'changed' })
@@ -304,6 +384,39 @@ describe('ChatEdgeClient owned message mutation', () => {
     await client.createAttachmentMessage('spaces/A', attachment)
 
     expect(starts).toEqual([0, 1_000])
+  })
+
+  test('uses and caches the exact mapped subject for upload and attachment create', async () => {
+    const assertions: Array<Record<string, string>> = []
+    const authorizations: string[] = []
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        assertions.push(JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString()))
+        return Response.json({ access_token: 'arnau-upload-token', expires_in: 3600 })
+      }
+      authorizations.push(String(new Headers(init?.headers).get('authorization')))
+      return authorizations.length === 1
+        ? Response.json({ attachmentDataRef: { resourceName: 'media/F1' } })
+        : Response.json({ name: 'spaces/DM/messages/server-generated' })
+    }) as typeof fetch)
+
+    const attachment = await client.uploadAttachment(
+      'spaces/DM',
+      'report.txt',
+      'text/plain',
+      new TextEncoder().encode('hello'),
+      'arnau@example.com'
+    )
+    await client.createAttachmentMessage('spaces/DM', attachment, {
+      subject: 'arnau@example.com'
+    })
+
+    expect(assertions).toEqual([expect.objectContaining({
+      sub: 'arnau@example.com',
+      scope: 'https://www.googleapis.com/auth/chat.messages.create'
+    })])
+    expect(authorizations).toEqual(['Bearer arnau-upload-token', 'Bearer arnau-upload-token'])
   })
 
 })

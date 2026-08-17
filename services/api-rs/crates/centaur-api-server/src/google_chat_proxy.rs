@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, env, sync::OnceLock, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -26,6 +31,7 @@ const DEFAULT_DOWNLOAD_RESPONSE_MAX_BYTES: usize = 100 * 1024 * 1024;
 const DEFAULT_JSON_RESPONSE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const GOOGLE_CHAT_DWD_SUBJECT_HEADER: &str = "x-centaur-google-chat-dwd-subject";
 
 pub(crate) fn google_chat_proxy_router() -> Router<AppState> {
     Router::new()
@@ -79,6 +85,8 @@ struct GoogleChatProxyJwt {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct GoogleChatClaims {
+    #[serde(default)]
+    reader_subjects: BTreeMap<String, String>,
     #[serde(default)]
     send_spaces: Vec<String>,
     #[serde(default)]
@@ -195,13 +203,14 @@ async fn list_messages(
     Path(space_id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::History)?;
-    forward(
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::History)?;
+    forward_as(
         Method::GET,
         &format!("/api/chat/{space}/messages"),
         page_query(&query)?.as_deref(),
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await
 }
@@ -211,15 +220,16 @@ async fn list_thread_messages(
     Path((space_id, thread_id)): Path<(String, String)>,
     Query(mut query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::History)?;
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::History)?;
     validate_resource_id(&thread_id, "thread")?;
     query.filter = Some(format!("thread.name = {space}/threads/{thread_id}"));
-    forward(
+    forward_as(
         Method::GET,
         &format!("/api/chat/{space}/messages"),
         page_query(&query)?.as_deref(),
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await
 }
@@ -229,13 +239,14 @@ async fn list_members(
     Path(space_id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Members)?;
-    forward(
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Members)?;
+    forward_as(
         Method::GET,
         &format!("/api/chat/{space}/members"),
         page_query(&query)?.as_deref(),
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await
 }
@@ -245,14 +256,15 @@ async fn list_reactions(
     Path((space_id, message_id)): Path<(String, String)>,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Reactions)?;
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Reactions)?;
     validate_resource_id(&message_id, "message")?;
-    forward(
+    forward_as(
         Method::GET,
         &format!("/api/chat/{space}/messages/{message_id}/reactions"),
         page_query(&query)?.as_deref(),
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await
 }
@@ -279,12 +291,13 @@ async fn list_files(
     Path(space_id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Download)?;
-    let page = forward_json(
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Download)?;
+    let page = forward_json_as(
         Method::GET,
         &format!("/api/chat/{space}/messages"),
         page_query(&query)?.as_deref(),
         None,
+        subject.as_deref(),
     )
     .await?;
     let files = files_from_messages(&space, &page);
@@ -337,14 +350,15 @@ async fn update_message(
     Path((space_id, message_id)): Path<(String, String)>,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Update)?;
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Update)?;
     validate_resource_id(&message_id, "message")?;
-    forward(
+    forward_as(
         Method::PATCH,
         &format!("/api/chat/{space}/messages/{message_id}"),
         None,
         body,
         config()?.max_json_body_bytes,
+        subject.as_deref(),
     )
     .await
 }
@@ -353,14 +367,15 @@ async fn delete_message(
     headers: HeaderMap,
     Path((space_id, message_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Delete)?;
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Delete)?;
     validate_resource_id(&message_id, "message")?;
-    forward(
+    forward_as(
         Method::DELETE,
         &format!("/api/chat/{space}/messages/{message_id}"),
         None,
         Body::empty(),
         0,
+        subject.as_deref(),
     )
     .await
 }
@@ -370,13 +385,14 @@ async fn upload_attachment(
     Path(space_id): Path<String>,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let space = authorized_space(&headers, &space_id, Operation::Upload)?;
-    forward(
+    let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Upload)?;
+    forward_as(
         Method::POST,
         &format!("/api/chat/{space}/attachments"),
         None,
         body,
         config()?.max_upload_body_bytes,
+        subject.as_deref(),
     )
     .await
 }
@@ -472,6 +488,28 @@ fn authorized_space(
         "JWT is not authorized for this Google Chat operation",
     )?;
     Ok(space)
+}
+
+fn authorized_space_with_reader(
+    headers: &HeaderMap,
+    space_id: &str,
+    operation: Operation,
+) -> Result<(String, Option<String>), ApiError> {
+    let claims = authorize(headers)?;
+    let space = normalize_space(space_id)?;
+    ensure_allowed(
+        operation_spaces(&claims.google_chat, operation),
+        &space,
+        "Google Chat operation is not allowed for this space",
+    )?;
+    let subject = claims
+        .google_chat
+        .reader_subjects
+        .get(&space)
+        .map(String::as_str)
+        .map(normalize_target_identity)
+        .transpose()?;
+    Ok((space, subject))
 }
 
 fn authorized_dm_target(headers: &HeaderMap, value: &str) -> Result<String, ApiError> {
@@ -655,12 +693,23 @@ async fn forward_json(
     query: Option<&str>,
     body: Option<Vec<u8>>,
 ) -> Result<Value, ApiError> {
-    let response = forward(
+    forward_json_as(method, path, query, body, None).await
+}
+
+async fn forward_json_as(
+    method: Method,
+    path: &str,
+    query: Option<&str>,
+    body: Option<Vec<u8>>,
+    subject: Option<&str>,
+) -> Result<Value, ApiError> {
+    let response = forward_as(
         method,
         path,
         query,
         body.map(Body::from).unwrap_or_else(Body::empty),
         DEFAULT_JSON_BODY_MAX_BYTES,
+        subject,
     )
     .await?;
     let status = response.status();
@@ -685,6 +734,17 @@ async fn forward(
     body: Body,
     max_body_bytes: usize,
 ) -> Result<Response, ApiError> {
+    forward_as(method, path, query, body, max_body_bytes, None).await
+}
+
+async fn forward_as(
+    method: Method,
+    path: &str,
+    query: Option<&str>,
+    body: Body,
+    max_body_bytes: usize,
+    subject: Option<&str>,
+) -> Result<Response, ApiError> {
     let config = config()?;
     let is_download = method == Method::GET && path.ends_with("/download");
     let max_response_bytes = if is_download {
@@ -702,6 +762,9 @@ async fn forward(
         .request(method, url)
         .bearer_auth(&config.internal_key)
         .header(header::CONTENT_TYPE.as_str(), "application/json");
+    if let Some(subject) = subject {
+        request = request.header(GOOGLE_CHAT_DWD_SUBJECT_HEADER, subject);
+    }
     if max_body_bytes > 0 {
         let bytes = to_bytes(body, max_body_bytes).await.map_err(|_| {
             ApiError::PayloadTooLarge(
@@ -981,6 +1044,7 @@ mod tests {
         method: Method,
         target: String,
         body: Vec<u8>,
+        reader_subject: Option<String>,
     }
 
     struct EnvGuard(Vec<(String, Option<OsString>)>);
@@ -1034,6 +1098,7 @@ mod tests {
     fn authorized_jwt() -> String {
         let spaces = ["spaces/S", "spaces/ERROR", "spaces/TIMEOUT"];
         let claims = json!({
+            "reader_subjects": { "spaces/S": "reader@example.com" },
             "send_spaces": spaces,
             "update_spaces": spaces,
             "delete_spaces": spaces,
@@ -1069,6 +1134,10 @@ mod tests {
 
     fn claims() -> GoogleChatClaims {
         GoogleChatClaims {
+            reader_subjects: BTreeMap::from([(
+                "spaces/HISTORY".to_owned(),
+                "reader@example.com".to_owned(),
+            )]),
             send_spaces: vec!["spaces/SEND".to_owned()],
             update_spaces: vec!["spaces/UPDATE".to_owned()],
             delete_spaces: vec!["spaces/DELETE".to_owned()],
@@ -1544,6 +1613,11 @@ mod tests {
                     method: parts.method,
                     target: target.clone(),
                     body,
+                    reader_subject: parts
+                        .headers
+                        .get(GOOGLE_CHAT_DWD_SUBJECT_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
                 });
                 if target.starts_with("/api/chat/spaces?") {
                     return Json(json!({"spaces": [{"name": "spaces/S"}]})).into_response();
@@ -1658,39 +1732,59 @@ mod tests {
             vec![
                 observed(Method::GET, "/api/chat/spaces?page_size=3", ""),
                 observed(Method::GET, "/api/chat/spaces/S", ""),
-                observed(
+                observed_as(
                     Method::GET,
                     "/api/chat/spaces/S/messages?page_size=4&page_token=next&filter=createTime%20%3E%20%222026-08-13T00%3A00%3A00Z%22&order_by=createTime%20DESC",
-                    ""
+                    "",
+                    "reader@example.com"
                 ),
                 observed(
                     Method::POST,
                     "/api/chat/spaces/S/messages",
                     r#"{"text":"send"}"#
                 ),
-                observed(
+                observed_as(
                     Method::PATCH,
                     "/api/chat/spaces/S/messages/M",
-                    r#"{"text":"edit"}"#
+                    r#"{"text":"edit"}"#,
+                    "reader@example.com"
                 ),
-                observed(Method::DELETE, "/api/chat/spaces/S/messages/M", ""),
-                observed(
+                observed_as(
+                    Method::DELETE,
+                    "/api/chat/spaces/S/messages/M",
+                    "",
+                    "reader@example.com"
+                ),
+                observed_as(
                     Method::GET,
                     "/api/chat/spaces/S/messages?page_size=5&filter=thread.name%20%3D%20spaces%2FS%2Fthreads%2FT",
-                    ""
+                    "",
+                    "reader@example.com"
                 ),
-                observed(Method::GET, "/api/chat/spaces/S/members?page_size=6", ""),
-                observed(
+                observed_as(
+                    Method::GET,
+                    "/api/chat/spaces/S/members?page_size=6",
+                    "",
+                    "reader@example.com"
+                ),
+                observed_as(
                     Method::GET,
                     "/api/chat/spaces/S/messages/M/reactions?page_size=7",
-                    ""
+                    "",
+                    "reader@example.com"
                 ),
-                observed(
+                observed_as(
                     Method::POST,
                     "/api/chat/spaces/S/attachments",
-                    r#"{"file":"body"}"#
+                    r#"{"file":"body"}"#,
+                    "reader@example.com"
                 ),
-                observed(Method::GET, "/api/chat/spaces/S/messages?page_size=8", ""),
+                observed_as(
+                    Method::GET,
+                    "/api/chat/spaces/S/messages?page_size=8",
+                    "",
+                    "reader@example.com"
+                ),
                 observed(
                     Method::GET,
                     "/api/chat/spaces/S/messages/M/attachments/A",
@@ -1730,6 +1824,14 @@ mod tests {
             method,
             target: target.to_owned(),
             body: body.as_bytes().to_vec(),
+            reader_subject: None,
+        }
+    }
+
+    fn observed_as(method: Method, target: &str, body: &str, subject: &str) -> ObservedRequest {
+        ObservedRequest {
+            reader_subject: Some(subject.to_owned()),
+            ..observed(method, target, body)
         }
     }
 

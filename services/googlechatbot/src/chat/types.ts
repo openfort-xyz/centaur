@@ -188,6 +188,7 @@ export type GoogleChatWorkflowEvent = {
 // Field reference: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages#Message
 export type ChatListMessage = {
   name?: string
+  clientAssignedMessageId?: string
   text?: string
   formattedText?: string
   argumentText?: string

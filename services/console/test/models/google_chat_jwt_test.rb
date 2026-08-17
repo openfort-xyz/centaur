@@ -48,6 +48,59 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
     end
   end
 
+  test "JWT maps authorized DM spaces to server-derived reader subjects" do
+    principal = principals(:acme_channel)
+    dm = Principal.create!(
+      foreign_id: "gchat-space-dm",
+      name: "Google Chat DM",
+      kind: "gchat_dm",
+      labels: { "gchat_space_id" => "DM", "google_email" => " Reader@Example.COM " },
+      created_by: principal.created_by
+    )
+    principal.update!(labels: principal.labels.merge(
+      "google_chat_reader_subjects" => {
+        "spaces/LEGACY" => " Legacy@Example.COM ",
+        "spaces/UNAUTHORIZED" => "other@example.com"
+      }
+    ))
+    principal.google_chat_space_permissions.create!(space_name: "spaces/DM", history_enabled: true)
+    principal.google_chat_space_permissions.create!(space_name: "spaces/LEGACY", history_enabled: true)
+    principal.google_chat_space_permissions.create!(space_name: "spaces/CHANNEL", history_enabled: true)
+
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      claims = jwt_payload(ApiServer::Jwt.encode_for_principal(principal))
+      assert_equal({
+        "spaces/DM" => "reader@example.com",
+        "spaces/LEGACY" => "legacy@example.com"
+      }, claims.dig("google_chat", "reader_subjects"))
+
+      principal.update!(labels: principal.labels.merge(
+        "google_chat_reader_subjects" => {
+          "spaces/DM" => "other@example.com",
+          "spaces/LEGACY" => "legacy@example.com"
+        }
+      ))
+      assert_equal(
+        { "spaces/LEGACY" => "legacy@example.com" },
+        jwt_payload(ApiServer::Jwt.encode_for_principal(principal)).dig("google_chat", "reader_subjects")
+      )
+
+      principal.update!(labels: principal.labels.merge(
+        "google_chat_reader_subjects" => { "spaces/LEGACY" => "legacy@example.com" }
+      ))
+      dm.update!(labels: dm.labels.merge("google_email" => "invalid"))
+      assert_equal(
+        { "spaces/LEGACY" => "legacy@example.com" },
+        jwt_payload(ApiServer::Jwt.encode_for_principal(principal)).dig("google_chat", "reader_subjects")
+      )
+
+      principal.update!(labels: principal.labels.merge(
+        "google_chat_reader_subjects" => { "spaces/LEGACY" => "invalid" }
+      ))
+      refute jwt_payload(ApiServer::Jwt.encode_for_principal(principal)).dig("google_chat").key?("reader_subjects")
+    end
+  end
+
   test "JWT exists for Chat-only grants, rotates every 15 minutes and is nil without either platform" do
     principal = principals(:acme_user_bob)
     principal.google_chat_dm_permissions.create!(target_identity: "person@example.com", setup_enabled: true)
