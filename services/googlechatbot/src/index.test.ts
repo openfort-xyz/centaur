@@ -158,7 +158,9 @@ describe('api-rs-only /api/chat routes', () => {
     bot.client.listMemberships = async () => ({ memberships: [] })
     bot.client.listMessageReactions = async () => ({ reactions: [] })
     bot.client.canReadReactions = () => true
-    bot.client.getAttachment = async () => ({ name: 'attachments/F1' })
+    bot.client.getAttachment = async () => ({
+      name: 'spaces/A/messages/M1/attachments/F1'
+    })
     bot.client.setupDm = async () => ({ name: 'spaces/DM' })
     bot.client.canSetupDm = () => true
     const headers = { Authorization: 'Bearer secret' }
@@ -357,12 +359,15 @@ describe('api-rs-only /api/chat routes', () => {
 
   test('streams message-qualified attachment bytes with safe headers', async () => {
     const bot = appWith({ GOOGLECHATBOT_INTERNAL_API_KEY: 'secret' })
-    bot.client.getAttachment = async () => ({
-      name: 'spaces/A/messages/M1/attachments/F1',
-      contentName: 'report\r\nunsafe.pdf',
-      contentType: 'application/pdf',
-      source: 'UPLOADED_CONTENT',
-      attachmentDataRef: { resourceName: 'media/F1' }
+    bot.client.resolveAttachment = async () => ({
+      attachment: {
+        name: 'spaces/A/messages/M1/attachments/F1',
+        contentName: 'report\r\nunsafe.pdf',
+        contentType: 'application/pdf',
+        source: 'UPLOADED_CONTENT',
+        attachmentDataRef: { resourceName: 'media/F1' }
+      },
+      credential: 'app'
     })
     bot.client.downloadAttachmentResource = async () => ({
       data: new TextEncoder().encode('%PDF').buffer,
@@ -381,23 +386,54 @@ describe('api-rs-only /api/chat routes', () => {
     expect(await response.text()).toBe('%PDF')
   })
 
-  test('rejects mismatched attachment metadata before downloading', async () => {
+  test('uses the trusted delegated subject for attachment metadata and media', async () => {
     const bot = appWith({ GOOGLECHATBOT_INTERNAL_API_KEY: 'secret' })
-    let downloaded = false
-    bot.client.getAttachment = async () => ({
-      name: 'spaces/OTHER/messages/M1/attachments/F1',
-      contentName: 'wrong.txt'
-    })
-    bot.client.downloadAttachmentResource = async () => {
-      downloaded = true
-      throw new Error('must not run')
+    const subjects: Array<string | undefined> = []
+    let mediaCredential: unknown
+    bot.client.getAttachment = (async (_message, _attachment, subject) => {
+      subjects.push(subject)
+      return { name: 'spaces/A/messages/M1/attachments/F1' }
+    }) as typeof bot.client.getAttachment
+    bot.client.resolveAttachment = (async (_message, _attachment, subject) => {
+      subjects.push(subject)
+      return {
+        attachment: {
+          name: 'spaces/A/messages/M1/attachments/F1',
+          contentName: 'report.pdf',
+          contentType: 'application/pdf',
+          source: 'UPLOADED_CONTENT',
+          attachmentDataRef: { resourceName: 'media/F1' }
+        },
+        credential: { kind: 'delegated-reader', subject: subject! }
+      }
+    }) as typeof bot.client.resolveAttachment
+    bot.client.downloadAttachmentResource = (async (_attachment, credential) => {
+      mediaCredential = credential
+      return {
+        data: new TextEncoder().encode('%PDF').buffer,
+        mimeType: 'application/pdf',
+        name: 'report.pdf',
+        size: 4
+      }
+    }) as typeof bot.client.downloadAttachmentResource
+    const headers = {
+      Authorization: 'Bearer secret',
+      'x-centaur-google-chat-dwd-subject': 'reader@example.com'
     }
-    const response = await bot.app.request(
+
+    expect((await bot.app.request(
+      '/api/chat/spaces/A/messages/M1/attachments/F1',
+      { headers }
+    )).status).toBe(200)
+    expect((await bot.app.request(
       '/api/chat/spaces/A/messages/M1/attachments/F1/download',
-      { headers: { Authorization: 'Bearer secret' } }
-    )
-    expect(response.status).toBe(502)
-    expect(downloaded).toBe(false)
+      { headers }
+    )).status).toBe(200)
+    expect(subjects).toEqual(['reader@example.com', 'reader@example.com'])
+    expect(mediaCredential).toEqual({
+      kind: 'delegated-reader',
+      subject: 'reader@example.com'
+    })
   })
 })
 

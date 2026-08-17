@@ -449,6 +449,108 @@ describe('ChatEdgeClient owned message mutation', () => {
     expect(authorizations).toEqual(['Bearer arnau-upload-token', 'Bearer arnau-upload-token'])
   })
 
+  test('resolves and downloads a user-authored attachment with one delegated read credential', async () => {
+    const assertions: Array<Record<string, string>> = []
+    const requests: Array<{ url: string; authorization: string }> = []
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        assertions.push(JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString()))
+        return Response.json({ access_token: 'reader-token', expires_in: 3600 })
+      }
+      requests.push({
+        url,
+        authorization: String(new Headers(init?.headers).get('authorization'))
+      })
+      if (url.endsWith('/spaces/A/messages/M1')) {
+        return Response.json({
+          name: 'spaces/A/messages/M1',
+          attachment: [{
+            name: 'spaces/A/messages/M1/attachments/F1',
+            contentName: 'report.txt',
+            contentType: 'text/plain',
+            source: 'UPLOADED_CONTENT',
+            attachmentDataRef: { resourceName: 'media/F1' }
+          }]
+        })
+      }
+      return new Response('hello', { headers: { 'content-type': 'text/plain' } })
+    }) as typeof fetch)
+
+    const resolved = await client.resolveAttachment(
+      'spaces/A/messages/M1',
+      'F1',
+      'reader@example.com'
+    )
+    expect(await client.downloadAttachmentResource(
+      resolved.attachment,
+      resolved.credential
+    )).toMatchObject({ name: 'report.txt', mimeType: 'text/plain', size: 5 })
+
+    expect(assertions).toEqual([expect.objectContaining({
+      sub: 'reader@example.com',
+      scope: 'https://www.googleapis.com/auth/chat.messages.readonly'
+    })])
+    expect(requests.map(request => request.url)).toEqual([
+      'https://chat.googleapis.com/v1/spaces/A/messages/M1',
+      'https://chat.googleapis.com/v1/media/media/F1?alt=media'
+    ])
+    expect(requests.map(request => request.authorization)).toEqual([
+      'Bearer reader-token',
+      'Bearer reader-token'
+    ])
+  })
+
+  test.each([
+    ['parent message', {
+      name: 'spaces/OTHER/messages/M1',
+      attachment: [{ name: 'spaces/A/messages/M1/attachments/F1' }]
+    }, 'parent message'],
+    ['attachment resource', {
+      name: 'spaces/A/messages/M1',
+      attachment: [{ name: 'spaces/OTHER/messages/M1/attachments/F1' }]
+    }, 'attachment resource']
+  ] as const)('rejects a mismatched delegated %s', async (_case, message, expected) => {
+    const client = await configuredClient((async (input: RequestInfo | URL) =>
+      String(input).includes('oauth2.googleapis.com/token')
+        ? Response.json({ access_token: 'reader-token', expires_in: 3600 })
+        : Response.json(message)
+    ) as typeof fetch)
+
+    await expect(client.resolveAttachment(
+      'spaces/A/messages/M1',
+      'F1',
+      'reader@example.com'
+    )).rejects.toThrow(expected)
+  })
+
+  test('does not fall back to app auth when delegated attachment access is denied', async () => {
+    const assertions: Array<Record<string, string>> = []
+    const urls: string[] = []
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        assertions.push(JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString()))
+        return Response.json({ access_token: 'reader-token', expires_in: 3600 })
+      }
+      urls.push(url)
+      return Response.json({ error: 'denied' }, { status: 403 })
+    }) as typeof fetch)
+
+    await expect(client.resolveAttachment(
+      'spaces/A/messages/M1',
+      'F1',
+      'reader@example.com'
+    )).rejects.toBeInstanceOf(ChatApiError)
+    expect(assertions).toEqual([expect.objectContaining({
+      sub: 'reader@example.com',
+      scope: 'https://www.googleapis.com/auth/chat.messages.readonly'
+    })])
+    expect(urls).toEqual(['https://chat.googleapis.com/v1/spaces/A/messages/M1'])
+  })
+
 })
 
 describe('ChatEdgeClient conversation resources', () => {
@@ -647,8 +749,11 @@ describe('ChatEdgeClient conversation resources', () => {
   test('uses message-qualified reaction and attachment resources', async () => {
     const calls: string[] = []
     globalThis.fetch = (async (input: RequestInfo | URL) => {
-      calls.push(String(input))
-      return Response.json({})
+      const url = String(input)
+      calls.push(url)
+      return Response.json(url.includes('/attachments/ATT.1')
+        ? { name: 'spaces/A/messages/M.1/attachments/ATT.1' }
+        : {})
     }) as typeof fetch
     const client = new ChatEdgeClient(loadConfig({}))
 

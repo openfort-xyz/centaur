@@ -455,6 +455,8 @@ export function createGooglechatbot(
   app.get('/api/chat/spaces/:spaceId/messages/:messageId/attachments/:attachmentId', async c => {
     const denied = requireInternalAuth(c)
     if (denied) return denied
+    const subject = delegatedSubject(c)
+    if (subject instanceof InputError) return c.json({ error: subject.message }, subject.status)
     const spaceName = spaceResource(c.req.param('spaceId'))
     const messageName = messageResource(c.req.param('spaceId'), c.req.param('messageId'))
     const attachmentId = c.req.param('attachmentId')
@@ -462,7 +464,7 @@ export function createGooglechatbot(
       return c.json({ error: 'invalid Google Chat resource ID' }, 400)
     }
     try {
-      return c.json(await client.getAttachment(messageName, attachmentId))
+      return c.json(await client.getAttachment(messageName, attachmentId, subject))
     } catch (error) {
       return internalFailure(c, 'googlechatbot_outbound_get_attachment_failed', error)
     }
@@ -473,18 +475,19 @@ export function createGooglechatbot(
     async c => {
       const denied = requireInternalAuth(c)
       if (denied) return denied
+      const subject = delegatedSubject(c)
+      if (subject instanceof InputError) return c.json({ error: subject.message }, subject.status)
       const messageName = messageResource(c.req.param('spaceId'), c.req.param('messageId'))
       const attachmentId = c.req.param('attachmentId')
       if (!messageName || !validResourceId(attachmentId)) {
         return c.json({ error: 'invalid Google Chat resource ID' }, 400)
       }
       try {
-        const attachment = await client.getAttachment(messageName, attachmentId)
-        const expectedName = `${messageName}/attachments/${attachmentId}`
-        if (attachment.name && attachment.name !== expectedName) {
-          return c.json({ error: 'Google Chat attachment resource mismatch' }, 502)
-        }
-        const downloaded = await client.downloadAttachmentResource(attachment)
+        const resolved = await client.resolveAttachment(messageName, attachmentId, subject)
+        const downloaded = await client.downloadAttachmentResource(
+          resolved.attachment,
+          resolved.credential
+        )
         return new Response(downloaded.data, {
           headers: {
             'Content-Type': downloaded.mimeType,

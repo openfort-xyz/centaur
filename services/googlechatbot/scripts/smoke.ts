@@ -366,13 +366,16 @@ async function runInternalRouteSmoke(runtime: ReturnType<typeof createGooglechat
     return { attachmentDataRef: { resourceName: 'media/uploaded' } }
   }
   runtime.client.createAttachmentMessage = async spaceName => ({ name: `${spaceName}/messages/FILE` })
-  runtime.client.getAttachment = async (messageName, attachmentId) => ({
-    name: `${messageName}/attachments/${attachmentId}`,
-    contentName: 'download.txt',
-    contentType: 'text/plain',
-    size: '10',
-    source: 'UPLOADED_CONTENT',
-    attachmentDataRef: { resourceName: 'media/download' }
+  runtime.client.resolveAttachment = async (messageName, attachmentId) => ({
+    attachment: {
+      name: `${messageName}/attachments/${attachmentId}`,
+      contentName: 'download.txt',
+      contentType: 'text/plain',
+      size: '10',
+      source: 'UPLOADED_CONTENT',
+      attachmentDataRef: { resourceName: 'media/download' }
+    },
+    credential: 'app'
   })
   runtime.client.downloadAttachmentResource = async () => {
     mutations.push('download')
