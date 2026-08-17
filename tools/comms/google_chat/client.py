@@ -77,6 +77,25 @@ def _headers() -> dict[str, str]:
     return headers
 
 
+def _raise_for_status(response: Any) -> None:
+    try:
+        response.raise_for_status()
+    except Exception as exc:
+        status = getattr(response, "status_code", None)
+        category = (
+            "unauthenticated"
+            if status == 401
+            else "permission_denied"
+            if status == 403
+            else "rate_limited"
+            if status == 429
+            else "upstream"
+            if status is not None and status >= 500
+            else "request"
+        )
+        raise GoogleChatApiError(status, category) from exc
+
+
 class GoogleChatClient:
     def _request(
         self,
@@ -100,22 +119,7 @@ class GoogleChatClient:
             json=json,
             timeout=timeout,
         )
-        try:
-            response.raise_for_status()
-        except Exception as exc:
-            status = getattr(response, "status_code", None)
-            category = (
-                "unauthenticated"
-                if status == 401
-                else "permission_denied"
-                if status == 403
-                else "rate_limited"
-                if status == 429
-                else "upstream"
-                if status is not None and status >= 500
-                else "request"
-            )
-            raise GoogleChatApiError(status, category) from exc
+        _raise_for_status(response)
         return response.json() if response.text else {}
 
     def _download_request(
@@ -134,22 +138,7 @@ class GoogleChatClient:
             headers=_headers(),
             timeout=120.0,
         ) as response:
-            try:
-                response.raise_for_status()
-            except Exception as exc:
-                status = getattr(response, "status_code", None)
-                category = (
-                    "unauthenticated"
-                    if status == 401
-                    else "permission_denied"
-                    if status == 403
-                    else "rate_limited"
-                    if status == 429
-                    else "upstream"
-                    if status is not None and status >= 500
-                    else "request"
-                )
-                raise GoogleChatApiError(status, category) from exc
+            _raise_for_status(response)
             content_type = response.headers.get("content-type", "application/octet-stream")
             if content_type.lower().startswith("text/html"):
                 raise GoogleChatApiError(response.status_code, "unexpected_content")

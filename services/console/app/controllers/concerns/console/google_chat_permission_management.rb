@@ -50,15 +50,13 @@ module Console
     def google_chat_permission_form_rows(owner, association:, target:, flags:)
       attributes_key = "#{association}_attributes"
       permitted = params.require(owner.model_name.param_key).permit(
-        attributes_key => [ :id, target, :_destroy, *flags ]
+        attributes_key => [ :id, target, *flags ]
       )
       rows = permitted.fetch(attributes_key, {}).values
       existing = owner.public_send(association).index_by { |permission| permission.id.to_s }
 
       rows.filter_map do |row|
         attrs = row.to_h.with_indifferent_access
-        next if ActiveModel::Type::Boolean.new.cast(attrs[:_destroy])
-
         target_value = google_chat_target_for_form_row(attrs, existing, target)
         next if target_value.blank?
 

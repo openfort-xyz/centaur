@@ -320,13 +320,20 @@ def test_download_rejects_html_and_cli_size_overflow(fake_httpx: _FakeHttpx) -> 
         (503, "upstream"),
     ],
 )
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda client: client.list_spaces(),
+        lambda client: client.download_file("spaces/S/messages/M/attachments/A"),
+    ],
+)
 def test_proxy_failures_are_classified_without_response_body(
-    fake_httpx: _FakeHttpx, status: int, category: str
+    fake_httpx: _FakeHttpx, status: int, category: str, call
 ) -> None:
     fake_httpx.responses = [_FakeResponse({"secret": "must-not-leak"}, status)]
 
     with pytest.raises(gc.GoogleChatApiError) as caught:
-        gc.GoogleChatClient().list_spaces()
+        call(gc.GoogleChatClient())
 
     assert caught.value.category == category
     assert "must-not-leak" not in str(caught.value)
