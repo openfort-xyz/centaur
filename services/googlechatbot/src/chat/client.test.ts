@@ -97,6 +97,34 @@ describe('ChatEdgeClient owned message mutation', () => {
     expect(mutations).toEqual(['Bearer bot-token'])
   })
 
+  test('uses a trusted delegated reader when app auth does not resolve members/app', async () => {
+    const mutations: string[] = []
+    const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        const payload = JSON.parse(Buffer.from(assertion.split('.')[1] ?? '', 'base64url').toString())
+        return Response.json({
+          access_token: payload.sub ? 'reader-token' : 'bot-token',
+          expires_in: 3600
+        })
+      }
+      if (url.endsWith('/members/app')) {
+        return new Headers(init?.headers).get('authorization') === 'Bearer reader-token'
+          ? Response.json({ member: { name: 'users/123', type: 'BOT' } })
+          : Response.json({ error: 'membership unavailable' }, { status: 403 })
+      }
+      if (init?.method === 'GET') {
+        return Response.json({ sender: { name: 'users/123', type: 'BOT' } })
+      }
+      mutations.push(String(new Headers(init?.headers).get('authorization')))
+      return Response.json({ name: 'spaces/A/messages/M1', text: 'changed' })
+    }) as typeof fetch)
+
+    await client.updateOwnedMessage('spaces/A', 'spaces/A/messages/M1', { text: 'changed' })
+    expect(mutations).toEqual(['Bearer bot-token'])
+  })
+
   test('uses a trusted DM reader only to prove bot ownership before app mutation', async () => {
     const mutations: string[] = []
     const client = await configuredClient((async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -111,7 +139,9 @@ describe('ChatEdgeClient owned message mutation', () => {
         })
       }
       if (url.endsWith('/members/app')) {
-        return Response.json({ member: { name: 'users/123', type: 'BOT' } })
+        return authorization === 'Bearer reader-token'
+          ? Response.json({ member: { name: 'users/123', type: 'BOT' } })
+          : Response.json({ error: 'membership unavailable' }, { status: 403 })
       }
       if (init?.method === 'GET') {
         return authorization === 'Bearer reader-token'
