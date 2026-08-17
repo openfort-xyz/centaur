@@ -13,11 +13,11 @@ use nanocodex::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::nanocodex_subagents::{ChildAgents, with_subagents};
+use crate::server::{AttachmentIntegrity, AttachmentIntegrityMetadata};
 use crate::util::default_codex_home;
 use crate::{HarnessServerError, Result};
 
@@ -244,13 +244,7 @@ enum BlocksCommand {
 enum AttachmentStage {
     Pending {
         path: PathBuf,
-        next_chunk_index: u64,
-        chunk_count: u64,
-        byte_size: u64,
-        received_bytes: u64,
-        sha256: String,
-        hasher: Sha256,
-        verified_integrity: bool,
+        integrity: AttachmentIntegrity,
     },
     Complete(PathBuf),
 }
@@ -343,19 +337,14 @@ fn parse_blocks_line(
                 return Ok(BlocksCommand::AttachmentChunk);
             }
             let chunk_index = required_u64(parsed.chunk_index, "chunkIndex")?;
-            let (chunk_count, byte_size, expected_sha256, verified_integrity) =
-                match (parsed.chunk_count, parsed.byte_size, parsed.sha256) {
-                    (None, None, None) => (0, 100 * 1024 * 1024, String::new(), false),
-                    (Some(count), Some(size), Some(hash))
-                        if count > 0
-                            && size <= 100 * 1024 * 1024
-                            && hash.len() == 64
-                            && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
-                    {
-                        (count, size, hash.to_ascii_lowercase(), true)
-                    }
-                    _ => return invalid_chunk(&id, "invalid integrity metadata"),
-                };
+            let integrity_metadata = AttachmentIntegrityMetadata::parse(
+                parsed.chunk_count,
+                parsed.byte_size,
+                parsed.sha256.as_deref(),
+            )
+            .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+                message: format!("invalid attachment chunk for {id}: invalid integrity metadata"),
+            })?;
             if matches!(staged.get(&id), Some(AttachmentStage::Complete(_))) {
                 return invalid_chunk(&id, "duplicate finalized attachment");
             }
@@ -367,29 +356,15 @@ fn parse_blocks_line(
                     id.clone(),
                     AttachmentStage::Pending {
                         path: temporary_attachment_path(parsed.name.as_deref()),
-                        next_chunk_index: 0,
-                        chunk_count,
-                        byte_size,
-                        received_bytes: 0,
-                        sha256: expected_sha256.clone(),
-                        hasher: Sha256::new(),
-                        verified_integrity,
+                        integrity: AttachmentIntegrity::new(integrity_metadata.clone()),
                     },
                 );
             }
-            let valid = matches!(staged.get(&id), Some(AttachmentStage::Pending {
-                next_chunk_index,
-                chunk_count: saved_count,
-                byte_size: saved_size,
-                sha256: saved_hash,
-                verified_integrity: saved_integrity,
-                ..
-            }) if *next_chunk_index == chunk_index
-                && *saved_integrity == verified_integrity
-                && (!verified_integrity || (*saved_count == chunk_count
-                    && *saved_size == byte_size
-                    && *saved_hash == expected_sha256
-                    && parsed.final_chunk == (chunk_index + 1 == chunk_count))));
+            let valid = matches!(
+                staged.get(&id),
+                Some(AttachmentStage::Pending { integrity, .. })
+                    if integrity.accepts(&integrity_metadata, chunk_index, parsed.final_chunk)
+            );
             if !valid {
                 discard_nanocodex_stage(staged, &id);
                 return invalid_chunk(&id, "invalid chunk sequence");
@@ -406,46 +381,25 @@ fn parse_blocks_line(
                 }
             };
             let stage = staged.get_mut(&id).expect("stage exists");
-            let AttachmentStage::Pending {
-                path,
-                next_chunk_index,
-                received_bytes,
-                hasher,
-                ..
-            } = stage
-            else {
+            let AttachmentStage::Pending { path, integrity } = stage else {
                 unreachable!()
             };
-            *received_bytes += bytes.len() as u64;
-            if *received_bytes > byte_size {
+            if !integrity.append(&bytes) {
                 discard_nanocodex_stage(staged, &id);
                 return invalid_chunk(&id, "chunks exceed declared byteSize");
             }
-            hasher.update(&bytes);
             OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)?
                 .write_all(&bytes)?;
-            *next_chunk_index += 1;
             if parsed.final_chunk {
-                let AttachmentStage::Pending {
-                    path,
-                    received_bytes,
-                    sha256,
-                    hasher,
-                    verified_integrity,
-                    ..
-                } = staged.remove(&id).expect("stage exists")
+                let AttachmentStage::Pending { path, integrity } =
+                    staged.remove(&id).expect("stage exists")
                 else {
                     unreachable!()
                 };
-                let actual_sha256 = hasher
-                    .finalize()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                if verified_integrity && (received_bytes != byte_size || actual_sha256 != sha256) {
+                if !integrity.verified() {
                     let _ = std::fs::remove_file(path);
                     return invalid_chunk(&id, "attachment size or hash mismatch");
                 }

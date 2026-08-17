@@ -711,45 +711,8 @@ export class ChatEdgeClient {
     spaceName: string,
     opts: ChatPageOptions = {}
   ): Promise<ChatMembershipPage> {
-    return this.listResource(spaceName, 'members', opts)
-  }
-
-  async listThreadMessages(
-    spaceName: string,
-    threadName: string,
-    opts: ChatPageOptions = {}
-  ): Promise<ChatMessagePage> {
-    return this.listMessages(spaceName, {
-      ...opts,
-      filter: `thread.name = ${threadName}`
-    })
-  }
-
-  /** Google exposes reactions below each message, so this space-level method
-   * aggregates one bounded message page for the internal scoped proxy. */
-  async listReactions(
-    spaceName: string,
-    opts: ChatPageOptions = {}
-  ): Promise<ChatReactionPage> {
-    const messages = await this.listMessages(spaceName, opts)
-    const namedMessages = (messages.messages ?? []).filter(message => message.name)
-    const pages: ChatReactionPage[] = []
-    for (let index = 0; index < namedMessages.length; index += 1) {
-      pages.push(await this.listMessageReactions(namedMessages[index]!.name!, {
-          pageSize: opts.pageSize,
-          credential: opts.credential
-      }))
-    }
-    return {
-      reactions: pages.flatMap((page, index) =>
-        (page.reactions ?? []).map(reaction => ({
-          ...reaction,
-          messageName: namedMessages[index]?.name
-        }))
-      ),
-      ...(messages.nextPageToken ? { nextPageToken: messages.nextPageToken } : {}),
-      ...(pages.some(page => page.nextPageToken) ? { incomplete: true } : {})
-    }
+    const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
+    return this.listNamedResource(`spaces/${id}`, 'members', opts)
   }
 
   async listMessageReactions(
@@ -790,17 +753,6 @@ export class ChatEdgeClient {
     return scheduled
   }
 
-  async listAttachments(
-    spaceName: string,
-    opts: { pageSize?: number; pageToken?: string } = {}
-  ): Promise<{ attachments: Array<Record<string, unknown>>; nextPageToken?: string }> {
-    const page = await this.listMessages(spaceName, opts)
-    return {
-      attachments: (page.messages ?? []).flatMap(message => message.attachment ?? []),
-      ...(page.nextPageToken ? { nextPageToken: page.nextPageToken } : {})
-    }
-  }
-
   async getAttachment(messageName: string, attachmentId: string): Promise<ChatAttachmentResource> {
     return this.request<ChatAttachmentResource>(
       'GET',
@@ -808,11 +760,8 @@ export class ChatEdgeClient {
     )
   }
 
-  async setupDm(
-    targetIdentity: string,
-    credential: 'dm-setup-user' = 'dm-setup-user'
-  ): Promise<ChatSpaceResource> {
-    if (credential !== 'dm-setup-user' || !validEmail(targetIdentity)) {
+  async setupDm(targetIdentity: string): Promise<ChatSpaceResource> {
+    if (!validEmail(targetIdentity)) {
       throw new ChatConfigurationError('Google Chat DM target must be an email address')
     }
     const token = await this.getDmSetupToken(targetIdentity)
@@ -822,18 +771,6 @@ export class ChatEdgeClient {
       requestId: crypto.randomUUID(),
       memberships: []
     }, { token })
-  }
-
-  private async listResource(
-    spaceName: string,
-    resource: string,
-    opts: ChatPageOptions
-  ): Promise<ChatMembershipPage> {
-    return this.listNamedResource(
-      `spaces/${spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName}`,
-      resource,
-      opts
-    )
   }
 
   private async listNamedResource<T>(

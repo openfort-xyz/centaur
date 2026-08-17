@@ -452,17 +452,11 @@ describe('ChatEdgeClient owned message mutation', () => {
 })
 
 describe('ChatEdgeClient conversation resources', () => {
-  test('builds typed pagination, thread filters, memberships, and reaction requests', async () => {
+  test('builds typed pagination, memberships, and reaction requests', async () => {
     const calls: Array<{ url: string; signal?: AbortSignal }> = []
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       calls.push({ url, signal: init?.signal as AbortSignal | undefined })
-      if (url.includes('/messages?')) {
-        return Response.json({
-          messages: [{ name: 'spaces/A/messages/M1' }],
-          nextPageToken: 'messages-next'
-        })
-      }
       if (url.includes('/messages/M1/reactions')) {
         return Response.json({ reactions: [{ name: 'reactions/R1' }], nextPageToken: 'more' })
       }
@@ -471,10 +465,6 @@ describe('ChatEdgeClient conversation resources', () => {
     const client = new ChatEdgeClient(loadConfig({}))
 
     await client.listSpaces({ pageSize: 7, pageToken: 'a/b', credential: 'app' })
-    await client.listThreadMessages('spaces/A', 'spaces/A/threads/T.1', {
-      pageSize: 11,
-      credential: 'app'
-    })
     await client.listMessages('spaces/A', {
       pageSize: 13,
       pageToken: 'message next',
@@ -482,26 +472,15 @@ describe('ChatEdgeClient conversation resources', () => {
       orderBy: 'createTime DESC'
     })
     await client.listMemberships('spaces/A', { pageToken: 'members next', credential: 'app' })
-    const reactions = await client.listReactions('spaces/A', { pageSize: 3, credential: 'app' })
     await client.listMessageReactions('spaces/A/messages/M1', { pageSize: 999 })
 
     expect(calls[0]?.url).toEndWith('/spaces?pageSize=7&pageToken=a%2Fb')
-    expect(calls[1]?.url).toContain(
-      '/spaces/A/messages?pageSize=11&filter=thread.name+%3D+spaces%2FA%2Fthreads%2FT.1'
-    )
-    expect(calls[2]?.url).toEndWith(
+    expect(calls[1]?.url).toEndWith(
       '/spaces/A/messages?pageSize=13&pageToken=message+next&filter=createTime+%3E+%222026-08-13T00%3A00%3A00Z%22&orderBy=createTime+DESC'
     )
-    expect(calls[3]?.url).toEndWith('/spaces/A/members?pageToken=members+next')
-    expect(calls[4]?.url).toEndWith('/spaces/A/messages?pageSize=3')
-    expect(calls[5]?.url).toEndWith('/spaces/A/messages/M1/reactions?pageSize=3')
-    expect(calls[6]?.url).toEndWith('/spaces/A/messages/M1/reactions?pageSize=200')
+    expect(calls[2]?.url).toEndWith('/spaces/A/members?pageToken=members+next')
+    expect(calls[3]?.url).toEndWith('/spaces/A/messages/M1/reactions?pageSize=200')
     expect(calls.every(call => call.signal instanceof AbortSignal)).toBe(true)
-    expect(reactions).toEqual({
-      reactions: [{ name: 'reactions/R1', messageName: 'spaces/A/messages/M1' }],
-      nextPageToken: 'messages-next',
-      incomplete: true
-    })
   })
 
   test('preserves text and cardsV2 on create and update', async () => {
@@ -617,28 +596,6 @@ describe('ChatEdgeClient conversation resources', () => {
     expect(new URL(url).pathname).toEndWith('/spaces/DM/messages')
     expect(new URL(url).searchParams.has('messageReplyOption')).toBe(false)
     expect(body).toEqual({ text: 'hello' })
-  })
-
-  test('paces aggregate reaction reads to the per-space read quota', async () => {
-    const reactionTimes: number[] = []
-    globalThis.fetch = (async input => {
-      const url = String(input)
-      if (url.endsWith('/spaces/A/messages')) {
-        return Response.json({ messages: [
-          { name: 'spaces/A/messages/M1' },
-          { name: 'spaces/A/messages/M2' },
-          { name: 'spaces/A/messages/M3' }
-        ] })
-      }
-      reactionTimes.push(Date.now())
-      return Response.json({ reactions: [] })
-    }) as typeof fetch
-
-    await new ChatEdgeClient(loadConfig({})).listReactions('spaces/A')
-
-    expect(reactionTimes).toHaveLength(3)
-    expect(reactionTimes[1]! - reactionTimes[0]!).toBeGreaterThanOrEqual(60)
-    expect(reactionTimes[2]! - reactionTimes[1]!).toBeGreaterThanOrEqual(60)
   })
 
   test('paces direct reaction reads used by ETL and CLI at the shared boundary', async () => {

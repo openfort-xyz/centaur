@@ -119,10 +119,6 @@ export function workKey(workId: string): string {
   return `googlechatbot:work:${workId}`
 }
 
-export function dedupeStateKey(dedupeKey: string): string {
-  return `googlechatbot:dedupe:${dedupeKey}`
-}
-
 export function workLeaseKey(threadKey: string): string {
   return `googlechatbot:work:lease:${threadKey}`
 }

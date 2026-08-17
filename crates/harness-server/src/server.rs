@@ -311,13 +311,101 @@ struct StagedAttachment {
     path: PathBuf,
     mime_type: Option<String>,
     attachment_type: Option<String>,
-    next_chunk_index: u64,
+    integrity: AttachmentIntegrity,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AttachmentIntegrityMetadata {
     chunk_count: u64,
     byte_size: u64,
-    received_bytes: u64,
     sha256: String,
+    verified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttachmentIntegrity {
+    metadata: AttachmentIntegrityMetadata,
+    next_chunk_index: u64,
+    received_bytes: u64,
     hasher: Sha256,
-    verified_integrity: bool,
+}
+
+impl AttachmentIntegrityMetadata {
+    pub(crate) fn parse(
+        chunk_count: Option<u64>,
+        byte_size: Option<u64>,
+        sha256: Option<&str>,
+    ) -> Option<Self> {
+        match (chunk_count, byte_size, sha256) {
+            (None, None, None) => Some(Self {
+                chunk_count: 0,
+                byte_size: 100 * 1024 * 1024,
+                sha256: String::new(),
+                verified: false,
+            }),
+            (Some(chunk_count), Some(byte_size), Some(sha256))
+                if chunk_count > 0
+                    && byte_size <= 100 * 1024 * 1024
+                    && sha256.len() == 64
+                    && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                Some(Self {
+                    chunk_count,
+                    byte_size,
+                    sha256: sha256.to_ascii_lowercase(),
+                    verified: true,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl AttachmentIntegrity {
+    pub(crate) fn new(metadata: AttachmentIntegrityMetadata) -> Self {
+        Self {
+            metadata,
+            next_chunk_index: 0,
+            received_bytes: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    pub(crate) fn accepts(
+        &self,
+        metadata: &AttachmentIntegrityMetadata,
+        chunk_index: u64,
+        final_chunk: bool,
+    ) -> bool {
+        self.next_chunk_index == chunk_index
+            && self.metadata.verified == metadata.verified
+            && (!metadata.verified
+                || (self.metadata == *metadata
+                    && final_chunk == (chunk_index + 1 == metadata.chunk_count)))
+    }
+
+    pub(crate) fn append(&mut self, bytes: &[u8]) -> bool {
+        if self.received_bytes + bytes.len() as u64 > self.metadata.byte_size {
+            return false;
+        }
+        self.received_bytes += bytes.len() as u64;
+        self.hasher.update(bytes);
+        self.next_chunk_index += 1;
+        true
+    }
+
+    pub(crate) fn verified(&self) -> bool {
+        !self.metadata.verified
+            || (self.received_bytes == self.metadata.byte_size
+                && self
+                    .hasher
+                    .clone()
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+                    == self.metadata.sha256)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -656,26 +744,14 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
         .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
             message: format!("attachment chunk missing chunkIndex for {attachment_id}"),
         })?;
-    let (chunk_count, byte_size, expected_sha256, verified_integrity) = match (
+    let integrity_metadata = AttachmentIntegrityMetadata::parse(
         parsed.chunk_count,
         parsed.byte_size,
         parsed.sha256.as_deref(),
-    ) {
-        (None, None, None) => (0, 100 * 1024 * 1024, String::new(), false),
-        (Some(count), Some(size), Some(hash))
-            if count > 0
-                && size <= 100 * 1024 * 1024
-                && hash.len() == 64
-                && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
-        {
-            (count, size, hash.to_ascii_lowercase(), true)
-        }
-        _ => {
-            return Err(HarnessServerError::InvalidBlocksInput {
-                message: format!("invalid attachment integrity metadata for {attachment_id}"),
-            });
-        }
-    };
+    )
+    .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+        message: format!("invalid attachment integrity metadata for {attachment_id}"),
+    })?;
 
     if state.staged.contains_key(attachment_id) {
         return Err(HarnessServerError::InvalidBlocksInput {
@@ -697,25 +773,15 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
                 mime_type: mime_type.map(ToOwned::to_owned),
                 attachment_type: non_empty(parsed.attachment_type.as_deref())
                     .map(ToOwned::to_owned),
-                next_chunk_index: 0,
-                chunk_count,
-                byte_size,
-                received_bytes: 0,
-                sha256: expected_sha256.clone(),
-                hasher: Sha256::new(),
-                verified_integrity,
+                integrity: AttachmentIntegrity::new(integrity_metadata.clone()),
             },
         );
     }
 
     let upload = state.uploads.get(attachment_id).expect("upload exists");
-    if upload.next_chunk_index != chunk_index
-        || upload.verified_integrity != verified_integrity
-        || (verified_integrity
-            && (upload.chunk_count != chunk_count
-                || upload.byte_size != byte_size
-                || upload.sha256 != expected_sha256
-                || parsed.final_chunk != (chunk_index + 1 == chunk_count)))
+    if !upload
+        .integrity
+        .accepts(&integrity_metadata, chunk_index, parsed.final_chunk)
     {
         discard_upload(state, attachment_id);
         return Err(HarnessServerError::InvalidBlocksInput {
@@ -738,13 +804,12 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
             });
         }
     };
-    if state
+    if !state
         .uploads
-        .get(attachment_id)
+        .get_mut(attachment_id)
         .expect("upload exists")
-        .received_bytes
-        + bytes.len() as u64
-        > upload_limit(state, attachment_id)
+        .integrity
+        .append(&bytes)
     {
         discard_upload(state, attachment_id);
         return Err(HarnessServerError::InvalidBlocksInput {
@@ -753,28 +818,16 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
     }
     {
         let upload = state.uploads.get_mut(attachment_id).expect("upload exists");
-        upload.received_bytes += bytes.len() as u64;
-        upload.hasher.update(&bytes);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&upload.path)?;
         file.write_all(&bytes)?;
-        upload.next_chunk_index += 1;
     }
 
     if parsed.final_chunk {
         let upload = state.uploads.remove(attachment_id).expect("upload exists");
-        let actual_sha256 = upload
-            .hasher
-            .clone()
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if upload.verified_integrity
-            && (upload.received_bytes != upload.byte_size || actual_sha256 != upload.sha256)
-        {
+        if !upload.integrity.verified() {
             let _ = std::fs::remove_file(&upload.path);
             return Err(HarnessServerError::InvalidBlocksInput {
                 message: format!("attachment size or hash mismatch for {attachment_id}"),
@@ -784,14 +837,6 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
     }
 
     Ok(())
-}
-
-fn upload_limit(state: &BlocksState, attachment_id: &str) -> u64 {
-    state
-        .uploads
-        .get(attachment_id)
-        .map(|upload| upload.byte_size)
-        .unwrap_or(0)
 }
 
 fn discard_upload(state: &mut BlocksState, attachment_id: &str) {
