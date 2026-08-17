@@ -166,10 +166,10 @@ describe('googlechatbot webhook e2e', () => {
     expect(createSessionCall).toBeTruthy()
   })
 
-  test('durably ACKs before a hanging bot-identity lookup or media work', async () => {
+  test('durably ACKs before hanging media work', async () => {
     const state = createMemoryState()
     const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })
-    runtime.client.getBotUserName = () => new Promise<string>(() => undefined)
+    runtime.client.downloadAttachment = () => new Promise<ArrayBuffer>(() => undefined)
     const started = performance.now()
     const response = await Promise.race([
       runtime.app.request('/api/chat/events', {
@@ -183,7 +183,11 @@ describe('googlechatbot webhook e2e', () => {
           message: {
             name: 'spaces/AAAA/messages/HANG',
             text: 'persist me',
-            sender: { name: 'users/U1', type: 'HUMAN' }
+            sender: { name: 'users/U1', type: 'HUMAN' },
+            attachment: [{
+              source: 'UPLOADED_CONTENT',
+              attachmentDataRef: { resourceName: 'opaque-media-ref' }
+            }]
           }
         })
       }),
@@ -200,7 +204,11 @@ describe('googlechatbot webhook e2e', () => {
 
   test('only an exact bot annotation or slash command starts a named-space run', async () => {
     const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state: createMemoryState() })
-    runtime.client.getBotUserName = async () => 'users/123456789'
+    let identityLookups = 0
+    runtime.client.getBotUserName = async () => {
+      identityLookups += 1
+      throw new Error('members/app requires user authentication')
+    }
     const bot = runtime.app
     const send = (message: Record<string, unknown>) =>
       bot.request('/api/chat/events', {
@@ -255,6 +263,7 @@ describe('googlechatbot webhook e2e', () => {
     })
     await waitFor(() => sessionCalls() === 2)
     expect(sessionCalls()).toBe(2)
+    expect(identityLookups).toBe(0)
   })
 
   // Explicit development opt-out: the event still runs, but cannot source an

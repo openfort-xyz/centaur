@@ -8,6 +8,7 @@ import {
   buildThreadKey,
   collectThreadHistory,
   isThreadReply,
+  mentionedChatAppUserName,
   normalizeChatEnvelope
 } from './chat/normalize'
 import { verifyChatRequest, verifyChatRequestToken } from './chat/verify'
@@ -818,13 +819,7 @@ export async function processWorkObligation(
       return
     }
     if (!work.event && work.envelope) {
-      let botUser: string | undefined
-      try {
-        botUser = await client.getBotUserName(work.envelope.space?.name ?? '')
-      } catch (error) {
-        logWarn('googlechatbot_bot_identity_lookup_failed', error)
-      }
-      work.event = await normalizeChatEnvelope(work.envelope, botUser, client, {
+      work.event = await normalizeChatEnvelope(work.envelope, undefined, client, {
         acceptFollowUpAttachments: config.GOOGLECHATBOT_FOLLOW_UP_THREADS
       }) ?? undefined
       if (work.event && work.identityUserEmail) work.event.user_email = work.identityUserEmail
@@ -873,18 +868,12 @@ export async function processWorkObligation(
       return
     }
 
-    let botUser: string | undefined
-    try {
-      botUser = await client.getBotUserName(event.space_name)
-    } catch (error) {
-      logWarn('googlechatbot_bot_identity_lookup_failed', error)
-    }
     const history = await collectThreadHistory(client, {
       spaceName: event.space_name,
       threadName: event.chat.thread_name,
       currentMessageName: event.message_id,
       threadReply: event.chat.thread_reply,
-      botUserName: botUser,
+      botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
       ...(event.user_email ? { requesterEmail: event.user_email } : {}),
       historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
     }).catch(error => {

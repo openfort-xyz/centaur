@@ -2,6 +2,7 @@ import { test, expect, describe } from 'bun:test'
 import {
   collectThreadHistory,
   isThreadReply,
+  mentionedChatAppUserName,
   normalizeChatEnvelope,
   normalizeChatText,
   type ChatAttachmentDownloader,
@@ -299,6 +300,25 @@ describe('normalizeChatEnvelope', () => {
       'users/123456789'
     )
     expect(wrong?.is_mention).toBe(false)
+  })
+
+  test('uses the sole BOT mention when members/app lookup is unavailable', async () => {
+    const envelope = messageEnvelope({
+      message: {
+        name: 'spaces/AAAA/messages/M7',
+        text: '<users/123456789> are you there?',
+        sender: { name: 'users/U1', type: 'HUMAN' },
+        annotations: [{
+          type: 'USER_MENTION',
+          userMention: { user: { name: 'users/123456789', type: 'BOT' }, type: 'MENTION' }
+        }]
+      }
+    })
+
+    expect(mentionedChatAppUserName(envelope)).toBe('users/123456789')
+    const normalized = await normalizeChatEnvelope(envelope)
+    expect(normalized?.is_mention).toBe(true)
+    expect(normalized?.parts).toEqual([{ type: 'text', text: 'are you there?' }])
   })
 })
 
