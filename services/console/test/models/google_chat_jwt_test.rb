@@ -58,10 +58,10 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
       created_by: principal.created_by
     )
     principal.update!(labels: principal.labels.merge(
-      "google_chat_reader_subjects" => {
+      "google_chat_reader_subjects" => JSON.generate({
         "spaces/LEGACY" => " Legacy@Example.COM ",
         "spaces/UNAUTHORIZED" => "other@example.com"
-      }
+      })
     ))
     principal.google_chat_space_permissions.create!(space_name: "spaces/DM", history_enabled: true)
     principal.google_chat_space_permissions.create!(space_name: "spaces/LEGACY", history_enabled: true)
@@ -75,10 +75,10 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
       }, claims.dig("google_chat", "reader_subjects"))
 
       principal.update!(labels: principal.labels.merge(
-        "google_chat_reader_subjects" => {
+        "google_chat_reader_subjects" => JSON.generate({
           "spaces/DM" => "other@example.com",
           "spaces/LEGACY" => "legacy@example.com"
-        }
+        })
       ))
       assert_equal(
         { "spaces/LEGACY" => "legacy@example.com" },
@@ -86,7 +86,7 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
       )
 
       principal.update!(labels: principal.labels.merge(
-        "google_chat_reader_subjects" => { "spaces/LEGACY" => "legacy@example.com" }
+        "google_chat_reader_subjects" => JSON.generate({ "spaces/LEGACY" => "legacy@example.com" })
       ))
       dm.update!(labels: dm.labels.merge("google_email" => "invalid"))
       assert_equal(
@@ -95,8 +95,11 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
       )
 
       principal.update!(labels: principal.labels.merge(
-        "google_chat_reader_subjects" => { "spaces/LEGACY" => "invalid" }
+        "google_chat_reader_subjects" => JSON.generate({ "spaces/LEGACY" => "invalid" })
       ))
+      refute jwt_payload(ApiServer::Jwt.encode_for_principal(principal)).dig("google_chat").key?("reader_subjects")
+
+      principal.update!(labels: principal.labels.merge("google_chat_reader_subjects" => "not-json"))
       refute jwt_payload(ApiServer::Jwt.encode_for_principal(principal)).dig("google_chat").key?("reader_subjects")
     end
   end
