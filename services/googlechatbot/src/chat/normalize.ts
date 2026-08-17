@@ -59,6 +59,23 @@ export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 // Bound the fan-out of media downloads triggered by a single inbound message.
 const MAX_ATTACHMENTS_PER_MESSAGE = 10
 
+/** The sole Chat app explicitly mentioned by this interaction event. */
+export function mentionedChatAppUserName(envelope: GoogleChatEnvelope): string | undefined {
+  const names = new Set<string>()
+  for (const annotation of envelope.message?.annotations ?? []) {
+    const user = annotation.userMention?.user
+    if (
+      annotation.type === 'USER_MENTION'
+      && annotation.userMention?.type === 'MENTION'
+      && user?.type === 'BOT'
+      && /^users\/[^/\s]{1,320}$/.test(user.name ?? '')
+    ) names.add(user.name!)
+  }
+  // ponytail: multi-app mentions stay ambiguous; add a configured canonical ID
+  // if routing messages that address several Chat apps becomes a requirement.
+  return names.size === 1 ? names.values().next().value : undefined
+}
+
 export async function normalizeChatEnvelope(
   envelope: GoogleChatEnvelope,
   botUserName?: string,
@@ -87,6 +104,11 @@ export async function normalizeChatEnvelope(
 
   const message = envelope.message
   if (!message || !message.sender || !message.name) return null
+
+  // Google includes the addressed Chat app as a BOT mention in the interaction
+  // payload. Prefer that official event identity: `members/app` requires user
+  // authentication and fails when called with the app service account.
+  botUserName ??= mentionedChatAppUserName(envelope)
 
   const senderName = message.sender.name
   if (!senderName) return null
