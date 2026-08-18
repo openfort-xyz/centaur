@@ -53,6 +53,10 @@ DEFAULT_MAX_PAGES_PER_RUN = 0
 # Default to named rooms only — DMs/group chats are private and would land in a
 # company-wide corpus, mirroring how Slack DMs are kept out of the shared ETL.
 DEFAULT_INCLUDE_SPACE_TYPES = "SPACE"
+# Reclaim runs orphaned in `running` by a dead workflow host after this long.
+# Must exceed the longest plausible run (~1h, bounded by the queue claim lease)
+# and stay under DEFAULT_SYNC_INTERVAL_SECONDS so the next run does the cleanup.
+RUN_STALE_RUNNING_HOURS = 3
 
 
 def _include_space_types() -> set[str]:
@@ -186,13 +190,41 @@ def _scope_ref(space_id: str, reason: str | None = None) -> dict[str, str]:
     return result
 
 
-def _safe_error(error: Exception) -> str:
+def _error_status(error: Exception) -> int | None:
+    """HTTP status of a `GoogleChatApiError`, or None for a transport failure."""
+    status = getattr(error, "status", None)
+    return status if isinstance(status, int) else None
+
+
+def _error_kind(error: Exception) -> str:
+    """Classify a Chat failure into a `_FAILURE_REASONS` label.
+
+    Prefers the HTTP status carried by `GoogleChatApiError`; the string sniffing
+    is only a fallback for transport errors (timeouts, DNS) that never got one.
+    """
+    status = _error_status(error)
+    if status is not None:
+        return {429: "rate_limited", 403: "permission_error"}.get(status, "api_error")
     message = str(error).lower()
-    if "429" in message or "rate limit" in message:
+    if "rate limit" in message:
+        return "rate_limited"
+    if "permission" in message or "denied" in message:
+        return "permission_error"
+    return "api_error"
+
+
+def _safe_error(error: Exception) -> str:
+    """Operator-facing failure text with no URL, token or response body in it."""
+    kind = _error_kind(error)
+    if kind == "rate_limited":
         return "Google Chat API rate limited"
-    if "403" in message or "permission" in message or "denied" in message:
+    if kind == "permission_error":
         return "Google Chat API permission denied"
-    return "Google Chat API request failed"
+    status = _error_status(error)
+    # Without this the generic bucket is undiagnosable: every 4xx, 5xx and
+    # timeout collapses into one string with nothing left to tell them apart.
+    detail = f"HTTP {status}" if status is not None else type(error).__name__
+    return f"Google Chat API request failed ({detail})"
 
 
 def _card_fallback_text(message: dict[str, Any]) -> str:
@@ -520,6 +552,23 @@ async def _update_checkpoint_failure(
     )
 
 
+async def _reap_abandoned_runs(pool) -> None:
+    """Close runs the workflow host died inside of, mirroring Slack backfill jobs.
+
+    A run row is written before the first API call and updated at the end, so a
+    host that dies mid-run strands it in `running` forever — no `except` is left
+    to run. A broken-pipe stretch on 2026-08-17 piled up 25 such rows. Nothing
+    else touches this table, so the next run reclaims them.
+    """
+    await pool.execute(
+        "UPDATE google_chat_sync_runs SET "
+        "status = 'failed', finished_at = NOW(), "
+        "error_text = 'run abandoned: workflow host exited before finishing' "
+        "WHERE status = 'running' AND started_at < "
+        f"NOW() - INTERVAL '{RUN_STALE_RUNNING_HOURS} hours'"
+    )
+
+
 async def _record_run_start(
     pool,
     *,
@@ -527,6 +576,7 @@ async def _record_run_start(
     workflow_run_id: str,
     metadata: dict[str, Any],
 ) -> None:
+    await _reap_abandoned_runs(pool)
     await pool.execute(
         "INSERT INTO google_chat_sync_runs ("
         "run_id, workflow_run_id, mode, status, scopes_requested, metadata"
@@ -1058,12 +1108,10 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                 if not page_token:
                     break
     except Exception as exc:
-        raw_error = str(exc)
+        kind = _error_kind(exc)
         error = _safe_error(exc)
-        record_api_outcome(
-            "list_spaces", "rate_limited" if "429" in raw_error else "error"
-        )
-        record_etl_items_failed("google_chat", "message", "spaces", "api_error")
+        record_api_outcome("list_spaces", "rate_limited" if kind == "rate_limited" else "error")
+        record_etl_items_failed("google_chat", "message", "spaces", kind)
         await _record_run_finish(
             ctx._pool,
             run_id=run_id,
@@ -1106,14 +1154,12 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                     break
             record_api_outcome("list_dm_spaces", "success")
         except Exception as exc:
-            raw_error = str(exc)
+            kind = _error_kind(exc)
             error = _safe_error(exc)
             record_api_outcome(
-                "list_dm_spaces", "rate_limited" if "429" in raw_error else "error"
+                "list_dm_spaces", "rate_limited" if kind == "rate_limited" else "error"
             )
-            record_space_failure(
-                "rate_limited" if "429" in raw_error else "api_error"
-            )
+            record_space_failure(kind)
             set_last_failure_time(dt.datetime.now(dt.timezone.utc).timestamp())
             enumeration_failures.append(_scope_ref("direct_messages", error))
             ctx.log("google_chat_sync_dm_subject_failed", owner_email=subject, error=error)
@@ -1154,25 +1200,11 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
                 watermark=_rfc3339(watermark) if watermark else "",
             )
         except Exception as exc:
-            raw_error = str(exc)
+            kind = _error_kind(exc)
             error = _safe_error(exc)
             failed.append(_scope_ref(space_id, error))
-            record_etl_items_failed(
-                "google_chat",
-                "message",
-                "space",
-                "permission_error"
-                if "403" in raw_error or "permission" in raw_error.lower()
-                else "api_error",
-            )
-            failure_reason = (
-                "rate_limited"
-                if "429" in raw_error
-                else "permission_error"
-                if "403" in raw_error or "permission" in raw_error.lower()
-                else "api_error"
-            )
-            record_space_failure(failure_reason)
+            record_etl_items_failed("google_chat", "message", "space", kind)
+            record_space_failure(kind)
             set_last_failure_time(dt.datetime.now(dt.timezone.utc).timestamp())
             await _update_checkpoint_failure(
                 ctx._pool,

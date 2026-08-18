@@ -4150,6 +4150,19 @@ fn google_chat_space_id(resource_name: &str) -> Result<&str, WorkflowRuntimeErro
     }
 }
 
+/// Path of a googlechatbot internal relay collection for `space_name`.
+///
+/// Every relay route is space-scoped (`/api/chat/spaces/{id}/…`); the flat
+/// `/api/chat/messages` and `/api/chat/attachments` routes no longer exist, so
+/// building the path anywhere else silently 404s every delivery.
+fn google_chat_relay_path(
+    space_name: &str,
+    collection: &str,
+) -> Result<String, WorkflowRuntimeError> {
+    let space_id = google_chat_space_id(space_name)?;
+    Ok(format!("/api/chat/spaces/{space_id}/{collection}"))
+}
+
 fn google_chat_message_ids(resource_name: &str) -> Result<(&str, &str), WorkflowRuntimeError> {
     let mut parts = resource_name.split('/');
     match (
@@ -4282,13 +4295,15 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
         .and_then(|args| args.get("thread_name"))
         .and_then(Value::as_str);
 
-    let mut body = json!({ "space_name": space_name, "text": text });
+    let path = google_chat_relay_path(space_name, "messages")?;
+
+    let mut body = json!({ "text": text });
     if let Some(thread) = thread_name {
         body["thread_name"] = json!(thread);
     }
 
     post_to_googlechatbot(
-        "/api/chat/messages",
+        &path,
         &body,
         std::time::Duration::from_secs(30),
         "google chat send failed",
@@ -4319,8 +4334,9 @@ async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowR
             .and_then(Value::as_str)
     };
 
+    let path = google_chat_relay_path(&space_name, "attachments")?;
+
     let mut body = json!({
-        "space_name": space_name,
         "filename": filename,
         "content_base64": content_base64,
     });
@@ -4331,7 +4347,7 @@ async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowR
     }
 
     post_to_googlechatbot(
-        "/api/chat/attachments",
+        &path,
         &body,
         std::time::Duration::from_secs(120),
         "google chat attachment upload failed",
@@ -5340,6 +5356,22 @@ mod tests {
         ] {
             let mut webhook = webhook_with_filter(filter);
             let error = normalize_webhook(&mut webhook).unwrap_err();
+            assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        }
+    }
+
+    #[test]
+    fn google_chat_relay_paths_are_space_scoped() {
+        assert_eq!(
+            google_chat_relay_path("spaces/AAQA42QLdws", "messages").unwrap(),
+            "/api/chat/spaces/AAQA42QLdws/messages"
+        );
+        assert_eq!(
+            google_chat_relay_path("spaces/AAQA42QLdws", "attachments").unwrap(),
+            "/api/chat/spaces/AAQA42QLdws/attachments"
+        );
+        for space_name in ["", "AAQA42QLdws", "spaces/A/messages/M", "spaces/bad id"] {
+            let error = google_chat_relay_path(space_name, "messages").unwrap_err();
             assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
         }
     }

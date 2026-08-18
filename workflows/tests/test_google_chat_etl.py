@@ -59,6 +59,7 @@ projection = importlib.import_module("workflows.company_context_documents")
 chat_sync = importlib.import_module("workflows.google_chat.sync")
 chat_metrics = importlib.import_module("workflows.google_chat.metrics")
 chat_retention = importlib.import_module("workflows.google_chat.retention")
+chat_client = importlib.import_module("workflows.google_chat.client")
 
 
 # --------------------------------------------------------------------------- #
@@ -846,6 +847,55 @@ def test_failing_dwd_subject_redacts_token_from_logs_and_result(monkeypatch):
     assert sentinel not in emitted
     assert "sentinel-delegated-token" not in emitted
     assert "Google Chat API request failed" in emitted
+
+
+def test_run_start_reaps_runs_abandoned_by_a_dead_host():
+    class Pool:
+        def __init__(self):
+            self.queries = []
+
+        async def execute(self, query, *args):
+            self.queries.append(query)
+            return "UPDATE 1"
+
+    pool = Pool()
+    asyncio.run(
+        chat_sync._record_run_start(
+            pool, run_id="r1", workflow_run_id="w1", metadata={}
+        )
+    )
+    reap, insert = pool.queries
+    assert reap.startswith("UPDATE google_chat_sync_runs SET status = 'failed'")
+    assert "status = 'running'" in reap
+    assert f"INTERVAL '{chat_sync.RUN_STALE_RUNNING_HOURS} hours'" in reap
+    assert insert.startswith("INSERT INTO google_chat_sync_runs")
+    # Reaping must not outlive a healthy run or it kills the run in flight.
+    assert chat_sync.RUN_STALE_RUNNING_HOURS * 3600 < chat_sync.DEFAULT_SYNC_INTERVAL_SECONDS
+
+
+def test_error_classification_uses_status_not_string_sniffing():
+    api_error = chat_client.GoogleChatApiError
+
+    # A space id that merely contains "403"/"429" must not be read as a status.
+    misleading = api_error("Chat API GET .../spaces/x403y429 failed: 500 {}", 500)
+    assert chat_sync._error_kind(misleading) == "api_error"
+    assert chat_sync._safe_error(misleading) == "Google Chat API request failed (HTTP 500)"
+
+    assert chat_sync._error_kind(api_error("boom", 429)) == "rate_limited"
+    assert chat_sync._safe_error(api_error("boom", 429)) == "Google Chat API rate limited"
+    assert chat_sync._error_kind(api_error("boom", 403)) == "permission_error"
+    assert chat_sync._safe_error(api_error("boom", 403)) == "Google Chat API permission denied"
+
+    # Transport failures never carry a status; the type still names the cause.
+    assert chat_sync._error_kind(TimeoutError("timed out")) == "api_error"
+    assert chat_sync._safe_error(TimeoutError("timed out")) == (
+        "Google Chat API request failed (TimeoutError)"
+    )
+
+    # Redaction still holds: no URL, status body or token reaches the message.
+    leaky = api_error("Chat API GET https://chat/x?token=sentinel failed: 404 nope", 404)
+    assert "sentinel" not in chat_sync._safe_error(leaky)
+    assert "nope" not in chat_sync._safe_error(leaky)
 
 
 def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(

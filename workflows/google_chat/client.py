@@ -31,6 +31,19 @@ MAX_RETRY_DELAY_SECONDS = 30.0
 # self-granted chat.bot scope alone is rejected with 403 for history.
 
 
+class GoogleChatApiError(RuntimeError):
+    """A Chat API response that carries its HTTP status.
+
+    The status travels on the exception because the caller redacts the message
+    before it reaches logs or the DB: sniffing "403" out of the redacted string
+    is both unreliable (a space id can contain it) and useless once redacted.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class GoogleChatReadonlyClient:
     """Read-only Google Chat REST client used by the ETL workflow.
 
@@ -55,7 +68,9 @@ class GoogleChatReadonlyClient:
                 return json.loads(content) if content else {}
             if response.status not in {429, 500, 502, 503, 504} or attempt == MAX_GET_ATTEMPTS - 1:
                 body = content.decode("utf-8", "replace") if content else ""
-                raise RuntimeError(f"Chat API GET {url} failed: {response.status} {body}")
+                raise GoogleChatApiError(
+                    f"Chat API GET {url} failed: {response.status} {body}", response.status
+                )
             time.sleep(_retry_delay_seconds(response, attempt))
         raise RuntimeError("unreachable")
 
