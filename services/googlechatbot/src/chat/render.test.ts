@@ -54,6 +54,19 @@ describe('markdownToChatMessage', () => {
     expect(image?.altText).toBe('a diagram')
   })
 
+  test('keeps underscores in image URLs out of the italic rule', () => {
+    // flattenCardProseInline runs before the card splitter, and its `_italic_`
+    // rule used to eat paired underscores out of the URL. The line still parsed
+    // as an image afterwards, so the widget pointed at a 404 and the card
+    // rendered blank with no API error to log.
+    const out = markdownToChatMessage('![shot](https://example.com/screenshot_2026_08_19.png)')
+    const image = (out.cardsV2 ?? [])
+      .flatMap((c) => c.card.sections ?? [])
+      .flatMap((s) => s.widgets ?? [])
+      .find((w) => w.image)?.image
+    expect(image?.imageUrl).toBe('https://example.com/screenshot_2026_08_19.png')
+  })
+
   test('maps headings to section headers', () => {
     const out = markdownToChatMessage('# Title\nbody text')
     const headers = (out.cardsV2 ?? []).flatMap((c) => c.card.sections ?? []).map((s) => s.header)
