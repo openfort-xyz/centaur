@@ -13,7 +13,6 @@ import {
 import { chatReplyLimits } from './constants'
 import { logError, logWarn } from './logging'
 import type {
-  ChatSpaceType,
   GoogleChatCard,
   GoogleChatCardWidget,
   GoogleChatMessage
@@ -46,8 +45,6 @@ const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
 // is create-only, so PATCH omits it while updating both text and cardsV2.
 export type RenderTarget = {
   spaceName: string
-  /** Official Google space discriminator; reply options only apply to SPACE. */
-  spaceType?: ChatSpaceType
   /** Resource name of the pre-posted "thinking" message we PATCH with the answer. */
   ackMessageName: string
   /** Thread to fall back into if the ack no longer exists and we must post fresh. */
@@ -292,8 +289,7 @@ async function createFinalPart(
     await rendererWrite(client, target).run(target.spaceName, () =>
       client.createMessage(target.spaceName, body, {
         messageId,
-        threadName: target.threadName,
-        spaceType: target.spaceType
+        threadName: target.threadName
       })
     )
   } catch (error) {

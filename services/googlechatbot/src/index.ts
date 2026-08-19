@@ -19,7 +19,6 @@ import type {
   GoogleChatActionPayload,
   GoogleChatActionType,
   GoogleChatEnvelope,
-  ChatSpaceType,
   GoogleChatWorkflowEvent,
   NormalizedChatEvent
 } from './chat/types'
@@ -370,7 +369,7 @@ export function createGooglechatbot(
     if (body instanceof InputError) return c.json({ error: body.message }, body.status)
     if (typeof body?.text !== 'string') return c.json({ error: 'text is required' }, 400)
     try {
-      const thread = await internalThreadOptions(client, spaceName, body.thread_name)
+      const thread = internalThreadOptions(spaceName, body.thread_name)
       const sent = await client.createMessage(
         spaceName,
         { text: body.text },
@@ -601,7 +600,7 @@ export function createGooglechatbot(
       return c.json({ error: `attachment exceeds the ${MAX_UPLOAD_BYTES} byte limit` }, 413)
     }
     try {
-      const thread = await internalThreadOptions(client, spaceName, body.thread_name)
+      const thread = internalThreadOptions(spaceName, body.thread_name)
       const uploaded = await client.uploadAttachment(
         spaceName,
         body.filename,
@@ -685,11 +684,19 @@ function messageResource(spaceId: string, messageId: string): string | null {
     : null
 }
 
-async function internalThreadOptions(
-  client: ChatEdgeClient,
+/**
+ * Bind a caller-supplied thread to the route's own space, so a scoped grant on
+ * one space can't be used to write into a thread of another.
+ *
+ * This used to also `spaces.get` the destination to resolve its spaceType,
+ * because thread options were suppressed outside named spaces. Google threads
+ * DMs and group chats now (see ChatEdgeClient.createMessage), so that lookup
+ * bought nothing but an API call in front of every send.
+ */
+function internalThreadOptions(
   spaceName: string,
   threadName?: string
-): Promise<{ threadName?: string; spaceType?: ChatSpaceType }> {
+): { threadName?: string } {
   if (!threadName) return {}
   const [prefix, threadSpace, collection, threadId, extra] = threadName.split('/')
   if (
@@ -701,11 +708,7 @@ async function internalThreadOptions(
   ) {
     throw new InputError(400, 'thread_name must belong to the route space')
   }
-  const spaceType = (await client.getSpace(spaceName)).spaceType
-  if (spaceType !== 'SPACE' && spaceType !== 'DIRECT_MESSAGE' && spaceType !== 'GROUP_CHAT') {
-    throw new Error('Google Chat returned an invalid spaceType')
-  }
-  return { threadName, spaceType }
+  return { threadName }
 }
 
 function contentDisposition(name: string): string {
@@ -878,7 +881,7 @@ export async function processWorkObligation(
         const ack = await client.createMessage(
           event.space_name,
           { text: INITIAL_STATUS },
-          { messageId, threadName: event.chat.thread_name, spaceType: event.space_type }
+          { messageId, threadName: event.chat.thread_name }
         )
         work.ackMessageName = ack.name ?? `${event.space_name}/messages/${messageId}`
       } catch (error) {
@@ -1050,7 +1053,6 @@ function durableRenderTarget(work: GoogleChatWorkObligation) {
   if (!work.event) throw new Error('Google Chat work is missing its normalized event')
   return {
     spaceName: work.event.space_name,
-    spaceType: work.event.space_type,
     ackMessageName: work.ackMessageName ?? '',
     threadName: work.event.chat.thread_name,
     fallbackMessageId: `client-centaur-${work.workId.replace(/-/g, '')}`
@@ -1316,7 +1318,6 @@ async function driveSession(
       : undefined
     const target = {
       spaceName: event.space_name,
-      spaceType: event.space_type,
       ackMessageName,
       threadName: event.chat.thread_name,
       consoleSessionWidget,
@@ -1420,8 +1421,7 @@ async function handleStopCommand(
   }
   try {
     await client.createMessage(event.space_name, { text }, {
-      threadName: event.chat.thread_name,
-      spaceType: event.space_type
+      threadName: event.chat.thread_name
     })
   } catch (deliverError) {
     logError('googlechatbot_stop_reply_failed', deliverError)
@@ -1445,8 +1445,7 @@ async function deliverDriveError(
       return true
     }
     await client.createMessage(event.space_name, { text }, {
-      threadName: event.chat.thread_name,
-      spaceType: event.space_type
+      threadName: event.chat.thread_name
     })
     incr('googlechatbot_delivery_total', { outcome: 'error_created' })
     return true

@@ -189,8 +189,12 @@ the scopes above to one convenience account.
   thinking acknowledgement, so Chat never leaves a deletion tombstone. Created
   replacement or overflow parts use stable client IDs and include
   `fallbackText`; the in-place PATCH omits that create-only field.
-- Named-space writes use Google threading options; direct and group chats omit
-  the unsupported `messageReplyOption` and thread body.
+- Every write threads: `message.thread.name` plus
+  `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`. Google shipped
+  in-line threading to DMs and group DMs on 2025-11-05, and `spaces.get` on a
+  1:1 bot DM reports `spaceThreadingState: THREADED_MESSAGES`. Verified live on
+  2026-08-19: a threaded create in a real DM succeeded and returned
+  `threadReply: true`.
 - Drive downloads validate metadata, size, and downloadable capability. Missing
   optional access produces a metadata-only part rather than leaking a signed
   URL. Google-native Docs/Sheets/Slides/Drawings/Apps Script use documented
