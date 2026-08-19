@@ -264,7 +264,12 @@ export function toChatTextMarkup(text: string): string {
  *  - `#` heading lines — extracted into section headers downstream;
  *  - whole-line bold (`**Pseudo heading**`, record-list row titles) — the span
  *    already owns the line, so "fragmenting" it changes nothing and the bold
- *    is wanted.
+ *    is wanted;
+ *  - standalone image embeds — the italic rule below eats paired `_` out of the
+ *    URL (`screenshot_2026_08_19.png` → `screenshot202608_19.png`), and the line
+ *    still matches standaloneImage afterwards, so a widget is emitted pointing at
+ *    a URL that 404s. A broken imageUrl is not an API error, so the card just
+ *    renders blank with nothing logged.
  * Fences pass through untouched. Links become `label (url)` — an `<a>`/`[]()`
  * span would fragment too. Card-path only; the plain path renders inline
  * markup fine via toChatTextMarkup.
@@ -281,7 +286,13 @@ export function flattenCardProseInline(markdown: string): string {
       out.push(line)
       continue
     }
-    if (inFence || isListItem(line) || isHeading(line) || isWholeLineBold(line)) {
+    if (
+      inFence
+      || isListItem(line)
+      || isHeading(line)
+      || isWholeLineBold(line)
+      || standaloneImage(line)
+    ) {
       out.push(line)
       continue
     }
