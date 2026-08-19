@@ -3,7 +3,6 @@ import type { StateAdapter } from 'chat'
 import type {
   ChatListMessage,
   NormalizedBinaryPart,
-  ChatSpaceType,
   ChatSpaceResource,
   GoogleChatMessage,
   UploadAttachmentResponse
@@ -485,23 +484,31 @@ export class ChatEdgeClient {
    * so we normalize to avoid double-prefixing the URL.
    *
    * When threadName is provided, the new message is threaded under the given
-   * thread (resource name like "spaces/<id>/threads/<id>"). In 1:1 DMs Google
-   * Chat ignores the field; in named spaces it makes the bot reply land under
-   * the user's message instead of in the space root.
+   * thread (resource name like "spaces/<id>/threads/<id>"), so the bot's reply
+   * lands under the user's message instead of in the space root.
+   *
+   * This applies to DMs and group chats too. Google shipped in-line threading to
+   * both on 2025-11-05, and `spaces.get` on a 1:1 bot DM now reports
+   * `spaceThreadingState: THREADED_MESSAGES`. The `messages.create` reference
+   * still says messageReplyOption is "Only supported in named spaces"; that line
+   * is stale. Probed live against a real DM on 2026-08-19: the create succeeded,
+   * landed in the requested thread, and came back `threadReply: true`.
+   *
+   * For a space that genuinely does not thread (continuous meeting chat, legacy
+   * pre-2022 group conversations) Google documents the field as ignored, and
+   * REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD is the forgiving variant by design —
+   * it starts a new thread rather than failing the write.
    */
   async createMessage(
     spaceName: string,
     message: Partial<GoogleChatMessage>,
-    opts: { messageId?: string; threadName?: string; spaceType?: ChatSpaceType } = {}
+    opts: { messageId?: string; threadName?: string } = {}
   ): Promise<GoogleChatMessage> {
     const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
     const body: Partial<GoogleChatMessage> = { ...message }
-    const supportsThreads = !opts.spaceType || opts.spaceType === 'SPACE'
-    if (opts.threadName && supportsThreads) {
-      body.thread = { name: opts.threadName }
-    }
     const query = new URLSearchParams()
-    if (opts.threadName && supportsThreads) {
+    if (opts.threadName) {
+      body.thread = { name: opts.threadName }
       query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD')
     }
     // Generate both idempotency keys once per invocation; fetch retries reuse
@@ -1144,7 +1151,7 @@ export class ChatEdgeClient {
   async createAttachmentMessage(
     spaceName: string,
     attachment: UploadAttachmentResponse,
-    opts: { text?: string; threadName?: string; spaceType?: ChatSpaceType; subject?: string } = {}
+    opts: { text?: string; threadName?: string; subject?: string } = {}
   ): Promise<GoogleChatMessage> {
     const token = await this.getUploadUserToken(opts.subject)
     if (!token) {
@@ -1156,13 +1163,12 @@ export class ChatEdgeClient {
       attachment: [attachment],
       ...(opts.text ? { text: opts.text } : {})
     }
-    const supportsThreads = !opts.spaceType || opts.spaceType === 'SPACE'
-    if (opts.threadName && supportsThreads) body.thread = { name: opts.threadName }
+    if (opts.threadName) body.thread = { name: opts.threadName }
     const query = new URLSearchParams({
       messageId: generatedMessageId(),
       requestId: crypto.randomUUID()
     })
-    if (opts.threadName && supportsThreads) {
+    if (opts.threadName) {
       query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD')
     }
     const path = `spaces/${id}/messages?${query}`

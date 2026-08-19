@@ -744,7 +744,7 @@ describe('ChatEdgeClient conversation resources', () => {
     expect(url).toEndWith('/spaces/A/messages?showDeleted=true')
   })
 
-  test('does not send named-space thread options in a direct message', async () => {
+  test('threads a reply in a direct message', async () => {
     let url = ''
     let body: Record<string, unknown> = {}
     globalThis.fetch = (async (input, init) => {
@@ -755,14 +755,16 @@ describe('ChatEdgeClient conversation resources', () => {
     await new ChatEdgeClient(loadConfig({})).createMessage(
       'spaces/DM',
       { text: 'hello' },
-      {
-        threadName: 'spaces/DM/threads/T1',
-        spaceType: 'DIRECT_MESSAGE'
-      }
+      { threadName: 'spaces/DM/threads/T1' }
     )
+    // Probed live against a real 1:1 bot DM on 2026-08-19: spaces.get reports
+    // spaceThreadingState=THREADED_MESSAGES, and this exact create landed in the
+    // requested thread with threadReply=true. The messages.create reference
+    // still calls messageReplyOption named-spaces-only; that line is stale.
     expect(new URL(url).pathname).toEndWith('/spaces/DM/messages')
-    expect(new URL(url).searchParams.has('messageReplyOption')).toBe(false)
-    expect(body).toEqual({ text: 'hello' })
+    expect(new URL(url).searchParams.get('messageReplyOption'))
+      .toBe('REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD')
+    expect(body).toEqual({ text: 'hello', thread: { name: 'spaces/DM/threads/T1' } })
   })
 
   test('paces direct reaction reads used by ETL and CLI at the shared boundary', async () => {

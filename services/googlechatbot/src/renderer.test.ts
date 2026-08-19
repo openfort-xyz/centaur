@@ -143,8 +143,7 @@ describe('finalizeRender surface selection', () => {
       stubClient(capture),
       target({
         fallbackMessageId: 'client-centaur-card',
-        threadName: 'spaces/AAAA/threads/T1',
-        spaceType: 'DIRECT_MESSAGE'
+        threadName: 'spaces/AAAA/threads/T1'
       }),
       state
     )

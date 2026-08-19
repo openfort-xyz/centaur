@@ -128,10 +128,14 @@ describe('api-rs-only /api/chat routes', () => {
     expect(calledWith).toBe('spaces/A')
   })
 
-  test('validates thread ownership and resolves the official space type before sending', async () => {
+  test('binds a caller-supplied thread to the route space before sending', async () => {
     const bot = appWith({ GOOGLECHATBOT_INTERNAL_API_KEY: 'secret' })
     let options: unknown
-    bot.client.getSpace = async () => ({ name: 'spaces/A', spaceType: 'GROUP_CHAT' })
+    let spaceLookups = 0
+    bot.client.getSpace = async () => {
+      spaceLookups += 1
+      return { name: 'spaces/A', spaceType: 'GROUP_CHAT' }
+    }
     bot.client.createMessage = (async (_space, _message, opts) => {
       options = opts
       return { name: 'spaces/A/messages/M1' }
@@ -141,10 +145,12 @@ describe('api-rs-only /api/chat routes', () => {
     expect((await post(bot, headers, {
       text: 'hi', thread_name: 'spaces/A/threads/T1'
     })).status).toBe(200)
-    expect(options).toEqual({
-      threadName: 'spaces/A/threads/T1',
-      spaceType: 'GROUP_CHAT'
-    })
+    expect(options).toEqual({ threadName: 'spaces/A/threads/T1' })
+    // The thread/space binding is a string check. Resolving the official
+    // spaceType was only ever needed to decide whether to suppress thread
+    // options; now that DMs and group chats thread too, that lookup is gone
+    // and a send costs one API call instead of two.
+    expect(spaceLookups).toBe(0)
     expect((await post(bot, headers, {
       text: 'hi', thread_name: 'spaces/OTHER/threads/T1'
     })).status).toBe(400)
@@ -496,7 +502,7 @@ describe('outbound /api/chat/attachments', () => {
     expect(body.error).toContain('not valid base64')
   })
 
-  test('resolves the official space type before a threaded attachment create', async () => {
+  test('binds a threaded attachment create to the route space', async () => {
     const bot = createGooglechatbot(loadConfig({
       GOOGLECHATBOT_INTERNAL_API_KEY: 'secret'
     }), { state: createMemoryState() })
@@ -531,7 +537,6 @@ describe('outbound /api/chat/attachments', () => {
     expect(uploadSubject).toBe('arnau@example.com')
     expect(options).toEqual({
       threadName: 'spaces/A/threads/T1',
-      spaceType: 'SPACE',
       subject: 'arnau@example.com'
     })
   })
