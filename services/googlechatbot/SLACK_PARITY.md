@@ -199,6 +199,22 @@ artifacts in `docs/google-chat-parity-verification.md`.
 
 ## Upstream sync windows
 
+### 2026-08-20 — 42 upstream commits, `0e58fe86..bc72622b`
+
+| Upstream | Slack change | Google Chat disposition |
+| --- | --- | --- |
+| #1437 own Nanocodex rollout policy | Slackbot now selects and records its rollout cohort after api-rs removed the shared policy. | **Ported.** Googlechatbot uses the same deterministic selection, model-override bypass, sticky conflict recovery, chart value, and session/execution metadata. |
+| #1411 preserve unchanged message timestamps | Slack ETL no longer advances `updated_at` when the raw payload is unchanged. | **Ported.** Google Chat message upserts now use the same `IS DISTINCT FROM` guard. |
+| #1422 omit default upload comments | Slack uploads only include an explicit comment. | **Already equivalent.** Google Chat uploads only send the optional `--text` caption. |
+| #1412 use the MCP user token for search | Slack native search uses the linked user token and falls back to authorized bot history only for bot-token rejection. | **Already equivalent.** Google Chat search is an exact-space bounded scan; delegated readers are selected and signed server-side. |
+| #1443 retry transient Slack sync failures | The Console Slack DM job defers Slack `fatal_error` and `internal_error` responses. | **Already equivalent.** Google Chat ETL retries rate limits and transient HTTP failures in its bounded client. |
+| #1441 and #1408 channel catalog resilience and autocomplete | Console caches and searches the Slack channel catalog. | **Not applicable.** Google Chat grants use exact `spaces/<id>` names and have no Console catalog job, as recorded in the previous sync window. |
+| #1401 custom workflow Slack identity | Workflow Slack messages may set `username` and `icon_emoji`. | **Not applicable.** Google Chat app messages cannot override the app identity per message. |
+| #1152, #1145, and #628 Slack API/emulator, DM scope, and ETL-token fixes | Slack-only SDK and credential behavior. | **Not applicable.** Google Chat uses its own signed fixtures, exact-email DWD DM setup, and scoped Console JWT proxy. |
+
+The remaining commits are platform-agnostic and merge without a Google Chat
+transport port.
+
 ### 2026-08-17 — 25 upstream commits, `1b60f619..0e58fe86`
 
 Slack-touching upstream work and its Google Chat disposition.

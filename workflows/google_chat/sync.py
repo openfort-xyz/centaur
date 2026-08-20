@@ -713,7 +713,9 @@ async def _upsert_message(
         "source_run_id = EXCLUDED.source_run_id, "
         "last_seen_at = NOW(), "
         "last_error = '', "
-        "updated_at = NOW()",
+        "updated_at = CASE WHEN google_chat_sync_messages.raw_payload "
+        "IS DISTINCT FROM EXCLUDED.raw_payload "
+        "THEN NOW() ELSE google_chat_sync_messages.updated_at END",
         owner_email,
         space_id,
         message_id,

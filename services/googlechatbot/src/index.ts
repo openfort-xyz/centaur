@@ -24,6 +24,7 @@ import type {
 } from './chat/types'
 import { messageUtf8Bytes } from './chat/render'
 import { logError, logInfo, logWarn } from './logging'
+import { resolveHarnessRollout } from './harness-rollout'
 import { addGauge, incr, renderMetrics, setGauge } from './metrics'
 import {
   WORK_INDEX_KEY,
@@ -1167,8 +1168,17 @@ async function driveSession(
     ?? spaceDefault?.provider
   const requestedHarnessType =
     resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS ?? 'codex'
-  const requestedModel =
-    resolvedModel ?? defaultModelForHarness(requestedHarnessType, harnessDefaultModels(config))
+  const harnessDefaultModel = defaultModelForHarness(
+    requestedHarnessType,
+    harnessDefaultModels(config)
+  )
+  const requestedModel = resolvedModel ?? harnessDefaultModel
+  const harnessRollout = resolveHarnessRollout({
+    modelOverride: resolvedModel !== harnessDefaultModel ? resolvedModel : undefined,
+    requestedHarness: requestedHarnessType,
+    rolloutPercent: config.GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT,
+    threadId: threadKey
+  })
   const resolvedReasoning = reasoningForModel(
     requestedHarnessType,
     requestedModel,
@@ -1180,7 +1190,7 @@ async function driveSession(
       config,
       threadKey,
       conversationName(event),
-      resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
+      harnessRollout.harnessType,
       {
         userId: event.user_id,
         userName: event.user_name,
@@ -1190,6 +1200,12 @@ async function driveSession(
           spaceType: event.space_type,
           confirmSpace: () => identity.confirmSpace(event.space_name)
         }
+      },
+      {
+        ...(harnessRollout.assignment
+          ? { harnessAssignment: harnessRollout.assignment }
+          : {}),
+        restartOnHarnessConflict: Boolean(overrides.harnessType)
       }
     )
 
@@ -1278,10 +1294,8 @@ async function driveSession(
     // base URL is configured. `threadKey` (`chat:spaces:…`) is the exact value
     // sent to the session API as `thread_key`, which the Console indexes by.
     const isFirstAssistantMessage = !event.history_messages?.length
-    // api-rs may route a Codex request onto Nanocodex (thread-key-hashed A/B
-    // split, upstream #1178), so the harness that actually runs is the one the
-    // create-session response reports -- not the one this turn asked for.
-    // Showing the requested harness here would mislabel the cohort (#1179).
+    // The persisted harness can differ from this turn's selected rollout
+    // cohort when the thread predates the current rollout configuration.
     const effectiveHarnessType =
       session.harnessType ?? resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
     // Without an explicit --model/--opus/... override the harness runs its

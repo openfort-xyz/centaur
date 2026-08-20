@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import { createHash } from 'node:crypto'
 import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
+import type { GoogleChatHarnessAssignment } from './harness-rollout'
 import { logWarn } from './logging'
 import { addGauge, incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
@@ -57,6 +58,7 @@ export type GoogleChatTurnMessage = {
 type CreateSessionRequest = {
   harness_type: string
   metadata: JsonObject
+  on_harness_conflict?: 'restart'
 }
 
 type AppendMessagesRequest = {
@@ -134,41 +136,6 @@ type CreateSessionResponse = {
   status?: string
   session?: { status?: string }
   harness_type?: string
-  harness_assignment?: unknown
-}
-
-/**
- * A/B provenance for the harness api-rs actually persisted (upstream #1178).
- * api-rs may route a Codex request onto Nanocodex by thread-key hash, so the
- * requested harness is not necessarily the one that runs.
- */
-export type GoogleChatHarnessAssignment = {
-  experiment: string
-  requestedHarness: string
-  cohort: string
-  rolloutPercent: number
-}
-
-function harnessAssignmentFromResponse(
-  value: unknown
-): GoogleChatHarnessAssignment | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const raw = value as Record<string, unknown>
-  const experiment = typeof raw.experiment === 'string' ? raw.experiment : undefined
-  const requestedHarness =
-    typeof raw.requested_harness === 'string' ? raw.requested_harness : undefined
-  const cohort = typeof raw.cohort === 'string' ? raw.cohort : undefined
-  const rolloutPercent = raw.rollout_percent
-  if (
-    !experiment ||
-    !requestedHarness ||
-    !cohort ||
-    typeof rolloutPercent !== 'number' ||
-    !Number.isFinite(rolloutPercent)
-  ) {
-    return undefined
-  }
-  return { experiment, requestedHarness, cohort, rolloutPercent }
 }
 
 export type CreateSessionResult = {
@@ -178,22 +145,23 @@ export type CreateSessionResult = {
    * `/execute` would collide with the `one active execution per thread` index
    * and 500, so the caller should append-and-fold instead of executing. */
   activeExecution: boolean
-  /** The harness persisted by api-rs after applying control-plane policy
-   * (the Codex/Nanocodex A/B split), which may differ from the requested one. */
+  /** The harness persisted by api-rs. */
   harnessType?: string
-  /** The experiment/cohort used to select the persisted harness. */
+  /** The Google Chat-owned experiment/cohort used for this thread. */
   harnessAssignment?: GoogleChatHarnessAssignment
 }
 
 export class SessionApiError extends Error {
+  readonly body: string
   readonly retryable: boolean
   readonly status: number
 
-  constructor(input: { action: string; retryable: boolean; status: number; statusText: string }) {
+  constructor(input: { action: string; body?: string; retryable: boolean; status: number; statusText: string }) {
     // api-rs is internal and its error bodies can carry internals; the message
     // stays generic because it is surfaced verbatim into the Google Chat thread.
     super(`Centaur session ${input.action} failed: ${input.status} ${input.statusText}`)
     this.name = 'SessionApiError'
+    this.body = input.body ?? ''
     this.retryable = input.retryable
     this.status = input.status
   }
@@ -285,7 +253,11 @@ export async function createSession(
   threadKey: string,
   conversationName?: string,
   harnessType?: string,
-  requester?: SessionRequester
+  requester?: SessionRequester,
+  options: {
+    harnessAssignment?: GoogleChatHarnessAssignment
+    restartOnHarnessConflict?: boolean
+  } = {}
 ): Promise<CreateSessionResult> {
   const name = conversationName?.trim()
   const claim = requester?.identity
@@ -327,24 +299,65 @@ export async function createSession(
       // `user_email` is credential-bearing, and only it is withheld when the
       // gate fails; the other two describe the request and always ship.
       ...identityMetadata(identity),
+      ...(options.harnessAssignment
+        ? { harness_assignment: harnessAssignmentMetadata(options.harnessAssignment) }
+        : {}),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }
   }
-  const response = await sessionApiRequest('create_session', 'create session', signal =>
-    fetch(apiSessionUrl(config, threadKey), {
-      method: 'POST', headers: apiHeaders(config), body: JSON.stringify(body), signal
-    }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
-  )
-  const payload = (await response.json().catch(() => ({}))) as CreateSessionResponse
+  const post = async (request: CreateSessionRequest): Promise<CreateSessionResponse> => {
+    const response = await sessionApiRequest('create_session', 'create session', signal =>
+      fetch(apiSessionUrl(config, threadKey), {
+        method: 'POST', headers: apiHeaders(config), body: JSON.stringify(request), signal
+      }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
+    )
+    return (await response.json().catch(() => ({}))) as CreateSessionResponse
+  }
+
+  let payload: CreateSessionResponse
+  try {
+    payload = await post(body)
+  } catch (error) {
+    const existingHarness = existingHarnessFromConflict(error)
+    if (!existingHarness) throw error
+    payload = await post({ ...body, harness_type: existingHarness })
+    const status = payload.status ?? payload.session?.status ?? ''
+    if (options.restartOnHarnessConflict && status !== ACTIVE_SESSION_STATUS) {
+      payload = await post({ ...body, on_harness_conflict: 'restart' })
+    }
+  }
   const status = payload.status ?? payload.session?.status ?? ''
   const resolvedHarness = payload.harness_type?.trim()
-  const harnessAssignment = harnessAssignmentFromResponse(payload.harness_assignment)
+  const harnessAssignment = options.harnessAssignment && resolvedHarness
+    ? { ...options.harnessAssignment, cohort: resolvedHarness }
+    : options.harnessAssignment
   return {
     status,
     activeExecution: status === ACTIVE_SESSION_STATUS,
     ...(resolvedHarness ? { harnessType: resolvedHarness } : {}),
     ...(harnessAssignment ? { harnessAssignment } : {})
+  }
+}
+
+function harnessAssignmentMetadata(assignment: GoogleChatHarnessAssignment): JsonObject {
+  return {
+    experiment: assignment.experiment,
+    requested_harness: assignment.requestedHarness,
+    cohort: assignment.cohort,
+    rollout_percent: assignment.rolloutPercent
+  }
+}
+
+function existingHarnessFromConflict(error: unknown): string | undefined {
+  if (!(error instanceof SessionApiError) || error.status !== 409) return undefined
+  try {
+    const body = JSON.parse(error.body) as Record<string, unknown>
+    return body.code === 'harness_conflict' && typeof body.existing_harness === 'string'
+      ? body.existing_harness
+      : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -424,14 +437,7 @@ export async function executeSession(
       action: 'execute',
       ...(opts.harnessType ? { harness_type: opts.harnessType } : {}),
       ...(opts.harnessAssignment
-        ? {
-            harness_assignment: {
-              experiment: opts.harnessAssignment.experiment,
-              requested_harness: opts.harnessAssignment.requestedHarness,
-              cohort: opts.harnessAssignment.cohort,
-              rollout_percent: opts.harnessAssignment.rolloutPercent
-            }
-          }
+        ? { harness_assignment: harnessAssignmentMetadata(opts.harnessAssignment) }
         : {})
     }),
     input_lines: toCodexInputLines(
@@ -946,6 +952,7 @@ async function ensureApiOk(response: Response, action: string): Promise<void> {
   }
   throw new SessionApiError({
     action,
+    body,
     retryable: isRetryableApiStatus(response.status),
     status: response.status,
     statusText: response.statusText

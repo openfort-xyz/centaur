@@ -109,9 +109,8 @@ describe('createSession', () => {
     expect(result.activeExecution).toBe(false)
   })
 
-  // Upstream #1178 parity: api-rs may persist a different harness than the one
-  // requested (Codex/Nanocodex A/B split, hashed by thread key). The bot has to
-  // read the resolved harness back so the trailer doesn't mislabel the cohort.
+  // The bot owns rollout selection, but api-rs still reports the harness it
+  // persisted so old threads keep their original cohort.
   test('surfaces the harness api-rs actually persisted', async () => {
     stubFetch({ status: 'idle', harness_type: 'nanocodex' })
     const result = await createSession(
@@ -123,35 +122,91 @@ describe('createSession', () => {
     expect(result.harnessType).toBe('nanocodex')
   })
 
-  test('surfaces the A/B assignment provenance', async () => {
-    stubFetch({
-      status: 'idle',
-      harness_type: 'nanocodex',
-      harness_assignment: {
-        experiment: 'codex_nanocodex_ab',
-        requested_harness: 'codex',
-        cohort: 'nanocodex',
-        rollout_percent: 50
-      }
-    })
-    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
-    expect(result.harnessAssignment).toEqual({
+  test('records the Google Chat-owned A/B assignment', async () => {
+    stubFetch({ status: 'idle', harness_type: 'nanocodex' })
+    const assignment = {
       experiment: 'codex_nanocodex_ab',
       requestedHarness: 'codex',
       cohort: 'nanocodex',
       rolloutPercent: 50
+    }
+    const result = await createSession(
+      loadConfig({}),
+      'chat:spaces:AAAA:threads:T1',
+      undefined,
+      'nanocodex',
+      undefined,
+      { harnessAssignment: assignment }
+    )
+    expect(result.harnessAssignment).toEqual({
+      ...assignment,
+      cohort: 'nanocodex'
     })
   })
 
-  test('ignores a malformed or absent assignment instead of throwing', async () => {
-    stubFetch({ status: 'idle', harness_assignment: { experiment: 'codex_nanocodex_ab' } })
-    const partial = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
-    expect(partial.harnessAssignment).toBeUndefined()
+  test('keeps an existing rollout cohort on harness conflict', async () => {
+    const requests: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      requests.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>)
+      return requests.length === 1
+        ? new Response(JSON.stringify({
+            code: 'harness_conflict',
+            existing_harness: 'codex',
+            requested_harness: 'nanocodex'
+          }), { status: 409 })
+        : new Response(JSON.stringify({ status: 'idle', harness_type: 'codex' }), { status: 200 })
+    }) as unknown as typeof fetch
 
-    stubFetch({ status: 'idle' })
-    const missing = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
-    expect(missing.harnessAssignment).toBeUndefined()
-    expect(missing.harnessType).toBeUndefined()
+    const result = await createSession(
+      loadConfig({}),
+      'chat:spaces:AAAA:threads:T1',
+      undefined,
+      'nanocodex',
+      undefined,
+      {
+        harnessAssignment: {
+          experiment: 'codex_nanocodex_ab',
+          requestedHarness: 'codex',
+          cohort: 'nanocodex',
+          rolloutPercent: 50
+        }
+      }
+    )
+
+    expect(requests.map(request => request.harness_type)).toEqual(['nanocodex', 'codex'])
+    expect(result.harnessType).toBe('codex')
+    expect(result.harnessAssignment?.cohort).toBe('codex')
+  })
+
+  test('restarts an idle session when an explicit harness override conflicts', async () => {
+    const requests: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      requests.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>)
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({
+          code: 'harness_conflict',
+          existing_harness: 'codex',
+          requested_harness: 'nanocodex'
+        }), { status: 409 })
+      }
+      return new Response(JSON.stringify({
+        status: 'idle',
+        harness_type: requests.length === 2 ? 'codex' : 'nanocodex'
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const result = await createSession(
+      loadConfig({}),
+      'chat:spaces:AAAA:threads:T1',
+      undefined,
+      'nanocodex',
+      undefined,
+      { restartOnHarnessConflict: true }
+    )
+
+    expect(requests.map(request => request.harness_type)).toEqual(['nanocodex', 'codex', 'nanocodex'])
+    expect(requests[2]?.on_harness_conflict).toBe('restart')
+    expect(result.harnessType).toBe('nanocodex')
   })
 
   test('omits requester fields that are not available', async () => {
