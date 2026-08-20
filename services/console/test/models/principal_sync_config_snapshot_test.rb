@@ -349,7 +349,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     role = roles(:globex_infra)
     PrincipalRole.find_or_create_by!(principal: principal, role: role)
 
-    bot_secret = StaticSecret.new(
+    role_static = StaticSecret.new(
       foreign_id: "slack-bot-#{SecureRandom.hex(4)}",
       replace_config: {
         "proxy_value" => "SLACK_BOT_TOKEN",
@@ -357,10 +357,10 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       },
       created_by: users(:globex_admin)
     )
-    bot_secret.build_source(source_type: "env", config: { "var" => "SLACK_BOT_TOKEN" })
-    bot_secret.rules.build(host: "slack.com", position: 0)
-    bot_secret.save!
-    Grant.create!(role: role, static_secret: bot_secret, created_by: users(:globex_admin))
+    role_static.build_source(source_type: "env", config: { "var" => "SLACK_BOT_TOKEN" })
+    role_static.rules.build(host: "slack.com", position: 0)
+    role_static.save!
+    Grant.create!(role: role, static_secret: role_static, created_by: users(:globex_admin))
 
     user_secret = grant_direct_static(host: "slack.com", header: "Authorization")
     served = PrincipalSyncConfigSnapshot.sync_secrets_for(principal)
@@ -368,7 +368,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     assert_equal 1, served.length
     assert_equal "direct-token", served.first.dig("source", "value")
     assert_equal "Authorization", served.first.dig("inject", "header")
-    refute_includes served, bot_secret.to_proxy_secret
+    refute_includes served, role_static.to_proxy_secret
     assert_equal user_secret.to_proxy_secret, served.first
   end
 
