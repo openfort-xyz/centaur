@@ -1,5 +1,53 @@
 # syntax=docker/dockerfile:1.7
 
+FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS sandbox-go-build
+
+RUN apk add --no-cache bash git
+
+FROM sandbox-go-build AS docker-cli-build
+ARG DOCKER_CLI_REF=a7dcaa6fdb6ed04aacbfdc76357fdae01605609e
+WORKDIR /src
+RUN git init \
+    && git remote add origin https://github.com/docker/cli.git \
+    && git fetch --depth 1 origin "${DOCKER_CLI_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && cp vendor.mod go.mod \
+    && CGO_ENABLED=0 go build -mod=vendor -tags grpcnotrace -trimpath \
+      -ldflags="-s -w -X github.com/docker/cli/cli/version.GitCommit=${DOCKER_CLI_REF} -X github.com/docker/cli/cli/version.Version=29.7.2 -X 'github.com/docker/cli/cli/version.PlatformName=Docker Engine - Community'" \
+      -o /docker ./cmd/docker
+
+FROM sandbox-go-build AS github-cli-build
+ARG GITHUB_CLI_REF=55dbb4dc6b7edb10b48e3d7fc5bccd32318d1b55
+WORKDIR /src
+RUN git init \
+    && git remote add origin https://github.com/cli/cli.git \
+    && git fetch --depth 1 origin "${GITHUB_CLI_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && git tag v2.97.0 "${GITHUB_CLI_REF}" \
+    && cp go.mod .build.mod \
+    && cp go.sum .build.sum \
+    && git config status.showUntrackedFiles no \
+    && go get -modfile=.build.mod golang.org/x/mod@v0.40.0 \
+    && CGO_ENABLED=0 go build -modfile=.build.mod -trimpath \
+      -ldflags="-s -w -X github.com/cli/cli/v2/internal/build.Version=2.97.0" \
+      -o /gh ./cmd/gh
+
+FROM sandbox-go-build AS kubectl-build
+ARG KUBERNETES_REF=bd6c4ad159ac77a879838b8f14f23a49bf97de5f
+WORKDIR /src
+RUN git init \
+    && git remote add origin https://github.com/kubernetes/kubernetes.git \
+    && git fetch --depth 1 origin "${KUBERNETES_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && git tag v1.34.10 "${KUBERNETES_REF}" \
+    && cp go.mod .build.mod \
+    && cp go.sum .build.sum \
+    && git config status.showUntrackedFiles no \
+    && GOWORK=off go get -modfile=.build.mod golang.org/x/net@v0.56.0 golang.org/x/text@v0.39.0 \
+    && GOWORK=off CGO_ENABLED=0 go build -modfile=.build.mod -trimpath \
+      -ldflags="-s -w -X k8s.io/component-base/version.gitVersion=v1.34.10 -X k8s.io/component-base/version.gitCommit=${KUBERNETES_REF} -X k8s.io/component-base/version.gitTreeState=clean" \
+      -o /kubectl ./cmd/kubectl
+
 FROM ubuntu:24.04 AS toolchain
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -7,7 +55,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # ── System packages (cached unless base image changes) ───────────────────────
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git curl wget ca-certificates gnupg lsb-release sudo \
     build-essential pkg-config cmake ninja-build \
     ffmpeg ghostscript dvisvgm file \
@@ -41,7 +89,7 @@ ENV LIBCLANG_PATH=/usr/lib/llvm-22/lib
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip3 install --break-system-packages --no-compile --ignore-installed "packaging>=24.2.0" \
     && pip3 install --break-system-packages --no-compile \
-    python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
+    python-docx==1.2.0 lxml==6.1.0 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
     faster-whisper \
@@ -56,6 +104,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     httpx>=0.28.0 \
     "openai>=2.53.0" \
     opentelemetry-proto==1.42.1 \
+    cryptography==50.0.0 \
     "psycopg[binary]>=3.2.0" \
     "githubkit>=0.16.1" \
     pysocks>=1.7.1 \
@@ -89,20 +138,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
-ARG CLAUDE_CODE_VERSION=2.1.154
+ARG CLAUDE_CODE_VERSION=2.1.237
 ARG CODEX_VERSION=0.144.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
-ARG KUBECTL_VERSION=v1.34.2
+ARG KUBECTL_VERSION=v1.34.10
 ARG KACHE_VERSION=v0.7.0
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
 # default; `manage-package-manager-versions` in v10) over the same registry
 # egress a dependency install already needs.
-ARG PNPM_VERSION=11.5.3
+ARG PNPM_VERSION=11.8.0
 
 # ── kubectl ──────────────────────────────────────────────────────────────────
 RUN set -eux; \
@@ -153,7 +202,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
       "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
-      agent-browser@0.26.0 \
+      agent-browser@0.34.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
@@ -171,6 +220,7 @@ RUN git init /opt/hermes-agent \
     && git -C /opt/hermes-agent checkout --detach FETCH_HEAD \
     && python3 -m venv /opt/hermes \
     && /opt/hermes/bin/pip install --no-cache-dir --editable /opt/hermes-agent \
+    && /opt/hermes/bin/pip install --no-cache-dir cryptography==50.0.0 \
     && rm -rf /opt/hermes-agent/.git \
     && ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes \
     && hermes version
@@ -276,7 +326,7 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace 
 # the COPY layers — the entire toolchain stage stays cached.
 # ==============================================================================
 
-FROM toolchain AS sandbox
+FROM toolchain AS sandbox-base
 
 USER root
 RUN rm -f /etc/sudoers.d/agent
@@ -322,3 +372,34 @@ COPY --link --chown=1001:1001 services/sandbox/SYSTEM_PROMPT.md /home/agent/AGEN
 ENTRYPOINT ["/entrypoint.sh"]
 # Default CMD uses Rust blocks mode; pass --mode=jsonrpc for raw App Server JSON-RPC.
 CMD ["harness-server", "codex"]
+
+FROM sandbox-base AS sandbox
+
+ARG NPM_VERSION=12.0.2
+ARG KUBECTL_VERSION=v1.34.10
+USER root
+COPY --from=docker-cli-build /docker /usr/bin/docker
+COPY --from=github-cli-build /gh /usr/bin/gh
+COPY --from=kubectl-build /kubectl /usr/local/bin/kubectl
+# gcloud falls back to its Python CRC32C implementation without the vulnerable helper.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    rm -f /usr/lib/google-cloud-sdk/bin/gcloud-crc32c \
+    && npm install -g --prefer-online --force "npm@${NPM_VERSION}" \
+    && npm install --prefix /tmp/npm-patches --ignore-scripts \
+      brace-expansion@5.0.9 ip-address@10.3.1 tar@7.5.19 undici@6.27.0 \
+    && rm -rf \
+      /usr/lib/node_modules/npm/node_modules/brace-expansion \
+      /usr/lib/node_modules/npm/node_modules/ip-address \
+      /usr/lib/node_modules/pnpm/dist/node_modules/tar \
+      /usr/lib/node_modules/pnpm/dist/node_modules/undici \
+    && cp -a /tmp/npm-patches/node_modules/brace-expansion/. /usr/lib/node_modules/npm/node_modules/brace-expansion/ \
+    && cp -a /tmp/npm-patches/node_modules/ip-address/. /usr/lib/node_modules/npm/node_modules/ip-address/ \
+    && cp -a /tmp/npm-patches/node_modules/tar/. /usr/lib/node_modules/pnpm/dist/node_modules/tar/ \
+    && cp -a /tmp/npm-patches/node_modules/undici/. /usr/lib/node_modules/pnpm/dist/node_modules/undici/ \
+    && rm -rf /tmp/npm-patches \
+    && npm --version | grep -F "${NPM_VERSION}" \
+    && node -e 'const assert = require("node:assert"); const version = path => require(`${path}/package.json`).version; assert.equal(version("/usr/lib/node_modules/npm/node_modules/brace-expansion"), "5.0.9"); assert.equal(version("/usr/lib/node_modules/npm/node_modules/ip-address"), "10.3.1"); assert.equal(version("/usr/lib/node_modules/pnpm/dist/node_modules/tar"), "7.5.19"); assert.equal(version("/usr/lib/node_modules/pnpm/dist/node_modules/undici"), "6.27.0")' \
+    && docker --version | grep -F '29.7.2' \
+    && gh --version | grep -F '2.97.0' \
+    && kubectl version --client=true | grep -F "${KUBECTL_VERSION#v}"
+USER agent

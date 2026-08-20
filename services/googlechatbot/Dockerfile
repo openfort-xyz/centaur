@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM oven/bun:1.3.13-slim
+FROM oven/bun:1.3.13-slim AS build
 
 WORKDIR /repo
 ENV NODE_ENV=production
@@ -23,7 +23,14 @@ COPY services/googlechatbot/ services/googlechatbot/
 # Chat Console-link line can name the model a harness runs without a
 # hardcoded copy of those values.
 COPY harness/ harness/
+
+FROM oven/bun:1.3.13-slim
+
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /repo /repo
 WORKDIR /repo/services/googlechatbot
+ENV NODE_ENV=production
 
 EXPOSE 3002
 ENV PORT=3002
