@@ -51,6 +51,13 @@ describe('googlechatbot config', () => {
     expect(defaults.GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES).toBe(100 * 1024 * 1024)
   })
 
+  test('bounds the Codex/Nanocodex rollout percentage', () => {
+    expect(loadConfig({}).GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT).toBe(0)
+    expect(loadConfig({ GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: '75' })
+      .GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT).toBe(75)
+    expect(() => loadConfig({ GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: '101' })).toThrow()
+  })
+
   test('defaults response metadata to the first response without service tier', () => {
     const config = loadConfig({})
     expect(config.GOOGLECHATBOT_RESPONSE_METADATA_MODE).toBe('first')

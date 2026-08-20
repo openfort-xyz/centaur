@@ -65,7 +65,7 @@ pub(crate) struct AuthenticatedCaller {
     class: CallerClass,
     identity: String,
     capabilities: BTreeSet<Capability>,
-    platform_prefix: Option<&'static str>,
+    platform_prefixes: Option<&'static [&'static str]>,
     principal_subject: Option<String>,
 }
 
@@ -82,8 +82,8 @@ impl AuthenticatedCaller {
         &self.identity
     }
 
-    pub(crate) const fn platform_prefix(&self) -> Option<&'static str> {
-        self.platform_prefix
+    pub(crate) const fn platform_prefixes(&self) -> Option<&'static [&'static str]> {
+        self.platform_prefixes
     }
 
     pub(crate) fn principal_subject(&self) -> Option<&str> {
@@ -123,50 +123,7 @@ impl ApiAuthConfig {
                 None,
             ));
         }
-        for spec in [
-            IngressSpec {
-                env_var: "SLACKBOT_API_KEY",
-                identity: "slackbot",
-                platform_prefix: "slack:",
-                workflow_events: true,
-            },
-            IngressSpec {
-                env_var: "DISCORDBOT_API_KEY",
-                identity: "discordbot",
-                platform_prefix: "discord:",
-                workflow_events: false,
-            },
-            IngressSpec {
-                env_var: "GITHUBBOT_API_KEY",
-                identity: "githubbot",
-                platform_prefix: "github:",
-                workflow_events: true,
-            },
-            IngressSpec {
-                env_var: "LINEARBOT_API_KEY",
-                identity: "linearbot",
-                platform_prefix: "linear:",
-                workflow_events: false,
-            },
-            IngressSpec {
-                env_var: "TEAMSBOT_API_KEY",
-                identity: "teamsbot",
-                platform_prefix: "teams:",
-                workflow_events: false,
-            },
-            // googlechatbot builds every thread key as
-            // `chat:spaces:<space_id>:<thread resource…>`. The prefix includes
-            // `spaces:` on purpose: bare `chat:C…` keys are the legacy
-            // Slack-compatible adapter shape, and this caller must not reach
-            // them. It dispatches card/command/form interactions as durable
-            // workflow events the way slackbot dispatches block actions.
-            IngressSpec {
-                env_var: "GOOGLECHATBOT_API_KEY",
-                identity: "googlechatbot",
-                platform_prefix: "chat:spaces:",
-                workflow_events: true,
-            },
-        ] {
+        for spec in INGRESS_SPECS {
             let Some(token) = optional_env(spec.env_var) else {
                 continue;
             };
@@ -179,7 +136,7 @@ impl ApiAuthConfig {
                 CallerClass::Ingress,
                 token,
                 capabilities,
-                Some(spec.platform_prefix),
+                Some(spec.platform_prefixes),
             ));
         }
 
@@ -215,7 +172,7 @@ impl ApiAuthConfig {
                 Capability::SessionsWrite,
                 Capability::WorkflowsEvents,
             ],
-            Some("slack:"),
+            Some(&["slack:"]),
         )];
         Self {
             static_callers: Arc::new(callers),
@@ -258,7 +215,7 @@ impl ApiAuthConfig {
                     class: CallerClass::Console,
                     identity: subject,
                     capabilities: Capability::ALL.into_iter().collect(),
-                    platform_prefix: None,
+                    platform_prefixes: None,
                     principal_subject: None,
                 })
             }
@@ -290,7 +247,7 @@ impl ApiAuthConfig {
                     class: CallerClass::Principal,
                     identity: subject.clone(),
                     capabilities,
-                    platform_prefix: None,
+                    platform_prefixes: None,
                     principal_subject: Some(subject),
                 })
             }
@@ -329,10 +286,61 @@ enum ApiJwtTokenUse {
     ConsoleService,
 }
 
+/// Every ingress key and the session thread-key families it is allowed to
+/// touch. The platform scoping in `authorize_api_request` denies any
+/// `/api/session/*` call outside them, so a family missing here locks a bot
+/// out of its own sessions.
+const INGRESS_SPECS: &[IngressSpec] = &[
+    IngressSpec {
+        env_var: "SLACKBOT_API_KEY",
+        identity: "slackbot",
+        platform_prefixes: &["slack:"],
+        workflow_events: true,
+    },
+    IngressSpec {
+        env_var: "DISCORDBOT_API_KEY",
+        identity: "discordbot",
+        platform_prefixes: &["discord:"],
+        workflow_events: false,
+    },
+    IngressSpec {
+        env_var: "GITHUBBOT_API_KEY",
+        identity: "githubbot",
+        platform_prefixes: &[
+            "github:",
+            "github-issue:",
+            "github-manage:",
+            "github-review:",
+        ],
+        workflow_events: true,
+    },
+    IngressSpec {
+        env_var: "LINEARBOT_API_KEY",
+        identity: "linearbot",
+        platform_prefixes: &["linear:"],
+        workflow_events: false,
+    },
+    IngressSpec {
+        env_var: "TEAMSBOT_API_KEY",
+        identity: "teamsbot",
+        platform_prefixes: &["teams:"],
+        workflow_events: false,
+    },
+    // Google Chat keys always include `spaces:`. Bare `chat:C…` keys belong
+    // to the legacy Slack-compatible adapter and stay out of this caller's scope.
+    IngressSpec {
+        env_var: "GOOGLECHATBOT_API_KEY",
+        identity: "googlechatbot",
+        platform_prefixes: &["chat:spaces:"],
+        workflow_events: true,
+    },
+];
+
 struct IngressSpec {
     env_var: &'static str,
     identity: &'static str,
-    platform_prefix: &'static str,
+    /// Every session thread-key prefix this ingress mints.
+    platform_prefixes: &'static [&'static str],
     workflow_events: bool,
 }
 
@@ -341,7 +349,7 @@ fn static_caller(
     class: CallerClass,
     token: String,
     capabilities: impl IntoIterator<Item = Capability>,
-    platform_prefix: Option<&'static str>,
+    platform_prefixes: Option<&'static [&'static str]>,
 ) -> StaticCaller {
     StaticCaller {
         token_digest: Sha256::digest(token.as_bytes()).into(),
@@ -349,7 +357,7 @@ fn static_caller(
             class,
             identity: identity.to_owned(),
             capabilities: capabilities.into_iter().collect(),
-            platform_prefix,
+            platform_prefixes,
             principal_subject: None,
         },
     }
@@ -440,7 +448,7 @@ mod tests {
                 .into_iter()
                 .all(|capability| caller.has_capability(capability))
         );
-        assert_eq!(caller.platform_prefix(), None);
+        assert_eq!(caller.platform_prefixes(), None);
         assert_eq!(caller.principal_subject(), None);
     }
 
@@ -532,6 +540,40 @@ mod tests {
     }
 
     #[test]
+    fn githubbot_ingress_covers_every_thread_key_family_it_mints() {
+        // Mirrors services/githubbot/src: chat threads (body-mention.ts), issue
+        // work (issue-manager.ts), owned-PR management (pr-manager.ts) and review
+        // runs (review.ts). githubbot/test/thread-keys.test.ts pins the producer
+        // side; dropping a family here 403s the bot out of its own sessions.
+        let githubbot = INGRESS_SPECS
+            .iter()
+            .find(|spec| spec.identity == "githubbot")
+            .expect("githubbot ingress spec");
+
+        assert_eq!(
+            githubbot.platform_prefixes,
+            [
+                "github:",
+                "github-issue:",
+                "github-manage:",
+                "github-review:"
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn every_ingress_scopes_itself_to_at_least_one_prefix() {
+        for spec in INGRESS_SPECS {
+            assert!(
+                !spec.platform_prefixes.is_empty(),
+                "{} would be scoped to no session at all",
+                spec.identity
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_tokens_are_rejected() {
         let callers = vec![
             static_caller(
@@ -539,14 +581,14 @@ mod tests {
                 CallerClass::Ingress,
                 "same".to_owned(),
                 [Capability::SessionsWrite],
-                Some("slack:"),
+                Some(&["slack:"]),
             ),
             static_caller(
                 "githubbot",
                 CallerClass::Ingress,
                 "same".to_owned(),
                 [Capability::SessionsWrite],
-                Some("github:"),
+                Some(&["github:"]),
             ),
         ];
 

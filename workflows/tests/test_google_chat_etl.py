@@ -564,6 +564,32 @@ def test_scheduled_sync_rescans_old_messages_so_edits_converge():
     assert client.calls[0]["filter"] is None
 
 
+def test_message_upsert_only_updates_timestamp_when_content_changes():
+    pool = FakeSyncPool()
+
+    asyncio.run(
+        chat_sync._upsert_message(
+            pool,
+            space_id="S1",
+            message={
+                "name": "spaces/S1/messages/M1",
+                "text": "hello",
+                "createTime": "2026-08-20T10:00:00Z",
+            },
+            member_names={},
+            run_id="run_1",
+        )
+    )
+
+    query = next(query for query, _ in pool.executed if "google_chat_sync_messages" in query)
+    assert (
+        "updated_at = CASE WHEN google_chat_sync_messages.raw_payload "
+        "IS DISTINCT FROM EXCLUDED.raw_payload "
+        "THEN NOW() ELSE google_chat_sync_messages.updated_at END"
+        in query
+    )
+
+
 def test_deletion_cleanup_is_idempotent_and_removes_retained_content():
     pool = FakeSyncPool()
     for _ in range(2):
