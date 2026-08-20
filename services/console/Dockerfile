@@ -8,7 +8,19 @@
 # For a containerized dev environment, see Dev Containers: https://guides.rubyonrails.org/getting_started_with_devcontainer.html
 
 # Make sure RUBY_VERSION matches the Ruby version in .ruby-version
-ARG RUBY_VERSION=3.4.8
+ARG RUBY_VERSION=3.4.10
+
+FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS thruster-build
+
+ARG THRUSTER_REF=343c4154dbd8102a4050a2306a644c06f7945f3a
+RUN apk add --no-cache git
+WORKDIR /src
+RUN git init \
+    && git remote add origin https://github.com/basecamp/thruster.git \
+    && git fetch --depth 1 origin "${THRUSTER_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /thrust ./cmd/...
+
 FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
 
 # Rails app lives here
@@ -16,6 +28,7 @@ WORKDIR /rails
 
 # Install base packages
 RUN apt-get update -qq && \
+    apt-get upgrade --no-install-recommends -y && \
     apt-get install --no-install-recommends -y curl libjemalloc2 libvips postgresql-client && \
     ln -s /usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
@@ -43,6 +56,12 @@ RUN bundle install && \
     rm -rf ~/.bundle/ "${BUNDLE_PATH}"/ruby/*/cache "${BUNDLE_PATH}"/ruby/*/bundler/gems/*/.git && \
     # -j 1 disable parallel compilation to avoid a QEMU bug: https://github.com/rails/bootsnap/issues/495
     bundle exec bootsnap precompile -j 1 --gemfile
+
+COPY --from=thruster-build /thrust /tmp/thrust
+# Replace the vulnerable gem-bundled binary and fail if its layout changes.
+RUN thrust_path="$(find "${BUNDLE_PATH}" -type f -path '*/thruster-*/exe/*/thrust' -print -quit)" && \
+    test -n "${thrust_path}" && \
+    cp /tmp/thrust "${thrust_path}"
 
 # Copy application code
 COPY . .
