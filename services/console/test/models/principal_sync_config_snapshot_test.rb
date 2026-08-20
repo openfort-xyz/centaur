@@ -357,7 +357,7 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       },
       created_by: users(:globex_admin)
     )
-    bot_secret.build_source(source_type: "control_plane", secret: "bot-token")
+    bot_secret.build_source(source_type: "env", config: { "var" => "SLACK_BOT_TOKEN" })
     bot_secret.rules.build(host: "slack.com", position: 0)
     bot_secret.save!
     Grant.create!(role: role, static_secret: bot_secret, created_by: users(:globex_admin))
