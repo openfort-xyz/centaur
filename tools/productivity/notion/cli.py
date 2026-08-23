@@ -467,19 +467,27 @@ def append_content(
 @app.command("blocks")
 def get_blocks(
     block_id: str = typer.Argument(..., help="Block or page ID"),
-    limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max results (0 = all)"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Get child blocks of a page or block.
 
+    Reads every page of children by default. A single Notion request caps at
+    100 children and reports the rest only through `has_more`, which a bare
+    `block_children` call discards -- so a page over the cap used to come back
+    silently short, and callers that round-trip it (read, rewrite, verify)
+    deleted whatever fell past the cut.
+
     Examples:
         notion blocks PAGE_ID
         notion blocks BLOCK_ID --json
+        notion blocks PAGE_ID -n 20
     """
     client = get_client()
     bid = extract_id(block_id)
-    result = client.block_children(bid, page_size=limit)
-    blocks = result.get("results", [])
+    blocks = client.get_page_content(bid)
+    if limit:
+        blocks = blocks[:limit]
 
     if not blocks:
         console.print("[yellow]No blocks found.[/]")
