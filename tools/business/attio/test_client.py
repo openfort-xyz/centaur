@@ -159,3 +159,50 @@ def test_retry_after_http_date_is_parsed() -> None:
     now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 
     assert client._retry_delay("Sat, 08 Aug 2026 12:00:05 GMT", now=now) == 5.0
+
+
+def _mock_client(handler) -> AttioClient:
+    client = AttioClient(api_key="test-key")
+    client._client = httpx.Client(
+        base_url="https://api.attio.com/v2",
+        headers={"Authorization": "Bearer test-key"},
+        transport=httpx.MockTransport(handler),
+    )
+    return client
+
+
+def test_create_entry_sends_parent_object_from_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.path == "/v2/lists/support"
+            return httpx.Response(200, json={"data": {"parent_object": ["people"]}})
+        assert request.url.path == "/v2/lists/support/entries"
+        assert json.loads(request.read()) == {
+            "data": {
+                "parent_record_id": "person-1",
+                "parent_object": "people",
+                "entry_values": {"state": "open"},
+            }
+        }
+        return httpx.Response(200, json={"data": {"id": {"entry_id": "entry-1"}}})
+
+    entry = _mock_client(handler).create_entry("support", "person-1", {"state": "open"})
+
+    assert entry == {"id": {"entry_id": "entry-1"}}
+
+
+def test_create_entry_explicit_parent_object_skips_lookup() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert json.loads(request.read())["data"]["parent_object"] == "companies"
+        return httpx.Response(200, json={"data": {}})
+
+    _mock_client(handler).create_entry("deals", "co-1", parent_object="companies")
+
+
+def test_create_entry_rejects_ambiguous_parent_object() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"parent_object": ["people", "companies"]}})
+
+    with pytest.raises(ValueError, match="pass parent_object explicitly"):
+        _mock_client(handler).create_entry("mixed", "rec-1")

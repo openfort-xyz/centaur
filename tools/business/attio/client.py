@@ -281,13 +281,43 @@ class AttioClient:
         data = self._request("POST", f"/lists/{list_id}/entries/query", json=body)
         return data.get("data", [])
 
-    def create_entry(self, list_id: str, parent_record_id: str, values: dict | None = None) -> dict:
-        """Create a new entry in a list."""
-        body: dict[str, Any] = {"data": {"parent_record_id": parent_record_id}}
+    def create_entry(
+        self,
+        list_id: str,
+        parent_record_id: str,
+        values: dict | None = None,
+        parent_object: str | None = None,
+    ) -> dict:
+        """Create a new entry in a list.
+
+        Attio requires parent_object (the slug of the object the entry points at,
+        e.g. "companies"). When omitted it is read off the list, which is
+        unambiguous for the single-object lists we use.
+        """
+        if parent_object is None:
+            parent_object = self._list_parent_object(list_id)
+        body: dict[str, Any] = {
+            "data": {
+                "parent_record_id": parent_record_id,
+                "parent_object": parent_object,
+            }
+        }
         if values:
             body["data"]["entry_values"] = values
         data = self._request("POST", f"/lists/{list_id}/entries", json=body)
         return data.get("data", {})
+
+    def _list_parent_object(self, list_id: str) -> str:
+        """Resolve the single parent object slug of a list."""
+        parents = self.get_list(list_id).get("parent_object") or []
+        if isinstance(parents, str):
+            parents = [parents]
+        if len(parents) != 1:
+            raise ValueError(
+                f"list {list_id} has {len(parents)} parent objects ({parents or 'none'}); "
+                "pass parent_object explicitly"
+            )
+        return parents[0]
 
     def list_notes(
         self,
