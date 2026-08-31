@@ -1,4 +1,5 @@
 require "fugit"
+require "uri"
 
 class ScheduledTask < ApplicationRecord
   class DeliveryDestinationUnavailable < StandardError; end
@@ -35,6 +36,10 @@ class ScheduledTask < ApplicationRecord
     [ "Sun", "0" ]
   ].freeze
   DELIVERY_DESTINATION_FORMAT = /\A[CDGUW][A-Z0-9]{8,}\z/
+  # Fork addition: a destination may also be a Google Chat space resource name
+  # or the author's own email (their 1:1 bot DM).
+  GOOGLE_CHAT_SPACE_DESTINATION_FORMAT = GoogleChatSpacePermission::SPACE_NAME_FORMAT
+  GOOGLE_CHAT_DM_DESTINATION_FORMAT = URI::MailTo::EMAIL_REGEXP
 
   belongs_to :author, class_name: "User"
 
@@ -54,7 +59,8 @@ class ScheduledTask < ApplicationRecord
                                format: {
                                  with: DELIVERY_DESTINATION_FORMAT,
                                  message: "must be a Slack channel or user ID"
-                               }
+                               },
+                               unless: :google_chat_delivery?
   validates :cron_expression, presence: true
   validates :timezone, presence: true
   validate :cron_schedule_is_valid
@@ -108,7 +114,20 @@ class ScheduledTask < ApplicationRecord
     ConsoleUserPrincipalProvisioner.call(author)
   end
 
+  def delivery_platform
+    destination = delivery_channel.to_s
+    return :slack if DELIVERY_DESTINATION_FORMAT.match?(destination)
+    return :gchat_space if GOOGLE_CHAT_SPACE_DESTINATION_FORMAT.match?(destination)
+    :gchat_dm if GOOGLE_CHAT_DM_DESTINATION_FORMAT.match?(destination)
+  end
+
+  def google_chat_delivery?
+    delivery_platform.in?(%i[gchat_space gchat_dm])
+  end
+
   def api_input
+    return google_chat_api_input if google_chat_delivery?
+
     delivery_policy = SlackDeliveryPolicy.new(author)
     unless delivery_policy.allowed?(delivery_channel)
       raise DeliveryDestinationUnavailable, "Slack delivery destination is no longer available to the author"
@@ -125,6 +144,22 @@ class ScheduledTask < ApplicationRecord
   end
 
   private
+
+  def google_chat_api_input
+    unless GoogleChatDeliveryPolicy.new(author).allowed?(delivery_channel)
+      raise DeliveryDestinationUnavailable,
+            "Google Chat delivery destination is no longer available to the author"
+    end
+
+    {
+      prompt: prompt,
+      principal: execution_principal.foreign_id,
+      channel: delivery_channel,
+      author_email: author.email.to_s.strip.downcase,
+      scheduled_task_id: oid,
+      scheduled_task_name: name
+    }
+  end
 
   def simple_weekly_schedule
     fields = cron_expression.to_s.split
@@ -197,8 +232,15 @@ class ScheduledTask < ApplicationRecord
 
   def delivery_destination_is_available_to_author
     return if author.blank? || delivery_channel.blank?
+    return google_chat_destination_is_available_to_author if google_chat_delivery?
     return unless DELIVERY_DESTINATION_FORMAT.match?(delivery_channel)
     return if SlackDeliveryPolicy.new(author).allowed?(delivery_channel)
+
+    errors.add(:delivery_channel, "is not available to the author")
+  end
+
+  def google_chat_destination_is_available_to_author
+    return if GoogleChatDeliveryPolicy.new(author).allowed?(delivery_channel)
 
     errors.add(:delivery_channel, "is not available to the author")
   end

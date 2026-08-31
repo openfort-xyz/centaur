@@ -57,11 +57,17 @@ class Console::ScheduledTasksController < ApplicationController
   def task_attributes
     attributes = task_params
     delivery_mode = attributes.delete(:delivery_mode)
+    delivery_space = attributes.delete(:delivery_space)
+    delivery_space_custom = attributes.delete(:delivery_space_custom)
     schedule_preset = attributes.delete(:schedule_preset)
     custom_days = attributes.delete(:custom_days)
     custom_time = attributes.delete(:custom_time)
     attributes.merge(
-      delivery_channel: delivery_channel_for(delivery_mode, attributes[:delivery_channel]),
+      delivery_channel: delivery_channel_for(
+        delivery_mode,
+        attributes[:delivery_channel],
+        delivery_space_custom.presence || delivery_space
+      ),
       cron_expression: ScheduledTask.cron_for(
         schedule_preset,
         nil,
@@ -71,11 +77,17 @@ class Console::ScheduledTasksController < ApplicationController
     )
   end
 
-  def delivery_channel_for(delivery_mode, channel_id)
+  def delivery_channel_for(delivery_mode, channel_id, space_name = nil)
     return SlackDeliveryPolicy.new(current_user).direct_message_user_id if delivery_mode == "dm"
     return channel_id if delivery_mode == "channel"
+    return google_chat_policy.direct_message_identity if delivery_mode == "gchat_dm"
+    return GoogleChatSpacePermission.normalize_resource_name(space_name) if delivery_mode == "gchat_space"
 
     nil
+  end
+
+  def google_chat_policy
+    @google_chat_policy ||= GoogleChatDeliveryPolicy.new(current_user)
   end
 
   def task_params
@@ -84,6 +96,8 @@ class Console::ScheduledTasksController < ApplicationController
       :prompt,
       :delivery_mode,
       :delivery_channel,
+      :delivery_space,
+      :delivery_space_custom,
       :schedule_preset,
       :custom_time,
       :enabled,
@@ -93,6 +107,9 @@ class Console::ScheduledTasksController < ApplicationController
 
   def prepare_form
     @slack_dm_user_id = SlackDeliveryPolicy.new(current_user).direct_message_user_id
+    @slack_delivery_available = SlackChannelCatalogSync.configured?
+    @google_chat_dm_email = google_chat_policy.direct_message_identity
+    @google_chat_spaces = google_chat_policy.send_spaces
     submitted_schedule = params[:scheduled_task]
     @schedule_preset = submitted_schedule&.[](:schedule_preset).presence || @task.schedule_preset
     @custom_schedule_days = if submitted_schedule&.key?(:custom_days)
@@ -105,6 +122,11 @@ class Console::ScheduledTasksController < ApplicationController
 
   def slack_destination_names
     names = SlackBotChannel.pluck(:channel_id, :name).to_h { |channel_id, name| [ channel_id, "##{name}" ] }
+    @tasks.each do |task|
+      next unless task.delivery_platform == :gchat_dm
+
+      names[task.delivery_channel] = "Google Chat DM to you"
+    end
     @tasks.each do |task|
       user_id = SlackDeliveryPolicy.new(task.author).direct_message_user_id
       next unless task.delivery_channel == user_id

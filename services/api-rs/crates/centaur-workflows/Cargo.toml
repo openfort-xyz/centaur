@@ -25,6 +25,7 @@ thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
 tracing.workspace = true
+urlencoding.workspace = true
 uuid.workspace = true
 
 [lints]
