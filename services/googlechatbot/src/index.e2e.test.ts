@@ -994,6 +994,68 @@ describe('googlechatbot DM thread transcript', () => {
     expect(appended().map(message => message.client_message_id))
       .toEqual(['spaces/AAAA/messages/M1'])
     expect((await transcriptOf(state)).map(entry => entry.text)).toEqual(['earlier', 'and this'])
+
+    // slackbotv2 #1519 parity: the folded message is acknowledged with a
+    // steering notice (the edited ack) instead of a silently deleted bubble.
+    await waitFor(async () =>
+      ((await state.get<GoogleChatThreadState>(threadStateKey(DM_THREAD_KEY)))
+        ?.steeringAckMessageNames?.length ?? 0) > 0
+    )
+    const steering = mock.calls.find(c =>
+      c.method === 'PATCH' && (c.body as { text?: string })?.text?.includes('running turn')
+    )
+    expect(steering).toBeTruthy()
+    expect(mock.calls.some(c => c.method === 'DELETE')).toBe(false)
+    expect((await state.get<GoogleChatThreadState>(threadStateKey(DM_THREAD_KEY)))
+      ?.steeringAckMessageNames).toEqual([new URL(steering!.url).pathname.replace(/^\/v1\//, '')])
+  })
+
+  test('finalizing a run deletes the steering notices it collected', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    const threadKey = 'thread-steering-finish'
+    await state.set(threadStateKey(threadKey), {
+      activeExecution: true,
+      steeringAckMessageNames: ['spaces/AAAA/messages/S1', 'spaces/AAAA/messages/S2']
+    } satisfies GoogleChatThreadState)
+    const work: GoogleChatWorkObligation = {
+      acceptedAt: new Date().toISOString(),
+      ackMessageName: 'spaces/AAAA/messages/ACK1',
+      canonicalFinal: { answer: 'durable final answer' },
+      dedupeKey: 'message:steering-finish',
+      event: {
+        thread_key: threadKey,
+        message_id: 'message-steering-finish',
+        space_name: 'spaces/AAAA',
+        space_type: 'DIRECT_MESSAGE',
+        user_id: 'users/U1',
+        user_name: 'Alice',
+        is_mention: true,
+        parts: [{ type: 'text', text: 'run' }],
+        chat: {}
+      },
+      executionId: 'exec-steering-finish',
+      failures: 0,
+      identityVerified: true,
+      lastEventId: 3,
+      stage: 'rendering',
+      workId: crypto.randomUUID()
+    }
+    await persistWork(state, work)
+    await state.disconnect()
+
+    const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })
+    runtime.client.updateMessage = async () => ({})
+    await runtime.stateConnected
+    await waitFor(async () => (await state.get(workKey(work.workId))) === null)
+
+    const deleted = mock.calls
+      .filter(c => c.method === 'DELETE')
+      .map(c => new URL(c.url).pathname.replace(/^\/v1\//, ''))
+    expect(deleted.sort()).toEqual(['spaces/AAAA/messages/S1', 'spaces/AAAA/messages/S2'])
+    const stored = await state.get<GoogleChatThreadState>(threadStateKey(threadKey))
+    expect(stored?.activeExecution).toBe(false)
+    expect(stored?.steeringAckMessageNames).toEqual([])
   })
 
   test('a recovered DM final is recorded under the name it was delivered under', async () => {

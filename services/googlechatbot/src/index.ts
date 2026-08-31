@@ -58,6 +58,7 @@ import {
 import { chatReplyLimits } from './constants'
 import {
   INITIAL_STATUS,
+  STEERING_STATUS,
   consumeRenderStream,
   createRenderState,
   finalizeRender
@@ -1072,8 +1073,7 @@ async function recoverFinalRender(
     outcome,
     answer: renderState.answer
   })
-  await updateThreadState(stateAdapter, work.event.thread_key, {
-    activeExecution: false,
+  await finishThreadRun(client, stateAdapter, work.event.thread_key, {
     lastEventId: work.lastEventId
   })
 }
@@ -1241,8 +1241,8 @@ async function driveSession(
     // collide with api-rs's "one active execution per thread" index and 500,
     // so mirror the Slack bot: fold the new message into the running turn by
     // appending it (the live execution will pick it up) and let that run own
-    // the answer. The redundant "thinking…" ack is removed so the thread isn't
-    // left with a stranded placeholder.
+    // the answer. The "thinking…" ack becomes a steering notice that the live
+    // run clears when it finalizes (slackbotv2 #1519 parity).
     // Only unforwarded messages are appended: api-rs steers every appended
     // user message into the live run, and for a DM `history` is the whole
     // stored transcript.
@@ -1250,12 +1250,13 @@ async function driveSession(
     const appended = [...history, execute].filter(message => !forwarded.has(message.id))
     if (session.activeExecution) {
       await appendSessionMessages(config, threadKey, appended)
+      const held = await holdSteeringAck(client, ackMessageName)
       await updateThreadState(durableState, threadKey, {
         activeExecution: true,
         forwardedMessageIds: appended.map(message => message.id),
+        ...(held ? { steeringAckMessageNames: [ackMessageName] } : {}),
         ...dmTranscriptUpdate(event, execute)
       }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
-      await removeAck(client, ackMessageName)
       incr('googlechatbot_runs_total', { outcome: 'folded' })
       logWarn('googlechatbot_folded_into_active_run', {
         thread_key: threadKey,
@@ -1302,6 +1303,7 @@ async function driveSession(
       if (folded) {
         await updateThreadState(durableState, threadKey, {
           forwardedMessageIds: [execute.id],
+          ...(folded.steeringAckHeld ? { steeringAckMessageNames: [ackMessageName] } : {}),
           ...dmTranscriptUpdate(event, execute)
         }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
         return
@@ -1419,7 +1421,7 @@ async function driveSession(
       outcome: deliveryOutcome,
       answer: state.answer
     })
-    await updateThreadState(durableState, threadKey, { activeExecution: false, lastEventId })
+    await finishThreadRun(client, durableState, threadKey, { lastEventId })
     incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
     // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
     // aggregate both: the final answer is written once and visible.
@@ -1440,7 +1442,7 @@ async function driveSession(
     if (!delivered) throw error
     work.stage = 'final'
     await persistWork(durableState, work)
-    await updateThreadState(durableState, threadKey, { activeExecution: false })
+    await finishThreadRun(client, durableState, threadKey)
   }
 }
 
@@ -1569,8 +1571,8 @@ async function deliverDriveError(
 
 /** Recovery for the execute-vs-execute race: when `/execute` is rejected
  * because another run is already active for the thread, append the message so
- * the live run picks it up (steering) and drop the redundant ack. Returns true
- * when the message was folded and this event needs no run of its own. */
+ * the live run picks it up (steering) and turn the ack into a steering
+ * notice. Returns the fold outcome when this event needs no run of its own. */
 async function foldIntoActiveRun(
   config: AppConfig,
   client: ChatEdgeClient,
@@ -1579,7 +1581,7 @@ async function foldIntoActiveRun(
   ackMessageName: string,
   error: unknown,
   session: { conversationName?: string; harnessType?: string }
-): Promise<boolean> {
+): Promise<{ steeringAckHeld: boolean } | false> {
   const conflictClass = classifyExecuteConflict(error)
   if (conflictClass === 'unrelated') return false
   let active = conflictClass === 'conflict'
@@ -1601,14 +1603,51 @@ async function foldIntoActiveRun(
   }
   if (!active) return false
   await appendSessionMessages(config, threadKey, [execute])
-  await removeAck(client, ackMessageName)
+  const steeringAckHeld = await holdSteeringAck(client, ackMessageName)
   incr('googlechatbot_runs_total', { outcome: 'folded' })
   logWarn('googlechatbot_folded_into_active_run', {
     thread_key: threadKey,
     message_id: execute.id,
     reason: 'execute_conflict'
   })
-  return true
+  return { steeringAckHeld }
+}
+
+/** slackbotv2 reacts to a steering message and clears the reaction when the
+ * live run finishes (#1519). Chat's `reactions.create` is user-auth only, so
+ * the acknowledgement is the eager "thinking…" bubble edited into a steering
+ * notice instead; `finishThreadRun` deletes it. Falls back to removing the
+ * bubble when the edit fails so no "thinking…" is stranded. */
+async function holdSteeringAck(client: ChatEdgeClient, ackMessageName: string): Promise<boolean> {
+  if (!ackMessageName) return false
+  try {
+    await client.updateMessage(ackMessageName, { text: STEERING_STATUS, cardsV2: [] })
+    return true
+  } catch (error) {
+    logWarn('googlechatbot_steering_ack_update_failed', error)
+    await removeAck(client, ackMessageName)
+    return false
+  }
+}
+
+/** Marks the thread idle and removes the steering notices the run collected.
+ * A crash between hold and finish strands a notice — the same ceiling
+ * slackbotv2 accepts for its process-local reactions. */
+async function finishThreadRun(
+  client: ChatEdgeClient,
+  durableState: StateAdapter,
+  threadKey: string,
+  update: Partial<GoogleChatThreadState> = {}
+): Promise<void> {
+  const held =
+    (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey)))
+      ?.steeringAckMessageNames ?? []
+  await updateThreadState(durableState, threadKey, {
+    ...update,
+    activeExecution: false,
+    steeringAckMessageNames: []
+  })
+  for (const name of held) await removeAck(client, name)
 }
 
 /** Best-effort removal of the eager "thinking…" ack when this event won't
