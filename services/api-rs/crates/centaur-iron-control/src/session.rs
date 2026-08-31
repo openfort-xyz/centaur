@@ -15,8 +15,7 @@ use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
     GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND, PrincipalRef,
     derive_github_requester_principal, derive_principal_with_slack_team,
-    derive_slack_requester_principal, is_direct_message, parse_gchat_space,
-    slack_conversation_id,
+    derive_slack_requester_principal, is_direct_message, parse_gchat_space, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

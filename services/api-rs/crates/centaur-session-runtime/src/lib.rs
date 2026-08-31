@@ -8264,7 +8264,7 @@ mod tests {
     #[test]
     fn input_line_with_session_context_adds_google_chat_thread_context() {
         let thread_key = ThreadKey::parse("chat:spaces:AAAA:spaces:AAAA:threads:BBBB").unwrap();
-        let trace = SessionTraceContext::new(&thread_key, None);
+        let trace = SessionTraceContext::new(None, None);
 
         let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
         let value: Value = serde_json::from_str(&line).unwrap();
