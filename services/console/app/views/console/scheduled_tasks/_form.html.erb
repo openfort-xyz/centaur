@@ -105,7 +105,15 @@
 
     <% raw_space = task.delivery_channel if task.delivery_platform == :gchat_space && @google_chat_spaces.exclude?(task.delivery_channel) %>
     <% selected_destination = task.delivery_platform == :gchat_dm ? "dm" : task.delivery_channel if delivery_mode == "gchat" %>
-    <% space_options = @google_chat_spaces.map { |space| [ @google_chat_space_names[space] || space, space ] }.sort %>
+    <%# With names available, unnamed grants (mostly other people's DM spaces)
+        would list as opaque codes, so they are left to the raw-space override.
+        On a directory outage the map is empty and every grant lists raw. %>
+    <% space_options = @google_chat_spaces.filter_map { |space|
+         label = @google_chat_space_names[space]
+         next [ space, space ] if @google_chat_space_names.empty?
+         [ label, space ] if label.present?
+       }.sort %>
+    <% space_options |= [ [ task.delivery_channel, task.delivery_channel ] ] if task.delivery_platform == :gchat_space && @google_chat_spaces.include?(task.delivery_channel) && space_options.none? { |_, value| value == task.delivery_channel } %>
     <div class="mt-3 space-y-2">
       <%= label_tag "scheduled_task_delivery_destination", "Google Chat destination", class: "block text-xs font-medium text-zinc-400" %>
       <%= select_tag "scheduled_task[delivery_destination]",

@@ -311,6 +311,24 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
                   text: "Your direct message"
   end
 
+  test "keeps unnamed granted spaces out of the picker when names are available" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+    principal = ConsoleUserPrincipalProvisioner.call(@operator)
+    GoogleChatSpacePermission.replace_for!(
+      principal,
+      [ { space_name: "spaces/AAQA42QLdws", send_enabled: true },
+        { space_name: "spaces/dmNoName1234", send_enabled: true } ]
+    )
+
+    GoogleChatSpaceDirectory.stub(:display_names, { "spaces/AAQA42QLdws" => "AI" }) do
+      get new_console_scheduled_task_url
+    end
+
+    assert_response :ok
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value='spaces/AAQA42QLdws']"
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value='spaces/dmNoName1234']", count: 0
+  end
+
   test "shows the space display name on the task table" do
     grant_google_chat_space("spaces/AAQA42QLdws")
     create_task.update!(delivery_channel: "spaces/AAQA42QLdws")
