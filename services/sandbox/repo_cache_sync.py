@@ -263,6 +263,7 @@ class RepoCacheSync:
                         "fetch",
                         "--prune",
                         "--tags",
+                        "--force",
                         "origin",
                         requested_ref,
                     ],
@@ -297,8 +298,11 @@ class RepoCacheSync:
             f"checkout {repo}@{default_branch}",
         )
 
+    def repository_url(self, repo: str) -> str:
+        return f"https://github.com/{repo}.git"
+
     def sync_repo(self, repo: str) -> None:
-        repo_url = f"https://github.com/{repo}.git"
+        repo_url = self.repository_url(repo)
         target = self.repository_target(repo)
         tmp = target.with_name(f"{target.name}.tmp")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -321,6 +325,7 @@ class RepoCacheSync:
                     "fetch",
                     "--prune",
                     "--tags",
+                    "--force",
                     "origin",
                 ],
                 f"fetch {repo}",
@@ -339,7 +344,17 @@ class RepoCacheSync:
         self._run_git(["clone", "--quiet", repo_url, str(tmp)], f"clone {repo}")
         self._git_ok(tmp, "config", "gc.auto", "0")
         self._run_git(
-            ["-C", str(tmp), "-c", "gc.auto=0", "fetch", "--prune", "--tags", "origin"],
+            [
+                "-C",
+                str(tmp),
+                "-c",
+                "gc.auto=0",
+                "fetch",
+                "--prune",
+                "--tags",
+                "--force",
+                "origin",
+            ],
             f"fetch {repo}",
         )
         self._git_ok(tmp, "remote", "set-head", "origin", "-a")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +160,46 @@ class RepoCacheSyncTest(unittest.TestCase):
 
             self.assertTrue((target / ".git").is_dir())
             self.assertFalse(old.exists())
+
+    def test_sync_repo_follows_a_tag_moved_on_the_remote(self) -> None:
+        # A tag re-pointed on GitHub used to fail every fetch ("would clobber
+        # existing tag"), which removed the ready file and kept the repo-cache
+        # DaemonSet unready until someone deleted the cached tag by hand.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote"
+            git = lambda *args: subprocess.run(
+                ["git", *args], check=True, text=True, capture_output=True,
+                env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"},
+            )
+            git("init", "-q", "-b", "main", str(remote))
+            git("-C", str(remote), "commit", "-q", "--allow-empty", "-m", "one")
+            git("-C", str(remote), "tag", "release")
+
+            class LocalRemote(repo_cache_sync.RepoCacheSync):
+                def repository_url(self, repo: str) -> str:
+                    return str(remote)
+
+            sync = LocalRemote(
+                cache_dir=root / "cache",
+                repositories=["acme/app"],
+                repository_refs={},
+                repository_visibilities={"acme/app": "public"},
+                sync_interval_seconds=30,
+                github_token_file=root / "missing-token",
+            )
+            sync.sync_repo("acme/app")
+
+            git("-C", str(remote), "commit", "-q", "--allow-empty", "-m", "two")
+            git("-C", str(remote), "tag", "-f", "release")
+            moved = git("-C", str(remote), "rev-parse", "release").stdout.strip()
+
+            sync.sync_repo("acme/app")
+
+            target = sync.repository_target("acme/app")
+            cached = git("-C", str(target), "rev-parse", "release").stdout.strip()
+            self.assertEqual(cached, moved)
 
     def test_run_forever_restores_repo_cache_umask(self) -> None:
         class StopAfterUmask(repo_cache_sync.RepoCacheSync):
