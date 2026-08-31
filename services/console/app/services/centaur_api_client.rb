@@ -111,6 +111,12 @@ class CentaurApiClient
     post("/api/session/#{escape_path(thread_key)}/execute", payload)
   end
 
+  def list_google_chat_spaces
+    # The proxy filters the bot's space list to the caller's granted set, so
+    # the page is small; pagination is unnecessary at current grant counts.
+    get("/api/google-chat/spaces")
+  end
+
   def list_workflow_schedules
     get("/api/workflows/schedules")
   end
