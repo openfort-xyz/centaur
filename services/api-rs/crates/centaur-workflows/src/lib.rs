@@ -3456,6 +3456,10 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.google_chat_dm_setup") => match google_chat_dm_setup(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         Some("ctx.google_chat_dwd_read") => {
             match google_chat_dwd_read(message, &input.workflow_name).await {
                 Ok(value) => Ok(value),
@@ -4472,6 +4476,23 @@ fn google_chat_relay_path(
     Ok(format!("/api/chat/spaces/{space_id}/{collection}"))
 }
 
+/// Path of the googlechatbot internal DM setup route for `target_identity`.
+///
+/// DM setup is keyed by the target email in the query string rather than by a
+/// space, so it cannot reuse the space-scoped `google_chat_relay_path`.
+fn google_chat_dm_setup_path(target_identity: &str) -> Result<String, WorkflowRuntimeError> {
+    let target = target_identity.trim().to_ascii_lowercase();
+    if !valid_google_chat_dwd_subject(&target) {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "ctx.google_chat_dm_setup requires an email target_identity".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "/api/chat/dms/setup?target_identity={}",
+        urlencoding::encode(&target)
+    ))
+}
+
 fn google_chat_message_ids(resource_name: &str) -> Result<(&str, &str), WorkflowRuntimeError> {
     let mut parts = resource_name.split('/');
     match (
@@ -4616,6 +4637,26 @@ async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRunt
         &body,
         std::time::Duration::from_secs(30),
         "google chat send failed",
+    )
+    .await
+}
+
+async fn google_chat_dm_setup(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let target_identity = message
+        .get("target_identity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.google_chat_dm_setup requires target_identity".to_owned(),
+            )
+        })?;
+    let path = google_chat_dm_setup_path(target_identity)?;
+
+    post_to_googlechatbot(
+        &path,
+        &json!({}),
+        std::time::Duration::from_secs(30),
+        "google chat dm setup failed",
     )
     .await
 }
@@ -6044,6 +6085,18 @@ mod tests {
         );
         for space_name in ["", "AAQA42QLdws", "spaces/A/messages/M", "spaces/bad id"] {
             let error = google_chat_relay_path(space_name, "messages").unwrap_err();
+            assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        }
+    }
+
+    #[test]
+    fn google_chat_dm_setup_paths_url_encode_the_target_email() {
+        assert_eq!(
+            google_chat_dm_setup_path(" Person+Tag@Example.COM ").unwrap(),
+            "/api/chat/dms/setup?target_identity=person%2Btag%40example.com"
+        );
+        for target in ["", "person", "person@", "@example.com", "a b@example.com"] {
+            let error = google_chat_dm_setup_path(target).unwrap_err();
             assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
         }
     }

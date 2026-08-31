@@ -205,6 +205,17 @@ class WorkflowContext:
             }
         )
 
+    async def google_chat_dm_setup(self, target_identity: str) -> Any:
+        # Creates or reuses the bot's 1:1 DM space with target_identity and
+        # returns the Chat Space resource, so a workflow can post to a person
+        # without knowing their space name. api-rs holds the bot credential.
+        return await self._rpc.request(
+            {
+                "type": "ctx.google_chat_dm_setup",
+                "target_identity": target_identity,
+            }
+        )
+
     async def post_to_google_chat_attachment(
         self,
         space_name: str,
