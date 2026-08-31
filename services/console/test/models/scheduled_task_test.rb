@@ -104,7 +104,68 @@ class ScheduledTaskTest < ActiveSupport::TestCase
     )
   end
 
+  test "allows a granted Google Chat space and rejects an ungranted one" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+    granted = ScheduledTask.new(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
+    ungranted = ScheduledTask.new(valid_attributes(delivery_channel: "spaces/AAQAotherspace"))
+
+    assert granted.valid?
+    assert_equal :gchat_space, granted.delivery_platform
+    assert_not ungranted.valid?
+    assert_includes ungranted.errors[:delivery_channel], "is not available to the author"
+  end
+
+  test "allows the author's own Google Chat DM email and rejects anyone else's" do
+    own_dm = ScheduledTask.new(valid_attributes(delivery_channel: users(:acme_admin).email))
+    foreign_dm = ScheduledTask.new(valid_attributes(delivery_channel: users(:globex_admin).email))
+
+    assert own_dm.valid?
+    assert_equal :gchat_dm, own_dm.delivery_platform
+    assert_not foreign_dm.valid?
+    assert_includes foreign_dm.errors[:delivery_channel], "is not available to the author"
+  end
+
+  test "builds api input for Google Chat destinations with the author's email" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+    space_task = ScheduledTask.create!(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
+    dm_task = ScheduledTask.create!(
+      valid_attributes(name: "Incident DM", delivery_channel: users(:acme_admin).email.upcase)
+    )
+
+    assert_equal(
+      {
+        prompt: "Summarize open incidents.",
+        principal: space_task.execution_principal.foreign_id,
+        channel: "spaces/AAQA42QLdws",
+        author_email: users(:acme_admin).email.downcase,
+        scheduled_task_id: space_task.oid,
+        scheduled_task_name: "Incident summary"
+      },
+      space_task.api_input
+    )
+    assert_equal users(:acme_admin).email.downcase, dm_task.api_input.fetch(:channel).downcase
+    assert_not_includes dm_task.api_input.keys, :slack_user_id
+  end
+
+  test "raises when a Google Chat space grant is revoked after the task was saved" do
+    principal = grant_google_chat_space("spaces/AAQA42QLdws")
+    task = ScheduledTask.create!(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
+
+    GoogleChatSpacePermission.replace_for!(principal, [])
+
+    assert_raises(ScheduledTask::DeliveryDestinationUnavailable) { task.api_input }
+  end
+
   private
+
+  def grant_google_chat_space(space_name, user: users(:acme_admin))
+    principal = ConsoleUserPrincipalProvisioner.call(user)
+    GoogleChatSpacePermission.replace_for!(
+      principal,
+      [ { space_name: space_name, send_enabled: true } ]
+    )
+    principal
+  end
 
   def valid_attributes(overrides = {})
     {
