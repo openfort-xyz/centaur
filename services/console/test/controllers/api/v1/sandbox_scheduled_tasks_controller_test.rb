@@ -23,6 +23,30 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     )
   end
 
+  test "dm falls back to the author's Google Chat DM without a Slack identity" do
+    @user.user_identities.destroy_all
+
+    with_token(@proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks",
+           params: {
+             data: {
+               name: "Chat DM briefing",
+               prompt: "Summarize the important updates.",
+               delivery_channel: "dm",
+               cron_expression: "0 9 * * *",
+               enabled: true
+             }
+           },
+           headers: headers,
+           as: :json
+    end
+    assert_response :created
+
+    task = @user.scheduled_tasks.find_by!(name: "Chat DM briefing")
+    assert_equal @user.email.downcase, task.delivery_channel
+    assert_equal :gchat_dm, task.delivery_platform
+  end
+
   test "linked user creates reads updates and deletes a scheduled task" do
     assert_difference("ScheduledTask.count", 1) do
       with_token(@proxy) do |headers|

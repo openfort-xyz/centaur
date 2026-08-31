@@ -103,7 +103,7 @@ def create_scheduled_task(
     delivery_channel: str = typer.Option(
         "dm",
         "--delivery-channel",
-        help="dm or a permitted Slack channel ID",
+        help="dm, a permitted Slack channel ID, or a Google Chat space (spaces/<id>)",
     ),
     enabled: bool = typer.Option(True, "--enabled/--disabled"),
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
@@ -139,7 +139,7 @@ def update_scheduled_task(
     delivery_channel: str | None = typer.Option(
         None,
         "--delivery-channel",
-        help="dm or a permitted Slack channel ID",
+        help="dm, a permitted Slack channel ID, or a Google Chat space (spaces/<id>)",
     ),
     enabled: bool | None = typer.Option(None, "--enabled/--disabled"),
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
