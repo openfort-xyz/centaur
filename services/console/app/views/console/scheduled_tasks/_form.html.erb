@@ -78,7 +78,13 @@
           <span>Slack &mdash; a channel</span>
         </label>
         <label class="flex items-center gap-2 text-sm text-zinc-300">
-          <%= radio_button_tag "scheduled_task[delivery_mode]", "gchat", delivery_mode == "gchat" %>
+          <%= radio_button_tag "scheduled_task[delivery_mode]",
+                               "gchat",
+                               delivery_mode == "gchat",
+                               data: {
+                                 slack_channel_autocomplete_target: "deliveryMode",
+                                 action: "slack-channel-autocomplete#deliveryModeChanged"
+                               } %>
           <span>Google Chat</span>
         </label>
       </div>
@@ -114,7 +120,9 @@
          [ label, space ] if label.present?
        }.sort %>
     <% space_options |= [ [ task.delivery_channel, task.delivery_channel ] ] if task.delivery_platform == :gchat_space && @google_chat_spaces.include?(task.delivery_channel) && space_options.none? { |_, value| value == task.delivery_channel } %>
-    <div class="mt-3 space-y-2">
+    <div class="mt-3 space-y-2"
+         <%= "hidden" if @slack_delivery_available && delivery_mode != "gchat" %>
+         <%= 'data-slack-channel-autocomplete-target="chatFields"'.html_safe if @slack_delivery_available %>>
       <%= label_tag "scheduled_task_delivery_destination", "Google Chat destination", class: "block text-xs font-medium text-zinc-400" %>
       <%= select_tag "scheduled_task[delivery_destination]",
                      options_for_select(

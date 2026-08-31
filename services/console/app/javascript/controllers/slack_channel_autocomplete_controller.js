@@ -1,7 +1,7 @@
 import { Controller } from "@hotwired/stimulus"
 
 export default class extends Controller {
-  static targets = ["input", "value", "list", "status", "submit", "deliveryMode", "channelFields"]
+  static targets = ["input", "value", "list", "status", "submit", "deliveryMode", "channelFields", "chatFields"]
   static values = { url: String, dmUserId: String }
 
   connect() {
@@ -168,16 +168,24 @@ export default class extends Controller {
       this.valueTarget.value = this.channelValue
     }
 
-    this.channelFieldsTarget.hidden = deliverToDm
-    this.inputTarget.disabled = deliverToDm
+    const deliverToChannel = deliveryMode === "channel"
+    this.channelFieldsTarget.hidden = !deliverToChannel
+    this.inputTarget.disabled = !deliverToChannel
+    if (this.hasChatFieldsTarget) this.chatFieldsTarget.hidden = deliveryMode !== "gchat"
     this.updateSubmitState()
   }
 
   updateSubmitState() {
-    const deliverToDm = this.hasDeliveryModeTarget &&
-      this.deliveryModeTargets.some((input) => input.checked && input.value === "dm")
-    if (deliverToDm) {
+    const deliveryMode = this.hasDeliveryModeTarget &&
+      this.deliveryModeTargets.find((input) => input.checked)?.value
+    if (deliveryMode === "dm") {
       this.submitTarget.disabled = this.dmUserIdValue === ""
+      return
+    }
+    if (deliveryMode === "gchat") {
+      // The Google Chat destination select always holds a valid choice;
+      // the server re-validates grants either way.
+      this.submitTarget.disabled = false
       return
     }
 
