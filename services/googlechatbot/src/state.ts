@@ -43,6 +43,9 @@ export type GoogleChatThreadState = {
   lastEventId?: number
   model?: string | null
   provider?: string | null
+  /** "Added to the running turn…" bubbles for messages folded into the live
+   * execution; deleted when that run finalizes. Updates append; `[]` clears. */
+  steeringAckMessageNames?: string[]
   /** Local thread transcript for direct messages, where Google refuses to list
    * messages under app auth. Bounded and deduped by message id. */
   transcript?: TranscriptEntry[]
@@ -184,6 +187,14 @@ export async function updateThreadState(
         ...(current.executedMessageIds ?? []),
         ...(update.executedMessageIds ?? [])
       ])
+    }
+    if (update.steeringAckMessageNames) {
+      next.steeringAckMessageNames = update.steeringAckMessageNames.length === 0
+        ? []
+        : capIds([
+          ...(current.steeringAckMessageNames ?? []),
+          ...update.steeringAckMessageNames
+        ])
     }
     if (next.transcript) {
       next.transcript = capTranscript(

@@ -166,6 +166,8 @@ Execution tuning:
 | `SLACK_FEEDBACK_LINEAR_TEAM_ID`, `SLACK_FEEDBACK_LINEAR_PROJECT_ID` | `slackbot.extraEnv`. | Linear destination for feedback issues. |
 | `SLACKBOT_EXTERNAL_ORG_ALLOWLIST` | `slackbot.extraEnv`. | Slack team ids allowed for external org handoff. |
 | `SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS` | `slackbotv2.autoJoinCreatedChannels`. | Joins newly-created public channels after subscribed `channel_created` events. Requires `channels:read` and `channels:join`. Defaults to `false`. |
+| `SLACKBOTV2_STEERING_REACTION_ENABLED` | `slackbotv2.steeringReactionEnabled`. | Reacts to mentioned follow-up messages while an execution is active, then removes their reactions after the assistant response is posted. Requires `reactions:write`. Defaults to `false` and disables itself for the running process if Slack reports the scope is missing. |
+| `SLACKBOTV2_STEERING_REACTION` | `slackbotv2.steeringReaction`. | Slack emoji name used for steering acknowledgements. Defaults to `hourglass_flowing_sand`. |
 | `SLACKBOTV2_DEFAULT_HARNESS` | `sandbox.harnessEngine`. | Base harness for new Slack threads without an explicit flag or channel default. |
 | `SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT` | `slackbotv2.codexNanocodexRolloutPercent`. | Percentage of otherwise-default Codex Slack threads assigned to Nanocodex. Assignment is deterministic by thread key and recorded in session and execution metadata. Selecting a non-default model bypasses the rollout. When response metadata is enabled, Slack shows the resolved harness name. Defaults to `0`; increase it to enroll new Codex Slack threads. |
 | `GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT` | `googlechatbot.codexNanocodexRolloutPercent`. | Google Chat counterpart to the Slack rollout. It uses the same deterministic thread-key assignment, metadata, model-override bypass, and `0` default. |
@@ -201,7 +203,7 @@ API-set variables:
 | --- | --- | --- |
 | `AGENT_IMAGE` | `sandbox.image.*`. | Sandbox image used by the Kubernetes backend. |
 | `AGENT_API_URL` | Chart-rendered API service URL. | Source for sandbox `CENTAUR_API_URL`; required by Kubernetes backend. |
-| `CENTAUR_API_URL`, `CENTAUR_THREAD_KEY`, `CENTAUR_TRACE_ID` | API sandbox creation. | API callback, thread key, and trace id. |
+| `CENTAUR_API_URL`, `CENTAUR_THREAD_KEY` | API sandbox creation. | API callback and thread key. |
 | `AMP_MODE`, `AMP_THREAD_VISIBILITY`, `AMP_CONTINUE_THREAD_ID` | API env or resume path. | Amp mode and resume behavior. |
 | `FIREWALL_HOST`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` and lowercase variants | API sandbox creation. | Routes sandbox egress through per-sandbox iron-proxy. |
 | `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `GIT_SSL_CAINFO` | API sandbox creation. | Trust bundle for proxied TLS. |
@@ -213,7 +215,8 @@ Kubernetes backend:
 | --- | --- | --- |
 | `KUBERNETES_NAMESPACE`, `POD_NAMESPACE`, `KUBERNETES_KUBECONFIG` | Chart namespace, downward API, or `api.extraEnv`. | Kubernetes client namespace/config. |
 | `KUBERNETES_AGENT_IMAGE_PULL_POLICY`, `KUBERNETES_SANDBOX_IMAGE_PULL_SECRETS` | `sandbox.image.pullPolicy`, `global.imagePullSecrets`. | Sandbox image pull behavior. |
-| `KUBERNETES_SANDBOX_RUNTIME_CLASS_NAME`, `KUBERNETES_SANDBOX_SERVICE_ACCOUNT_NAME` | `sandbox.runtimeClassName`, `api.extraEnv`. | Pod runtime class and service account. |
+| `SESSION_SANDBOX_RUNTIME_CLASS_NAME` | `sandbox.runtimeClassName`. | RuntimeClass for sandbox and iron-proxy pods (e.g. gVisor). |
+| `SESSION_SANDBOX_SERVICE_ACCOUNT_NAME` | `sandbox.serviceAccountName`. | ServiceAccount for sandbox pods (session, warm, and workflow-host), e.g. for cloud workload identity (EKS IRSA). Must already exist in the namespace; iron-proxy pods are unaffected and `automountServiceAccountToken` stays `false`. Changing it drains retained sandboxes before reuse. |
 | `SESSION_SANDBOX_RESOURCES` | `sandbox.resources`. | Session sandbox pod resources (per-session and warm) as a JSON Kubernetes `ResourceRequirements` object. Arbitrary resource names are preserved, and malformed input fails startup. |
 | `WORKFLOW_HOST_RESOURCES` | `apiRs.workflowHostResources`. | Workflow-host sandbox pod resources as a JSON Kubernetes `ResourceRequirements` object, sized independently of session sandboxes. |
 | `KUBERNETES_IRON_PROXY_RESOURCES` | `ironProxy.resources`. | Per-sandbox iron-proxy pod resources as a JSON Kubernetes `ResourceRequirements` object. |
@@ -248,6 +251,7 @@ Sandbox entrypoint and wrappers:
 | `CODEX_MODEL_REASONING_EFFORT` | `sandbox.extraEnv`. | Overrides the Codex `model_reasoning_effort` (baked into `harness/codex/config.toml`) and Nanocodex's default thinking effort. It is mirrored into Slackbot so the first response footer displays the effective level. One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; an unknown value is ignored (the config default stands). |
 | `CLAUDE_MODEL`, `CLAUDE_CONTINUE_SESSION_ID` | `sandbox.extraEnv` or runtime resume. | Claude model and resume behavior. |
 | `CLAUDE_CODE_AUTH_MODE` | `sandbox.claudeCodeAuthMode`. | Claude Code auth flow: `api_key` (default, uses `ANTHROPIC_API_KEY`) or `access_token` (Claude.ai Pro or Max via the brokered OAuth login). The chart sets this on api-rs, which propagates it into sandboxes. See [Claude Auth Modes](/deploying-in-production#claude-auth-modes). |
+| `CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS` | `sandbox.telemetry.captureTranscripts`; defaults to `false`. | Includes user prompts and assistant responses on harness LLM spans, plus bounded shell commands and workspace-relative working directories on tool spans. Usage, cost, status, session association, and tool telemetry do not require transcript capture. |
 | `DEPLOY_ENV`, `ENVIRONMENT`, `TRACEPARENT` | Deployment env or wrapper-generated. | Runtime environment and trace context. |
 | `CALL_TIMEOUT_SECONDS` | Sandbox env before running `call`. | Curl watchdog for API tool calls. |
 | `SLACK_CHANNEL`, `SLACK_THREAD_TS` | Sandbox env. | File-upload helper target. |
@@ -275,6 +279,16 @@ Slack ETL workflows:
 | `SLACK_RETENTION_ENABLED`, `SLACK_RETENTION_INTERVAL_MINUTES`, `SLACK_ETL_RETENTION_DAYS`, `SLACK_DM_RETENTION_DAYS` | `apiRs.etl.slack.retention.*`. | Slack retention enablement, cadence, and separate public ETL/DM TTLs. |
 | `COMPANY_CONTEXT_DOCUMENTS_ENABLED` | `apiRs.etl.companyContextDocuments.enabled`. | Enables company-context projection when any ETL is on. |
 | `COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS` | `apiRs.etl.companyContextDocuments.maxWindowSeconds`. | Maximum source `updated_at` window projected by one company-context documents run. |
+| `COMPANY_CONTEXT_EMBEDDINGS_ENABLED` | `apiRs.etl.companyContextEmbeddings.enabled`, default `false`. | Enables scheduled document embedding and hybrid company-context search in agent sandboxes. |
+| `COMPANY_CONTEXT_EMBEDDINGS_INTERVAL_SECONDS` | `apiRs.etl.companyContextEmbeddings.intervalSeconds`, default `300`. | Delay between scans for missing or stale document embeddings. |
+| `COMPANY_CONTEXT_EMBEDDINGS_BATCH_SIZE` | `apiRs.etl.companyContextEmbeddings.batchSize`, default `250`. | Maximum documents claimed by one embedding workflow run. |
+| `COMPANY_CONTEXT_EMBEDDINGS_MAX_INPUT_CHARS` | `apiRs.etl.companyContextEmbeddings.maxInputChars`, default `8192`. | Maximum characters embedded from each document. Values cannot exceed `8192`. |
+| `COMPANY_CONTEXT_EMBEDDINGS_MODEL` | `apiRs.etl.companyContextEmbeddings.model`, default `text-embedding-3-small`. | Embedding model shared by document generation and hybrid queries. The model must support the chart's 1536-dimension vector schema. |
+
+The bundled PostgreSQL image provides pgvector. External PostgreSQL deployments
+must make the `vector` extension available before migrations run. The workflow
+uses the shared Python workflow-host database connection, OpenAI credential,
+and `OPENAI_BASE_URL`. No workflow-specific PostgreSQL role or DSN is required.
 
 Google Workspace ETL workflows:
 

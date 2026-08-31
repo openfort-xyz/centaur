@@ -199,6 +199,28 @@ artifacts in `docs/google-chat-parity-verification.md`.
 
 ## Upstream sync windows
 
+### 2026-08-31 — 36 upstream commits, `bc72622b..d8523f7a`
+
+| Upstream | Slack change | Google Chat disposition |
+| --- | --- | --- |
+| #1519 acknowledge steering messages | A mention forwarded into an active execution gets an hourglass reaction that is removed when that run's render finalizes; the thread-wide assistant status is no longer cleared or replaced by the steering turn. | **Ported.** Chat's `reactions.create` is user-auth only, so the acknowledgement is the eager "thinking…" bubble edited into `_Centaur · added to the running turn…_` instead of being deleted on fold; the live run deletes the held notices when it finalizes (live and recovery paths). Names persist in thread state (`steeringAckMessageNames`), so a bot restart still clears them. The status half is moot: each Chat event owns its own bubble. |
+| #1477 log Slack webhook retry headers | `x-slack-retry-num`/`x-slack-retry-reason` land on the receipt log. | **Not applicable.** Google Chat HTTP endpoints receive each event once and carry no retry headers. |
+| #1445 persist Slack bot channel catalog | Console caches the channels the bot is in and refreshes memberships on principal creation. | **Not applicable.** Chat grants take exact `spaces/<id>` names; no Console catalog (unchanged since 2026-08-17). |
+| #1440, #1447, #1453, #1456, #1479, #1480 scheduled tasks | Console-managed cron tasks deliver to a Slack channel or DM, with Slack formatting and an author footer; `mrkdwn` passes through the workflow Slack payload. | **Follow-up.** Delivery is Slack-only (`delivery_channel` validates as a Slack ID, `_deliver_to_slack`). A Chat delivery target is a feature, not a port; queued. |
+| #1457, #1465, #1468 Slack DM sync resilience | Console Slack DM credential sync serializes per credential and retries DNS/rate-limit failures. | **Not applicable.** Chat DM history is the bot's own transcript (#166); there is no Console Chat DM sync job. |
+| #1494, #1496 bind the requester principal on console and GitHub turns | Console/GitHub turns carry a `requester_principal_foreign_id` that only console callers may assert. | **Already equivalent.** Chat binds the verified DM requester at the api-rs boundary (`google_email`), which this change leaves in place. |
+| #1505 inject selected persona prompts into sandboxes | Persona prompts are mounted as sandbox files and composed into the system prompt. | **Shared.** Selection lives in api-rs/Console; neither bot selects personas. |
+
+Merge mechanics: six conflicts. `otel.rs` took upstream's rewrite (#1449) —
+the fork's only change there was a lint fix to a function upstream deleted;
+upstream also dropped `sha2` from harness-server, which the fork's attachment
+chunk hashing still needs, so it is re-added. Console `Principal::KINDS`,
+iron-control imports, and the api-rs route tests are unions; the sandbox
+Dockerfile keeps the fork's `cryptography` pin and drops upstream's removed
+`opentelemetry-proto`. Upstream's `0053`/`0054` company-context embedding
+migrations import as **`0057`/`0058`** (fork is +4). The fork's Chat
+`SessionTraceContext` test follows upstream's new `new(None, None)` signature.
+
 ### 2026-08-20 — 42 upstream commits, `0e58fe86..bc72622b`
 
 | Upstream | Slack change | Google Chat disposition |

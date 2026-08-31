@@ -25,6 +25,24 @@ afterAll(async () => {
   await Promise.all(adapters.map(adapter => adapter.disconnect()))
 })
 
+test('steering ack names append on hold and clear on an empty update', async () => {
+  const state = createMemoryState()
+  await state.connect()
+  await updateThreadState(state, 'thread-steering', { steeringAckMessageNames: ['spaces/A/messages/1'] })
+  await updateThreadState(state, 'thread-steering', {
+    activeExecution: true,
+    steeringAckMessageNames: ['spaces/A/messages/2']
+  })
+  expect((await state.get<GoogleChatThreadState>(threadStateKey('thread-steering')))
+    ?.steeringAckMessageNames).toEqual(['spaces/A/messages/1', 'spaces/A/messages/2'])
+  await updateThreadState(state, 'thread-steering', { activeExecution: false, steeringAckMessageNames: [] })
+  expect(await state.get<GoogleChatThreadState>(threadStateKey('thread-steering'))).toMatchObject({
+    activeExecution: false,
+    steeringAckMessageNames: []
+  })
+  await state.disconnect()
+})
+
 describe('durable Google Chat state', () => {
   test('readiness stays disconnected through bounded exponential retries', async () => {
     const state = createMemoryState()
