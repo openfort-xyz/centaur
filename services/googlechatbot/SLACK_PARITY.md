@@ -28,7 +28,7 @@ Do not mark parity complete from fixture or unit tests alone.
 | Conversation permissions | Exact channel lists for upload/download/history. | Exact space lists for send/update/delete/upload/download/history/members/reactions, plus exact DM setup targets. Direct and role grants merge. | Model/API/proxy tests pass; sandbox-JWT live smoke pending. |
 | Credential topology | Slack proxy/direct APIs use scoped secrets and bot tokens. | Sandboxes call api-rs with a scoped Console JWT. Only api-rs can call googlechatbot's private API with a separate key; Google credentials remain at the bot/ETL edge. | Static, route, and live Kind NetworkPolicy/internal-auth checks pass. |
 | api-rs ingress auth | `SLACKBOT_API_KEY` authenticates slackbotv2 as an ingress caller scoped to `slack:` thread keys; `/api/slack/*` requires a principal. | `GOOGLECHATBOT_API_KEY` authenticates googlechatbot as an ingress caller scoped to `chat:spaces:` thread keys, with workflow-event capability; `/api/google-chat/*` requires a principal. | Route-policy unit test passes; live 401/403 smoke pending. |
-| DMs | Open/reuse DM by user; separate user-scoped private ingestion. | Create/reuse and send by exact email grant. Resource-name targets are rejected. Live DM identity/history uses a verified Add-on requester. ETL DMs are opt-in and owner-scoped. | Automated DM and cross-owner RLS checks pass; live DWD checks pending. |
+| DMs | Open/reuse DM by user; separate user-scoped private ingestion. | Create/reuse and send by exact email grant. Resource-name targets are rejected. 1:1 DM history is the bot's own stored transcript of the webhook stream (every DM message is delivered to the app); no Google read is attempted for DMs. Named spaces still list Google history under app auth. ETL DMs are opt-in and owner-scoped. | Automated DM transcript, redelivery, fold and recovery checks pass; live sandbox-drain drill pending. |
 | Conversation discovery | Channels, metadata, members, threads, users. | Spaces, metadata, members, threads, and paginated history. A broad Workspace user directory is intentionally excluded. | Automated pass; scoped live reads pending. |
 | Search and analysis | Search, questions, dump, reactions. Upstream removed Slack's stateful feedback subsystem with the personas API. | Bounded authorized scans for search, questions, dump, feedback, and message-qualified reaction reads. `feedback` is a stateless derived view over `dump`, not the removed Slack subsystem, so it stays. | Automated pass; live reaction scope/rate-limit pending. |
 | Send/update/delete | Slack tool sends; renderer owns its updates. No generic delete CLI. | Scoped send, app-owned update, and app-owned delete through api-rs. | Automated pass; live ownership/denial smoke pending. |
@@ -103,9 +103,9 @@ Dedicated DWD subjects keep capabilities separately revocable:
 | Reaction reads | `GOOGLECHATBOT_REACTION_READ_USER` | `chat.messages.reactions.readonly` |
 | Drive attachments | `GOOGLECHATBOT_DRIVE_DOWNLOAD_USER` | `drive.readonly` |
 
-The signed and Google-confirmed human requester is the only valid subject for
-live 1:1 DM history. Missing configuration fails closed or degrades to
-metadata-only content; it never falls back to a broader credential.
+Live 1:1 DM history never reads Google: the bot replays its stored transcript
+of the webhook stream. Agent-facing DM reads go through the api-rs proxy with
+the server-selected reader subject; nothing falls back to a broader credential.
 
 ## Durable acceptance boundary
 

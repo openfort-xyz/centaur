@@ -4,7 +4,14 @@ import { loadConfig } from './config'
 import { ChatApiError } from './chat/client'
 import { renderMetrics, resetMetrics } from './metrics'
 import { createMemoryState } from '@chat-adapter/state-memory'
-import { WORK_INDEX_KEY, persistWork, workKey, type GoogleChatWorkObligation } from './state'
+import {
+  WORK_INDEX_KEY,
+  persistWork,
+  threadStateKey,
+  workKey,
+  type GoogleChatThreadState,
+  type GoogleChatWorkObligation
+} from './state'
 
 const CHATBOT_ENV = {
   CHAT_EVENTS_PATH: '/api/chat/events',
@@ -17,9 +24,25 @@ type MockCall = { url: string; method: string; body: unknown }
 /** Dispatches the real webhook route's outbound fetch traffic (Chat API +
  * session-api) so a full inbound event can be driven through the actual Hono
  * app end-to-end, exactly as production traffic would. */
-function installMockFetch(): { calls: MockCall[]; restore: () => void } {
+function installMockFetch(): {
+  calls: MockCall[]
+  /** Queued answers, keyed by thread: the next one for THAT thread completes
+   * its SSE stream. Background work from an earlier test keeps running against
+   * the live global fetch, so an unkeyed queue would hand them this answer.
+   * Empty (the default) keeps the historical no-body, no-answer stream. */
+  answers: Array<{ threadKey: string; answer: string }>
+  /** Messages returned by spaces.messages.list (named-space thread history). */
+  listed: unknown[]
+  /** Thread keys whose session create reports a run already in flight. */
+  activeThreads: string[]
+  restore: () => void
+} {
   const realFetch = globalThis.fetch
   const calls: MockCall[] = []
+  const answers: Array<{ threadKey: string; answer: string }> = []
+  const listed: unknown[] = []
+  const activeThreads: string[] = []
+  let messageSeq = 0
 
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = String(input instanceof URL ? input.toString() : input)
@@ -42,7 +65,21 @@ function installMockFetch(): { calls: MockCall[]; restore: () => void } {
           headers: { 'content-type': 'application/json' }
         })
       }
-      return new Response(JSON.stringify({ name: 'spaces/AAAA/messages/ACK1' }), {
+      if (method === 'GET' && url.includes('/messages?')) {
+        return new Response(JSON.stringify({ messages: listed }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      // Google never reuses a message name. A create echoes the caller's
+      // client-assigned id (as the 409 fallback path assumes); anything else
+      // gets a fresh server id.
+      const clientId = new URL(url).searchParams.get('messageId')
+      messageSeq += 1
+      const name = clientId
+        ? `spaces/AAAA/messages/${clientId}`
+        : `spaces/AAAA/messages/ACK${messageSeq}`
+      return new Response(JSON.stringify({ name }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
       })
@@ -59,14 +96,22 @@ function installMockFetch(): { calls: MockCall[]; restore: () => void } {
       )
     }
     if (url.includes('/events?')) {
+      const queued = answers.findIndex(item => decodeURIComponent(url).includes(item.threadKey))
       // No body → openSessionEventStream treats this as an already-closed stream.
-      return new Response(null, { status: 200 })
+      if (queued < 0) return new Response(null, { status: 200 })
+      const [answer] = answers.splice(queued, 1)
+      return new Response(
+        'event: session.execution_completed\nid: 1\n'
+          + `data: ${JSON.stringify({ result: answer!.answer })}\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } }
+      )
     }
     if (url.includes('/api/workflows/events')) {
       return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (method === 'POST' && /\/api\/session\/[^/]+$/.test(url)) {
-      return new Response(JSON.stringify({ status: 'idle' }), {
+      const active = activeThreads.some(key => decodeURIComponent(url).includes(key))
+      return new Response(JSON.stringify({ status: active ? 'executing' : 'idle' }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
       })
@@ -81,6 +126,9 @@ function installMockFetch(): { calls: MockCall[]; restore: () => void } {
 
   return {
     calls,
+    answers,
+    listed,
+    activeThreads,
     restore: () => {
       globalThis.fetch = realFetch
     }
@@ -803,5 +851,246 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
       '--codex deploy the thing'
     )
     expect(body.harness_type).toBe('codex')
+  })
+})
+
+describe('googlechatbot DM thread transcript', () => {
+  let mock: ReturnType<typeof installMockFetch>
+
+  beforeEach(() => {
+    resetMetrics()
+    mock = installMockFetch()
+  })
+
+  afterEach(() => {
+    mock.restore()
+  })
+
+  const DM_THREAD_KEY = 'chat:spaces:AAAA:spaces:AAAA:threads:T1'
+  const SPACE_THREAD_KEY = 'chat:spaces:BBBB:spaces:BBBB:threads:T2'
+
+  const dmEvent = (messageId: string, text: string) => ({
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'MESSAGE',
+      eventTime: NOW_ISO,
+      space: { name: 'spaces/AAAA', spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true },
+      message: {
+        name: `spaces/AAAA/messages/${messageId}`,
+        text,
+        thread: { name: 'spaces/AAAA/threads/T1' },
+        sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' }
+      },
+      user: { name: 'users/U1', displayName: 'Alice' }
+    })
+  })
+
+  const transcriptOf = async (state: ReturnType<typeof createMemoryState>) =>
+    (await state.get<GoogleChatThreadState>(threadStateKey(DM_THREAD_KEY)))?.transcript ?? []
+
+  // Scoped to one thread: background work from earlier tests keeps calling the
+  // live global fetch and lands in the same `calls` array.
+  const sessionCalls = (threadKey: string, action: string) => mock.calls.filter(
+    c => c.method === 'POST'
+      && decodeURIComponent(c.url).includes(`/api/session/${threadKey}/${action}`)
+  )
+
+  const appended = (threadKey = DM_THREAD_KEY) => sessionCalls(threadKey, 'messages')
+    .flatMap(c =>
+      ((c.body as { messages?: Array<{ client_message_id?: string }> })?.messages ?? []))
+
+  const executes = (threadKey = DM_THREAD_KEY) => sessionCalls(threadKey, 'execute')
+    .map(c => c.body as { input_lines: string[] })
+
+  const threadContext = (execute: { input_lines: string[] }): string => {
+    const line = JSON.parse(execute.input_lines[0] ?? '{}') as {
+      message?: { content?: Array<{ text?: string }> }
+    }
+    return (line.message?.content ?? [])
+      .map(part => part.text ?? '')
+      .find(text => text.includes('Google Chat Thread Context')) ?? ''
+  }
+
+  const listCalls = (space: string) =>
+    mock.calls.filter(c => c.method === 'GET' && c.url.includes(`${space}/messages?`))
+
+  test('a second DM turn carries the first turn from the transcript, no Google read', async () => {
+    const state = createMemoryState()
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state }).app
+
+    mock.answers.push({ threadKey: DM_THREAD_KEY, answer: 'the deploy finished' })
+    await bot.request('/api/chat/events', dmEvent('M1', 'did the deploy finish?'))
+    await waitFor(async () => (await transcriptOf(state)).length === 2)
+
+    mock.answers.push({ threadKey: DM_THREAD_KEY, answer: 'yes, twice' })
+    await bot.request('/api/chat/events', dmEvent('M2', 'and the second one?'))
+    await waitFor(async () => (await transcriptOf(state)).length === 4)
+
+    const context = threadContext(executes()[1]!)
+    expect(context).toContain('did the deploy finish?')
+    expect(context).toContain('the deploy finished')
+
+    // Every accepted message and every delivered answer, once, under its
+    // Google message name (the answer replaces the ack, so it keeps that name).
+    const ids = appended().map(message => message.client_message_id)
+    const ackName = /^spaces\/AAAA\/messages\/client-centaur-ack-[a-f0-9]{32}$/
+    expect(ids).toHaveLength(4)
+    expect(ids[0]).toBe('spaces/AAAA/messages/M1')
+    expect(ids[1]).toMatch(ackName)
+    expect(ids[2]).toBe('spaces/AAAA/messages/M2')
+    expect(ids[3]).toMatch(ackName)
+    expect(ids[1]).not.toBe(ids[3])
+    expect((await transcriptOf(state)).map(entry => [entry.role, entry.text])).toEqual([
+      ['user', 'did the deploy finish?'],
+      ['assistant', 'the deploy finished'],
+      ['user', 'and the second one?'],
+      ['assistant', 'yes, twice']
+    ])
+    expect(listCalls('spaces/AAAA')).toHaveLength(0)
+  // Two turns of ack + final writes, serialized one quota window apart by the
+  // renderer write scheduler, do not fit bun's 5s default.
+  }, 30_000)
+
+  test('redelivering a DM webhook grows neither the transcript nor session_messages', async () => {
+    const state = createMemoryState()
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state }).app
+
+    mock.answers.push({ threadKey: DM_THREAD_KEY, answer: 'once is enough' })
+    await bot.request('/api/chat/events', dmEvent('M1', 'run it'))
+    await waitFor(async () => (await transcriptOf(state)).length === 2)
+    const appendsBefore = appended().length
+
+    await bot.request('/api/chat/events', dmEvent('M1', 'run it'))
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    expect(await transcriptOf(state)).toHaveLength(2)
+    expect(appended()).toHaveLength(appendsBefore)
+  }, 30_000)
+
+  test('a folded DM turn enters the transcript and only it is appended', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    await state.set(threadStateKey(DM_THREAD_KEY), {
+      forwardedMessageIds: ['spaces/AAAA/messages/M0'],
+      transcript: [{
+        id: 'spaces/AAAA/messages/M0',
+        role: 'user',
+        text: 'earlier',
+        userId: 'users/U1',
+        userName: 'Alice',
+        attachments: []
+      }]
+    } satisfies GoogleChatThreadState)
+    await state.disconnect()
+    mock.activeThreads.push(DM_THREAD_KEY)
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state }).app
+
+    await bot.request('/api/chat/events', dmEvent('M1', 'and this'))
+    await waitFor(async () => (await transcriptOf(state)).length === 2)
+
+    expect(executes()).toHaveLength(0)
+    // The stored transcript is not re-steered into the live run.
+    expect(appended().map(message => message.client_message_id))
+      .toEqual(['spaces/AAAA/messages/M1'])
+    expect((await transcriptOf(state)).map(entry => entry.text)).toEqual(['earlier', 'and this'])
+  })
+
+  test('a recovered DM final is recorded under the name it was delivered under', async () => {
+    for (const updateWorks of [true, false]) {
+      const state = createMemoryState()
+      await state.connect()
+      const work: GoogleChatWorkObligation = {
+        acceptedAt: new Date().toISOString(),
+        ackMessageName: 'spaces/AAAA/messages/ACK1',
+        canonicalFinal: { answer: 'durable final answer' },
+        dedupeKey: `message:dm-recovery-${updateWorks}`,
+        event: {
+          thread_key: `thread-dm-recovery-${updateWorks}`,
+          message_id: `message-dm-recovery-${updateWorks}`,
+          space_name: 'spaces/AAAA',
+          space_type: 'DIRECT_MESSAGE',
+          user_id: 'users/U1',
+          user_name: 'Alice',
+          is_mention: true,
+          parts: [{ type: 'text', text: 'run' }],
+          chat: {}
+        },
+        executionId: 'exec-dm-recovery',
+        failures: 0,
+        identityVerified: true,
+        lastEventId: 9,
+        stage: 'rendering',
+        workId: crypto.randomUUID()
+      }
+      await persistWork(state, work)
+      await state.disconnect()
+
+      const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })
+      runtime.client.updateMessage = async () => {
+        if (!updateWorks) {
+          throw new ChatApiError('PATCH', 'spaces/AAAA/messages/ACK1', 404, 'NOT_FOUND')
+        }
+        return {}
+      }
+      runtime.client.createMessage = async (_space, _body, opts) =>
+        ({ name: `spaces/AAAA/messages/${opts?.messageId}` })
+      await runtime.stateConnected
+      await waitFor(async () => (await state.get(workKey(work.workId))) === null)
+
+      const stored = await state.get<GoogleChatThreadState>(
+        threadStateKey(work.event!.thread_key)
+      )
+      expect(stored?.transcript).toEqual([{
+        id: updateWorks
+          ? 'spaces/AAAA/messages/ACK1'
+          : `spaces/AAAA/messages/client-centaur-${work.workId.replace(/-/g, '')}`,
+        role: 'assistant',
+        text: 'durable final answer',
+        userId: '',
+        userName: 'Centaur',
+        attachments: []
+      }])
+    }
+  })
+
+  test('a named-space thread reply still lists Google history and appends it', async () => {
+    mock.listed.push({
+      name: 'spaces/BBBB/messages/OLD',
+      text: 'the earlier turn',
+      createTime: NOW_ISO,
+      sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' }
+    })
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state: createMemoryState() }).app
+
+    await bot.request('/api/chat/events', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'MESSAGE',
+        eventTime: NOW_ISO,
+        space: { name: 'spaces/BBBB', spaceType: 'SPACE' },
+        message: {
+          name: 'spaces/BBBB/messages/SP1',
+          text: 'and now?',
+          thread: { name: 'spaces/BBBB/threads/T2' },
+          threadReply: true,
+          sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' },
+          annotations: [{
+            type: 'USER_MENTION',
+            userMention: { user: { name: 'users/123456789', type: 'BOT' }, type: 'MENTION' }
+          }]
+        },
+        user: { name: 'users/U1', displayName: 'Alice' }
+      })
+    })
+
+    await waitFor(() => executes(SPACE_THREAD_KEY).length === 1)
+    expect(listCalls('spaces/BBBB').length).toBeGreaterThan(0)
+    expect(appended(SPACE_THREAD_KEY).map(message => message.client_message_id)).toEqual([
+      'spaces/BBBB/messages/OLD',
+      'spaces/BBBB/messages/SP1'
+    ])
+    expect(threadContext(executes(SPACE_THREAD_KEY)[0]!)).toContain('the earlier turn')
   })
 })

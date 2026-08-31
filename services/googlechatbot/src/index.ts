@@ -29,10 +29,13 @@ import { addGauge, incr, renderMetrics, setGauge } from './metrics'
 import {
   WORK_INDEX_KEY,
   acquireLease,
+  assistantTurnMessage,
   createDefaultState,
   ensureStateConnected,
   persistWork,
   threadStateKey,
+  transcriptEntryFromTurn,
+  transcriptHistoryMessages,
   updateThreadState,
   workKey,
   workLeaseKey,
@@ -797,8 +800,21 @@ function internalFailure(c: Context, event: string, error: unknown): Response {
     return c.json({ error: error.message }, 403)
   }
   // Do not serialize upstream errors: OAuth and API failures can contain
-  // credential-bearing diagnostics. The stable event and error class suffice.
-  logError(event, { error_name: error instanceof Error ? error.name : 'unknown' })
+  // credential-bearing diagnostics. The stable event, the error class, and the
+  // request's own space/credential kind/upstream status suffice — never the
+  // subject email, the token, or the response body.
+  const spaceId = c.req.param('spaceId')
+  const space = spaceId ? spaceResource(spaceId) : null
+  logError(event, {
+    error_name: error instanceof Error ? error.name : 'unknown',
+    ...(space ? { space } : {}),
+    credential: c.req.header(DWD_SUBJECT_HEADER)
+      ? 'delegated-etl-reader'
+      : c.req.query('impersonate')
+        ? 'impersonate'
+        : 'app',
+    ...(error instanceof ChatApiError ? { status: error.status } : {})
+  })
   return c.json({ error: 'Google Chat request failed' }, 502)
 }
 
@@ -904,18 +920,26 @@ export async function processWorkObligation(
       return
     }
 
-    const history = await collectThreadHistory(client, {
-      spaceName: event.space_name,
-      threadName: event.chat.thread_name,
-      currentMessageName: event.message_id,
-      threadReply: event.chat.thread_reply,
-      botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
-      ...(event.user_email ? { requesterEmail: event.user_email } : {}),
-      historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
-    }).catch(error => {
-      logWarn('googlechatbot_thread_history_failed', error)
-      return [] as NonNullable<NormalizedChatEvent['history_messages']>
-    })
+    // A 1:1 DM delivers every message to this app over the webhook, so the
+    // local transcript IS the thread — and Google refuses messages.list under
+    // app auth there anyway. Named spaces only see @mentions, so they keep
+    // asking Google.
+    const history = event.space_type === 'DIRECT_MESSAGE'
+      ? transcriptHistoryMessages(
+          (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key)))?.transcript,
+          event.message_id
+        )
+      : await collectThreadHistory(client, {
+        spaceName: event.space_name,
+        threadName: event.chat.thread_name,
+        currentMessageName: event.message_id,
+        threadReply: event.chat.thread_reply,
+        botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
+        historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
+      }).catch(error => {
+        logWarn('googlechatbot_thread_history_failed', error)
+        return [] as NonNullable<NormalizedChatEvent['history_messages']>
+      })
     if (history.length) event.history_messages = history
 
     await driveSession(
@@ -1044,6 +1068,10 @@ async function recoverFinalRender(
   incr('googlechatbot_delivery_total', { outcome, source: 'recovery' })
   work.stage = 'final'
   await persistWork(stateAdapter, work)
+  await recordAssistantFinal(config, stateAdapter, work.event, durableRenderTarget(work), {
+    outcome,
+    answer: renderState.answer
+  })
   await updateThreadState(stateAdapter, work.event.thread_key, {
     activeExecution: false,
     lastEventId: work.lastEventId
@@ -1215,16 +1243,18 @@ async function driveSession(
     // appending it (the live execution will pick it up) and let that run own
     // the answer. The redundant "thinking…" ack is removed so the thread isn't
     // left with a stranded placeholder.
+    // Only unforwarded messages are appended: api-rs steers every appended
+    // user message into the live run, and for a DM `history` is the whole
+    // stored transcript.
+    const forwarded = new Set(threadState.forwardedMessageIds ?? [])
+    const appended = [...history, execute].filter(message => !forwarded.has(message.id))
     if (session.activeExecution) {
-      await appendSessionMessages(config, threadKey, [...history, execute])
+      await appendSessionMessages(config, threadKey, appended)
       await updateThreadState(durableState, threadKey, {
         activeExecution: true,
-        forwardedMessageIds: [
-          ...(threadState.forwardedMessageIds ?? []),
-          ...history.map(message => message.id),
-          execute.id
-        ]
-      })
+        forwardedMessageIds: appended.map(message => message.id),
+        ...dmTranscriptUpdate(event, execute)
+      }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
       await removeAck(client, ackMessageName)
       incr('googlechatbot_runs_total', { outcome: 'folded' })
       logWarn('googlechatbot_folded_into_active_run', {
@@ -1234,7 +1264,10 @@ async function driveSession(
       return
     }
 
-    await appendSessionMessages(config, threadKey, history)
+    // Deliberately NOT appended before the execute: api-rs forwards appended
+    // user messages into any active execution, so a turn that loses the
+    // check-then-execute race above would be steered into the other run and
+    // then folded again below. Appended after the run is ours.
     let execution
     try {
       execution = await executeSession(config, threadKey, execute, {
@@ -1266,17 +1299,25 @@ async function driveSession(
         conversationName: conversationName(event),
         harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
       })
-      if (folded) return
+      if (folded) {
+        await updateThreadState(durableState, threadKey, {
+          forwardedMessageIds: [execute.id],
+          ...dmTranscriptUpdate(event, execute)
+        }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
+        return
+      }
       throw error
     }
+    // Slack's rule: session_messages records each human turn exactly once.
+    // The execution is already running, so a failed append must not abort the
+    // render loop: the DM transcript below is the context source and
+    // session_messages only feeds the Console.
+    await appendSessionMessagesBestEffort(config, threadKey, appended)
     await updateThreadState(durableState, threadKey, {
       activeExecution: true,
-      executedMessageIds: [...(threadState.executedMessageIds ?? []), execute.id],
-      forwardedMessageIds: [
-        ...(threadState.forwardedMessageIds ?? []),
-        ...history.map(message => message.id),
-        execute.id
-      ],
+      executedMessageIds: [execute.id],
+      forwardedMessageIds: appended.map(message => message.id),
+      ...dmTranscriptUpdate(event, execute),
       ...(overrides.harnessType ? { harnessType: overrides.harnessType } : {}),
       ...(overrides.model
         ? { model: overrides.model }
@@ -1284,7 +1325,7 @@ async function driveSession(
       ...(overrides.provider
         ? { provider: overrides.provider }
         : overrides.harnessType ? { provider: null } : {})
-    })
+    }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
     work.executionId = execution.execution_id
     work.stage = 'rendering'
     await persistWork(durableState, work)
@@ -1374,6 +1415,10 @@ async function driveSession(
     incr('googlechatbot_delivery_total', { outcome: deliveryOutcome, source: 'live' })
     work.stage = 'final'
     await persistWork(durableState, work)
+    await recordAssistantFinal(config, durableState, event, target, {
+      outcome: deliveryOutcome,
+      answer: state.answer
+    })
     await updateThreadState(durableState, threadKey, { activeExecution: false, lastEventId })
     incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
     // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
@@ -1396,6 +1441,58 @@ async function driveSession(
     work.stage = 'final'
     await persistWork(durableState, work)
     await updateThreadState(durableState, threadKey, { activeExecution: false })
+  }
+}
+
+/** Record a delivered answer in the DM transcript and in session_messages,
+ * keyed by the Google message name it was delivered under (`deliverFinal`
+ * PATCHes the ack, or creates under the deterministic fallback id). Both the
+ * live and the recovery delivery path must call this, or a crash between
+ * delivery and record loses the answer from the thread's memory. */
+async function recordAssistantFinal(
+  config: AppConfig,
+  durableState: StateAdapter,
+  event: NormalizedChatEvent,
+  target: { spaceName: string; ackMessageName: string; fallbackMessageId?: string },
+  delivery: { outcome: 'updated' | 'created'; answer: string }
+): Promise<void> {
+  if (event.space_type !== 'DIRECT_MESSAGE' || !delivery.answer.trim()) return
+  const messageName = delivery.outcome === 'updated'
+    ? target.ackMessageName
+    : target.fallbackMessageId && `${target.spaceName}/messages/${target.fallbackMessageId}`
+  if (!messageName) return
+  const turn = assistantTurnMessage(messageName, delivery.answer)
+  await appendSessionMessagesBestEffort(config, event.thread_key, [turn])
+  await updateThreadState(durableState, event.thread_key, {
+    forwardedMessageIds: [turn.id],
+    transcript: [transcriptEntryFromTurn(turn)]
+  }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
+}
+
+/** A DM's transcript is this bot's only durable memory of the thread. */
+function dmTranscriptUpdate(
+  event: NormalizedChatEvent,
+  turn: GoogleChatTurnMessage
+): Pick<GoogleChatThreadState, 'transcript'> {
+  return event.space_type === 'DIRECT_MESSAGE'
+    ? { transcript: [transcriptEntryFromTurn(turn)] }
+    : {}
+}
+
+/** session_messages only feeds the Console; once a run is in flight (or an
+ * answer delivered) a failed append is logged, never fatal. */
+async function appendSessionMessagesBestEffort(
+  config: AppConfig,
+  threadKey: string,
+  messages: GoogleChatTurnMessage[]
+): Promise<void> {
+  try {
+    await appendSessionMessages(config, threadKey, messages)
+  } catch (error) {
+    logWarn('googlechatbot_session_append_failed', error, {
+      thread_key: threadKey,
+      message_count: messages.length
+    })
   }
 }
 

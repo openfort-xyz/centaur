@@ -8,7 +8,7 @@ import {
   createGooglechatbot
 } from './index'
 import { loadConfig } from './config'
-import { ChatOwnershipError } from './chat/client'
+import { ChatApiError, ChatOwnershipError } from './chat/client'
 import { createMemoryState } from '@chat-adapter/state-memory'
 
 describe('durable startup health', () => {
@@ -100,6 +100,34 @@ describe('api-rs-only /api/chat routes', () => {
     } finally {
       console.error = realError
     }
+  })
+
+  test('logs the space, credential kind and upstream status of a failed list', async () => {
+    const bot = appWith({ GOOGLECHATBOT_INTERNAL_API_KEY: 'secret' })
+    bot.client.listMessages = async () => {
+      throw new ChatApiError(
+        'GET', 'spaces/DM1/messages', 400, 'filter rejected for bob@example.com'
+      )
+    }
+    const logged: unknown[][] = []
+    const realError = console.error
+    console.error = (...values: unknown[]) => logged.push(values)
+    try {
+      const res = await bot.app.request(
+        '/api/chat/spaces/DM1/messages?impersonate=bob%40example.com',
+        { headers: { Authorization: 'Bearer secret' } }
+      )
+      expect(res.status).toBe(502)
+      expect(await res.json()).toEqual({ error: 'Google Chat request failed' })
+    } finally {
+      console.error = realError
+    }
+    expect(logged).toEqual([[
+      'googlechatbot_outbound_list_failed',
+      { error_name: 'Error', space: 'spaces/DM1', credential: 'impersonate', status: 400 }
+    ]])
+    expect(JSON.stringify(logged)).not.toContain('bob@example.com')
+    expect(JSON.stringify(logged)).not.toContain('filter rejected')
   })
 
   test('binds the route space and rejects invalid resource names and bodies', async () => {

@@ -4,11 +4,15 @@ import { createPostgresState } from '@chat-adapter/state-pg'
 import { randomUUID } from 'node:crypto'
 import { loadConfig } from './config'
 import {
+  assistantTurnMessage,
   ensureStateConnected,
   persistWork,
   threadStateKey,
+  transcriptEntryFromTurn,
+  transcriptHistoryMessages,
   updateThreadState,
   workKey,
+  type GoogleChatThreadState,
   type GoogleChatWorkObligation,
   type StateConnectionStatus
 } from './state'
@@ -130,6 +134,56 @@ describe('durable Google Chat state', () => {
       harnessType: 'codex', model: 'gpt-5.6-sol', provider: 'openai'
     })
     expect(await restartedAgainB.get(workKey(work.workId))).toMatchObject({ workId: work.workId })
+  })
+  test('the DM transcript round-trips, dedupes by id, caps at limit, drops bytes', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    const entry = transcriptEntryFromTurn({
+      id: 'spaces/AAAA/messages/M1',
+      role: 'user',
+      text: 'look at this',
+      parts: [
+        { type: 'text', text: 'look at this' },
+        {
+          type: 'image',
+          name: 'shot.png',
+          mime_type: 'image/png',
+          size: 3,
+          source: { type: 'base64', media_type: 'image/png', data: 'QUFB' }
+        }
+      ],
+      isMention: true,
+      userId: 'users/U1',
+      userName: 'Alice',
+      timestamp: '2026-08-31T00:00:00Z'
+    })
+    expect(entry.attachments).toEqual([{ name: 'shot.png', mimeType: 'image/png', size: 3 }])
+    expect(JSON.stringify(entry)).not.toContain('QUFB')
+
+    // Same entry twice: a redelivered webhook must not grow the transcript.
+    await updateThreadState(state, 'dm-thread', { transcript: [entry] }, 3)
+    await updateThreadState(state, 'dm-thread', { transcript: [entry] }, 3)
+    const stored = await state.get<GoogleChatThreadState>(threadStateKey('dm-thread'))
+    expect(stored?.transcript).toEqual([entry])
+
+    const answer = transcriptEntryFromTurn(assistantTurnMessage('spaces/AAAA/messages/A1', 'hi'))
+    await updateThreadState(state, 'dm-thread', { transcript: [answer] }, 3)
+    expect(transcriptHistoryMessages(
+      (await state.get<GoogleChatThreadState>(threadStateKey('dm-thread')))?.transcript,
+      'spaces/AAAA/messages/A1'
+    )).toEqual([{
+      message_id: 'spaces/AAAA/messages/M1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'look at this\n[attachment: shot.png (image/png, 3 bytes)]' }],
+      user_id: 'users/U1',
+      metadata: { user_name: 'Alice', create_time: '2026-08-31T00:00:00Z' }
+    }])
+
+    for (const id of ['m2', 'm3', 'm4']) {
+      await updateThreadState(state, 'dm-thread', { transcript: [{ ...entry, id }] }, 3)
+    }
+    const capped = await state.get<GoogleChatThreadState>(threadStateKey('dm-thread'))
+    expect(capped?.transcript?.map(item => item.id)).toEqual(['m2', 'm3', 'm4'])
   })
 })
 

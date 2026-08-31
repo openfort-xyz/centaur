@@ -23,7 +23,6 @@ export interface ChatHistoryFetcher {
       pageToken?: string
       filter?: string
       orderBy?: string
-      impersonateSubject?: string
     }
   ): Promise<{ messages?: ChatListMessage[]; nextPageToken?: string }>
 }
@@ -316,9 +315,6 @@ export async function collectThreadHistory(
     currentMessageName: string
     threadReply?: boolean
     botUserName?: string
-    /** Requester email; used to read DM history as that user when app auth
-     * (which cannot read DMs) is refused. */
-    requesterEmail?: string
     historyLimit?: number
   }
 ): Promise<ChatHistoryMessage[]> {
@@ -347,7 +343,6 @@ export async function collectThreadHistory(
         pageSize: Math.min(100, historyLimit - collected.length),
         pageToken,
         filter,
-        ...(opts.requesterEmail ? { impersonateSubject: opts.requesterEmail } : {}),
         // Newest first so the cap drops the OLDEST messages — recency carries
         // the most context for a reply. Long threads will lose their head turn;
         // acceptable for an assistant in conversational use.
