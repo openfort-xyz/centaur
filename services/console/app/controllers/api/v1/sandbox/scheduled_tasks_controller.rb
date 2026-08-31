@@ -72,7 +72,11 @@ module Api
             :enabled
           )
           if attributes[:delivery_channel].to_s.strip.casecmp?("dm")
-            attributes[:delivery_channel] = SlackDeliveryPolicy.new(task_author).direct_message_user_id
+            # Slack DM when the author has a linked Slack identity; otherwise
+            # their Google Chat DM (the author's own email).
+            attributes[:delivery_channel] =
+              SlackDeliveryPolicy.new(task_author).direct_message_user_id ||
+              GoogleChatDeliveryPolicy.new(task_author).direct_message_identity
           end
           attributes
         end
