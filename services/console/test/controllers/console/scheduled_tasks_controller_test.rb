@@ -231,7 +231,7 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
 
   test "creates a task that delivers to the author's Google Chat DM" do
     post console_scheduled_tasks_url, params: {
-      scheduled_task: task_params.merge(delivery_mode: "gchat_dm", delivery_channel: "C0123456789")
+      scheduled_task: task_params.merge(delivery_mode: "gchat", delivery_destination: "dm", delivery_channel: "C0123456789")
     }
 
     assert_redirected_to console_scheduled_tasks_path
@@ -245,9 +245,9 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
 
     post console_scheduled_tasks_url, params: {
       scheduled_task: task_params.merge(
-        delivery_mode: "gchat_space",
+        delivery_mode: "gchat",
         delivery_channel: "C0123456789",
-        delivery_space: "spaces/AAQA42QLdws"
+        delivery_destination: "spaces/AAQA42QLdws"
       )
     }
 
@@ -260,8 +260,8 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
 
     post console_scheduled_tasks_url, params: {
       scheduled_task: task_params.merge(
-        delivery_mode: "gchat_space",
-        delivery_space: "",
+        delivery_mode: "gchat",
+        delivery_destination: "dm",
         delivery_space_custom: " spaces/AAQAraw12345 "
       )
     }
@@ -274,8 +274,8 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_no_difference -> { ScheduledTask.count } do
       post console_scheduled_tasks_url, params: {
         scheduled_task: task_params.merge(
-          delivery_mode: "gchat_space",
-          delivery_space: "spaces/AAQAungranted"
+          delivery_mode: "gchat",
+          delivery_destination: "spaces/AAQAungranted"
         )
       }
     end
@@ -291,12 +291,36 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
 
     assert_response :ok
     assert_select "form[data-controller='slack-channel-autocomplete']", count: 0
-    assert_select "input[type=radio][name='scheduled_task[delivery_mode]'][value=dm]", count: 0
-    assert_select "input[type=radio][name='scheduled_task[delivery_mode]'][value=channel]", count: 0
-    assert_select "input[type=radio][name='scheduled_task[delivery_mode]'][value=gchat_dm][checked]"
-    assert_select "input[type=radio][name='scheduled_task[delivery_mode]'][value=gchat_space]"
-    assert_select "select[name='scheduled_task[delivery_space]']"
+    assert_select "input[type=radio][name='scheduled_task[delivery_mode]']", count: 0
+    assert_select "input[type=hidden][name='scheduled_task[delivery_mode]'][value=gchat]"
+    assert_select "select[name='scheduled_task[delivery_destination]']"
     assert_select "input[name='scheduled_task[delivery_space_custom]']"
+  end
+
+  test "labels granted spaces with their display names in the destination picker" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+
+    GoogleChatSpaceDirectory.stub(:display_names, { "spaces/AAQA42QLdws" => "AI" }) do
+      get new_console_scheduled_task_url
+    end
+
+    assert_response :ok
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value='spaces/AAQA42QLdws']",
+                  text: "AI"
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value=dm]",
+                  text: "Your direct message"
+  end
+
+  test "shows the space display name on the task table" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+    create_task.update!(delivery_channel: "spaces/AAQA42QLdws")
+
+    GoogleChatSpaceDirectory.stub(:display_names, { "spaces/AAQA42QLdws" => "AI" }) do
+      get console_scheduled_tasks_url
+    end
+
+    assert_response :ok
+    assert_select "td", text: /AI/
   end
 
   test "shows the Google Chat DM destination on the task table" do
