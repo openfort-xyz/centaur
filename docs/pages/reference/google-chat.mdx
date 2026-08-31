@@ -206,6 +206,26 @@ threads, bounded search, reactions, DM setup/send, questions, dump, feedback,
 message send/update/delete, upload, file list/search/info, and raw download.
 Every command routes through api-rs authorization.
 
+## Deliver scheduled tasks
+
+Console scheduled tasks deliver to Google Chat as well as Slack. The
+destination is one string and is dispatched by shape: a Slack ID, a
+`spaces/<id>` resource name, or an email address.
+
+- A space is available to a task only while the author's console principal
+  holds an effective **Send** grant for that exact space, directly or through a
+  role. The grant is checked when the task is saved and again when each run is
+  enqueued, so revoking it stops the next run before any Chat call.
+- An email destination must be the author's own console email. The workflow
+  resolves it to the bot's 1:1 DM space at run time (create-or-reuse), so no
+  space name is stored.
+
+Each run makes one agent turn, formats the answer as Google Chat text
+(`*bold*`, `_italics_`, `<url|label>`), splits it into 4,000-character chunks,
+posts the first chunk and threads the rest under it, and appends a plain-text
+`Sent by <email>'s scheduled task` footer. Delivery failures land in the task's
+last error in the Console.
+
 ## Durable delivery and health
 
 Googlechatbot requires Postgres state in production. It does not bind the
