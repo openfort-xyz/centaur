@@ -22,6 +22,8 @@ class FakeContext:
         self.step_calls = []
         self.step_results = {}
         self.slack_calls = []
+        self.google_chat_calls = []
+        self.dm_setup_calls = []
 
     async def agent_turn(self, prompt, **kwargs):
         self.agent_calls.append((prompt, kwargs))
@@ -43,6 +45,25 @@ class FakeContext:
             "channel": self.slack_response_channel or channel,
             "ts": f"123.{len(self.slack_calls)}",
         }
+
+
+    async def post_to_google_chat(self, space_name, text, **kwargs):
+        self.google_chat_calls.append((space_name, text, kwargs))
+        index = len(self.google_chat_calls)
+        return {
+            "name": f"{space_name}/messages/msg-{index}",
+            "thread": {"name": f"{space_name}/threads/thread-1"},
+        }
+
+    async def google_chat_dm_setup(self, target_identity):
+        self.dm_setup_calls.append(target_identity)
+        return {"name": "spaces/DM123", "type": "DM"}
+
+
+class ThreadlessContext(FakeContext):
+    async def post_to_google_chat(self, space_name, text, **kwargs):
+        self.google_chat_calls.append((space_name, text, kwargs))
+        return {"name": f"{space_name}/messages/msg-{len(self.google_chat_calls)}"}
 
 
 def scheduled_task_blocks(body: str, footer: str):
@@ -348,3 +369,170 @@ def test_handler_rejects_missing_required_input_before_starting_an_agent():
     assert context.agent_calls == []
     assert context.step_calls == []
     assert context.slack_calls == []
+
+
+def test_handler_delivers_to_a_google_chat_space_with_chat_formatting():
+    context = FakeContext()
+    footer = "Sent by author@example.com's scheduled task"
+
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "spaces/AAQA42QLdws",
+                "author_email": "author@example.com",
+                "scheduled_task_id": "tsk_123",
+                "scheduled_task_name": "Incident summary",
+            },
+            context,
+        )
+    )
+
+    prompt, kwargs = context.agent_calls[0]
+    assert prompt == (
+        f"{console_workflow.SCHEDULED_TASK_EXECUTION_INSTRUCTIONS}\n\n"
+        "Task to execute:\nSummarize open incidents\n\n"
+        f"{console_workflow.GCHAT_FORMAT_INSTRUCTIONS}"
+    )
+    assert kwargs["principal"] == "console-user-author"
+    assert context.step_calls == ["post_result"]
+    assert context.slack_calls == []
+    assert context.dm_setup_calls == []
+    assert context.google_chat_calls == [
+        ("spaces/AAQA42QLdws", f"Daily summary\n\n{footer}", {})
+    ]
+    assert result["delivery"] == {
+        "space_name": "spaces/AAQA42QLdws",
+        "messages_posted": 1,
+        "thread_name": "spaces/AAQA42QLdws/threads/thread-1",
+    }
+
+
+def test_handler_threads_long_google_chat_results_under_the_first_message():
+    response_text = "x" * (console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH * 2 + 25)
+    context = FakeContext(result_text=response_text)
+
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "spaces/AAQA42QLdws",
+                "author_email": "author@example.com",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    footer = "Sent by author@example.com's scheduled task"
+    assert context.step_calls == [
+        "post_result",
+        "post_result_reply_1",
+        "post_result_reply_2",
+    ]
+    assert "".join(call[1] for call in context.google_chat_calls) == (
+        f"{response_text}\n\n{footer}"
+    )
+    assert all(
+        len(call[1]) <= console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH
+        for call in context.google_chat_calls
+    )
+    assert context.google_chat_calls[0][2] == {}
+    thread_name = "spaces/AAQA42QLdws/threads/thread-1"
+    assert all(
+        call[2] == {"thread_name": thread_name} for call in context.google_chat_calls[1:]
+    )
+    assert result["delivery"]["messages_posted"] == 3
+
+
+def test_handler_resolves_the_author_dm_space_once_and_replays_checkpoints():
+    response_text = "a" * (console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH + 25)
+    context = FakeContext(result_text=response_text)
+    params = {
+        "prompt": "Summarize open incidents",
+        "principal": "console-user-author",
+        "channel": "author@example.com",
+        "author_email": "author@example.com",
+        "scheduled_task_id": "tsk_123",
+    }
+
+    result = asyncio.run(console_workflow.handler(params, context))
+
+    assert context.dm_setup_calls == ["author@example.com"]
+    assert context.step_calls == ["dm_setup", "post_result", "post_result_reply_1"]
+    assert [call[0] for call in context.google_chat_calls] == ["spaces/DM123"] * 2
+    assert result["delivery"]["space_name"] == "spaces/DM123"
+
+    asyncio.run(console_workflow.handler(params, context))
+
+    assert context.dm_setup_calls == ["author@example.com"]
+    assert len(context.google_chat_calls) == 2
+    assert context.step_calls == ["dm_setup", "post_result", "post_result_reply_1"] * 2
+
+
+def test_handler_posts_unthreaded_google_chat_replies_without_a_thread_name():
+    response_text = "b" * (console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH + 25)
+    context = ThreadlessContext(result_text=response_text)
+
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "spaces/AAQA42QLdws",
+                "author_email": "author@example.com",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    assert len(context.google_chat_calls) == 2
+    assert all(call[2] == {} for call in context.google_chat_calls)
+    assert result["delivery"]["thread_name"] == ""
+
+
+def test_handler_uses_the_generic_footer_for_google_chat_without_an_author():
+    context = FakeContext()
+
+    asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "spaces/AAQA42QLdws",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    assert context.google_chat_calls == [
+        ("spaces/AAQA42QLdws", "Daily summary\n\nSent by a scheduled task", {})
+    ]
+
+
+def test_handler_still_routes_slack_shaped_destinations_to_slack():
+    context = FakeContext()
+
+    asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "C0123456789",
+                "slack_user_id": "U0123456789",
+                "author_email": "author@example.com",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    prompt, _kwargs = context.agent_calls[0]
+    assert prompt.endswith(console_workflow.SLACK_MRKDWN_INSTRUCTIONS)
+    assert context.google_chat_calls == []
+    assert context.dm_setup_calls == []
+    assert len(context.slack_calls) == 1
