@@ -112,7 +112,11 @@ class Console::ScheduledTasksController < ApplicationController
 
   def prepare_form
     @slack_dm_user_id = SlackDeliveryPolicy.new(current_user).direct_message_user_id
-    @slack_delivery_available = SlackChannelCatalogSync.configured?
+    # A configured token alone is not enough: this deployment carries the
+    # console Slack token in its shared secret while running no Slack bot, so
+    # offer Slack only when something is actually deliverable.
+    @slack_delivery_available =
+      SlackChannelCatalogSync.configured? && (SlackBotChannel.exists? || @slack_dm_user_id.present?)
     @google_chat_dm_email = google_chat_policy.direct_message_identity
     @google_chat_spaces = google_chat_policy.send_spaces
     @google_chat_space_names = GoogleChatSpaceDirectory.display_names(current_user)

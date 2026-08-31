@@ -297,6 +297,18 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_select "input[name='scheduled_task[delivery_space_custom]']"
   end
 
+  test "hides Slack delivery when nothing is deliverable despite a configured token" do
+    SlackBotChannel.delete_all
+    @operator.user_identities.destroy_all
+
+    get new_console_scheduled_task_url
+
+    assert_response :ok
+    assert_select "input[type=radio][name='scheduled_task[delivery_mode]']", count: 0
+    assert_select "input[type=hidden][name='scheduled_task[delivery_mode]'][value=gchat]"
+    assert_select "select[name='scheduled_task[delivery_destination]']"
+  end
+
   test "labels granted spaces with their display names in the destination picker" do
     grant_google_chat_space("spaces/AAQA42QLdws")
 
