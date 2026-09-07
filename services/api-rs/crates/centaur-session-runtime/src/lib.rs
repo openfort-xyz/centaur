@@ -1739,6 +1739,18 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionRuntimeError> {
+        self.append_messages_with_forwarding(thread_key, messages, true)
+            .await
+    }
+
+    /// Persist transcript messages, optionally steering an active execution.
+    /// Callers that already supplied these messages to execute must pass false.
+    pub async fn append_messages_with_forwarding(
+        &self,
+        thread_key: &ThreadKey,
+        messages: &[SessionMessageInput],
+        forward_to_active_execution: bool,
+    ) -> Result<Vec<String>, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.messages.append",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1797,8 +1809,10 @@ impl SessionRuntime {
                 return Err(error);
             }
         };
-        self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
-            .await;
+        if forward_to_active_execution {
+            self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
+                .await;
+        }
         self.spawn_session_title_generation(thread_key);
         Ok(message_ids)
     }
@@ -9619,6 +9633,72 @@ mod adoption_tests {
                 .is_err(),
             "unscoped stream should stay open after a terminal event"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_append_persists_without_replaying_but_new_messages_still_steer() {
+        use tokio::io::AsyncReadExt;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:transcript-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-transcript"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, mut stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-transcript")
+            .await
+            .unwrap();
+        let message = SessionMessageInput {
+            client_message_id: Some("already-executed".to_owned()),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "already executed"})],
+            metadata: json!({}),
+        };
+        let ids = runtime
+            .append_messages_with_forwarding(&thread_key, &[message], false)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from session_messages where thread_key = $1")
+                .bind(thread_key.as_str())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "transcript must still be durable");
+        let mut buffer = [0u8; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stdin.read(&mut buffer))
+                .await
+                .is_err(),
+            "persist-only append must not write another harness input"
+        );
+        runtime
+            .append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("new-message".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "a real follow-up"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(Duration::from_secs(2), stdin.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let input: Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert!(input.to_string().contains("a real follow-up"));
+        assert!(!input.to_string().contains("already executed"));
+        store.complete_execution(&execution_id).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -776,7 +776,11 @@ async fn append_messages(
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let message_ids = state
         .runtime()?
-        .append_messages(&thread_key, &request.messages)
+        .append_messages_with_forwarding(
+            &thread_key,
+            &request.messages,
+            request.forward_to_active_execution.unwrap_or(true),
+        )
         .await?;
     Ok(Json(AppendMessagesResponse {
         ok: true,

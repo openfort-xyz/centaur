@@ -48,6 +48,7 @@ type CreateSessionRequest = {
 }
 
 type AppendMessagesRequest = {
+  forward_to_active_execution?: boolean
   messages: Array<{
     client_message_id?: string
     role: 'user' | 'assistant'
@@ -347,10 +348,13 @@ function identityMetadata(identity: ResolvedSessionIdentity | undefined): JsonOb
 export async function appendSessionMessages(
   config: AppConfig,
   threadKey: string,
-  messages: GoogleChatTurnMessage[]
+  messages: GoogleChatTurnMessage[],
+  opts: { forwardToActiveExecution?: boolean } = {}
 ): Promise<void> {
   if (messages.length === 0) return
   const body: AppendMessagesRequest = {
+    ...(opts.forwardToActiveExecution === undefined
+      ? {} : { forward_to_active_execution: opts.forwardToActiveExecution }),
     messages: messages.map(message => ({
       client_message_id: message.id,
       role: message.role,

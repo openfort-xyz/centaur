@@ -927,6 +927,10 @@ describe('googlechatbot DM thread transcript', () => {
     await bot.request('/api/chat/events', dmEvent('M2', 'and the second one?'))
     await waitFor(async () => (await transcriptOf(state)).length === 4)
 
+    for (const call of sessionCalls(DM_THREAD_KEY, 'messages')) {
+      expect((call.body as { forward_to_active_execution?: boolean }).forward_to_active_execution)
+        .toBe(false)
+    }
     const context = threadContext(executes()[1]!)
     expect(context).toContain('did the deploy finish?')
     expect(context).toContain('the deploy finished')
@@ -990,6 +994,10 @@ describe('googlechatbot DM thread transcript', () => {
     await waitFor(async () => (await transcriptOf(state)).length === 2)
 
     expect(executes()).toHaveLength(0)
+    for (const call of sessionCalls(DM_THREAD_KEY, 'messages')) {
+      expect((call.body as { forward_to_active_execution?: boolean }).forward_to_active_execution)
+        .not.toBe(false)
+    }
     // The stored transcript is not re-steered into the live run.
     expect(appended().map(message => message.client_message_id))
       .toEqual(['spaces/AAAA/messages/M1'])

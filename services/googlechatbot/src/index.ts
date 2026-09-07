@@ -1307,7 +1307,7 @@ async function driveSession(
     // Slack's rule: session_messages records each human turn exactly once.
     // The execution is already running, so a failed append must not abort the
     // render loop: the DM transcript below is the context source and
-    // session_messages only feeds the Console.
+    // this append must persist only: execute already supplied the input.
     await appendSessionMessagesBestEffort(config, threadKey, appended)
     await updateThreadState(durableState, threadKey, {
       activeExecution: true,
@@ -1481,15 +1481,15 @@ function dmTranscriptUpdate(
     : {}
 }
 
-/** session_messages only feeds the Console; once a run is in flight (or an
- * answer delivered) a failed append is logged, never fatal. */
+/** Record the transcript without sending it into the harness again. Once a
+ * run is in flight (or an answer delivered), log append failures, never abort. */
 async function appendSessionMessagesBestEffort(
   config: AppConfig,
   threadKey: string,
   messages: GoogleChatTurnMessage[]
 ): Promise<void> {
   try {
-    await appendSessionMessages(config, threadKey, messages)
+    await appendSessionMessages(config, threadKey, messages, { forwardToActiveExecution: false })
   } catch (error) {
     logWarn('googlechatbot_session_append_failed', error, {
       thread_key: threadKey,
