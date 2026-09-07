@@ -199,6 +199,26 @@ artifacts in `docs/google-chat-parity-verification.md`.
 
 ## Upstream sync windows
 
+### 2026-09-07 — 26 upstream commits, `d8523f7a..d3143c35`
+
+| Upstream | Slack change | Google Chat disposition |
+| --- | --- | --- |
+| #1595 pin personas for thread lifetime | `--persona <id>` flag; the persona sent when the session is created is pinned by api-rs for the thread's lifetime, later flags are stripped but ignored; the pinned value persists in thread state. | **Ported.** Same flag in `overrides.ts`; `createSession` sends `persona_id` and reads back `persona_id`; `personaId` persists in thread state and is re-sent on harness restarts. The LLM strategy still reads the rest of a persona-flagged message. Slack's preserve/reconcile machinery is not copied: api-rs ignores later personas, so the bot just records what api-rs returns. |
+| #1598 fall back from unavailable personas | api-rs replaces an unavailable requested persona and reports `unavailable_requested_persona_id`; the Slack context block carries a warning notice. | **Ported.** `personaFallbackNotice` renders as a leading `⚠️` segment on the Console/metadata widget, which now renders for the notice alone. |
+| #1485 Claude aliases to Opus 5 / Sonnet 5 | `--opus`/`--sonnet` and the LLM strategy expand to `claude-opus-5`/`claude-sonnet-5`; Claude Code bumped to 2.1.245. | **Ported** verbatim (alias map, strategy prompt). The sandbox Dockerfile merge takes upstream's Claude Code/Codex pins. |
+| #1599 GPT-6-Astra support | `gpt-6-astra` model with the `ultra` effort level in flags, the strategy vocabulary, and the trailer. | **Ported** verbatim (`-rsn ultra`, `gpt-6-astra` in `STRATEGY_MODEL_HARNESSES`, astra effort table and `Ultra` display name). |
+| #1597 hide Slack console links when chat is disabled | The chart only passes `CENTAUR_CONSOLE_PUBLIC_URL` to slackbotv2 when `console.chat.enabled`. | **Ported.** Same gate on the googlechatbot template; verified by rendering both values. |
+| #1596 console chat sunset controls | Console-side feature flag and PWA/threads UI changes. | **Shared.** Console-only; the Chat-facing half is #1597 above. |
+| #1590 canonical Slack permalinks | The Slack tool asks `chat.getPermalink` instead of formatting `slack.com/archives` URLs. | **Not applicable.** Google Chat has no permalink API; the Chat tool already builds the canonical `mail.google.com/chat/...` deep link from the space and message ids. |
+| #1573 default Codex reasoning medium | Baked `harness/codex/config.toml` effort and Slack test expectations. | **Shared.** The Chat trailer tests read the baked value, so no change. |
+| #1539 linearbot per-turn reasoning effort | Linear only. | **Not applicable.** |
+
+Merge mechanics: one conflict, the sandbox Dockerfile `CLAUDE_CODE_VERSION` /
+`CODEX_VERSION` pins (upstream wins). No new numbered SQLx migrations
+(the memory-generation migration is experimental and unnumbered), so the
+fork offset stays **+4**. api-rs, harness-server, and the Console
+controllers auto-merged around the fork's Chat additions.
+
 ### 2026-08-31 — 36 upstream commits, `bc72622b..d8523f7a`
 
 | Upstream | Slack change | Google Chat disposition |

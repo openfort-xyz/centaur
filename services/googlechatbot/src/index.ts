@@ -50,6 +50,7 @@ import {
 import { resolveSpaceDefault, spaceDefaultsFromConfig, type SpaceDefaults } from './space-defaults'
 import {
   buildConsoleSessionWidget,
+  personaFallbackNotice,
   defaultModelForHarness,
   effectiveReasoningForHarness,
   defaultServiceTierForHarness,
@@ -1194,6 +1195,7 @@ async function driveSession(
     overrides.provider
     ?? (overrides.harnessType ? undefined : valueOrUndefined(threadState.provider))
     ?? spaceDefault?.provider
+  const pinnedPersonaId = valueOrUndefined(threadState.personaId) ?? overrides.personaId
   const requestedHarnessType =
     resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS ?? 'codex'
   const harnessDefaultModel = defaultModelForHarness(
@@ -1233,6 +1235,9 @@ async function driveSession(
         ...(harnessRollout.assignment
           ? { harnessAssignment: harnessRollout.assignment }
           : {}),
+        // api-rs pins the first persisted persona for the thread's lifetime;
+        // re-sending the pinned one keeps it across a harness restart.
+        ...(pinnedPersonaId ? { personaId: pinnedPersonaId } : {}),
         restartOnHarnessConflict: Boolean(overrides.harnessType)
       }
     )
@@ -1326,7 +1331,8 @@ async function driveSession(
         : overrides.harnessType ? { model: null } : {}),
       ...(overrides.provider
         ? { provider: overrides.provider }
-        : overrides.harnessType ? { provider: null } : {})
+        : overrides.harnessType ? { provider: null } : {}),
+      ...(session.personaId !== undefined ? { personaId: session.personaId } : {})
     }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
     work.executionId = execution.execution_id
     work.stage = 'rendering'
@@ -1357,7 +1363,11 @@ async function driveSession(
     const includeResponseMetadata =
       config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'always' ||
       (config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'first' && isFirstAssistantMessage)
-    const consoleSessionWidget = isFirstAssistantMessage || includeResponseMetadata
+    const fallbackNotice = personaFallbackNotice(
+      session.unavailableRequestedPersonaId,
+      session.personaId
+    )
+    const consoleSessionWidget = isFirstAssistantMessage || includeResponseMetadata || fallbackNotice
       ? buildConsoleSessionWidget({
           consoleBaseUrl: isFirstAssistantMessage
             ? config.CENTAUR_CONSOLE_PUBLIC_URL
@@ -1366,6 +1376,7 @@ async function driveSession(
           harnessType: effectiveHarnessType,
           metadataEnabled: includeResponseMetadata,
           model: effectiveModel,
+          notice: fallbackNotice,
           reasoning: effectiveReasoning,
           serviceTier:
             config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED && !resolvedProvider

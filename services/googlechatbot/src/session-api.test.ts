@@ -1179,3 +1179,52 @@ describe('emitWorkflowEvent', () => {
     ).rejects.toThrow()
   })
 })
+
+// Upstream #1595/#1598 parity: the persona rides session creation and api-rs
+// reports what it pinned, including a replaced unavailable request.
+describe('createSession persona', () => {
+  const realFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  test('sends persona_id only when requested and reads back the pinned value', async () => {
+    const requests: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      requests.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        status: 'idle',
+        harness_type: 'codex',
+        persona_id: 'eng',
+        unavailable_requested_persona_id: 'ghost'
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const withPersona = await createSession(
+      loadConfig({}), 'chat:spaces:AAAA:threads:T1', undefined, 'codex', undefined,
+      { personaId: 'ghost' }
+    )
+    const withoutPersona = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+
+    expect(requests[0]?.persona_id).toBe('ghost')
+    expect('persona_id' in (requests[1] ?? {})).toBe(false)
+    expect(withPersona.personaId).toBe('eng')
+    expect(withPersona.unavailableRequestedPersonaId).toBe('ghost')
+    expect(withoutPersona.personaId).toBe('eng')
+  })
+
+  test('distinguishes no persona (null) from an unreported one', async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ status: 'idle', persona_id: null }), { status: 200 })
+    ) as unknown as typeof fetch
+    const pinnedWithout = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(pinnedWithout.personaId).toBeNull()
+    expect(pinnedWithout.unavailableRequestedPersonaId).toBeUndefined()
+
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ status: 'idle' }), { status: 200 })
+    ) as unknown as typeof fetch
+    const unreported = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect('personaId' in unreported).toBe(false)
+  })
+})

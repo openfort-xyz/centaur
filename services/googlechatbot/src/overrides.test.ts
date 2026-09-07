@@ -10,7 +10,7 @@ describe('extractMessageOverrides', () => {
 
   test('expands Claude aliases and implies the harness via shortcut flags', () => {
     const out = extractMessageOverrides('--opus refactor this')
-    expect(out.model).toBe('claude-opus-4-8')
+    expect(out.model).toBe('claude-opus-5')
     expect(out.harnessType).toBe('claudecode')
     expect(out.cleanedText).toBe('refactor this')
   })
@@ -65,5 +65,32 @@ describe('extractMessageOverrides', () => {
     const out = extractMessageOverrides('just a normal message')
     expect(out.cleanedText).toBe('just a normal message')
     expect(out.model).toBeUndefined()
+  })
+})
+
+// Upstream #1595/#1599 parity: --persona pins the thread's persona at session
+// creation; gpt-6-astra adds the ultra effort level.
+describe('persona and astra flags', () => {
+  test('extracts --persona in both spellings and strips it from the prompt', () => {
+    expect(extractMessageOverrides('--persona eng fix the bug')).toMatchObject({
+      personaId: 'eng',
+      cleanedText: 'fix the bug'
+    })
+    expect(extractMessageOverrides('fix the bug --persona=sales.eu')).toMatchObject({
+      personaId: 'sales.eu',
+      cleanedText: 'fix the bug'
+    })
+  })
+
+  test('--persona composes with model flags and leaves plain text alone', () => {
+    const out = extractMessageOverrides('--claude --persona eng go')
+    expect(out.personaId).toBe('eng')
+    expect(out.harnessType).toBe('claudecode')
+    expect(out.cleanedText).toBe('go')
+    expect(extractMessageOverrides('the persona system').personaId).toBeUndefined()
+  })
+
+  test('-rsn ultra is a recognized effort', () => {
+    expect(extractMessageOverrides('go -rsn ultra').reasoning).toBe('ultra')
   })
 })

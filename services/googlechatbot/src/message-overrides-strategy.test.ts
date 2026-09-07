@@ -213,3 +213,37 @@ describe('messageOverridesStrategyFromConfig', () => {
   })
 
 })
+
+describe('persona flag with the OpenAI strategy', () => {
+  test('a lone --persona still lets the LLM read the rest of the message', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: 'gpt-6-astra', provider: null, reasoning: 'ultra' })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('--persona eng use astra at ultra effort')
+
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, { body: string }]
+    expect((JSON.parse(init.body) as { input: string }).input).toBe('use astra at ultra effort')
+    expect(out.personaId).toBe('eng')
+    expect(out.model).toBe('gpt-6-astra')
+    expect(out.reasoning).toBe('ultra')
+    expect(out.cleanedText).toBe('use astra at ultra effort')
+  })
+
+  test('keeps the persona when the strategy request fails', async () => {
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: mock(async () => new Response('boom', { status: 500 })) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+    const out = await strategy('--persona eng hello')
+    expect(out.personaId).toBe('eng')
+    expect(out.cleanedText).toBe('hello')
+  })
+})
