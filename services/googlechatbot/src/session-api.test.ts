@@ -738,6 +738,10 @@ describe('executeSession', () => {
     expect(context?.text).toContain('2. assistant (you):')
     expect(context?.text).toContain('Done — profile drafted.')
     expect(context?.text).not.toContain('3.')
+    // Continued harness threads already hold these turns, so the block says so
+    // once (regression: 2026-09-03 the bot re-answered a replayed message).
+    expect(context?.text?.split('they are context,').length).toBe(2)
+    expect(context?.text).toContain('Only the message under "# Current Request" needs an answer.')
     // The context block precedes the user turn, which stays its own block.
     const contextIndex = line.message.content.findIndex(c => c === context)
     const promptIndex = line.message.content.findIndex(c => c.text === 'deploy the thing')

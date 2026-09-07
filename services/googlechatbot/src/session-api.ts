@@ -794,7 +794,9 @@ function threadHistoryContext(
   const lines = [
     '# Google Chat Thread Context',
     '',
-    'Earlier messages in this Google Chat thread, in chronological order:'
+    'Earlier messages in this Google Chat thread, in chronological order.',
+    'Some may already be in your session from earlier turns; they are context,',
+    'not new requests. Only the message under "# Current Request" needs an answer.'
   ]
   if (kept.length < priorMessages.length) {
     lines.push('', `…(${priorMessages.length - kept.length} earlier messages truncated)`)
