@@ -7,10 +7,13 @@
  *   --model <name> (or --model=<name>)           pick the model within that harness
  *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex)
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
+ *   --persona <id> (or --persona=<id>)           pick the persona independently
  *
  * Flags are stripped from the text before it reaches the agent. The harness
  * applies at session creation — an explicit harness flag on a thread pinned to
- * another harness restarts the thread on the requested one. The model and
+ * another harness restarts the thread on the requested one. The persona chosen
+ * when the session is created is pinned for the lifetime of the thread; later
+ * persona flags are stripped but do not change it. The model and
  * reasoning effort apply per turn via the blocks-protocol `model` / `reasoning`
  * fields; `--model` accepts either a full model id (claude-sonnet-4-6, gpt-5.2,
  * ...), an amp mode (deep/fast), or a Claude alias (fable/opus/sonnet/haiku)
@@ -30,6 +33,8 @@
 export type HarnessOverrides = {
   harnessType?: string
   model?: string
+  /** Persona requested when the thread is created; the API pins the first persisted value. */
+  personaId?: string
   provider?: string
   reasoning?: string
 }
@@ -62,8 +67,8 @@ const PROVIDER_FLAGS: Record<string, { provider: string; harnessType: string }> 
 const CLAUDE_MODEL_ALIASES: Record<string, string> = {
   fable: 'claude-fable-5',
   haiku: 'claude-haiku-4-5',
-  opus: 'claude-opus-4-8',
-  sonnet: 'claude-sonnet-4-6'
+  opus: 'claude-opus-5',
+  sonnet: 'claude-sonnet-5'
 }
 
 const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
@@ -91,6 +96,11 @@ const REASONING_FLAG_PATTERN = new RegExp(
   'i'
 )
 
+const PERSONA_FLAG_PATTERN = new RegExp(
+  String.raw`(?:^|\s)--persona${MODEL_VALUE_SEPARATOR}([A-Za-z0-9][A-Za-z0-9._-]*)${FLAG_VALUE_BOUNDARY}`,
+  'i'
+)
+
 // Codex reasoning efforts (turn/start `effort`), plus convenience aliases.
 const REASONING_EFFORTS: Record<string, string> = {
   none: 'none',
@@ -104,15 +114,23 @@ const REASONING_EFFORTS: Record<string, string> = {
   xhigh: 'xhigh',
   xhi: 'xhigh',
   'x-high': 'xhigh',
-  max: 'max'
+  max: 'max',
+  ultra: 'ultra'
 }
 
 export function extractMessageOverrides(text: string): MessageOverrides {
   let cleaned = text
   let harnessType: string | undefined
   let model: string | undefined
+  let personaId: string | undefined
   let provider: string | undefined
   let reasoning: string | undefined
+
+  const personaMatch = PERSONA_FLAG_PATTERN.exec(cleaned)
+  if (personaMatch) {
+    personaId = personaMatch[1]!
+    cleaned = stripMatch(cleaned, personaMatch)
+  }
 
   const modelMatch = MODEL_FLAG_PATTERN.exec(cleaned)
   if (modelMatch) {
@@ -157,6 +175,7 @@ export function extractMessageOverrides(text: string): MessageOverrides {
     cleanedText: cleaned === text ? text : cleaned.trim(),
     harnessType,
     model,
+    personaId,
     provider,
     reasoning
   }
@@ -234,7 +253,8 @@ export const STRATEGY_REASONING_EFFORTS = new Set([
   'medium',
   'high',
   'xhigh',
-  'max'
+  'max',
+  'ultra'
 ])
 
 export const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
@@ -256,7 +276,8 @@ export const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'gpt-5.5-pro': 'codex',
   'gpt-5.6-luna': 'codex',
   'gpt-5.6-sol': 'codex',
-  'gpt-5.6-terra': 'codex'
+  'gpt-5.6-terra': 'codex',
+  'gpt-6-astra': 'codex'
 }
 
 function cleanString(value: unknown): string | undefined {

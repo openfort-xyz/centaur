@@ -20,14 +20,14 @@ const SYSTEM_PROMPT = [
   'Use null for every field when the message does not ask to change model selection.',
   'Allowed harness values: codex, claudecode, amp, nanocodex, hermes.',
   'Allowed provider values: responses, amazon-bedrock, openrouter.',
-  'Allowed reasoning values: none, minimal, low, medium, high, xhigh, max.',
+  'Allowed reasoning values: none, minimal, low, medium, high, xhigh, max, ultra.',
   'Treat inline flags such as "--claude", "--claude --model=fable", and "--fable" as model selection requests.',
-  'In this Chat bot, a request to use Claude without another named Claude model means harness claudecode and model claude-opus-4-8. Examples: "--claude what model are you?" and "using claude:" select harness claudecode and model claude-opus-4-8. Explicit Fable requests such as "--claude --model=fable" and "using claude fable:" select harness claudecode and model claude-fable-5.',
+  'In this Chat bot, a request to use Claude without another named Claude model means harness claudecode and model claude-opus-5. Examples: "--claude what model are you?" and "using claude:" select harness claudecode and model claude-opus-5. Explicit Fable requests such as "--claude --model=fable" and "using claude fable:" select harness claudecode and model claude-fable-5.',
   'Only return reasoning when the user explicitly asks to change model reasoning or effort. A reasoning word appearing incidentally, in quoted text, pasted model output, code, or task requirements is not a selection request.',
   'When the user explicitly requests a reasoning or effort change, map fuzzy magnitude words to the nearest reasoning value. Examples: tiny/cheap/fast -> low or minimal; normal/default -> medium; deep/strong/intense -> high or xhigh; maximum/superduper/biggest -> max.',
   'Return reasoning even when the requested model is not Codex; validation will ignore reasoning that cannot apply.',
-  'Map OpenAI model aliases to canonical IDs: sol -> gpt-5.6-sol, terra -> gpt-5.6-terra, luna -> gpt-5.6-luna, 5.5 -> gpt-5.5, 5.5 pro -> gpt-5.5-pro, 5.4 -> gpt-5.4, 5.4 pro -> gpt-5.4-pro, 5.4 mini -> gpt-5.4-mini, 5.4 nano -> gpt-5.4-nano.',
-  'Map Claude model aliases to canonical IDs: fable -> claude-fable-5, opus -> claude-opus-4-8, opus 4.7 -> claude-opus-4-7, opus 5 -> claude-opus-5, opus 5 fast -> claude-opus-5-fast, sonnet -> claude-sonnet-4-6, sonnet 5 -> claude-sonnet-5, haiku -> claude-haiku-4-5.',
+  'Map OpenAI model aliases to canonical IDs: astra -> gpt-6-astra, sol -> gpt-5.6-sol, terra -> gpt-5.6-terra, luna -> gpt-5.6-luna, 5.5 -> gpt-5.5, 5.5 pro -> gpt-5.5-pro, 5.4 -> gpt-5.4, 5.4 pro -> gpt-5.4-pro, 5.4 mini -> gpt-5.4-mini, 5.4 nano -> gpt-5.4-nano.',
+  'Map Claude model aliases to canonical IDs: fable -> claude-fable-5, opus -> claude-opus-5, opus 4.8 -> claude-opus-4-8, opus 4.7 -> claude-opus-4-7, opus 5 -> claude-opus-5, opus 5 fast -> claude-opus-5-fast, sonnet -> claude-sonnet-5, sonnet 4.6 -> claude-sonnet-4-6, sonnet 5 -> claude-sonnet-5, haiku -> claude-haiku-4-5.',
   'Map Amp model aliases to canonical IDs: deep -> deep, fast -> fast. Select an Amp model only when the user explicitly names Amp or clearly asks for the deep or fast model/mode. Requests such as "use the deep model" and "switch to fast mode" select the corresponding Amp model. Do not infer Amp from superlatives, coined terms, or casual requests to be more intelligent, thorough, or fast.',
   'Words containing or merely evoking model aliases are not model requests. For example, "think deeply", "do a deep analysis", "use your strongest thinking", and "give me a fast answer" do not select Amp. Unless another explicit selector is present, return null for every field.',
   'For example, "use max effort and the sol model" should return model "gpt-5.6-sol" and reasoning "max".',
@@ -101,10 +101,12 @@ export function createOpenAiMessageOverridesStrategy(
     // Explicit flags are a deterministic user command, even when the deployment
     // enables the LLM strategy for natural-language model requests. Handle them
     // first so a strict strategy schema or model failure cannot discard the
-    // selection, and so flags never leak into the harness prompt.
-    const { cleanedText, ...explicitOverrides } = extractMessageOverrides(text)
+    // selection, and so flags never leak into the harness prompt. A persona
+    // flag on its own still lets the LLM read the rest of the message.
+    const { cleanedText, personaId, ...explicitOverrides } = extractMessageOverrides(text)
+    const persona = personaId ? { personaId } : {}
     if (Object.values(explicitOverrides).some(value => value !== undefined)) {
-      return { cleanedText, ...explicitOverrides }
+      return { cleanedText, ...persona, ...explicitOverrides }
     }
 
     const controller = new AbortController()
@@ -112,7 +114,7 @@ export function createOpenAiMessageOverridesStrategy(
     try {
       const response = await fetchFn(responsesUrl, {
         body: JSON.stringify({
-          input: text,
+          input: cleanedText,
           instructions: SYSTEM_PROMPT,
           max_output_tokens: maxOutputTokens,
           model: options.model,
@@ -150,7 +152,8 @@ export function createOpenAiMessageOverridesStrategy(
       }
       const parsed = JSON.parse(outputText)
       return {
-        cleanedText: text,
+        cleanedText,
+        ...persona,
         ...validateStrategyOverrides(
           isJsonObject(parsed) ? (parsed as OpenAiMessageOverridesStrategyOutput) : null
         )
@@ -161,7 +164,7 @@ export function createOpenAiMessageOverridesStrategy(
         model: options.model,
         timeout_ms: timeoutMs
       })
-      return { cleanedText: text }
+      return { cleanedText, ...persona }
     } finally {
       clearTimeout(timeout)
     }

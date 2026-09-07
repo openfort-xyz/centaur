@@ -59,6 +59,8 @@ type CreateSessionRequest = {
   harness_type: string
   metadata: JsonObject
   on_harness_conflict?: 'restart'
+  /** Only honoured when the session is created; the first persisted persona is pinned. */
+  persona_id?: string
 }
 
 type AppendMessagesRequest = {
@@ -136,6 +138,8 @@ type CreateSessionResponse = {
   status?: string
   session?: { status?: string }
   harness_type?: string
+  persona_id?: string | null
+  unavailable_requested_persona_id?: string
 }
 
 export type CreateSessionResult = {
@@ -149,6 +153,10 @@ export type CreateSessionResult = {
   harnessType?: string
   /** The Google Chat-owned experiment/cohort used for this thread. */
   harnessAssignment?: GoogleChatHarnessAssignment
+  /** The persona persisted by api-rs. Null means the session has no persona. */
+  personaId?: string | null
+  /** The unavailable persona api-rs replaced while creating the session. */
+  unavailableRequestedPersonaId?: string
 }
 
 export class SessionApiError extends Error {
@@ -256,6 +264,7 @@ export async function createSession(
   requester?: SessionRequester,
   options: {
     harnessAssignment?: GoogleChatHarnessAssignment
+    personaId?: string
     restartOnHarnessConflict?: boolean
   } = {}
 ): Promise<CreateSessionResult> {
@@ -286,6 +295,7 @@ export async function createSession(
   }
   const body: CreateSessionRequest = {
     harness_type: harnessType ?? 'codex',
+    ...(options.personaId ? { persona_id: options.personaId } : {}),
     metadata: {
       source: 'googlechatbot',
       platform: 'googlechat',
@@ -332,11 +342,14 @@ export async function createSession(
   const harnessAssignment = options.harnessAssignment && resolvedHarness
     ? { ...options.harnessAssignment, cohort: resolvedHarness }
     : options.harnessAssignment
+  const unavailableRequestedPersonaId = payload.unavailable_requested_persona_id?.trim()
   return {
     status,
     activeExecution: status === ACTIVE_SESSION_STATUS,
     ...(resolvedHarness ? { harnessType: resolvedHarness } : {}),
-    ...(harnessAssignment ? { harnessAssignment } : {})
+    ...(harnessAssignment ? { harnessAssignment } : {}),
+    ...('persona_id' in payload ? { personaId: payload.persona_id ?? null } : {}),
+    ...(unavailableRequestedPersonaId ? { unavailableRequestedPersonaId } : {})
   }
 }
 

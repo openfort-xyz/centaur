@@ -4,6 +4,7 @@ import {
   defaultModelForHarness,
   defaultServiceTierForHarness,
   effectiveReasoningForHarness,
+  personaFallbackNotice,
   reasoningForModel
 } from './console-session-link'
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -288,5 +289,50 @@ describe('buildConsoleSessionWidget effort segment', () => {
     })
     expect(widget?.textParagraph.text).toContain('CLAUDE-OPUS-5 · Claude Code')
     expect(widget?.textParagraph.text).not.toContain('·  ·')
+  })
+})
+
+// Upstream #1598 parity: api-rs may replace an unavailable requested persona;
+// the trailer says so even when neither the link nor metadata would render.
+describe('persona fallback notice', () => {
+  test('names the replacement or the absence of a persona', () => {
+    expect(personaFallbackNotice(undefined, 'eng')).toBeUndefined()
+    expect(personaFallbackNotice('ghost', 'eng')).toBe(
+      'Persona "ghost" isn\'t available. Using "eng" instead.'
+    )
+    expect(personaFallbackNotice('ghost', null)).toBe(
+      'Persona "ghost" isn\'t available. Continuing without a persona.'
+    )
+  })
+
+  test('renders the notice first, HTML-escaped, and alone if needed', () => {
+    expect(
+      buildConsoleSessionWidget({
+        consoleBaseUrl: undefined,
+        threadKey: 'chat:spaces:A:1',
+        metadataEnabled: false,
+        notice: 'Persona "<x>" isn\'t available. Continuing without a persona.'
+      })?.textParagraph.text
+    ).toBe('⚠️ Persona "&lt;x&gt;" isn\'t available. Continuing without a persona.')
+
+    expect(
+      buildConsoleSessionWidget({
+        consoleBaseUrl: undefined,
+        threadKey: 'chat:spaces:A:1',
+        harnessType: 'codex',
+        metadataEnabled: true,
+        model: 'gpt-6-astra',
+        notice: 'n',
+        reasoning: 'ultra'
+      })?.textParagraph.text
+    ).toBe('⚠️ n · GPT-6-ASTRA · Codex · Ultra')
+  })
+})
+
+describe('gpt-6-astra efforts', () => {
+  test('accepts ultra on astra only', () => {
+    expect(reasoningForModel('codex', 'gpt-6-astra', 'ultra')).toBe('ultra')
+    expect(reasoningForModel('codex', 'gpt-6-astra', 'minimal')).toBeUndefined()
+    expect(reasoningForModel('codex', 'gpt-5.6-sol', 'ultra')).toBeUndefined()
   })
 })

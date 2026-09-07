@@ -42,6 +42,9 @@ export type GoogleChatThreadState = {
   harnessType?: string | null
   lastEventId?: number
   model?: string | null
+  /** Persona pinned by api-rs when the thread's session was created. Null
+   * means the thread is pinned without a persona. */
+  personaId?: string | null
   provider?: string | null
   /** "Added to the running turn…" bubbles for messages folded into the live
    * execution; deleted when that run finalizes. Updates append; `[]` clears. */
