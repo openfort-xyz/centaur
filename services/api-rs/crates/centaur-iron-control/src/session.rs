@@ -1,7 +1,7 @@
 //! Per-session principal registration.
 //!
-//! Roles are registered once at startup (see [`crate::register_role`]); a
-//! session starts, [`SessionRegistrar`] upserts the session's principal.
+//! Roles are registered once at startup. See [`crate::register_role`].
+//! When a session starts, [`SessionRegistrar`] upserts its principal.
 //! Iron-control owns default role assignment for brand-new principals, while
 //! existing principals keep their current assignments so operator revocations
 //! in console or ``centaur-perms`` remain sticky. The principal is derived from
@@ -24,10 +24,8 @@ struct SessionPrincipalMetadata<'a> {
     slack_team_id: Option<&'a str>,
     slack_user_email: Option<&'a str>,
     conversation_name: Option<&'a str>,
-    /// The requester's address as the ingress reported it. Google Chat carries
-    /// it on the event; ``slack_user_email`` stays separate because the
-    /// slackbot resolves that one out of band (see
-    /// [`apply_gchat_identity`]).
+    /// Email verified by googlechatbot from an Add-on userIdToken and released
+    /// only after domain and DM checks. Separate from Slack's users.info email.
     user_email: Option<&'a str>,
     /// Google Chat ``SpaceType`` for the conversation this session runs in.
     space_type: Option<&'a str>,
@@ -293,29 +291,14 @@ fn set_slack_email(input: &mut PrincipalInput, slack_user_email: Option<&str>) {
     }
 }
 
-/// Identify a Google Chat principal by its space kind and, for a 1:1 DM, the
-/// requester's email.
+/// Set the Google Chat principal kind and label a verified DM requester.
 ///
-/// Google Chat principals key on the space, so the thread key alone cannot say
-/// whether the conversation is 1:1 the way a Slack ``D`` conversation id can.
-/// The space type answers it: Google documents ``DIRECT_MESSAGE`` as "1:1
-/// messages between two humans or a human and a Chat app", so a space our bot
-/// sees with that type has exactly one human in it and the requester's address
-/// identifies them. ``GROUP_CHAT`` and ``SPACE`` hold more people and never get
-/// an identity label — console's credential reconciliation grants a principal
-/// the secrets of whoever its labels name, and in a shared space that would
-/// hand every member one person's credentials.
-///
-/// The email rides the Chat event body, which is attacker-controllable on its
-/// own: only the Google-signed request JWT proves an event came from Google.
-/// The ingress reports whether it verified that token, and without it we leave
-/// the principal unlabelled rather than let a forged event mint an identity
-/// that reconciliation will attach real credentials to. Slack needs no such
-/// gate because the slackbot reads the address from ``users.info`` rather than
-/// from the event payload.
-///
-/// A missing space type means the ingress predates this contract; we label
-/// nothing rather than guess, which leaves the principal exactly as it is today.
+/// googlechatbot verifies the Add-on userIdToken, applies the domain allowlist,
+/// and confirms a one-human DM with Google before sending user_email. Its
+/// request JWT alone does not authenticate an email in the event body.
+/// This layer requires a Google Chat key, DIRECT_MESSAGE, request verification,
+/// and a non-empty email before assigning the credential-bearing google_email
+/// label. Shared spaces must never inherit one member's personal credentials.
 fn apply_gchat_identity(
     thread_key: &str,
     metadata: &SessionPrincipalMetadata<'_>,

@@ -49,7 +49,7 @@ const EnvSchema = z.object({
   // Google Chat's media.upload rejects app auth (chat.bot) — the official path
   // for a headless app is domain-wide delegation: an admin grants the SA's
   // client ID the chat.messages.create scope, and uploads run as this user.
-  // Unset = the /api/chat/attachments route fails closed (503).
+  // Unset makes the space-scoped attachment upload route return 503.
   GOOGLECHATBOT_UPLOAD_USER: z.string().default(''),
   // Separate least-privilege DWD subjects. DM setup impersonates its validated
   // target directly; fixed subjects remain only for these shared capabilities.
@@ -60,10 +60,8 @@ const EnvSchema = z.object({
   CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   CHAT_EVENT_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(60 * 5),
 
-  // Hard ceiling on every outbound Google Chat REST call (OAuth token exchange,
-  // message create/patch/list, attachment upload). A hung Chat backend on the
-  // ack or thread-history fetch must never stall the handoff to api-rs — these
-  // calls are best-effort and bounded, mirroring slackbotv2's slackApiTimeoutMs.
+  // Bound Google API and token-exchange calls. Failed acknowledgement writes
+  // remain work obligations; history failures can fall back to no context.
   GOOGLECHATBOT_CHAT_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
 
   // Comma/space-separated email-domain allowlist for verified inbound identity.
@@ -79,10 +77,8 @@ const EnvSchema = z.object({
         .filter(Boolean)
     ),
 
-  // Authenticate inbound webhook requests by verifying Google Chat's signed
-  // bearer JWT (issuer chat@system.gserviceaccount.com). ON by default; the
-  // explicit false/0 switch is only for local development and rollback.
-  // Requires at least one audience below or every request 401s.
+  // Verify the bearer using the selected ingress mode's issuer and audience.
+  // Disable only for local fixtures. Production rollback must disable ingress.
   GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: strictBoolean,
 
   // Inbound authentication contracts are not interchangeable. Keep the
@@ -106,7 +102,7 @@ const EnvSchema = z.object({
   // Add-on supplies one. The verified email, never the token, becomes identity.
   GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID: z.string().optional(),
 
-  // Optional per-run guards forwarded to api-rs.
+  // Overrides for the execution and idle limits defined in session-api.ts.
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
   SESSION_MAX_DURATION_MS: z.coerce.number().int().positive().optional(),
   GOOGLECHATBOT_SESSION_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),

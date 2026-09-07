@@ -26,6 +26,15 @@ It is a Rails application backed by Postgres. It provides a JSON API, an operato
 
 Operators manage credentials, principals, roles, and grants through the API or the console. Each `iron-proxy` instance signs in with its own token, fetches the configuration for its assigned principal, and adds the granted credentials to matching outbound requests.
 
+## Google Chat permissions
+
+Principals and roles can hold exact Google Chat space grants and DM target
+grants. The Console merges these into short-lived api-rs JWT claims and
+selects per-space delegated readers. Scheduled tasks check the author's send
+grant for a space or require the author's own email for a DM destination.
+See [Google Chat configuration](../../docs/pages/reference/google-chat.mdx) for
+operation flags, identity checks, and verification requirements.
+
 ## Local Development
 
 Console requires ParadeDB with the `pg_search` extension. A vanilla Postgres

@@ -32,9 +32,23 @@ awk -F '|' '
     return value
   }
   /^\| TASK-[0-9]+ \| TEST-[0-9]+ \|/ {
+    # Escaped Markdown pipes belong to a cell, not the table structure.
+    gsub(/\\[|]/, "ESCAPED_PIPE")
     task = trim($2)
     status = trim($4)
     evidence = trim($6)
+    if (NF != 11) {
+      printf "expected 9 columns for %s, got %d\n", task, NF - 2 > "/dev/stderr"
+      failed = 1
+    }
+    for (column = 2; column <= 10; column++) {
+      if (trim($column) == "") {
+        printf "empty column %d for %s\n", column - 1, task > "/dev/stderr"
+        failed = 1
+      }
+    }
+    # Markdown code spans do not change the underlying evidence identifier.
+    if (evidence ~ /^`[^`]+`$/) evidence = substr(evidence, 2, length(evidence) - 2)
     if (status !~ /^(Passed|Verified-local|Provisional|Pending|Failed|Blocked)$/) {
       printf "invalid status %s for %s\n", status, task > "/dev/stderr"
       failed = 1

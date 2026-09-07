@@ -9,23 +9,9 @@ import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/
 import type { SpaceDmConfirmation } from './chat/space-verify'
 import { resolveSessionIdentity, type ResolvedSessionIdentity } from './chat/verify'
 
-// ---------------------------------------------------------------------------
-// api-rs session contract
-//
-// This is the Google Chat analog of services/discordbot/src/session-api.ts and
-// services/slackbotv2/src/session-api.ts. The legacy chatbot drove the deleted
-// Python API via POST /workflows/runs plus an outbox poll; api-rs replaced that
-// with a session lifecycle:
-//
-//   POST /api/session/{thread_key}            create the session
-//   POST /api/session/{thread_key}/messages   append prior thread turns
-//   POST /api/session/{thread_key}/execute    start an agent run for this turn
-//   GET  /api/session/{thread_key}/events     SSE stream of the run's output
-//
-// The platform is opaque to api-rs (metadata.platform is advisory), so the
-// only Google-Chat-specific bits are the metadata source/platform tags and the
-// conversation display name.
-// ---------------------------------------------------------------------------
+// Session flow: create/reuse, append messages, execute, then consume SSE.
+// api-rs owns execution state. This client supplies Google Chat context and
+// verified identity metadata used to register the session principal.
 
 export type JsonValue =
   | null
@@ -45,9 +31,7 @@ export type GoogleChatTurnMessage = {
   isMention: boolean
   userId: string
   userName: string
-  /** Requester email when the Chat sender profile exposes it (see
-   * NormalizedChatEvent.user_email). Rides the session/message metadata so the
-   * Console can attribute the thread to the signed-in user (#875 analogue). */
+  /** Email from a verified Workspace Add-on userIdToken, never a Chat User field. */
   userEmail?: string
   timestamp?: string
   /** Upload destination for the session-context block (executing turn only). */
@@ -84,25 +68,10 @@ export type ExecuteSessionResponse = {
   execution_id: string
 }
 
-/** api-rs marks a session `executing` for the lifetime of an in-flight run and
- * flips it back to `idle`/`failed` when the run settles (see
- * `mark_execution_running` / `mark_execution_completed` in centaur-session-sqlx).
- * Treating that status as the source of truth lets a stateless bot detect an
- * active run without its own state store. */
+/** Use api-rs status to detect active executions across bot replicas. */
 const ACTIVE_SESSION_STATUS = 'executing'
 
-/** Wall-clock ceiling on a single execution, sent as `max_duration_ms`.
- *
- * api-rs only arms `spawn_max_duration_failure` when the caller supplies this,
- * so omitting it means a turn that blocks on a slow tool runs unbounded. On
- * 2026-08-04 a turn sat 45 minutes on an untimed `browser-agent` call and only
- * the out-of-band stuck-execution-reaper cronjob stopped it — after which the
- * agent process kept running, because the reaper only writes to Postgres.
- *
- * Defaulted in code rather than left to `SESSION_MAX_DURATION_MS` alone: the
- * bound is a safety property, and a missing env var in one values file is
- * exactly how it went missing in production. Config tunes it; it does not
- * enable it. */
+/** Always send a wall-clock execution limit, including when configuration omits it. */
 export const DEFAULT_SESSION_MAX_DURATION_MS = 30 * 60 * 1000
 
 /** Mirrors `DEFAULT_SESSION_IDLE_TIMEOUT_MS` in slackbotv2's session-api. */
@@ -112,29 +81,20 @@ export const MAX_INLINE_ATTACHMENT_BYTES = 25 * 1024 * 1024
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024
 
-/** Config tunes the bound; it does not enable it — an unset env var still gets
- * the built-in ceiling. */
+/** Configuration overrides the built-in execution limit. */
 function sessionMaxDurationMs(config: AppConfig): number {
   return config.SESSION_MAX_DURATION_MS ?? DEFAULT_SESSION_MAX_DURATION_MS
 }
 
-/** Resolve `idle_timeout_ms`, mirroring slackbotv2's `sessionIdleTimeoutMs`.
- *
- * This is not merely a sandbox-lifecycle knob: `record_max_duration_failure`
- * in centaur-session-runtime only calls `spawn_idle_pause` — the thing that
- * actually suspends the sandbox and so stops the agent process — when an idle
- * timeout is present. Sending `max_duration_ms` without this fails the
- * execution row while leaving the runaway process alive, which is the state
- * the 2026-08-04 incident ended in. */
+/** Also send an idle timeout so api-rs can pause the sandbox after execution. */
 function sessionIdleTimeoutMs(config: AppConfig): number {
   if (config.SESSION_IDLE_TIMEOUT_MS !== undefined) return config.SESSION_IDLE_TIMEOUT_MS
   return Math.min(DEFAULT_SESSION_IDLE_TIMEOUT_MS, sessionMaxDurationMs(config))
 }
 
 type CreateSessionResponse = {
-  // api-rs returns the session object flat on the response body; the nested
-  // `session` shape never existed in api-rs and made activeExecution always
-  // false (so execute-vs-execute conflicts 500'd instead of folding).
+  // Current responses expose status at the top level. Accept the nested
+  // form as a compatibility fallback.
   status?: string
   session?: { status?: string }
   harness_type?: string
@@ -145,9 +105,7 @@ type CreateSessionResponse = {
 export type CreateSessionResult = {
   /** Lifecycle status reported by api-rs, e.g. `idle` / `executing` / `failed`. */
   status: string
-  /** True when a run is already in flight for this thread. A second
-   * `/execute` would collide with the `one active execution per thread` index
-   * and 500, so the caller should append-and-fold instead of executing. */
+  /** Append to the active execution instead of starting a competing turn. */
   activeExecution: boolean
   /** The harness persisted by api-rs. */
   harnessType?: string
@@ -280,8 +238,7 @@ export async function createSession(
       })
     : undefined
   if (identity && !identity.email.emit) {
-    // Never silent: centaur attaches a person's OAuth credentials off this key,
-    // so its absence has to be explainable after the fact.
+    // Record why credential-bearing identity was withheld, without logging email.
     incr('googlechatbot_session_identity_total', {
       outcome: 'suppressed',
       reason: identity.email.reason
@@ -300,9 +257,7 @@ export async function createSession(
       source: 'googlechatbot',
       platform: 'googlechat',
       thread_id: threadKey,
-      // Requester identity mirrored from slackbotv2's session metadata
-      // (slack_user_id/…): the Console matches user_email against the
-      // signed-in user's email to grant thread visibility (#875 analogue).
+      // Display identity is separate from the credential-bearing email below.
       ...(requester?.userId ? { user_id: requester.userId } : {}),
       ...(requester?.userName ? { user_name: requester.userName } : {}),
       // Identity keys api-rs gates its DM-principal labelling on. Only
@@ -375,23 +330,10 @@ function existingHarnessFromConflict(error: unknown): string | undefined {
 }
 
 /**
- * The identity half of the create-session metadata.
- *
- * Two layers gate the same decision. api-rs labels a session principal with the
- * requester's identity — and auto-grants that person's OAuth credentials to
- * every session in the room — only when `googlechat_space_type` is
- * DIRECT_MESSAGE AND `googlechat_request_verified` is true AND there is a
- * `user_email` to name. This side withholds the email unless the request was
- * signature-verified, the sender's domain is allowlisted, and GOOGLE itself
- * confirmed the space is a 1:1 DM. Either layer alone is sufficient to deny.
- *
- * The two gate inputs ship unconditionally so a room stays observable — neither
- * names anybody, and api-rs cannot label without the email. The space type is
- * Google's confirmed value where one was obtained and the envelope's claim
- * otherwise, so it is a gate input, never a trust signal in itself.
- *
- * `single_user_bot_dm` is deliberately not emitted: the confirmation already
- * requires exactly one joined human, so the key would restate the check.
+ * Emit user_email only after signature and Add-on user-token verification,
+ * domain allowlisting, and Google's confirmation of a one-human DM.
+ * api-rs also requires DIRECT_MESSAGE and googlechat_request_verified before
+ * labelling the principal. Space type alone does not authorize credentials.
  */
 function identityMetadata(identity: ResolvedSessionIdentity | undefined): JsonObject {
   if (!identity) return {}

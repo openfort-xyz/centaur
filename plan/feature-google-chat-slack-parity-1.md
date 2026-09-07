@@ -2,15 +2,18 @@
 goal: Bring the Centaur Google Chat integration to outcome-level feature parity with the Slack integration
 version: 1.0
 date_created: 2026-08-13
-last_updated: 2026-08-14
+last_updated: 2026-09-07
 owner: Centaur Platform
 status: 'In progress'
 tags: [feature, google-chat, slack, parity, security, reliability, verification]
 ---
 
-# Introduction
+# Google Chat parity plan
 
-![Status: In progress](https://img.shields.io/badge/status-In%20progress-yellow)
+Implementation is present, but the verification contract remains open. Use
+[the evidence ledger](../docs/google-chat-parity-verification.md) for dated
+results and [service parity status](../services/googlechatbot/SLACK_PARITY.md)
+for current behavior. Unchecked tasks below do not mean the code is absent.
 
 This plan closes the actionable differences identified in `docs/slack-vs-google-chat-n-to-n-comparison.md`. Parity means equivalent security, authorization, durability, conversation access, file handling, historical context, observability, and operator confidence. It does not mean recreating Slack-only product concepts that have no Google Chat equivalent.
 

@@ -11,9 +11,8 @@ def build_http(timeout: float | None = None):
     explicitly. The imports stay lazy so workflow modules can load in test
     environments that have not installed tool-only Google dependencies.
 
-    Pass ``timeout`` (seconds) to bound socket connect/read — without it an
-    unreachable or blocked upstream (e.g. a missing egress rule) hangs the
-    workflow indefinitely, with no run-ledger entry to show why.
+    Pass ``timeout`` in seconds to bound socket connect/read waits.
+    Without it, a blocked upstream can stall a workflow.
     """
     import httplib2
     import socks

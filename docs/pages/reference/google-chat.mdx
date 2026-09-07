@@ -5,15 +5,12 @@ description: Configure Centaur's signed Google Chat ingress, scoped agent permis
 
 # Google Chat
 
-:::warning[Parity verification is still in progress]
-The implementation described here is present in the current Centaur working
-tree, but Google Chat parity is not achieved until every row in the
-[`docs/google-chat-parity-verification.md`](https://github.com/paradigmxyz/centaur/blob/main/docs/google-chat-parity-verification.md)
-ledger passes on one commit. The real Workspace and browser gates remain
-pending; the live Kind NetworkPolicy and active-turn recovery gates pass.
-Fixture tests are not substitutes for the remaining checks. The Centaur VPS
-observations dated 2026-08-14 came from the older deployed image
-`sha-980e5e3b`; they do not validate this uncommitted working tree.
+:::warning[Verification remains incomplete]
+The repository's `docs/google-chat-parity-verification.md` records dated
+Workspace, Kind, and automated evidence. The August 17 release has live proof
+for signed named-space ingress, same-message rendering, representative scoped
+operations, files, and ETL. Other scenarios and a full rerun on one immutable
+release remain pending. Those records do not validate later source changes.
 :::
 
 Centaur's Google Chat integration accepts signed Chat events, hands durable work
@@ -32,7 +29,8 @@ sandbox -- Console JWT --> api-rs -- exact operation/space check --> googlechatb
 ```
 
 The chart's NetworkPolicy permits api-rs, but not sandbox or workflow pods, to
-reach googlechatbot's private `/api/chat/*` routes. Keep the public Ingress
+reach googlechatbot's private `/api/chat/*` routes when `networkPolicy.enabled`
+is true and the cluster's CNI enforces these policies. Keep the public Ingress
 limited to `googlechatbot.eventsPath`.
 
 ## Create the Google Chat app
@@ -111,8 +109,8 @@ resource such as `spaces/AAAA`. Enable only the operations it needs:
 | Permission | Agent capability |
 | --- | --- |
 | Send | Create a message in the space. |
-| Update | Update an app-owned message in the space. |
-| Delete | Delete an app-owned message in the space. |
+| Update | Update a message owned by the app or configured delegated sender. |
+| Delete | Delete a message owned by the app or configured delegated sender. |
 | Upload | Upload a file and create the containing message. |
 | Download | Fetch message-qualified attachment metadata and raw bytes. |
 | History | List/search messages, read threads, list files, questions, dumps, and feedback scans. |
@@ -122,7 +120,7 @@ resource such as `spaces/AAAA`. Enable only the operations it needs:
 Direct and role grants are merged with OR semantics. A grant applies only to
 the exact normalized resource; knowing another `spaces/...` or
 `messages/...` name does not grant it. Update and delete also retain Google's
-app-ownership check.
+ownership check for the selected app or delegated credential.
 
 DM creation has a separate grant. Add an exact email address under **Google
 Chat DM permissions**. Resource names such as `users/<id>` and the legacy
@@ -147,9 +145,10 @@ capability can be revoked independently:
 | `googlechatbot.reactionReadUser` | `chat.messages.reactions.readonly` | Read reactions. Empty means reaction reads return 503. |
 | `googlechatbot.driveDownloadUser` | `drive.readonly` | Download Drive-backed Chat attachments. Empty or denied access degrades inbound content to metadata. |
 
-Live 1:1 DM thread history impersonates the verified human requester and needs
-`chat.messages.readonly` delegated to the service account. This is intentionally
-not replaced by a broad Workspace user directory.
+Live 1:1 DM turns use the bot's retained transcript and do not call Google's
+history API. Agent-facing DM history reads need `chat.messages.readonly` and
+use the exact reader subject selected by the Console for that space. The agent
+cannot choose the reader or fall back to a broader credential.
 
 DM setup has no fixed Helm subject. The validated target email is impersonated
 with `chat.spaces.create`, so the target must be an active, impersonable user in
@@ -172,9 +171,11 @@ the scopes above to one convenience account.
 - Legacy Chat events and Workspace Add-ons button, app-command, and form
   payloads normalize into typed workflow events. Durable dedupe keys include
   the event time, space, message, user, function, and canonical parameters.
-- The bot fetches at most `googlechatbot.threadHistoryLimit` messages per turn
-  (50 by default) and includes a newest-biased 24,000-character thread-context
-  block in the execution input.
+- The bot includes at most `googlechatbot.threadHistoryLimit` prior messages
+  per turn, 50 by default, in a newest-biased 24,000-character context block.
+  Named spaces and group chats fetch history from Google. DMs replay retained
+  user turns and delivered assistant answers, with attachment metadata only.
+  The transcript does not backfill messages that the bot never retained.
 - The first 10 attachments on an accepted message are hydrated. A file may be
   at most 100 MiB, and all decoded attachments in one turn share the
   `googlechatbot.attachmentAggregateMaxBytes` ceiling (100 MiB by default).
@@ -184,10 +185,11 @@ the scopes above to one convenience account.
   download default is 10 MiB and refuses to overwrite an existing file.
 - A complete serialized Google `Message` is capped at 32,000 UTF-8 bytes.
   Longer answers are split losslessly into ordered, retry-safe messages.
-- Card v2 output never exceeds 100 widgets per card and never emits an empty
-  section. The first final part PATCHes `text` and `cardsV2` onto the durable
-  thinking acknowledgement, so Chat never leaves a deletion tombstone. Created
-  replacement or overflow parts use stable client IDs and include
+- Ordinary answers use Chat text formatting. Standalone images use Cards v2
+  unless the requester asks for plain text; a Console link may add a small
+  card. Cards contain at most 100 widgets and no empty sections. The first
+  final part PATCHes `text` and `cardsV2` onto the thinking acknowledgement.
+  Replacement and overflow parts use stable client IDs. Card creates include
   `fallbackText`; the in-place PATCH omits that create-only field.
 - Every write threads: `message.thread.name` plus
   `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`. Google shipped
@@ -233,10 +235,11 @@ webhook port until the state adapter connects, and there is no in-memory
 production fallback.
 
 Accepted events, action dedupe, sticky harness/model/provider selection,
-forwarded/executed message IDs, active execution state, and final-render
-obligations are durable. A recurring sweep leases unfinished work, resumes SSE
-from the last event ID and updates the thinking message with one canonical final
-answer. Only a definitive missing acknowledgement creates a stable replacement;
+forwarded/executed message IDs, DM transcripts, active execution state, and
+final-render obligations are durable. During a live turn, SSE reconnects from
+the last event ID. After restart, recovery replays the execution from its start
+to rebuild the answer, or reuses an already stored final answer, then updates
+the thinking message. Only a definitive missing acknowledgement creates a stable replacement;
 ambiguous PATCH failures remain durable retry obligations. Old obligations and
 repeated failures are bounded by the configured age and failure budget.
 
@@ -283,13 +286,10 @@ cluster:
 5. In the Console, use keyboard-only navigation at narrow and wide viewports and
    save screenshots for permission CRUD and malformed-input errors.
 
-Record redacted request IDs, resource names, screenshots, and metrics in the
-parity verification ledger. The current VPS confirms only older deployed
-`spaces.list`, `members.list`, `messages.list`, create/execute/SSE delivery and
-health behavior. It has no retained evidence for the new ingress modes,
-`spaces.setup`, reactions, scoped proxy, DWD broker, upload/download, current
-rendering, or ETL tombstones. Until current-branch artifacts exist, parity
-remains pending.
+Record redacted request IDs, resource names, screenshots, and metrics in
+`docs/google-chat-parity-verification.md`. Keep each result tied to its tested
+commit or image digest. Preserve earlier evidence as history; complete parity
+requires every ledger gate to pass on the same immutable release.
 
 ## Roll back safely
 

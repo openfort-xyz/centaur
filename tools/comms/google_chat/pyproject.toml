@@ -3,8 +3,7 @@ name = "google-chat"
 version = "0.1.0"
 description = "Google Chat messaging"
 requires-python = ">=3.11"
-# rich: the CLI renders tables directly via rich.table (centaur_sdk no longer
-# re-exports Table since upstream #828 removed the cli_tables helpers).
+# The CLI imports rich.table directly.
 dependencies = ["httpx", "typer>=0.12.0", "rich>=13.0", "python-dotenv>=1.0.0"]
 
 [project.scripts]

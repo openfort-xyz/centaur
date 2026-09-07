@@ -103,15 +103,8 @@ export function createRendererWriteScheduler(opts: {
 const clientWriteSchedulers = new WeakMap<ChatEdgeClient, RendererWriteScheduler>()
 
 /**
- * Consume the api-rs SSE stream for one turn and deliver the result to Google
- * Chat as a single message (the single-message UX from the legacy chatbot):
- * status pulses edit the "thinking" bubble live, then the final answer PATCHes
- * the same bubble. There is no streaming answer text — Google Chat lacks a
- * streaming primitive and rate-limits edits — so the canonical answer is only
- * written once, at the end.
- *
- * Drive it with createRenderState + consumeRenderStream + finalizeRender, which
- * lets the caller re-open a dropped stream between passes (see driveSession).
+ * Accumulate one execution across SSE reconnects. Status edits update the
+ * acknowledgement; finalization replaces it and creates overflow parts.
  */
 export type RenderState = {
   answer: string
@@ -138,11 +131,7 @@ export function createRenderState(): RenderState {
   }
 }
 
-/**
- * Process one SSE pass into the render state, pulsing the live bubble. Does NOT
- * flush or deliver — a stream that drops mid-run leaves state.terminal false so
- * the caller can re-open from the last event id and continue.
- */
+/** Consume one SSE connection without flushing, so a dropped stream can resume. */
 export async function consumeRenderStream(
   client: ChatEdgeClient,
   stream: AsyncIterable<RustSessionStreamEvent>,
@@ -210,12 +199,7 @@ async function applyRendererEvents(
   }
 }
 
-/**
- * Edit the "thinking" bubble with a single compact `_Centaur · <activity>…_`
- * line. The agent's reasoning and tool calls arrive as task updates; we DON'T
- * render them — they're noise that eats space — and only surface the current
- * activity. Deduped and rate-limited to 1 Hz for the 1-write/second-per-space cap.
- */
+/** Update the activity line at most once per second; omit reasoning and tool details. */
 async function pulse(
   client: ChatEdgeClient,
   target: RenderTarget,
