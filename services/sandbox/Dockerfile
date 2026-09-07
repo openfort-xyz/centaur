@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && pip3 install --break-system-packages --no-compile \
     python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
-    python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
+    python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 weasyprint==69.0 markdown==3.10.3 \
     faster-whisper \
     asyncpg==0.30.0 \
     boto3>=1.40.0 \
