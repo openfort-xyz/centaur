@@ -221,6 +221,7 @@ pub(crate) async fn append_user_message(
         .append_messages(
             thread_key,
             AppendMessagesRequest {
+                forward_to_active_execution: None,
                 messages: vec![SessionMessageInput {
                     client_message_id: None,
                     role: MessageRole::User,
