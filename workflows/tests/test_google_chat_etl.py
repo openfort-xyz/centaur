@@ -9,6 +9,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from unittest import SkipTest
 
 
 def _install_api_stubs() -> None:
@@ -929,7 +930,7 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
 ):
     database_url = os.getenv("SESSION_SQLX_TEST_DATABASE_URL")
     if not database_url:
-        return
+        raise SkipTest("SESSION_SQLX_TEST_DATABASE_URL is required for database coverage")
 
     class AppClient:
         def list_spaces(self, *, page_size, page_token=None):
@@ -1080,7 +1081,7 @@ def test_retention_modes_never_call_google_api():
 def test_retention_db_age_batch_cleanup_and_idempotency():
     database_url = os.getenv("SESSION_SQLX_TEST_DATABASE_URL")
     if not database_url:
-        return
+        raise SkipTest("SESSION_SQLX_TEST_DATABASE_URL is required for database coverage")
 
     async def run():
         import asyncpg

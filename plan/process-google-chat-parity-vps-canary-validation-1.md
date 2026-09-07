@@ -2,15 +2,18 @@
 goal: Validate the Google Chat parity implementation against the working Centaur VPS deployment without disrupting production
 version: 1.0
 date_created: 2026-08-14
-last_updated: 2026-08-14
+last_updated: 2026-09-07
 owner: Centaur Platform
-status: 'Planned'
+status: 'Historical procedure'
 tags: [process, google-chat, parity, canary, vps, validation, security, release]
 ---
 
-# Introduction
+# Google Chat canary validation procedure
 
-![Status: Planned](https://img.shields.io/badge/status-Planned-blue)
+This is the August 14 procedure. Its recorded control, candidate, deployment
+names, and task checks are historical inputs, not defaults for a new run. The
+[evidence ledger](../docs/google-chat-parity-verification.md) records the canary
+result and later releases. Select and verify new inputs before reusing it.
 
 This plan validates the Google Chat parity working tree against the known-good
 Centaur VPS control deployment. The control is `origin/main` commit

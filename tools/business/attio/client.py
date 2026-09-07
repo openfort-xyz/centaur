@@ -290,9 +290,8 @@ class AttioClient:
     ) -> dict:
         """Create a new entry in a list.
 
-        Attio requires parent_object (the slug of the object the entry points at,
-        e.g. "companies"). When omitted it is read off the list, which is
-        unambiguous for the single-object lists we use.
+        Omit parent_object to use the list's single object slug. Lists with
+        zero or multiple parent objects require an explicit slug.
         """
         if parent_object is None:
             parent_object = self._list_parent_object(list_id)

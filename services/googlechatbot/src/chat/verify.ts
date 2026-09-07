@@ -236,15 +236,7 @@ export function resolveIdentityEmission(opts: {
   return { emit: true, userEmail: email }
 }
 
-/**
- * Everything the create-session metadata needs to say about who sent an event.
- *
- * The three parts are reported separately because they are trusted separately.
- * `verified` and `spaceType` describe the request and are always reported —
- * api-rs gates on both, and neither hands anyone a credential on its own.
- * `email` is the credential-bearing part, so it is the only one that has to
- * survive every check.
- */
+/** Request verification, space type, and credential-bearing email are separate checks. */
 export type ResolvedSessionIdentity = {
   /** Whether Google's signature was actually checked on this request. */
   verified: boolean
@@ -256,39 +248,19 @@ export type ResolvedSessionIdentity = {
 }
 
 /**
- * resolveIdentityEmission plus the one thing the request body cannot be trusted
- * for: that the space really is a 1:1 DM.
+ * Check signature status and the verified-token email's domain, then confirm
+ * a one-human DM with Google before releasing identity metadata. The ingress
+ * must supply email from its verified Add-on userIdToken, never the event body.
  *
- * Google's signed request token verifies iss/aud/exp/signature but binds
- * NOTHING in the body, so a valid token can carry an envelope that names a
- * shared room while claiming `spaceType: DIRECT_MESSAGE` and a colleague's
- * address. Labelling that room's principal with that person would hand their
- * live OAuth credentials to everyone in it. So the DM-ness is re-asked of
- * Google, and only Google's answer can release the email.
- *
- * Order is deliberate and cost-ordered:
- *  1. the existing local checks (signature, sender domain) — free, and their
- *     reasons keep precedence so an unsigned request still reports `unverified`;
- *  2. the envelope's own `spaceType` as a pre-filter — a body that does not even
- *     claim a DM is suppressed without spending a Chat API call. Necessary,
- *     never sufficient;
- *  3. Google's answer, which is the only one that can release the email.
- *
- * The returned `spaceType` prefers Google's answer and falls back to the body's
- * claim on the paths that never asked (steps 1 and 2). It is therefore a mix of
- * confirmed and unconfirmed values and is NOT a trust signal on its own — but a
- * consumer can only label a principal once it also has an email, and the email
- * is released only on the path where Google confirmed the DM.
- *
- * Fails closed for credentials, open for chat: a Chat API failure suppresses
- * the email and is reported, but never throws at the caller, whose turn proceeds.
+ * Claimed space type can reject a request early but cannot authorize identity.
+ * If no lookup runs, the returned spaceType remains the unconfirmed claim.
+ * A failed confirmation suppresses email while allowing the chat turn to proceed.
  */
 export async function resolveSessionIdentity(opts: {
   config: AppConfig
   verified: boolean
   userEmail: string | undefined
-  /** spaceType AS CLAIMED BY THE REQUEST BODY. Attacker-controllable; used only
-   * to skip the API call for events that are obviously not DMs. */
+  /** Untrusted body claim, used only to skip confirmation for non-DM events. */
   claimedSpaceType: ChatSpaceType
   confirmSpace: () => Promise<SpaceDmConfirmation>
 }): Promise<ResolvedSessionIdentity> {

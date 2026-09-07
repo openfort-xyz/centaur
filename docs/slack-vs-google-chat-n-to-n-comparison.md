@@ -1,10 +1,15 @@
-# Slack vs Google Chat: current N-to-N integration comparison
+# Slack and Google Chat comparison, August 2026
 
 Audit date: 2026-08-17
 
 Repository: Centaur
 Production release: `ad844b2565bdae8d830663bac5437193ecdf76dd`
 VPS GitOps release: `cfc4b90b75036851a1ae67754eb5f808a59289a5`
+
+This comparison records the releases named above. Later DM transcript and
+rendering changes are described in [the service README](../services/googlechatbot/README.md)
+and [parity status](../services/googlechatbot/SLACK_PARITY.md). The evidence below
+has not been rerun for the current branch.
 
 ## Scope and status
 

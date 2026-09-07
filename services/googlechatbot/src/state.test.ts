@@ -74,8 +74,7 @@ describe('durable Google Chat state', () => {
     const first = createPostgresState({ url: postgresUrl, keyPrefix: prefix })
     const second = createPostgresState({ url: postgresUrl, keyPrefix: prefix })
     adapters.push(first, second)
-    // Adapter schema initialization is not concurrency-safe on a brand-new DB;
-    // production migrations create it ahead of replicas, so establish one first.
+    // Initialize the adapter schema before connecting the second test replica.
     await first.connect()
     await second.connect()
 

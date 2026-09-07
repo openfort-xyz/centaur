@@ -20,11 +20,7 @@ export type StateConnectionStatus = {
   lastError?: string
 }
 
-/** One delivered Google Chat turn, as this bot saw it on the webhook stream.
- *
- * Deliberately NOT a NormalizedPart list: `NormalizedPart.source.data` carries
- * inline attachment bytes (up to 100 MiB) and would land in the state row.
- * Earlier-turn attachments are re-fed to the agent as metadata only. */
+/** A retained DM turn. Keep attachment metadata only; parts can contain 100 MiB of bytes. */
 export type TranscriptEntry = {
   id: string
   role: 'user' | 'assistant'
@@ -161,11 +157,8 @@ export async function persistWork(
 }
 
 /**
- * Merge an update into the stored thread state.
- *
- * Scalar fields replace. The id lists and `transcript` are APPENDED to what is
- * stored and then deduped (by id) and capped, so a caller may pass only its new
- * entries and does not have to re-read the row it is racing with.
+ * Merge thread state under a lock. ID lists and transcript entries append,
+ * dedupe, and retain their newest bounded tail. Empty steering ack lists clear.
  */
 export async function updateThreadState(
   state: StateAdapter,

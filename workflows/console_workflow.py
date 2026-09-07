@@ -178,9 +178,8 @@ async def _deliver_to_google_chat(
     else:
         chunks.append(footer)
 
-    # Accepted ceiling: the bot send route mints its own message id, so a crash
-    # between a send and its ctx.step checkpoint can double-post one chunk.
-    # Slack delivery has the same window.
+    # ponytail: send/checkpoint crashes can duplicate a chunk. Pass stable
+    # message IDs through the broker when delivery needs retry deduplication.
     root = await ctx.step(
         "post_result",
         lambda: ctx.post_to_google_chat(space_name, chunks[0]),

@@ -13,7 +13,7 @@ spaces and delegated DM subjects whose data Centaur may retain.
 
 Google Chat ETL is separate from live bot delivery. The `google_chat_sync`
 workflow reads Chat history into Postgres, and `company_context_documents`
-projects shared-space threads and attachment metadata/text into searchable
+projects shared-space thread text and attachment metadata into searchable
 documents. The optional `google_chat_retention` workflow deletes only
 Centaur-derived rows; it never mutates Google Chat.
 
@@ -39,7 +39,8 @@ The sandbox sends only the requested subject, operation, resource name, and
 bounded pagination through `WorkflowContext` to api-rs. api-rs accepts an exact
 lowercase subject from `dmSync.subjects`, validates the resource and operation,
 and forwards the read to googlechatbot. googlechatbot alone holds the service
-account and mints the subject-bound token. Never add the service-account JSON to
+account and mints delegated tokens for this path. Shared-space app reads use
+iron-proxy's separate service-account grant. Never add the service-account JSON to
 `SESSION_SANDBOX_PASSTHROUGH_ENV`; subjects remain explicit and are never
 discovered from a global Workspace directory.
 
@@ -126,11 +127,18 @@ bounded reaction context to shared-space thread documents.
 
 ## Run and verify manually
 
-Start a sync from inside api-rs:
+Use a reachable api-rs endpoint and an authorized bearer with the `workflows_write` capability.
+Loopback and in-pod requests still require authentication. Set
+`CENTAUR_API_AUTH_HEADER_FILE` to a protected file containing the Authorization
+header; keep the credential out of shell arguments and output. Run the SQL
+examples through your configured read-only PostgreSQL connection.
+
+Start a bounded sync in the selected environment:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
-  http://localhost:8080/api/workflows/runs \
+curl --fail-with-body -sS -X POST \
+  "${CENTAUR_API_URL%/}/api/workflows/runs" \
+  --header "@${CENTAUR_API_AUTH_HEADER_FILE}" \
   -H 'Content-Type: application/json' \
   -d '{
     "workflow_name": "google_chat_sync",
@@ -141,49 +149,45 @@ kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
 
 Inspect checkpoints and continuation pressure:
 
-```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
-  psql "$DATABASE_URL" -c \
-  "SELECT owner_email, space_id, watermark_time,
+```sql
+SELECT owner_email = '' AS shared, space_id, watermark_time,
           continuation_token <> '' AS continuing,
           continuation_started_at, last_error
      FROM google_chat_sync_checkpoints
-    ORDER BY updated_at DESC;"
+    ORDER BY updated_at DESC
+    LIMIT 100;
 ```
 
 Check data counts without printing message or DM content:
 
-```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
-  psql "$DATABASE_URL" -c \
-  "SELECT owner_email = '' AS shared, count(*)
+```sql
+SELECT owner_email = '' AS shared, count(*)
      FROM google_chat_sync_messages
     GROUP BY shared
-    ORDER BY shared DESC;"
+    ORDER BY shared DESC;
 ```
 
 Force projection after a completed shared-space sync:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
-  http://localhost:8080/api/workflows/runs \
+curl --fail-with-body -sS -X POST \
+  "${CENTAUR_API_URL%/}/api/workflows/runs" \
+  --header "@${CENTAUR_API_AUTH_HEADER_FILE}" \
   -H 'Content-Type: application/json' \
   -d '{"workflow_name":"company_context_documents","input":{},"eager_start":true}' | jq
 ```
 
 Verify that private DMs did not enter the company corpus:
 
-```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- \
-  psql "$DATABASE_URL" -c \
-  "SELECT count(*)
+```sql
+SELECT count(*)
      FROM company_context_documents d
      JOIN google_chat_sync_messages m
        ON d.source = 'google_chat'
       AND d.source_type = 'google_chat_thread'
       AND d.metadata->>'space_id' = m.space_id
       AND d.metadata->>'thread_id' = m.thread_id
-    WHERE m.owner_email <> '';"
+    WHERE m.owner_email <> '';
 ```
 
 The expected count is zero. Also test RLS with two distinct non-production
@@ -194,8 +198,9 @@ identities: each identity must see its own DM rows and must not see the other's.
 Start with a count-only run:
 
 ```bash
-kubectl exec -n centaur deploy/centaur-centaur-api-rs -- curl -sS -X POST \
-  http://localhost:8080/api/workflows/runs \
+curl --fail-with-body -sS -X POST \
+  "${CENTAUR_API_URL%/}/api/workflows/runs" \
+  --header "@${CENTAUR_API_AUTH_HEADER_FILE}" \
   -H 'Content-Type: application/json' \
   -d '{
     "workflow_name":"google_chat_retention",
@@ -247,7 +252,9 @@ Before calling the ETL production-ready, verify in a non-production Workspace:
    mutate Workspace messages.
 
 Save redacted workflow IDs, checkpoint output, metrics, and RLS assertions in
-the parity verification ledger. These live ETL checks are still pending.
+the parity verification ledger. It records successful shared/DM ingestion on
+older releases; deletion convergence, RLS, retention, and a same-release rerun
+remain separate gates.
 
 ## Disable or roll back
 

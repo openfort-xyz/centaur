@@ -18,6 +18,7 @@ Use these as the main extension points:
 | `apiRs.metrics.*` | Prometheus/VictoriaMetrics scrape metadata for the Rust API `/metrics` endpoint. |
 | `console.sqlExporter.*` | SQL Exporter configuration and scrape metadata for Console database metrics. |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
+| `googlechatbot.*` | Google Chat ingress, state, delegated operations, and rendering. See [Google Chat](/reference/google-chat). |
 | `sandbox.extraEnv` | Extra variables copied into every sandbox pod through `KUBERNETES_SANDBOX_EXTRA_ENV`. |
 | `overlays.sources` | Ordered repo-cache-backed overlay repos for tools, workflows, and skills; subdirs default to `tools`, `workflows`, and `.agents/skills`. |
 | `overlay.systemPrompt` | Small inline prompt overlay escape hatch. |

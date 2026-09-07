@@ -1,201 +1,115 @@
-# Google Chat ↔ Slack parity status
+# Google Chat and Slack parity status
 
-Status date: 2026-08-17
+Source review date: 2026-09-07. Live evidence remains dated separately in the
+[verification ledger](../../docs/google-chat-parity-verification.md).
 
-Google Chat parity is **implemented but not yet verified as achieved**. The
-automated feature work is present in the current Centaur working tree; the
-verification ledger still requires real Google Workspace and narrow/wide
-browser evidence, then a final all-gates rerun on one commit.
+Google Chat implements the planned integration, but complete parity remains
+unverified. The August release records include signed named-space ingress,
+same-message rendering, scoped operations, files, and shared/DM ETL. They do
+not certify later changes or the remaining auth-mode, action/form, deletion,
+large-file, Console browser, quota, RLS, retention, and same-release gates.
 
-The authoritative artifacts are:
+Use these documents for different purposes:
 
-- `docs/slack-vs-google-chat-n-to-n-comparison.md` — current capability matrix;
-- `plan/feature-google-chat-slack-parity-1.md` — task/test contract;
-- `docs/google-chat-parity-verification.md` — evidence ledger;
-- `docs/google-chat-official-spec-conformance.md` — official-source traceability;
-- `docs/pages/reference/google-chat.mdx` — operator setup and live smoke;
-- `docs/pages/operate/google-chat-etl.mdx` — ETL, privacy, and retention.
+- [Service README](README.md) and [operator reference](../../docs/pages/reference/google-chat.mdx)
+  describe current configuration and behavior.
+- [ETL guide](../../docs/pages/operate/google-chat-etl.mdx) covers ingestion and retention.
+- [Parity plan](../../plan/feature-google-chat-slack-parity-1.md) defines the 31 verification gates.
+- [Verification ledger](../../docs/google-chat-parity-verification.md) records results by release.
+- [August comparison](../../docs/slack-vs-google-chat-n-to-n-comparison.md) and
+  [official-spec audit](../../docs/google-chat-official-spec-conformance.md) are dated snapshots.
 
-Do not mark parity complete from fixture or unit tests alone.
+## Implementation boundaries
 
-## Outcome matrix
+| Area | Current behavior | Evidence or remaining check |
+| --- | --- | --- |
+| Ingress | Three explicit JWT modes; verified Add-on user token, domain allowlist, and Google-confirmed DM required before releasing a requester email. | Named-space Add-on ingress is recorded live; other modes and negative cases remain. |
+| Addressing | Exact mentions in spaces/group chats; DMs are addressed to the bot. Actions become durable workflow events. | Mention/app identity has recorded evidence; action, command, form, and suppression scenarios remain. |
+| Permissions | Console merges direct and role grants for each exact space/operation and DM target. api-rs checks them before forwarding. | Representative allow/deny operations are recorded; the full same-release matrix remains. |
+| Agent credentials | Tools use a Console JWT. api-rs selects a reader from signed claims and authenticates to the private bot API. | Keep Google credentials and the internal key out of sandboxes. |
+| Live DM context | Replay retained user turns and delivered assistant answers from Postgres, without Google history reads. Prior attachments become metadata. | Transcript, fold, redelivery, and recovery tests exist; live sandbox-replacement proof remains. |
+| Shared context | Fetch named-space/group thread history from Google, then include bounded context in the execution input. | Unmentioned messages are included when the API returns them. |
+| Tools | Discovery, history, search, messages, reactions, DM setup/send, and files use scoped api-rs routes. | Search is bounded and reports truncation. No global user directory. |
+| Mutations | Update/delete verify app or configured delegated ownership. Uploads are authored by the delegated uploader. | Representative mutations and exact small-file transfer are recorded; full boundary tests remain. |
+| Rendering | Edit one thinking acknowledgement. Ordinary answers use Chat text, images use cards, and overflow uses stable message IDs. | Same-message rendering is recorded live. A missing acknowledgement permits replacement; ambiguous failures remain retry obligations. |
+| State and recovery | Persist accepted work, dedupe, overrides, DM transcripts, execution IDs, and final answers. Recover through leases and a recurring sweep. | Earlier Kind restart and policy checks are recorded; they do not prove every crash boundary on the current source. |
+| ETL | Shared-space projection, separate owner-scoped DM rows, resumable pagination, tombstones, retention, and metrics. | Ingestion is recorded live. Deletion convergence, RLS, and retention gates remain. |
+| Console | Space and DM grants, scheduled destinations, and thread visibility. | Automated coverage exists; narrow/wide keyboard interaction evidence remains. |
+| Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, and notice tests cover the September sync. |
 
-| Area | Slack reference behavior | Google Chat implementation | Verification state |
-| --- | --- | --- | --- |
-| Signed ingress | Body-bound Slack HMAC is mandatory. | Google-signed JWT is mandatory by default; issuer, audience, signature, numeric lifetime, age, sender domain, and canonical bot identity are checked. The token does not bind the body, so requester identity is released only after `spaces.get` confirms a signed 1:1 DM. | Automated pass; real signed legacy/Add-ons events pending. |
-| Addressing and self suppression | Exact bot ID, Slack trigger-bot policy, DMs. | Exact Chat annotation/resource identity, slash annotations, DMs, self/other-bot suppression, optional follow-up threads. | Automated pass; live `members/app` identity pending. |
-| Interactive events | Durable Slack block-action workflow events. | Legacy card clicks and Add-ons buttons, app commands, and forms become typed durable workflow events; dedupe includes user/function/parameters. | Automated pass; live button/form/command pending. |
-| Conversation permissions | Exact channel lists for upload/download/history. | Exact space lists for send/update/delete/upload/download/history/members/reactions, plus exact DM setup targets. Direct and role grants merge. | Model/API/proxy tests pass; sandbox-JWT live smoke pending. |
-| Credential topology | Slack proxy/direct APIs use scoped secrets and bot tokens. | Sandboxes call api-rs with a scoped Console JWT. Only api-rs can call googlechatbot's private API with a separate key; Google credentials remain at the bot/ETL edge. | Static, route, and live Kind NetworkPolicy/internal-auth checks pass. |
-| api-rs ingress auth | `SLACKBOT_API_KEY` authenticates slackbotv2 as an ingress caller scoped to `slack:` thread keys; `/api/slack/*` requires a principal. | `GOOGLECHATBOT_API_KEY` authenticates googlechatbot as an ingress caller scoped to `chat:spaces:` thread keys, with workflow-event capability; `/api/google-chat/*` requires a principal. | Route-policy unit test passes; live 401/403 smoke pending. |
-| DMs | Open/reuse DM by user; separate user-scoped private ingestion. | Create/reuse and send by exact email grant. Resource-name targets are rejected. 1:1 DM history is the bot's own stored transcript of the webhook stream (every DM message is delivered to the app); no Google read is attempted for DMs. Named spaces still list Google history under app auth. ETL DMs are opt-in and owner-scoped. | Automated DM transcript, redelivery, fold and recovery checks pass; live sandbox-drain drill pending. |
-| Conversation discovery | Channels, metadata, members, threads, users. | Spaces, metadata, members, threads, and paginated history. A broad Workspace user directory is intentionally excluded. | Automated pass; scoped live reads pending. |
-| Search and analysis | Search, questions, dump, reactions. Upstream removed Slack's stateful feedback subsystem with the personas API. | Bounded authorized scans for search, questions, dump, feedback, and message-qualified reaction reads. `feedback` is a stateless derived view over `dump`, not the removed Slack subsystem, so it stays. | Automated pass; live reaction scope/rate-limit pending. |
-| Send/update/delete | Slack tool sends; renderer owns its updates. No generic delete CLI. | Scoped send, app-owned update, and app-owned delete through api-rs. | Automated pass; live ownership/denial smoke pending. |
-| Inbound files | Up to 100 MiB; large content uses staging; delayed Slack Connect repair. | Up to 10 files, 100 MiB each/aggregate by default; inline through 25 MiB, then hashed `attachment.chunk` staging. Uploaded and Drive-backed content supported. | Boundary/hash fixtures pass; live Workspace files pending. |
-| Agent file tooling | List/search/info/download/upload through channel authorization. | List/search/info/raw download/upload through exact space authorization. Proxy ceiling 100 MiB; CLI download default 10 MiB. | Automated route/client tests pass; live file path pending. |
-| Thread context | Refreshed history reaches every execution. | Configurable message cap and newest-biased 24k-character context; card-only text and accepted follow-up attachments are included. | Automated fixtures pass; live follow-up pending. |
-| Sticky state | Harness/model/provider and delivery state persist in Postgres. | Harness/model/provider, message IDs, active execution, dedupe, and render obligations persist in Postgres; reasoning remains per-turn. | Database/restart tests and live Kind processing-pod replacement pass. |
-| Delivery recovery | Durable lease, SSE resume/replay, final reconciliation. | Durable accepted-work record, per-thread lease, recurring sweep, SSE resume, canonical final update/replacement, bounded stale/failure cleanup. | Deterministic crash-stage tests and live Kind active-turn recovery with exactly one final pass. |
-| Timeouts and health | Bounded API operations; readiness follows state. | Chat/control fetches are bounded, SSE connect timeout is separate, reader cleanup is tracked; liveness is process-only and readiness follows Postgres. | Automated and live Kind health/rollout checks pass. |
-| Quota safety | Platform SDK/retry behavior. | Shared StateAdapter reservations pace every same-space write at 1/second and direct/aggregate reaction reads at 15/second across replicas; other reads retain bounded 429 retry. | Two-client shared-state tests pass; live multi-replica Workspace load proof pending. |
-| Metrics | Webhook, handoff, state, render, recovery, and delivery families. | Events, runs, identity, session API, dedupe, recovery, upstream timeout, delivery, state, open SSE, and pending obligations. | Automated and live Kind scrape checks pass. |
-| Historical ingestion | Incremental history, continuation/backfill, attachments, reactions/context, private data, retention, metrics. | Incremental per-space and owner checkpoint, durable page continuation, attachment/reaction tables, shared-space projection, owner-scoped DM RLS, retention, metrics. | Database and subject-aware broker tests pass; live Workspace ETL pending. |
-| Console UX | Channel grants on principals/roles. | Space and DM grants on principals/roles with validation, immutable targets, cache invalidation, and responsive keyboard-addressable forms. | Rails tests pass; actual browser screenshots/interactions pending. |
-| CI/smoke | Slack suite and integration fixtures. | Typecheck/tests, signed legacy/Add-ons fixture smoke, tool tests, Rust/Console/workflow checks, Helm/schema checks. | Fixture-only CI and docs build pass; final all-suites-on-one-SHA gate pending. |
+## Platform differences
 
-## Platform-specific differences accepted by the plan
+Google Chat has no equivalent to Slack's streaming and assistant-title APIs.
+The bot uses status edits and final message updates. It does not delete the
+thinking acknowledgement after a successful final PATCH.
 
-These are not missing work:
+The plan excludes Slack-only objects and several Google-native features,
+including a global user directory, App Home, dialogs, dynamic suggestions,
+link previews, named-space administration, membership writes, reaction writes,
+and pins. See CON-001 and CON-002 for the full exclusion list.
 
-1. **No streaming-copy requirement.** Google Chat has no Slack-equivalent
-   streaming primitive and enforces a write-rate model. The bot uses one
-   thinking message, bounded status edits, and one canonical text update or
-   retry-safe rich-message create followed by acknowledgement deletion. It does
-   not reproduce Slack's assistant title API or every
-   Block Kit presentation detail.
-2. **No global Workspace directory.** Space membership and exact email DM
-   targets provide the required outcomes without adding broad
-   Admin SDK Directory access.
-3. **No Slack-only objects.** Slack user groups, Slack Connect delayed-file
-   repair, Slack export ZIP import, and Slack-specific channel/public/private
-   vocabulary are not copied where Google Chat has no equivalent.
-4. **Different authorship for uploads.** Chat media upload rejects app auth in
-   this flow, so a dedicated DWD user creates the upload message. Slack uploads
-   are bot-authored.
-5. **Google-only message mutation.** Google Chat exposes scoped update/delete of
-   app-owned messages to the agent tool. Slack does not need artificial commands
-   merely to make the command counts identical.
-6. **Google-native unimplemented APIs.** App Home, dynamic
-   `widgetUpdatedPayload` suggestions, dialog UI responses, native message
-   search/events, named-space administration, membership writes, reaction
-   writes, and pins are outside the current Slack outcome surface. They remain
-   explicit Google product-scope exclusions, not Slack parity gaps.
+The Google Chat `feedback` command derives a bounded view from `dump`. It has
+no counterpart to the removed Slack feedback database or persona subsystem.
 
-## Security boundary
+## Authorization and delegated reads
 
-The public endpoint is only `CHAT_EVENTS_PATH`. Every `/api/chat/*` route is
-private and requires `GOOGLECHATBOT_INTERNAL_API_KEY`. Agent commands instead
-call `/api/google-chat/*` on api-rs with a Console JWT containing exact claims:
+`CHAT_EVENTS_PATH` is public. Other `/api/chat/*` routes require the private
+api-rs key. Agent commands use `/api/google-chat/*` and exact Console claims:
+`send_spaces`, `update_spaces`, `delete_spaces`, `upload_spaces`,
+`download_spaces`, `history_spaces`, `member_spaces`, `reaction_spaces`, and
+`dm_setup_targets`. `reader_subjects` maps authorized spaces to readers selected
+by the Console; it does not grant additional operations or destinations.
 
-- `send_spaces`;
-- `update_spaces`;
-- `delete_spaces`;
-- `upload_spaces`;
-- `download_spaces`;
-- `history_spaces`;
-- `member_spaces`;
-- `reaction_spaces`;
-- `dm_setup_targets`.
+A zero-space discovery grant returns no results without an upstream call.
+Attachment and reaction routes require message-qualified resources. DM setup
+and first send use one api-rs request, but separate Google calls. A failed send
+can leave the DM created.
 
-api-rs authorizes the method and exact resource before forwarding. A zero-space
-list returns an empty result without an upstream call. Reaction and attachment
-routes are message-qualified. DM setup/send validates only the granted target
-and the exact space returned by Google; it does not let a caller smuggle a
-different space.
-
-Dedicated DWD subjects keep capabilities separately revocable:
-
-| Capability | Subject setting | Scope |
+| Delegated operation | Subject | Scope |
 | --- | --- | --- |
 | Upload | `GOOGLECHATBOT_UPLOAD_USER` | `chat.messages.create` |
-| DM setup target | Validated target email (same-domain, impersonable user) | `chat.spaces.create` |
-| Reaction reads | `GOOGLECHATBOT_REACTION_READ_USER` | `chat.messages.reactions.readonly` |
-| Drive attachments | `GOOGLECHATBOT_DRIVE_DOWNLOAD_USER` | `drive.readonly` |
+| DM setup | Validated target email | `chat.spaces.create` |
+| Agent DM history | Console-selected reader for the exact space | `chat.messages.readonly` |
+| Shared reactions | `GOOGLECHATBOT_REACTION_READ_USER` | `chat.messages.reactions.readonly` |
+| DM ETL | Exact allowlisted owner | Message, space, membership, and reaction read scopes |
+| Drive attachment | `GOOGLECHATBOT_DRIVE_DOWNLOAD_USER` | `drive.readonly` |
 
-Live 1:1 DM history never reads Google: the bot replays its stored transcript
-of the webhook stream. Agent-facing DM reads go through the api-rs proxy with
-the server-selected reader subject; nothing falls back to a broader credential.
+Live DM transcript replay does not need a delegated history token. Shared ETL
+app reads use iron-proxy; delegated ETL reads go through the api-rs broker.
 
-## Durable acceptance boundary
+## Recovery and limits
 
-The bot requires Postgres and does not bind until it connects. Before returning
-the Chat-required `{}` response, it writes the accepted message/action and its
-dedupe state. Work transitions through accepted, thinking, rendering, and final
-stages. A renewable per-thread lease prevents concurrent replicas from
-delivering the same obligation.
+The bot waits for Postgres before binding its port. Accepted work moves through
+`accepted`, `thinking`, `rendering`, and `final`. Live SSE reconnects use the last
+event ID. Restart recovery replays the execution from zero to reconstruct the
+answer unless a canonical final is already stored. Age and failure limits stop
+indefinite retries and record abandonment in metrics.
 
-Recovery scans at startup and on a configured interval. It resumes an existing
-execution from the last event ID, reuses a stored canonical final when present,
-and clears thread activity only after delivery/cleanup. Obligations older than
-the configured maximum or beyond the failure budget are abandoned visibly in
-metrics rather than retried forever.
-
-## File and history ceilings
-
-| Boundary | Value |
+| Boundary | Limit |
 | --- | --- |
-| Thread messages collected | Configurable, 50 by default, maximum 1000. |
-| Thread context text | Newest-biased 24,000 characters. |
-| Attachments per inbound message | 10. |
-| Inline decoded file | 25 MiB. |
-| Staged/decoded binary file | 100 MiB. |
-| Google-native Drive `files.export` | 10 MB Google service limit; the client enforces/classifies the boundary and tests both declared and API-reported oversize failures. |
-| Aggregate decoded files per turn | Configurable, 100 MiB by default. |
-| api-rs proxy upload/download | 100 MiB. |
-| Agent CLI download | 10 MiB by default, caller may lower/raise up to proxy policy. |
-| JSON control response | 10 MiB. |
-| Complete serialized Google `Message` | 32,000 UTF-8 bytes. |
-| Card widgets | 100 per card; each section must contain a widget. |
+| Retained DM turns or fetched thread history | Configurable, default 50, maximum 1000 |
+| Execution thread context | Newest-biased 24,000 characters |
+| Inbound attachments | First 10 per message |
+| Inline file | 25 MiB decoded |
+| Staged file | 100 MiB decoded, ordered chunks with SHA-256 |
+| Aggregate files per turn | Configurable, default 100 MiB |
+| Proxy upload/download | 100 MiB |
+| CLI download | Default 10 MiB, bounded by proxy policy |
+| Native Drive export | Separate 10 MB limit |
+| JSON control response | 10 MiB |
+| Serialized Chat message | 32,000 UTF-8 bytes |
+| Card | At most 100 widgets; no empty sections |
 
-Staged chunks carry deterministic order, total size, and SHA-256. Malformed,
-missing, oversized, or aggregate-over-limit attachments fail before execution.
-Drive reads validate the resource metadata and exact observed byte count.
+These are per-operation limits, not an overall memory or queue-capacity bound. The
+[source review](../../docs/fork-upstream-review.md) records unresolved work-index
+and lease-ownership defects. Earlier recovery tests do not close those cases.
 
-## ETL privacy and lifecycle
+## Validation
 
-Shared-space data uses `owner_email=''` and may be projected into company
-context. Delegated DM data uses the exact allowlisted DWD subject as owner;
-memberships contribute canonical IDs/display names because Google `User` has no
-email field. Requester-email RLS protects the owner boundary. Private DM rows
-are never projected into the company-wide Google Chat corpus.
-
-Page tokens and their filters are persisted per owner/space, so a bounded first
-backfill continues instead of skipping unread pages. The ETL stores message,
-attachment, and reaction records; projects shared thread/attachment context;
-exports bounded-label health metrics; and has count/dry-run/delete retention.
-Retention deletes only Centaur data.
-
-Scheduled sync rescans history so edits to old messages converge. Every app and
-delegated message scan requests the officially supported `showDeleted=true` and
-removes tombstoned local messages, attachments, and reactions. The former claim
-that app-authenticated shared-space scans could not request tombstones was
-incorrect. Automated cleanup exists; real shared-space and DM
-create→sync→delete→resync evidence remains required. Retention must not be used
-as a substitute for that source-reconciliation proof.
-
-## Required live evidence
-
-In plain language, a release blocker means the new branch has not yet been
-shown to work with Google's real signer, scopes, payloads, or browser surface.
-It does not mean a Slack-only platform feature must be copied. The following
-remain blockers even when every local suite is green:
-
-- real Google-signed project-number and endpoint-audience events;
-- real legacy and Workspace Add-ons mention/action/command/form wire shapes;
-- live `members/app` canonical bot identity and sender suppression;
-- live scoped sandbox JWT allow/deny checks for every operation;
-- DWD DM setup, DM history, upload, reaction, Drive, and rotation checks;
-- attachment boundary/hash checks against Workspace;
-- narrow/wide keyboard-only Console permission interaction screenshots;
-- ETL continuation, reaction/attachment capture, private-DM RLS, and retention
-  against a non-production Workspace.
-- shared-space and delegated-DM deletion-convergence smokes using
-  `showDeleted=true`;
-- native Drive export checks below and above Google's separate 10 MB
-  `files.export` limit; the 100 MiB binary ceiling does not apply to native
-  exports.
-
-The 2026-08-14 read-only VPS audit observed an older deployed image
-(`sha-980e5e3b`), not this working tree. It confirms retained legacy
-`spaces.list`, `members.list`, `messages.list`, create/execute/SSE and health
-behavior only. It provides no current-branch evidence for ingress auth modes,
-DM setup, reactions, DWD brokers, scoped proxy calls, uploads/downloads,
-rendering limits, or deletion tombstones.
-
-Run `pnpm --filter googlechatbot run smoke` for deterministic fixtures, then
-follow `docs/pages/reference/google-chat.mdx` for the live procedure and record
-artifacts in `docs/google-chat-parity-verification.md`.
+Run the service checks in the [README](README.md), then follow the operator
+reference for Workspace, Kind, and Console browser verification. Keep all live
+results tied to an immutable commit or image digest. TEST-031 requires every
+preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
 

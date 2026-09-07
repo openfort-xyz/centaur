@@ -472,11 +472,8 @@ def get_blocks(
 ):
     """Get child blocks of a page or block.
 
-    Reads every page of children by default. A single Notion request caps at
-    100 children and reports the rest only through `has_more`, which a bare
-    `block_children` call discards -- so a page over the cap used to come back
-    silently short, and callers that round-trip it (read, rewrite, verify)
-    deleted whatever fell past the cut.
+    Reads all pages before applying --limit. Keep pagination so callers that
+    rewrite a page do not lose children beyond the first API response.
 
     Examples:
         notion blocks PAGE_ID

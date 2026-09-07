@@ -90,6 +90,7 @@ The main directories are:
 
 - [`services/api-rs`](services/api-rs/) — Rust control plane for agents, tools, workflows, auth, and durable state
 - [`services/slackbotv2`](services/slackbotv2/) — Slack event handling and Slack delivery
+- [`services/googlechatbot`](services/googlechatbot/), Google Chat ingress and reply delivery
 - [`services/sandbox`](services/sandbox/) — agent container image and harness adapter
 - [iron-proxy](https://docs.iron.sh) ([service](services/iron-proxy/)) — controlled outbound access and credential injection
 - [`tools`](tools/) — tool plugins
@@ -231,6 +232,7 @@ See [Security](docs/pages/security.mdx) for the full threat model and the mechan
 - [Agent plugin](plugins/centaur/) — connect Codex, Claude Code, and other MCP clients to Centaur
 - [API service](services/api-rs/) — Rust control plane
 - [Slackbot](services/slackbotv2/) — Slack integration
+- [Google Chat](docs/pages/reference/google-chat.mdx), setup, permissions, and verification
 - [Sandbox](services/sandbox/) — agent runtime image
 
 ## Contributing

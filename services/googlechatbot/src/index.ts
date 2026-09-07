@@ -922,10 +922,8 @@ export async function processWorkObligation(
       return
     }
 
-    // A 1:1 DM delivers every message to this app over the webhook, so the
-    // local transcript IS the thread — and Google refuses messages.list under
-    // app auth there anyway. Named spaces only see @mentions, so they keep
-    // asking Google.
+    // Replay retained DM turns without a Google history read. Shared spaces
+    // fetch thread history because unmentioned messages may not reach the bot.
     const history = event.space_type === 'DIRECT_MESSAGE'
       ? transcriptHistoryMessages(
           (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key)))?.transcript,
@@ -1242,15 +1240,9 @@ async function driveSession(
       }
     )
 
-    // A run is already in flight for this thread. Starting a second one would
-    // collide with api-rs's "one active execution per thread" index and 500,
-    // so mirror the Slack bot: fold the new message into the running turn by
-    // appending it (the live execution will pick it up) and let that run own
-    // the answer. The "thinking…" ack becomes a steering notice that the live
-    // run clears when it finalizes (slackbotv2 #1519 parity).
-    // Only unforwarded messages are appended: api-rs steers every appended
-    // user message into the live run, and for a DM `history` is the whole
-    // stored transcript.
+    // Append only unforwarded messages to the active execution. Replaying the
+    // full DM transcript here would steer old turns again. Keep a steering
+    // notice until the active execution delivers its answer.
     const forwarded = new Set(threadState.forwardedMessageIds ?? [])
     const appended = [...history, execute].filter(message => !forwarded.has(message.id))
     if (session.activeExecution) {
@@ -1282,11 +1274,8 @@ async function driveSession(
           provider: resolvedProvider,
           reasoning: resolvedReasoning
         },
-        // Thread history rides the execute input itself (slackbotv2 parity):
-        // messages appended via /messages are stored for the Console but never
-        // reach the harness, and the harness's own conversation state dies
-        // with its sandbox (pool drain/reap), so without this block any
-        // follow-up after a sandbox swap starts from amnesia.
+        // Include history in the execution input so a replacement sandbox has
+        // prior context. Durable message rows do not seed a new harness turn.
         history,
         // A/B provenance for the harness api-rs actually persisted, so the
         // execution metadata records the cohort (upstream #1178 parity).

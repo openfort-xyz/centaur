@@ -5,7 +5,7 @@ description: How Centaur runs agents with an API, Postgres, sandbox pods, tools,
 
 # Architecture
 
-Centaur accepts Slack and API requests, stores each turn, assigns an isolated
+Centaur accepts Slack, Google Chat, and API requests, stores each turn, assigns an isolated
 runtime, exposes approved tools, injects credentials through a proxy, and keeps
 an event trail clients can replay.
 
@@ -17,7 +17,7 @@ an event trail clients can replay.
 
 | Plane | Responsibility | Main components |
 |-------|----------------|-----------------|
-| Ingress | Accept user and client input. | Slack Events API, Slackbot webhook, external API clients. |
+| Ingress | Accept user and client input. | Slack and Google Chat webhooks, external API clients. |
 | Control | Persist requests and coordinate runtime state. | api-rs, Postgres, session runtime, workflow runtime. |
 | Execution | Run one assigned agent session per thread. | Kubernetes sandbox pods. |
 | Capabilities | Give agents approved actions. | Tool plugins, workflow engine, overlays. |
@@ -59,6 +59,16 @@ During a Slack delivery, the API owns the execution state while Slackbot owns
 Slack rendering: opening or updating the thread UI, streaming chunks, rendering
 steps, and posting the final answer. The landing page preview shows that Slack
 thread surface; the durable API lifecycle above is the system underneath it.
+
+## Google Chat ingress
+
+`googlechatbot` verifies Google-signed requests, persists accepted work in
+Postgres, and calls the same session API with `GOOGLECHATBOT_API_KEY`. It edits
+a thinking acknowledgement with the final answer and retains unfinished
+render obligations for recovery. Agent tools call api-rs with scoped Console
+JWTs; api-rs authorizes the exact operation and space before calling the bot's
+private Google API routes. See [Google Chat](/reference/google-chat) for setup
+and the remaining verification gates.
 
 ## Execution path
 
