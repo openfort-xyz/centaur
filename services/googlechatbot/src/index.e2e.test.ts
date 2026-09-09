@@ -1018,6 +1018,55 @@ describe('googlechatbot DM thread transcript', () => {
       ?.steeringAckMessageNames).toEqual([new URL(steering!.url).pathname.replace(/^\/v1\//, '')])
   })
 
+  test('a shared-space follow-up from another sender is not folded into the running turn', async () => {
+    // The run's proxy carries the starter's own grants (their desktop), so a
+    // message from anyone else must not steer it. This event carries no
+    // verified email at all, which is the same refusal.
+    const state = createMemoryState()
+    await state.connect()
+    await state.set(threadStateKey(SPACE_THREAD_KEY), {
+      activeExecution: true,
+      activeRequesterEmail: 'ada@openfort.xyz'
+    } satisfies GoogleChatThreadState)
+    await state.disconnect()
+    mock.activeThreads.push(SPACE_THREAD_KEY)
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state }).app
+
+    await bot.request('/api/chat/events', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'MESSAGE',
+        eventTime: NOW_ISO,
+        space: { name: 'spaces/BBBB', spaceType: 'SPACE' },
+        message: {
+          name: 'spaces/BBBB/messages/OTHER1',
+          text: 'take a screenshot for me too',
+          thread: { name: 'spaces/BBBB/threads/T2' },
+          threadReply: true,
+          sender: { name: 'users/U2', displayName: 'Joan', type: 'HUMAN' },
+          annotations: [{
+            type: 'USER_MENTION',
+            userMention: { user: { name: 'users/123456789', type: 'BOT' }, type: 'MENTION' }
+          }]
+        },
+        user: { name: 'users/U2', displayName: 'Joan' }
+      })
+    })
+
+    await waitFor(() => mock.calls.some(c =>
+      c.method === 'PATCH' && (c.body as { text?: string })?.text?.includes('still running')
+    ))
+    expect(executes(SPACE_THREAD_KEY)).toHaveLength(0)
+    expect(appended(SPACE_THREAD_KEY)).toHaveLength(0)
+    expect(mock.calls.some(c =>
+      c.method === 'PATCH' && (c.body as { text?: string })?.text?.includes('running turn')
+    )).toBe(false)
+    const stored = await state.get<GoogleChatThreadState>(threadStateKey(SPACE_THREAD_KEY))
+    expect(stored?.activeRequesterEmail).toBe('ada@openfort.xyz')
+    expect(stored?.forwardedMessageIds ?? []).not.toContain('spaces/BBBB/messages/OTHER1')
+  })
+
   test('finalizing a run deletes the steering notices it collected', async () => {
     const state = createMemoryState()
     await state.connect()

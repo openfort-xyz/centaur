@@ -103,9 +103,9 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     PrincipalSyncConfigSnapshot.private_class_method(:live_union_config_for_proxy)
   end
 
-  def build_requester
+  def build_requester(kind: "user")
     Principal.create!(foreign_id: "requester-#{SecureRandom.hex(4)}",
-                      kind: "user", created_by: users(:globex_admin))
+                      kind: kind, created_by: users(:globex_admin))
   end
 
   # Builds an always_available (unless overridden) OAuth app, a minted (unless
@@ -130,6 +130,26 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
       broker_credential: cred, created_by: users(:globex_admin)
     )
     secret.build_source(source_type: "token_broker", config: { "credential_id" => cred.oid })
+    secret.rules.build(host: host, position: 0)
+    secret.save!
+    if via_role
+      PrincipalRole.find_or_create_by!(principal: granted_to, role: via_role)
+      Grant.create!(role: via_role, static_secret: secret, created_by: users(:globex_admin))
+    else
+      Grant.create!(principal: granted_to, static_secret: secret, created_by: users(:globex_admin))
+    end
+    secret
+  end
+
+  # A hand-granted, non-broker static injecting `header` on `host`, the shape
+  # of a per-person desktop token: direct to `granted_to`, or via `via_role`.
+  def build_operator_static(granted_to:, host:, header:, via_role: nil)
+    secret = StaticSecret.new(
+      foreign_id: "operator-#{SecureRandom.hex(4)}",
+      inject_config: { "header" => header, "formatter" => "{{ .Value }}" },
+      created_by: users(:globex_admin)
+    )
+    secret.build_source(source_type: "control_plane", secret: "operator-token")
     secret.rules.build(host: host, position: 0)
     secret.save!
     if via_role
@@ -754,6 +774,57 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     requester = build_requester
     build_hoistable_wrapper(granted_to: requester, host: "github.com", always_available: false)
     proxy = Proxy.create!(name: "not-whitelisted", principal: principals(:globex_user), requester_principal: requester)
+
+    assert_empty proxy.sync_config_snapshot.fetch(:config).fetch("secrets")
+  end
+
+  # A per-person static an operator granted by hand (a desktop token, say) is
+  # not a broker wrapper, so no always_available app can vouch for it. For the
+  # Google Chat per-user requester the direct grant itself is the opt-in,
+  # because no other Chat principal can hold a personal grant.
+  test "a non-broker static granted directly to a Google Chat requester hoists" do
+    requester = build_requester(kind: "gchat_user")
+    build_operator_static(granted_to: requester, host: "cua.example", header: "X-Cua-Desktop")
+    proxy = Proxy.create!(name: "desktop", principal: principals(:globex_user), requester_principal: requester)
+
+    hoisted = proxy.sync_config_snapshot.fetch(:config).fetch("secrets")
+    assert_equal 1, hoisted.length
+    assert_equal "X-Cua-Desktop", hoisted.first.dig("inject", "header")
+    assert_equal [ { "host" => "cua.example" } ], hoisted.first.fetch("rules").map { |rule| rule.slice("host") }
+  end
+
+  # A static whose source is a broker token but which is not linked to that
+  # credential is not a hand grant: without the link the always_available gate
+  # cannot read the app, so it must not ride the hand-grant branch either.
+  test "an unlinked broker-source static granted directly to a Google Chat requester does not hoist" do
+    requester = build_requester(kind: "gchat_user")
+    wrapper = build_hoistable_wrapper(granted_to: requester, host: "github.com", always_available: false)
+    unlinked = StaticSecret.new(
+      foreign_id: "unlinked-#{SecureRandom.hex(4)}",
+      inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
+      created_by: users(:globex_admin)
+    )
+    unlinked.build_source(source_type: "token_broker", config: { "credential_id" => wrapper.broker_credential.oid })
+    unlinked.rules.build(host: "github.com", position: 0)
+    unlinked.save!
+    Grant.create!(principal: requester, static_secret: unlinked, created_by: users(:globex_admin))
+    proxy = Proxy.create!(name: "unlinked", principal: principals(:globex_user), requester_principal: requester)
+
+    assert_empty proxy.sync_config_snapshot.fetch(:config).fetch("secrets")
+  end
+
+  test "a non-broker static granted directly to a non-Chat requester keeps upstream's wrapper-only rule" do
+    requester = build_requester
+    build_operator_static(granted_to: requester, host: "cua.example", header: "X-Cua-Desktop")
+    proxy = Proxy.create!(name: "slack-desktop", principal: principals(:globex_user), requester_principal: requester)
+
+    assert_empty proxy.sync_config_snapshot.fetch(:config).fetch("secrets")
+  end
+
+  test "a non-broker static granted to a Google Chat requester through a role does not hoist" do
+    requester = build_requester(kind: "gchat_user")
+    build_operator_static(granted_to: requester, host: "cua.example", header: "X-Cua-Desktop", via_role: roles(:globex_infra))
+    proxy = Proxy.create!(name: "role-desktop", principal: principals(:globex_user), requester_principal: requester)
 
     assert_empty proxy.sync_config_snapshot.fetch(:config).fetch("secrets")
   end

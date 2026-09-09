@@ -42,6 +42,12 @@ export type GoogleChatThreadState = {
    * means the thread is pinned without a persona. */
   personaId?: string | null
   provider?: string | null
+  /** Verified email of the person whose message started the active execution;
+   * null when it started without one. In a shared space, follow-ups from
+   * anyone else are not folded into that run: its proxy carries the starter's
+   * own per-turn grants (their desktop, their credentials), so another
+   * sender's instructions must not steer it. Cleared when the run finishes. */
+  activeRequesterEmail?: string | null
   /** "Added to the running turn…" bubbles for messages folded into the live
    * execution; deleted when that run finalizes. Updates append; `[]` clears. */
   steeringAckMessageNames?: string[]

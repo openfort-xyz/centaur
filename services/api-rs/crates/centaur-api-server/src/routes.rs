@@ -818,17 +818,23 @@ async fn execute_session(
 }
 
 /// `requester_principal_foreign_id` is an identity assertion made by the
-/// authenticated Console service, not ordinary caller-controlled metadata.
-/// Strip it from every other caller class before the execution is persisted so
-/// the runtime can safely honor Console requesters on any thread namespace.
+/// authenticated Console service, and the `googlechat_*` requester keys are
+/// one made by the Google Chat ingress from its signed request; neither is
+/// ordinary caller-controlled metadata. Strip each from every other caller
+/// class before the execution is persisted so the runtime can safely honor
+/// them on any thread namespace.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
     mut metadata: Option<Value>,
 ) -> Option<Value> {
-    if caller_class != CallerClass::Console
-        && let Some(Value::Object(fields)) = metadata.as_mut()
-    {
-        fields.remove("requester_principal_foreign_id");
+    if let Some(Value::Object(fields)) = metadata.as_mut() {
+        if caller_class != CallerClass::Console {
+            fields.remove("requester_principal_foreign_id");
+        }
+        if caller_class != CallerClass::Ingress {
+            fields.remove("googlechat_request_verified");
+            fields.remove("googlechat_requester_email");
+        }
     }
     metadata
 }
@@ -1003,6 +1009,31 @@ mod session_authorization_tests {
                     Some(RouteAccess::PrincipalOnly)
                 ),
                 "{method} {route} must authorize as a principal"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ingress_callers_may_assert_a_google_chat_requester() {
+        let metadata = json!({
+            "source": "googlechatbot",
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@example.com"
+        });
+
+        assert_eq!(
+            sanitize_execute_metadata(CallerClass::Ingress, Some(metadata.clone())),
+            Some(metadata.clone())
+        );
+        for caller_class in [
+            CallerClass::Admin,
+            CallerClass::Console,
+            CallerClass::Principal,
+        ] {
+            assert_eq!(
+                sanitize_execute_metadata(caller_class, Some(metadata.clone())),
+                Some(json!({ "source": "googlechatbot" })),
+                "{caller_class:?}"
             );
         }
     }

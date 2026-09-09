@@ -91,12 +91,19 @@ only a separately verified Workspace Add-on `userIdToken` can satisfy a
 non-empty domain allowlist. Configuring `allowedDomain` for either Chat API mode
 therefore rejects every event by design.
 
-Google's request token does not bind the JSON body. Centaur therefore releases
-a requester email only when it came from a separately verified Add-on
-`userIdToken`, passed the allowlist, matched the event user ID, and the 1:1 DM
-was confirmed with `spaces.get`. Legacy Chat API events create sessions without
-human email identity. Shared spaces and group chats do not inherit a
-requester's personal credentials.
+Google's request token does not bind the JSON body. Centaur therefore labels a
+space principal with a requester email only when it came from a separately
+verified Add-on `userIdToken`, passed the allowlist, matched the event user ID,
+and the 1:1 DM was confirmed with `spaces.get`. Legacy Chat API events create
+sessions without human email identity. Shared spaces and group chats do not
+inherit a requester's personal credentials.
+
+Each turn also binds the sender's own `gchat-user-<email>-<sha256[:12]>` principal as
+the requester, in DMs and group spaces alike, from the same verified and
+allowlisted email but without the DM confirmation. Its direct grants apply to
+that turn only, so a person's desktop or credential follows them into a group
+without the space principal ever holding it. See
+[advanced permissioning](/secrets/advanced-permissioning).
 
 `requireSignedRequests: false` exists only for local fixture development. Do not
 use it as a production rollback switch.

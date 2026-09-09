@@ -20,6 +20,8 @@ import type {
 
 export const INITIAL_STATUS = '_Centaur is thinking…_'
 export const STEERING_STATUS = '_Centaur · added to the running turn…_'
+export const BUSY_STATUS =
+  "_Centaur · someone else's turn is still running in this thread. Ask again once it finishes._"
 const STATUS_FLUSH_INTERVAL_MS = 1_000
 const WRITE_INTERVAL_MS = 1_000
 const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'

@@ -57,7 +57,9 @@ import {
   reasoningForModel
 } from './console-session-link'
 import { chatReplyLimits } from './constants'
+import { canFoldIntoActiveRun } from './fold-guard'
 import {
+  BUSY_STATUS,
   INITIAL_STATUS,
   STEERING_STATUS,
   consumeRenderStream,
@@ -1246,11 +1248,20 @@ async function driveSession(
     const forwarded = new Set(threadState.forwardedMessageIds ?? [])
     const appended = [...history, execute].filter(message => !forwarded.has(message.id))
     if (session.activeExecution) {
-      await appendSessionMessages(config, threadKey, appended)
+      if (!canFoldIntoActiveRun(event, threadState)) {
+        await refuseFoldForOtherRequester(client, ackMessageName, threadKey, execute.id)
+        return
+      }
+      // In a shared space only the sender's own message steers the run. The
+      // listed thread history can hold other people's messages, including
+      // ones refused above, and steering those in would carry them into a
+      // turn that holds the starter's grants after all.
+      const steered = event.space_type === 'DIRECT_MESSAGE' ? appended : [execute]
+      await appendSessionMessages(config, threadKey, steered)
       const held = await holdSteeringAck(client, ackMessageName)
       await updateThreadState(durableState, threadKey, {
         activeExecution: true,
-        forwardedMessageIds: appended.map(message => message.id),
+        forwardedMessageIds: steered.map(message => message.id),
         ...(held ? { steeringAckMessageNames: [ackMessageName] } : {}),
         ...dmTranscriptUpdate(event, execute)
       }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
@@ -1277,6 +1288,12 @@ async function driveSession(
         // Include history in the execution input so a replacement sandbox has
         // prior context. Durable message rows do not seed a new harness turn.
         history,
+        // The person behind this turn, for their own per-user grants (their
+        // desktop, their credentials) in any space, DM or group.
+        requester: {
+          verified: identity.verified,
+          ...(event.user_email ? { userEmail: event.user_email } : {})
+        },
         // A/B provenance for the harness api-rs actually persisted, so the
         // execution metadata records the cohort (upstream #1178 parity).
         ...(session.harnessType ? { harnessType: session.harnessType } : {}),
@@ -1292,8 +1309,16 @@ async function driveSession(
       // live run instead of erroring into the thread.
       const folded = await foldIntoActiveRun(config, client, threadKey, execute, ackMessageName, error, {
         conversationName: conversationName(event),
-        harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+        harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
+        // The other run started between the check and this execute, so read
+        // its requester fresh rather than from the state loaded above.
+        canFold: async () =>
+          canFoldIntoActiveRun(
+            event,
+            (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
+          )
       })
+      if (folded === 'refused') return
       if (folded) {
         await updateThreadState(durableState, threadKey, {
           forwardedMessageIds: [execute.id],
@@ -1311,6 +1336,7 @@ async function driveSession(
     await appendSessionMessagesBestEffort(config, threadKey, appended)
     await updateThreadState(durableState, threadKey, {
       activeExecution: true,
+      activeRequesterEmail: event.user_email ?? null,
       executedMessageIds: [execute.id],
       forwardedMessageIds: appended.map(message => message.id),
       ...dmTranscriptUpdate(event, execute),
@@ -1580,8 +1606,8 @@ async function foldIntoActiveRun(
   execute: GoogleChatTurnMessage,
   ackMessageName: string,
   error: unknown,
-  session: { conversationName?: string; harnessType?: string }
-): Promise<{ steeringAckHeld: boolean } | false> {
+  session: { conversationName?: string; harnessType?: string; canFold: () => Promise<boolean> }
+): Promise<{ steeringAckHeld: boolean } | 'refused' | false> {
   const conflictClass = classifyExecuteConflict(error)
   if (conflictClass === 'unrelated') return false
   let active = conflictClass === 'conflict'
@@ -1602,6 +1628,10 @@ async function foldIntoActiveRun(
     }
   }
   if (!active) return false
+  if (!(await session.canFold())) {
+    await refuseFoldForOtherRequester(client, ackMessageName, threadKey, execute.id)
+    return 'refused'
+  }
   await appendSessionMessages(config, threadKey, [execute])
   const steeringAckHeld = await holdSteeringAck(client, ackMessageName)
   incr('googlechatbot_runs_total', { outcome: 'folded' })
@@ -1611,6 +1641,27 @@ async function foldIntoActiveRun(
     reason: 'execute_conflict'
   })
   return { steeringAckHeld }
+}
+
+/** A message from someone other than the running turn's verified starter, in a
+ * shared space: not appended, so it cannot steer a turn holding the starter's
+ * per-person grants. The eager ack becomes a "still running" notice that
+ * stays, since the message itself is not carried into any run. */
+async function refuseFoldForOtherRequester(
+  client: ChatEdgeClient,
+  ackMessageName: string,
+  threadKey: string,
+  messageId: string
+): Promise<void> {
+  incr('googlechatbot_runs_total', { outcome: 'refused_other_requester' })
+  logWarn('googlechatbot_fold_refused_other_requester', { thread_key: threadKey, message_id: messageId })
+  if (!ackMessageName) return
+  try {
+    await client.updateMessage(ackMessageName, { text: BUSY_STATUS, cardsV2: [] })
+  } catch (error) {
+    logWarn('googlechatbot_busy_ack_update_failed', error)
+    await removeAck(client, ackMessageName)
+  }
 }
 
 /** slackbotv2 reacts to a steering message and clears the reaction when the
@@ -1645,6 +1696,7 @@ async function finishThreadRun(
   await updateThreadState(durableState, threadKey, {
     ...update,
     activeExecution: false,
+    activeRequesterEmail: null,
     steeringAckMessageNames: []
   })
   for (const name of held) await removeAck(client, name)

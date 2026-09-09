@@ -65,6 +65,21 @@ Attachment and reaction routes require message-qualified resources. DM setup
 and first send use one api-rs request, but separate Google calls. A failed send
 can leave the DM created.
 
+Personal grants in shared spaces diverge from Slack because every Chat session
+principal is a space, including a 1:1 DM. api-rs binds a per-user
+`gchat-user-<email slug>-<sha256[:12]>` principal (kind `gchat_user`) as the requester of every
+Chat turn, DM or group, from the Add-on-verified, allowlisted sender email the
+bot sends on `/execute` as `googlechat_requester_email` with
+`googlechat_request_verified`. The Console hoists that principal's hand-granted
+non-broker static secrets into the turn's proxy config, which is how a
+per-person desktop token follows its owner into a group; Slack, GitHub and
+console requesters keep upstream's always-available-wrapper-only hoist. The
+gate is `requester.kind == gchat_user` in `PrincipalSyncConfigSnapshot`.
+Because that turn now carries one person's grants, the bot folds a follow-up
+into a running turn only from the same verified sender (`fold-guard.ts`); in a
+DM everything folds, in a shared space anyone else gets a "still running"
+notice and their message is not appended. slackbotv2 folds every follow-up.
+
 | Delegated operation | Subject | Scope |
 | --- | --- | --- |
 | Upload | `GOOGLECHATBOT_UPLOAD_USER` | `chat.messages.create` |

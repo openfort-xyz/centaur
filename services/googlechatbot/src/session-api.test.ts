@@ -562,6 +562,71 @@ describe('executeSession', () => {
     expect(body.idle_timeout_ms).toBe(60_000)
   })
 
+  // The requester keys are what api-rs binds a per-user principal from, so a
+  // group turn carries the asker's own grants. They travel under their own
+  // names: `user_email` on message metadata is display-only and never gated.
+  const captureExecuteMetadata = async (
+    config: Parameters<typeof executeSession>[0],
+    requester?: { verified: boolean; userEmail?: string }
+  ): Promise<Record<string, unknown>> => {
+    let captured: string | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      captured = String(init?.body ?? '')
+      return new Response(
+        JSON.stringify({ execution_id: 'e1', ok: true, status: 'executing', thread_key: 't' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    }) as unknown as typeof fetch
+    const { execute } = turnMessagesFromEvent(baseEvent)
+    await executeSession(config, baseEvent.thread_key, execute, {
+      ...(requester ? { requester } : {})
+    })
+    const body = JSON.parse(captured ?? '{}') as { metadata?: Record<string, unknown> }
+    return body.metadata ?? {}
+  }
+
+  test('names the verified, allowlisted requester on a group-space execute', async () => {
+    const metadata = await captureExecuteMetadata(
+      loadConfig({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' }),
+      { verified: true, userEmail: 'Ada@Openfort.xyz' }
+    )
+    // baseEvent is a SPACE, not a DM: no DM confirmation gates the requester.
+    expect(metadata.googlechat_request_verified).toBe(true)
+    expect(metadata.googlechat_requester_email).toBe('Ada@Openfort.xyz')
+  })
+
+  test('withholds the requester email when unverified, malformed, or outside a configured allowlist', async () => {
+    const allowlisted = loadConfig({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' })
+    for (const [config, requester] of [
+      [allowlisted, { verified: false, userEmail: 'ada@openfort.xyz' }],
+      [allowlisted, { verified: true, userEmail: 'ada@elsewhere.example' }],
+      [allowlisted, { verified: true }],
+      [loadConfig({}), { verified: true, userEmail: 'a@b@c' }],
+      [loadConfig({}), { verified: false, userEmail: 'ada@openfort.xyz' }]
+    ] as const) {
+      const metadata = await captureExecuteMetadata(config, requester)
+      expect(metadata.googlechat_request_verified).toBe(requester.verified)
+      expect('googlechat_requester_email' in metadata).toBe(false)
+    }
+  })
+
+  test('an empty allowlist does not suppress a verified requester', async () => {
+    // Session identity fails closed without a domain policy because it
+    // labels the whole space; the requester names one person and only
+    // carries grants made to that person by name, so the roster is the gate.
+    const metadata = await captureExecuteMetadata(loadConfig({}), {
+      verified: true,
+      userEmail: 'ada@openfort.xyz'
+    })
+    expect(metadata.googlechat_requester_email).toBe('ada@openfort.xyz')
+  })
+
+  test('sends no requester keys when the caller names no requester', async () => {
+    const metadata = await captureExecuteMetadata(loadConfig({}))
+    expect('googlechat_request_verified' in metadata).toBe(false)
+    expect('googlechat_requester_email' in metadata).toBe(false)
+  })
+
   test('prepends the requester context and counts the operation', async () => {
     let captured: string | undefined
     globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
