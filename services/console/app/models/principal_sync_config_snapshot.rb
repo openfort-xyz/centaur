@@ -188,12 +188,24 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   # The hoist gate reads the linked credential's app, while the served value
   # resolves from the source; require both to be the same credential so an
   # operator-edited source cannot serve a token the whitelist never covered.
+  #
+  # Google Chat divergence: a Chat session principal is always the space, so
+  # the per-user `gchat_user` requester is the only principal that can hold a
+  # personal grant at all. Its hand-granted non-broker statics (a per-person
+  # desktop token) therefore hoist on the grant alone. Slack, GitHub and
+  # console requesters keep upstream's wrapper-only rule.
   def self.requester_hoisted_statics_for(requester)
     return [] unless requester
 
-    requester.always_available_static_secrets.select do |ss|
+    wrappers = requester.always_available_static_secrets.select do |ss|
       ss.source&.deliverable? && ss.source.resolves_credential?(ss.broker_credential)
     end
+    return wrappers unless requester.kind == Principal::GCHAT_USER_KIND
+
+    hand_granted = requester.directly_granted_static_secrets.select do |ss|
+      ss.broker_credential.nil? && ss.source&.source_type != "token_broker" && ss.source&.deliverable?
+    end
+    wrappers + hand_granted
   end
   private_class_method :requester_hoisted_statics_for
 

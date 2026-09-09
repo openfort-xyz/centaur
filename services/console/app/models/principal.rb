@@ -35,13 +35,16 @@ class Principal < ApplicationRecord
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
   SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
-  # Stamped by api-rs only for signature-verified Google Chat 1:1 DMs.
+  # Stamped by api-rs only from a signature-verified Google Chat identity: on a
+  # 1:1 DM space principal, and on the per-user requester principal.
   GOOGLE_EMAIL_LABEL = "google_email".freeze
+  GCHAT_USER_KIND = "gchat_user".freeze
+  GOOGLE_CHAT_HUMAN_KINDS = %w[gchat_dm gchat_user].freeze
   SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
   UNKNOWN_KIND = "unknown".freeze
   KINDS = %w[
     unknown user console_user workflow slack_channel slack_dm discord_channel linear_issue
-    github_user teams_user teams_conversation gchat_dm gchat_space
+    github_user teams_user teams_conversation gchat_dm gchat_space gchat_user
   ].freeze
   SLACK_USER_ID_FORMAT = /\A(?:[UW][A-Z0-9]{8,}|USLACK)\z/
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
@@ -82,12 +85,13 @@ class Principal < ApplicationRecord
     granted_secrets_by_priority(StaticSecret, :static_secret_id, includes: %i[source rules])
   end
 
-  # Static wrapper secrets this principal may carry into turns it starts as
-  # the requester: DIRECT grants only (never role grants, so shared role
-  # infrastructure cannot hoist), and only wrappers of broker credentials
-  # whose OAuth app an admin marked always_available. Starting from
-  # StaticSecret structurally excludes every other secret kind.
-  def always_available_static_secrets
+  # Static secrets this principal may carry into turns it starts as the
+  # requester: DIRECT grants only (never role grants, so shared role
+  # infrastructure cannot hoist). Starting from StaticSecret structurally
+  # excludes every other secret kind. Only always_available_static_secrets
+  # hoist by default; PrincipalSyncConfigSnapshot widens this for the Google
+  # Chat per-user requester.
+  def directly_granted_static_secrets
     priorities = grants
       .where.not(static_secret_id: nil)
       .group(:static_secret_id)
@@ -96,11 +100,18 @@ class Principal < ApplicationRecord
     StaticSecret
       .joins("INNER JOIN (#{priorities.to_sql}) granted_priorities " \
              "ON granted_priorities.secret_id = static_secrets.id")
+      .select("static_secrets.*", "granted_priorities.effective_priority")
+      .includes(:source, :rules, :broker_credential)
+      .order(Arel.sql("granted_priorities.effective_priority ASC, static_secrets.id ASC"))
+  end
+
+  # The directly granted wrappers of broker credentials whose OAuth app an
+  # admin marked always_available. Wrappers are auto-granted on consent, so
+  # unlike an operator's hand grant they need this per-app opt-in to hoist.
+  def always_available_static_secrets
+    directly_granted_static_secrets
       .joins(broker_credential: :oauth_app)
       .where(oauth_apps: { always_available: true })
-      .select("static_secrets.*", "granted_priorities.effective_priority")
-      .includes(:source, :rules)
-      .order(Arel.sql("granted_priorities.effective_priority ASC, static_secrets.id ASC"))
   end
 
   # gcp_auth credentials this principal resolves to, via its effective grants.
@@ -167,13 +178,14 @@ class Principal < ApplicationRecord
   end
 
   # Google Chat's equivalent bridge. Chat has no first-class email column
-  # because the bot only learns a requester's address after the signed event
-  # and `spaces.get` confirm a 1:1 DM; it stamps that verified address into the
-  # `google_email` label. Unverified events never carry one, so the label is as
-  # trusted as slack_email. Called from the same API upsert boundary for the
-  # same reason: an omitted label must not activate a stale stored value.
+  # because the bot only learns a requester's address from the verified Add-on
+  # token; api-rs stamps that address into the `google_email` label on a
+  # confirmed 1:1 DM space principal and on the per-user requester principal.
+  # Unverified events never carry one, so the label is as trusted as
+  # slack_email. Called from the same API upsert boundary for the same reason:
+  # an omitted label must not activate a stale stored value.
   def link_console_user_by_google_email
-    return unless kind == "gchat_dm"
+    return unless GOOGLE_CHAT_HUMAN_KINDS.include?(kind)
 
     email = labels.to_h[GOOGLE_EMAIL_LABEL].to_s.strip.downcase
     return if email.blank?

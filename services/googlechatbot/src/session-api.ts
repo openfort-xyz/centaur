@@ -345,6 +345,47 @@ function identityMetadata(identity: ResolvedSessionIdentity | undefined): JsonOb
   }
 }
 
+/**
+ * Requester identity for one execute. api-rs derives the per-user principal
+ * from `googlechat_requester_email` and refuses it without
+ * `googlechat_request_verified`; the key is distinct from the display-only
+ * `user_email` on message metadata so the two can never be confused.
+ *
+ * Unlike session identity, an EMPTY domain allowlist does not suppress the
+ * requester. Session identity labels a space principal, and every personal
+ * credential auto-granted to it would then follow the space, so that gate
+ * fails closed without a domain policy. The requester principal names one
+ * verified person, and it only carries what an operator granted to that
+ * person by name, so the roster is the allowlist. A configured domain policy
+ * still applies.
+ */
+function requesterMetadata(
+  config: AppConfig,
+  requester: { verified: boolean; userEmail?: string } | undefined
+): JsonObject {
+  if (!requester) return {}
+  const email = requesterEmail(config, requester)
+  return {
+    googlechat_request_verified: requester.verified,
+    ...(email ? { googlechat_requester_email: email } : {})
+  }
+}
+
+function requesterEmail(
+  config: AppConfig,
+  requester: { verified: boolean; userEmail?: string }
+): string | undefined {
+  if (!requester.verified) return undefined
+  const email = (requester.userEmail ?? '').trim()
+  const [local, domain, ...rest] = email.split('@')
+  if (!local || !domain || rest.length > 0) return undefined
+  const allowed = config.GOOGLECHATBOT_ALLOWED_DOMAIN
+  if (allowed.length > 0 && !allowed.some(entry => entry.toLowerCase() === domain.toLowerCase())) {
+    return undefined
+  }
+  return email
+}
+
 export async function appendSessionMessages(
   config: AppConfig,
   threadKey: string,
@@ -388,12 +429,20 @@ export async function executeSession(
     /** Harness api-rs persisted for this thread (see CreateSessionResult). */
     harnessType?: string
     harnessAssignment?: GoogleChatHarnessAssignment
+    /** Who is asking this turn, for api-rs's per-turn requester principal.
+     * `verified` must be the request's signature status, and `userEmail` the
+     * Add-on userIdToken email; the domain allowlist is applied here. Unlike
+     * session identity, no DM confirmation is required: the requester
+     * principal is per person, so a group turn binds the asker's own grants
+     * without the space inheriting them. */
+    requester?: { verified: boolean; userEmail?: string }
   } = {}
 ): Promise<ExecuteSessionResponse> {
   const body: ExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(threadKey, message, {
       action: 'execute',
+      ...requesterMetadata(config, opts.requester),
       ...(opts.harnessType ? { harness_type: opts.harnessType } : {}),
       ...(opts.harnessAssignment
         ? { harness_assignment: harnessAssignmentMetadata(opts.harnessAssignment) }

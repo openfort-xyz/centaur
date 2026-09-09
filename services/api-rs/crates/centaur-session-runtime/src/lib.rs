@@ -3188,9 +3188,11 @@ impl SessionRuntime {
     }
 
     /// Resolve and upsert the principal of the human requesting this turn from
-    /// the execute metadata. `None` for DM and non-Slack threads (the
-    /// registrar decides) and on registrar failure: a broken requester lookup
-    /// must degrade to today's requester-less turn, never fail the execution.
+    /// the execute metadata. `None` when the ingress named no eligible
+    /// requester (the registrar decides: Slack DMs, unverified Google Chat
+    /// senders, other thread families) and on registrar failure: a broken
+    /// requester lookup must degrade to today's requester-less turn, never
+    /// fail the execution.
     async fn resolve_requester_principal(
         &self,
         thread_key: &ThreadKey,
