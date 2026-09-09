@@ -117,6 +117,9 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                     }
                 }
             }
+            Ok(BlocksCommand::Steer { steering, .. }) => {
+                steering.reply(&mut stdout, "failed")?;
+            }
             Ok(BlocksCommand::Interrupt) => {
                 eprintln!("Hermes blocks interrupt ignored: no active turn runs");
             }

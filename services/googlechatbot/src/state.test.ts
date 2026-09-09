@@ -11,6 +11,7 @@ import {
   transcriptEntryFromTurn,
   transcriptHistoryMessages,
   updateThreadState,
+  finishThreadExecution,
   workKey,
   type GoogleChatThreadState,
   type GoogleChatWorkObligation,
@@ -226,3 +227,19 @@ function obligation(): GoogleChatWorkObligation {
     workId: randomUUID()
   }
 }
+
+ test('an old renderer only clears its own acknowledgement and leaves a newer execution active', async () => {
+  const state = createMemoryState()
+  await state.connect()
+  await updateThreadState(state, 'overlapping', {
+    activeExecution: true, activeExecutionId: 'new', lastEventId: 20,
+    steeringAckMessageNames: ['old-ack', 'new-ack'],
+    steeringAckExecutions: { 'old-ack': 'old', 'new-ack': 'new' }
+  })
+  expect(await finishThreadExecution(state, 'overlapping', 'old', 10)).toEqual(['old-ack'])
+  expect(await state.get(threadStateKey('overlapping'))).toMatchObject({
+    activeExecution: true, activeExecutionId: 'new', lastEventId: 20,
+    steeringAckMessageNames: ['new-ack']
+  })
+  await state.disconnect()
+})

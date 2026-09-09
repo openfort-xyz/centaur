@@ -32,6 +32,7 @@ use crate::amp::AmpHarness;
 use crate::claude::ClaudeCodeHarness;
 use crate::codex::CodexHarnessServer;
 use crate::otel::{TraceContext, TurnStatus as TelemetryTurnStatus, TurnTelemetry};
+use crate::steering::Steering;
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
     NormalizedEvent, ThreadState,
@@ -104,6 +105,16 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 }
 
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
+                    Ok(BlocksCommand::Steer { input, steering })
+                        if turn_active.load(Ordering::SeqCst) =>
+                    {
+                        if request_tx
+                            .send(ActiveTurnRequest::Steer { input, steering })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                         if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
                             break;
@@ -165,11 +176,14 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     &request_rx,
                     &turn_active,
                 );
-                drain_active_turn_requests(&request_rx);
+                drain_active_turn_requests(&request_rx, &mut stdout)?;
                 if let Err(error) = result {
                     eprintln!("blocks turn failed: {error:#}");
                     write_blocks_error(&mut stdout, &state.id, "turn", error.to_string())?;
                 }
+            }
+            BlocksReaderInput::Command(BlocksCommand::Steer { steering, .. }) => {
+                steering.reply(&mut stdout, "not_active")?;
             }
             BlocksReaderInput::Command(BlocksCommand::Interrupt) => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
@@ -228,6 +242,9 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
                     eprintln!("request failed: {error:#}");
                 }
             }
+            ActiveTurnRequest::Steer { steering, .. } => {
+                steering.reply(&mut stdout, "not_active")?;
+            }
             ActiveTurnRequest::BlocksInterrupt => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
@@ -277,17 +294,33 @@ enum BlocksReaderInput {
 }
 
 enum ActiveTurnRequest {
+    Steer {
+        input: Vec<UserInput>,
+        steering: Steering,
+    },
     JsonRpc(JSONRPCRequest),
     BlocksInterrupt,
 }
 
-fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
-    while rx.try_recv().is_ok() {}
+fn drain_active_turn_requests(
+    rx: &Receiver<ActiveTurnRequest>,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    while let Ok(request) = rx.try_recv() {
+        if let ActiveTurnRequest::Steer { steering, .. } = request {
+            steering.reply(stdout, "not_active")?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum BlocksCommand {
+    Steer {
+        input: Vec<UserInput>,
+        steering: Steering,
+    },
     User {
         input: Vec<UserInput>,
         client_user_message_id: Option<String>,
@@ -567,6 +600,11 @@ pub(crate) fn parse_blocks_line_with_state(
                     text: "continue".to_string(),
                     text_elements: Vec::new(),
                 });
+            }
+            if let Some(steering) =
+                Steering::from_metadata(&serde_json::to_value(&trace_context.metadata)?)
+            {
+                return Ok(BlocksCommand::Steer { input, steering });
             }
             Ok(BlocksCommand::User {
                 input,
@@ -1258,8 +1296,31 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     process: &mut HarnessChild,
     normalizer: &mut CodexTurnNormalizer,
     request: ActiveTurnRequest,
+    execution_id: Option<&str>,
     stdout: &mut W,
 ) -> Result<bool> {
+    let request = match request {
+        ActiveTurnRequest::Steer { input, steering } => {
+            if execution_id != Some(steering.execution_id.as_str()) {
+                steering.reply(stdout, "not_active")?;
+                return Ok(false);
+            }
+            let result = process
+                .stdin
+                .write_all(&harness.stdin_for_steer(&input)?)
+                .and_then(|_| process.stdin.flush());
+            steering.reply(stdout, if result.is_ok() { "accepted" } else { "failed" })?;
+            if result.is_ok() {
+                for notification in
+                    normalizer.emit_user_message(Some(steering.message_id), input)?
+                {
+                    write_value(stdout, &notification_to_wire_value(&notification)?)?;
+                }
+            }
+            return Ok(false);
+        }
+        other => other,
+    };
     let ActiveTurnRequest::JsonRpc(request) = request else {
         process.kill_and_wait()?;
         return Ok(true);
@@ -1393,6 +1454,9 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         stdout,
         request_rx,
         &mut telemetry,
+        trace_context
+            .and_then(|trace| trace.metadata.get("execution_id"))
+            .and_then(Value::as_str),
     ) {
         Ok(Some(turn)) => {
             telemetry.finish(TelemetryTurnStatus::Completed);
@@ -1452,6 +1516,7 @@ fn finish_turn_with_error<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_harness_turn<H: HarnessServer, W: Write>(
     harness: &H,
     state: &mut ThreadState,
@@ -1460,6 +1525,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     stdout: &mut W,
     request_rx: &Receiver<ActiveTurnRequest>,
     telemetry: &mut TurnTelemetry,
+    execution_id: Option<&str>,
 ) -> Result<Option<codex_app_server_protocol::Turn>> {
     ensure_harness_process(harness, state)?;
     {
@@ -1491,7 +1557,14 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 .process
                 .as_mut()
                 .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
-            if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
+            if handle_active_turn_request(
+                harness,
+                process,
+                normalizer,
+                request,
+                execution_id,
+                stdout,
+            )? {
                 state.process = None;
                 return Err(HarnessServerError::TurnInterrupted {
                     kind: harness.kind(),

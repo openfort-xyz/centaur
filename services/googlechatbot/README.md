@@ -34,6 +34,20 @@ or a definitively missing acknowledgement uses a stable create. A Postgres-backe
 recovery sweep leases unfinished obligations after disconnects or restarts and
 delivers one canonical final answer.
 
+A mentioned follow-up in an active thread is persisted and sent to the running
+harness turn. Direct messages and the existing opt-in setting for unmentioned
+thread replies retain their current eligibility rules. The bot acknowledges
+harness acceptance without opening a second execution. The current tool call
+may finish before the harness consumes the update; steering does not undo work.
+If the turn has already ended, the bot asks for another mention instead of
+starting a hidden follow-up turn. An uncertain delivery is reported explicitly
+and is not automatically dispatched again.
+
+Steering requires the updated sandbox harness and session API. Roll these out
+before this bot, and drain old sandbox sessions before relying on confirmed
+steering. Codex, Claude, Amp, and Nanocodex are supported; other harnesses must
+not be treated as accepting an update without a correlated acknowledgement.
+
 The initial `--persona <id>` selection is pinned by api-rs for the session;
 later persona flags do not replace it. An unavailable requested persona produces
 a fallback notice. Helm supplies Console session links only when

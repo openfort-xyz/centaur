@@ -774,6 +774,26 @@ async fn append_messages(
     Json(request): Json<AppendMessagesRequest>,
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    if request.confirm_steering {
+        if request.forward_to_active_execution == Some(false) {
+            return Err(ApiError::BadRequest(
+                "confirm_steering requires forwarding".to_owned(),
+            ));
+        }
+        let (message_ids, steering) = state
+            .runtime()?
+            .append_messages_confirmed(
+                &thread_key,
+                &request.messages,
+                request.expected_execution_id.as_deref(),
+            )
+            .await?;
+        return Ok(Json(AppendMessagesResponse {
+            ok: true,
+            message_ids,
+            steering: Some(steering),
+        }));
+    }
     let message_ids = state
         .runtime()?
         .append_messages_with_forwarding(
@@ -783,6 +803,7 @@ async fn append_messages(
         )
         .await?;
     Ok(Json(AppendMessagesResponse {
+        steering: None,
         ok: true,
         message_ids,
     }))

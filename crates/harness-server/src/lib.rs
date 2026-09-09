@@ -8,6 +8,7 @@ mod nanocodex;
 mod nanocodex_subagents;
 mod otel;
 mod server;
+mod steering;
 mod traits;
 mod turn;
 mod util;

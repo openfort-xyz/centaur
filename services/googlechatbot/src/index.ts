@@ -32,6 +32,7 @@ import {
   assistantTurnMessage,
   createDefaultState,
   ensureStateConnected,
+  finishThreadExecution,
   persistWork,
   threadStateKey,
   transcriptEntryFromTurn,
@@ -831,13 +832,19 @@ export async function processWorkObligation(
 ): Promise<void> {
   const release = await acquireLease(
     state,
-    workLeaseKeyFor(initial),
+    `${workKey(initial.workId)}:lease`,
     120_000,
     60_000
   )
   if (!release) {
     incr('googlechatbot_recovery_total', { outcome: 'lease_skipped', source })
     return
+  }
+  let releaseThread: (() => Promise<void>) | null = null
+  const releaseHandoff = async () => {
+    const release = releaseThread
+    releaseThread = null
+    await release?.()
   }
   try {
     const work = (await state.get<GoogleChatWorkObligation>(workKey(initial.workId))) ?? initial
@@ -894,6 +901,10 @@ export async function processWorkObligation(
       return
     }
 
+    if (!work.executionId && !work.canonicalFinal) {
+      releaseThread = await acquireLease(state, workLeaseKeyFor(work), 120_000, 60_000)
+      if (!releaseThread) return
+    }
     if (!work.ackMessageName) {
       const messageId = `client-centaur-ack-${work.workId.replace(/-/g, '')}`
       try {
@@ -953,7 +964,8 @@ export async function processWorkObligation(
         confirmSpace: spaceName => spaceVerifier.confirm(spaceName)
       },
       state,
-      work
+      work,
+      releaseHandoff
     )
     await finishWork(state, work)
     incr('googlechatbot_recovery_total', { outcome: 'completed', source })
@@ -964,6 +976,7 @@ export async function processWorkObligation(
     incr('googlechatbot_recovery_total', { outcome: 'failed', source })
     logError('googlechatbot_work_failed', error, { source, work_id: initial.workId })
   } finally {
+    await releaseHandoff()
     await release()
   }
 }
@@ -1001,9 +1014,10 @@ export async function recoverWorkObligations(
   }
   setGauge('googlechatbot_pending_render_obligations', pending.length)
   incr('googlechatbot_recovery_total', { outcome: 'scan' })
-  for (const work of pending) {
-    await processWorkObligation(config, client, runtime, state, spaceVerifier, work, 'recovery')
-  }
+  // ponytail: at most WORK_INDEX_MAX_LENGTH recovery tasks; add a worker pool if backlog load requires it.
+  await Promise.all(pending.map(work =>
+    processWorkObligation(config, client, runtime, state, spaceVerifier, work, 'recovery')
+  ))
 }
 
 async function startRecoverySweeps(
@@ -1072,9 +1086,9 @@ async function recoverFinalRender(
     outcome,
     answer: renderState.answer
   })
-  await finishThreadRun(client, stateAdapter, work.event.thread_key, {
+  if (work.executionId) await finishThreadRun(client, stateAdapter, work.event.thread_key, {
     lastEventId: work.lastEventId
-  })
+  }, work.executionId)
 }
 
 function durableRenderTarget(work: GoogleChatWorkObligation) {
@@ -1163,7 +1177,8 @@ async function driveSession(
   ackMessageName: string,
   identity: IdentityContext,
   durableState: StateAdapter,
-  work: GoogleChatWorkObligation
+  work: GoogleChatWorkObligation,
+  releaseHandoff: () => Promise<void>
 ): Promise<void> {
   const threadKey = event.thread_key
   const { execute, history } = turnMessagesFromEvent(event)
@@ -1236,7 +1251,7 @@ async function driveSession(
         // api-rs pins the first persisted persona for the thread's lifetime;
         // re-sending the pinned one keeps it across a harness restart.
         ...(pinnedPersonaId ? { personaId: pinnedPersonaId } : {}),
-        restartOnHarnessConflict: Boolean(overrides.harnessType)
+        restartOnHarnessConflict: threadState.activeExecution !== true && Boolean(overrides.harnessType)
       }
     )
 
@@ -1245,20 +1260,9 @@ async function driveSession(
     // notice until the active execution delivers its answer.
     const forwarded = new Set(threadState.forwardedMessageIds ?? [])
     const appended = [...history, execute].filter(message => !forwarded.has(message.id))
-    if (session.activeExecution) {
-      await appendSessionMessages(config, threadKey, appended)
-      const held = await holdSteeringAck(client, ackMessageName)
-      await updateThreadState(durableState, threadKey, {
-        activeExecution: true,
-        forwardedMessageIds: appended.map(message => message.id),
-        ...(held ? { steeringAckMessageNames: [ackMessageName] } : {}),
-        ...dmTranscriptUpdate(event, execute)
-      }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
-      incr('googlechatbot_runs_total', { outcome: 'folded' })
-      logWarn('googlechatbot_folded_into_active_run', {
-        thread_key: threadKey,
-        message_id: execute.id
-      })
+    if (session.activeExecution || threadState.activeExecution === true) {
+      await appendSessionMessagesBestEffort(config, threadKey, history.filter(message => !forwarded.has(message.id)))
+      await acceptActiveFollowUp(config, client, durableState, event, execute, ackMessageName, threadState.activeExecutionId)
       return
     }
 
@@ -1290,17 +1294,13 @@ async function driveSession(
       // execute on its one-active-execution index (409 once api-rs types the
       // conflict; an opaque 500 on older servers). Re-check and fold into the
       // live run instead of erroring into the thread.
-      const folded = await foldIntoActiveRun(config, client, threadKey, execute, ackMessageName, error, {
-        conversationName: conversationName(event),
-        harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
-      })
-      if (folded) {
-        await updateThreadState(durableState, threadKey, {
-          forwardedMessageIds: [execute.id],
-          ...(folded.steeringAckHeld ? { steeringAckMessageNames: [ackMessageName] } : {}),
-          ...dmTranscriptUpdate(event, execute)
-        }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
-        return
+      const conflictClass = classifyExecuteConflict(error)
+      if (conflictClass !== 'unrelated') {
+        const recheck = await createSession(config, threadKey, conversationName(event), session.harnessType)
+        if (recheck.activeExecution || conflictClass === 'conflict') {
+          await acceptActiveFollowUp(config, client, durableState, event, execute, ackMessageName, threadState.activeExecutionId)
+          return
+        }
       }
       throw error
     }
@@ -1311,6 +1311,7 @@ async function driveSession(
     await appendSessionMessagesBestEffort(config, threadKey, appended)
     await updateThreadState(durableState, threadKey, {
       activeExecution: true,
+      activeExecutionId: execution.execution_id,
       executedMessageIds: [execute.id],
       forwardedMessageIds: appended.map(message => message.id),
       ...dmTranscriptUpdate(event, execute),
@@ -1326,6 +1327,7 @@ async function driveSession(
     work.executionId = execution.execution_id
     work.stage = 'rendering'
     await persistWork(durableState, work)
+    await releaseHandoff()
     // "Open chat in Console" trailer on the FIRST assistant message in a
     // thread (no earlier thread history = this event started the thread),
     // mirroring slackbotv2's console-session-link. Undefined when no Console
@@ -1421,7 +1423,7 @@ async function driveSession(
       outcome: deliveryOutcome,
       answer: state.answer
     })
-    await finishThreadRun(client, durableState, threadKey, { lastEventId })
+    await finishThreadRun(client, durableState, threadKey, { lastEventId }, execution.execution_id)
     incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
     // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
     // aggregate both: the final answer is written once and visible.
@@ -1442,7 +1444,7 @@ async function driveSession(
     if (!delivered) throw error
     work.stage = 'final'
     await persistWork(durableState, work)
-    await finishThreadRun(client, durableState, threadKey)
+    if (work.executionId) await finishThreadRun(client, durableState, threadKey, {}, work.executionId)
   }
 }
 
@@ -1569,48 +1571,43 @@ async function deliverDriveError(
   }
 }
 
-/** Recovery for the execute-vs-execute race: when `/execute` is rejected
- * because another run is already active for the thread, append the message so
- * the live run picks it up (steering) and turn the ack into a steering
- * notice. Returns the fold outcome when this event needs no run of its own. */
-async function foldIntoActiveRun(
+async function acceptActiveFollowUp(
   config: AppConfig,
   client: ChatEdgeClient,
-  threadKey: string,
+  state: StateAdapter,
+  event: NormalizedChatEvent,
   execute: GoogleChatTurnMessage,
   ackMessageName: string,
-  error: unknown,
-  session: { conversationName?: string; harnessType?: string }
-): Promise<{ steeringAckHeld: boolean } | false> {
-  const conflictClass = classifyExecuteConflict(error)
-  if (conflictClass === 'unrelated') return false
-  let active = conflictClass === 'conflict'
-  if (!active) {
-    try {
-      // Same harness/name as the original createSession: a mismatched
-      // harness_type would turn this idempotent re-check into its own 409.
-      const recheck = await createSession(
-        config,
-        threadKey,
-        session.conversationName,
-        session.harnessType
-      )
-      active = recheck.activeExecution
-    } catch (recheckError) {
-      logWarn('googlechatbot_fold_recheck_failed', recheckError)
-      return false
+  expectedExecutionId?: string
+): Promise<void> {
+  const results = await appendSessionMessages(config, event.thread_key, [execute], { confirmSteering: true, expectedExecutionId })
+  const result = results[0]
+  if (result?.status === 'accepted' && result.execution_id) {
+    const held = await holdSteeringAck(client, ackMessageName)
+    await updateThreadState(state, event.thread_key, {
+      forwardedMessageIds: [execute.id],
+      ...(held ? {
+        steeringAckMessageNames: [ackMessageName],
+        steeringAckExecutions: { [ackMessageName]: result.execution_id }
+      } : {}),
+      ...dmTranscriptUpdate(event, execute)
+    }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
+    // Completion may have raced the acknowledgement. Do not strand a notice.
+    const session = await createSession(config, event.thread_key)
+    const current = await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key))
+    if (!session.activeExecution || (current?.activeExecutionId && current.activeExecutionId !== result.execution_id)) {
+      await finishThreadRun(client, state, event.thread_key, {}, result.execution_id)
     }
+    incr('googlechatbot_runs_total', { outcome: 'folded' })
+    return
   }
-  if (!active) return false
-  await appendSessionMessages(config, threadKey, [execute])
-  const steeringAckHeld = await holdSteeringAck(client, ackMessageName)
-  incr('googlechatbot_runs_total', { outcome: 'folded' })
-  logWarn('googlechatbot_folded_into_active_run', {
-    thread_key: threadKey,
-    message_id: execute.id,
-    reason: 'execute_conflict'
-  })
-  return { steeringAckHeld }
+  const text = result?.status === 'not_active'
+    ? 'This task finished before I could apply your update. Mention me again with the update to start another turn.'
+    : result?.status === 'failed'
+      ? 'I could not send your update to the running task. Mention me again to retry.'
+      : 'I could not confirm whether the running task received your update. Check its answer before sending it again.'
+  await client.updateMessage(ackMessageName, { text, cardsV2: [] })
+  incr('googlechatbot_runs_total', { outcome: result?.status ?? 'unknown' })
 }
 
 /** slackbotv2 reacts to a steering message and clears the reaction when the
@@ -1637,16 +1634,10 @@ async function finishThreadRun(
   client: ChatEdgeClient,
   durableState: StateAdapter,
   threadKey: string,
-  update: Partial<GoogleChatThreadState> = {}
+  update: Partial<GoogleChatThreadState> = {},
+  executionId?: string
 ): Promise<void> {
-  const held =
-    (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey)))
-      ?.steeringAckMessageNames ?? []
-  await updateThreadState(durableState, threadKey, {
-    ...update,
-    activeExecution: false,
-    steeringAckMessageNames: []
-  })
+  const held = await finishThreadExecution(durableState, threadKey, executionId, update.lastEventId)
   for (const name of held) await removeAck(client, name)
 }
 

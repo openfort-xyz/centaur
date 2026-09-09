@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::nanocodex_subagents::{ChildAgents, with_subagents};
 use crate::server::{AttachmentIntegrity, AttachmentIntegrityMetadata};
+use crate::steering::Steering;
 use crate::util::default_codex_home;
 use crate::{HarnessServerError, Result};
 
@@ -58,6 +59,16 @@ async fn run() -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
+        if let Some(steering) = line_steering(&line) {
+            steering.reply(&mut stdout, "not_active")?;
+            continue;
+        }
+        let execution_id = serde_json::from_str::<Value>(&line).ok().and_then(|value| {
+            value
+                .pointer("/trace_metadata/execution_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
         match parse_blocks_line(&line, &mut staged)? {
             BlocksCommand::User {
                 prompt,
@@ -97,6 +108,7 @@ async fn run() -> Result<()> {
                     &mut staged,
                     &mut stdout,
                     subagents_enabled,
+                    execution_id.as_deref(),
                 )
                 .await?;
             }
@@ -170,6 +182,7 @@ async fn run_turn(
     staged: &mut HashMap<String, AttachmentStage>,
     stdout: &mut impl Write,
     subagents_enabled: bool,
+    execution_id: Option<&str>,
 ) -> Result<()> {
     let mut input_open = true;
     loop {
@@ -193,6 +206,12 @@ async fn run_turn(
                 if line.trim().is_empty() {
                     continue;
                 }
+                let steering = line_steering(&line);
+                if let Some(steering) = &steering
+                    && execution_id != Some(steering.execution_id.as_str()) {
+                    steering.reply(stdout, "not_active")?;
+                    continue;
+                }
                 match parse_blocks_line(&line, staged)? {
                     BlocksCommand::User {
                         prompt,
@@ -202,7 +221,10 @@ async fn run_turn(
                         if subagents && !subagents_enabled {
                             eprintln!("nanocodex --subagents only applies to the first session message");
                         }
-                        turn.steer(prompt).await.map_err(nanocodex_error)?;
+                        let result = turn.steer(prompt).await;
+                        if let Some(steering) = steering {
+                            steering.reply(stdout, if result.is_ok() { "accepted" } else { "failed" })?;
+                        } else { result.map_err(nanocodex_error)?; }
                     }
                     BlocksCommand::AttachmentChunk => {}
                     BlocksCommand::Interrupt => {
@@ -642,6 +664,11 @@ fn required_value_string_alias(value: &Value, name: &str, alias: &str) -> Result
             .map(ToOwned::to_owned),
         name,
     )
+}
+
+fn line_steering(line: &str) -> Option<Steering> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    Steering::from_metadata(value.get("trace_metadata")?)
 }
 
 #[cfg(test)]

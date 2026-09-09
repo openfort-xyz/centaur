@@ -48,6 +48,8 @@ type CreateSessionRequest = {
 }
 
 type AppendMessagesRequest = {
+  confirm_steering?: boolean
+  expected_execution_id?: string
   forward_to_active_execution?: boolean
   messages: Array<{
     client_message_id?: string
@@ -349,10 +351,11 @@ export async function appendSessionMessages(
   config: AppConfig,
   threadKey: string,
   messages: GoogleChatTurnMessage[],
-  opts: { forwardToActiveExecution?: boolean } = {}
-): Promise<void> {
-  if (messages.length === 0) return
+  opts: { forwardToActiveExecution?: boolean; confirmSteering?: boolean; expectedExecutionId?: string } = {}
+): Promise<SteeringResult[]> {
+  if (messages.length === 0) return []
   const body: AppendMessagesRequest = {
+    ...(opts.confirmSteering ? { confirm_steering: true, expected_execution_id: opts.expectedExecutionId } : {}),
     ...(opts.forwardToActiveExecution === undefined
       ? {} : { forward_to_active_execution: opts.forwardToActiveExecution }),
     messages: messages.map(message => ({
@@ -362,7 +365,7 @@ export async function appendSessionMessages(
       metadata: sessionMetadata(threadKey, message)
     }))
   }
-  await sessionApiRequest('append_messages', 'append session messages', signal =>
+  const response = await sessionApiRequest('append_messages', 'append session messages', signal =>
     fetch(apiSessionUrl(config, threadKey, 'messages'), {
       method: 'POST',
       headers: apiHeaders(config),
@@ -370,6 +373,15 @@ export async function appendSessionMessages(
       signal
     }), config.GOOGLECHATBOT_SESSION_API_TIMEOUT_MS
   )
+  if (!opts.confirmSteering) return []
+  const bodyResult = await response.json() as { steering?: SteeringResult[] }
+  return bodyResult.steering ?? []
+}
+
+export type SteeringResult = {
+  message_id: string
+  execution_id?: string | null
+  status: 'accepted' | 'not_active' | 'failed' | 'unknown'
 }
 
 export type TurnOverrides = {

@@ -103,6 +103,10 @@ pub struct GoogleChatThreadContext {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppendMessagesRequest {
+    #[serde(default)]
+    pub confirm_steering: bool,
+    #[serde(default)]
+    pub expected_execution_id: Option<String>,
     pub messages: Vec<SessionMessageInput>,
     /// False records transcript context without sending another harness input.
     /// Omitted retains the existing active-turn steering behavior.
@@ -112,6 +116,8 @@ pub struct AppendMessagesRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppendMessagesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steering: Option<Vec<serde_json::Value>>,
     pub ok: bool,
     pub message_ids: Vec<String>,
 }

@@ -1743,6 +1743,88 @@ impl SessionRuntime {
             .await
     }
 
+    /// Confirm harness acceptance separately from durable transcript persistence.
+    pub async fn append_messages_confirmed(
+        &self,
+        thread_key: &ThreadKey,
+        messages: &[SessionMessageInput],
+        expected_execution_id: Option<&str>,
+    ) -> Result<(Vec<String>, Vec<Value>), SessionRuntimeError> {
+        let message_ids = self
+            .append_messages_with_forwarding(thread_key, messages, false)
+            .await?;
+        let mut results = Vec::new();
+        for (message, message_id) in messages.iter().zip(&message_ids) {
+            if message.role != MessageRole::User {
+                continue;
+            }
+            let execution = self
+                .store
+                .active_execution_for_thread(thread_key)
+                .await?
+                .filter(|execution| {
+                    expected_execution_id.is_none_or(|expected| expected == execution.execution_id)
+                });
+            let execution_id = execution
+                .as_ref()
+                .map(|execution| execution.execution_id.as_str());
+            let (claimed, attempt) = self
+                .store
+                .claim_steering(thread_key, execution_id, message_id)
+                .await?;
+            if claimed {
+                let mut status = None;
+                if let Some(execution_id) = execution_id {
+                    match self
+                        .wait_for_active_steering_pipe(thread_key, execution_id)
+                        .await
+                    {
+                        Ok(pipe) => {
+                            let trace =
+                                SessionTraceContext::for_execution(None, None, Some(execution_id));
+                            let lines = input_lines_with_session_context(
+                                thread_key,
+                                &trace,
+                                &steering_input_lines(
+                                    thread_key,
+                                    std::slice::from_ref(message),
+                                    std::slice::from_ref(message_id),
+                                ),
+                            );
+                            if write_input_lines(&pipe, &lines, thread_key, execution_id, None)
+                                .await
+                                .is_err()
+                            {
+                                // A partial write is ambiguous. Never redispatch this durable attempt.
+                                status = Some("unknown");
+                            }
+                        }
+                        Err(_) => status = Some("failed"),
+                    }
+                } else {
+                    status = Some("not_active");
+                }
+                if let Some(status) = status {
+                    self.store.append_event(thread_key, execution_id, "session.steering_result",
+                        json!({"message_id": message_id, "execution_id": execution_id, "status": status})).await?;
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(event) = self.store.steering_result(thread_key, message_id).await? {
+                    results.push(event.payload);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    results.push(json!({"message_id": message_id, "execution_id": attempt.execution_id, "status": "unknown"}));
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok((message_ids, results))
+    }
+
     /// Persist transcript messages, optionally steering an active execution.
     /// Callers that already supplied these messages to execute must pass false.
     pub async fn append_messages_with_forwarding(
@@ -4848,6 +4930,23 @@ async fn run_stdout_pump(
             };
             line_count += 1;
             let output_value = serde_json::from_str::<Value>(&line).ok();
+            if let Some(value) = &output_value
+                && value.get("type").and_then(Value::as_str) == Some("centaur.steering_result")
+            {
+                if let (Some(message_id), Some(execution_id), Some(status)) = (
+                    value.get("message_id").and_then(Value::as_str),
+                    value.get("execution_id").and_then(Value::as_str),
+                    value.get("status").and_then(Value::as_str),
+                ) && matches!(status, "accepted" | "not_active" | "failed") {
+                    let valid = ctx.store.steering_belongs_to_session(&thread_key, message_id, execution_id).await?;
+                    if valid {
+                        ctx.store.append_event(&thread_key, Some(execution_id), "session.steering_result",
+                            json!({"message_id": message_id, "execution_id": execution_id, "status": status})).await?;
+                    }
+                }
+                continue;
+            }
+
             if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line)
                 && let Err(error) = ctx
                     .store
@@ -9699,6 +9798,87 @@ mod adoption_tests {
         assert!(input.to_string().contains("a real follow-up"));
         assert!(!input.to_string().contains("already executed"));
         store.complete_execution(&execution_id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confirmed_steering_is_durable_and_does_not_redispatch() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:confirmed-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-confirmed"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-confirmed")
+            .await
+            .unwrap();
+        let message = SessionMessageInput {
+            client_message_id: Some("follow-up".to_owned()),
+            role: MessageRole::User,
+            parts: vec![json!({"type":"text", "text":"also check X"})],
+            metadata: json!({}),
+        };
+        let stale = SessionMessageInput {
+            client_message_id: Some("wrong-execution".to_owned()),
+            ..message.clone()
+        };
+        let (_, rejected) = runtime
+            .append_messages_confirmed(&thread_key, &[stale], Some("previous-execution"))
+            .await
+            .unwrap();
+        assert_eq!(rejected[0]["status"], "not_active");
+        let messages = [message];
+        let mut stdin = BufReader::new(stdin);
+        let receive = async {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), stdin.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let input: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(input["trace_metadata"]["execution_id"], execution_id);
+            let result = json!({"type":"centaur.steering_result", "message_id":input["trace_metadata"]["message_id"],
+                "execution_id":execution_id,"status":"accepted"});
+            stdout
+                .write_all(format!("{result}\n").as_bytes())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            runtime.append_messages_confirmed(&thread_key, &messages, None),
+            receive
+        );
+        let (ids, outcomes) = result.unwrap();
+        assert_eq!(outcomes[0]["status"], "accepted");
+        store.complete_execution(&execution_id).await.unwrap();
+        let (retry_ids, retry_outcomes) = runtime
+            .append_messages_confirmed(&thread_key, &messages, None)
+            .await
+            .unwrap();
+        assert_eq!(ids, retry_ids);
+        assert_eq!(outcomes, retry_outcomes);
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stdin.read(&mut byte))
+                .await
+                .is_err()
+        );
+        let new_message = SessionMessageInput {
+            client_message_id: Some("late-follow-up".to_owned()),
+            ..messages[0].clone()
+        };
+        let (_, outcomes) = runtime
+            .append_messages_confirmed(&thread_key, &[new_message], None)
+            .await
+            .unwrap();
+        assert_eq!(outcomes[0]["status"], "not_active");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

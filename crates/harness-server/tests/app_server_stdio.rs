@@ -84,6 +84,182 @@ impl Harness {
 }
 
 #[test]
+#[ignore = "runs real Codex and Claude CLIs with network/auth calls"]
+fn real_blocks_follow_up_changes_the_running_answer() {
+    for harness in [Harness::Codex, Harness::ClaudeCode] {
+        real_blocks_steering(harness);
+    }
+}
+
+#[test]
+#[ignore = "runs real Amp with network/auth calls"]
+fn real_amp_blocks_follow_up_changes_the_running_answer() {
+    real_blocks_steering(Harness::Amp);
+}
+
+fn real_blocks_steering(harness: Harness) {
+    let workspace = temp_path("real-steering-workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_harness-server"));
+    command
+        .args(harness.blocks_args())
+        .current_dir(&workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut bridge = BridgeProcess::spawn_command(command);
+    bridge.send(json!({"type":"user", "text":"Run a shell command that sleeps for 8 seconds. Do not read or change any files. Then reply exactly ORIGINAL unless a follow-up changes the requested answer.", "trace_metadata":{"execution_id":"exe-real-steer"}}));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut sent = false;
+    let mut accepted = false;
+    let mut updated = false;
+    loop {
+        let value = bridge.read_json_allowing_error(deadline);
+        let method = value.get("method").and_then(Value::as_str);
+        if !sent
+            && method == Some("item/started")
+            && value.pointer("/params/item/type").and_then(Value::as_str) != Some("userMessage")
+        {
+            bridge.send(json!({"type":"user", "text":"Follow-up: after the sleep, reply exactly STEERED_X instead of ORIGINAL.", "trace_metadata":{"action":"steer_active_execution", "message_id":"msg-real-steer", "execution_id":"exe-real-steer"}}));
+            sent = true;
+        }
+        if value["type"] == "centaur.steering_result" {
+            accepted = value["status"] == "accepted";
+        }
+        if method == Some("item/completed")
+            && value.pointer("/params/item/type").and_then(Value::as_str) == Some("agentMessage")
+        {
+            updated |= value
+                .pointer("/params/item/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("STEERED_X"));
+        }
+        if method == Some("turn/completed") {
+            break;
+        }
+    }
+    bridge.finish_successfully();
+    assert!(
+        sent && accepted && updated,
+        "{} failed live steering",
+        harness.name()
+    );
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn blocks_follow_up_steers_active_turn_and_rejects_late_input() {
+    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::Amp] {
+        let script_path = temp_path("steering-harness.py");
+        let log = temp_path("steering-harness.jsonl");
+        let script = r#"#!/usr/bin/env python3
+import json, sys
+codex = len(sys.argv) > 1 and sys.argv[1] == 'app-server'
+if '--help' in sys.argv:
+    print('--listen stdio://'); sys.exit(0)
+def emit(value): print(json.dumps(value), flush=True)
+count = 0
+steers = 0
+for line in sys.stdin:
+    value = json.loads(line)
+    with open(LOG, 'a') as f: f.write(line)
+    if codex:
+        method, rid = value.get('method'), value.get('id')
+        if method == 'initialize': emit({'id': rid, 'result': {}})
+        elif method in ('thread/start', 'thread/resume'): emit({'id': rid, 'result': {'thread': {'id': 'thread-1'}}})
+        elif method == 'turn/start':
+            count += 1
+            assert count == 1, 'follow-up must not start another turn'
+            emit({'id': rid, 'result': {'turn': {'id': 'turn-1'}}})
+            emit({'method': 'turn/started', 'params': {'threadId':'thread-1', 'turn': {'id':'turn-1', 'items':[], 'itemsView':'full', 'status':'inProgress', 'error':None}}})
+        elif method == 'turn/steer':
+            steers += 1
+            assert value['params']['expectedTurnId'] == 'turn-1'
+            emit({'id': rid, 'result': {'turnId': 'turn-1'}})
+            if steers < 2: continue
+            emit({'method':'item/agentMessage/delta','params':{'threadId':'thread-1','turnId':'turn-1','itemId':'answer','delta':'Updated answer includes X'}})
+            emit({'method':'turn/completed','params':{'threadId':'thread-1','turn':{'id':'turn-1','items':[],'itemsView':'full','status':'completed','error':None}}})
+    else:
+        count += 1
+        if count == 1:
+            emit({'type':'system','subtype':'init','session_id':'session-1'})
+        elif count == 3:
+            emit({'type':'assistant','message':{'id':'answer','role':'assistant','content':[{'type':'text','text':'Updated answer includes X'}], 'stop_reason':'end_turn'}})
+            emit({'type':'result','subtype':'success','result':'Updated answer includes X'})
+"#;
+        std::fs::write(
+            &script_path,
+            script.replace("LOG", &format!("{:?}", log.to_str().unwrap())),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut bridge = if harness == Harness::Codex {
+            BridgeProcess::spawn_harness_blocks(
+                harness,
+                None,
+                Some(("CODEX_BIN", script_path.to_str().unwrap())),
+            )
+        } else {
+            BridgeProcess::spawn_harness_blocks(
+                harness,
+                Some(format!("python3 {}", script_path.display())),
+                None,
+            )
+        };
+        bridge.send(json!({"type":"user","text":"Original task", "trace_metadata":{"execution_id":"exe-steer"}}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let value = bridge.read_json(deadline);
+            if value.get("method").and_then(Value::as_str) == Some("turn/started") {
+                break;
+            }
+        }
+        bridge.send(json!({"type":"user","text":"Also check X", "trace_metadata":{"action":"steer_active_execution", "message_id":"msg-steer", "execution_id":"exe-steer"}}));
+        let mut accepted = 0;
+        let mut answer = false;
+        loop {
+            let value = bridge.read_json(deadline);
+            if value["type"] == "centaur.steering_result" {
+                assert_eq!(value["status"], "accepted");
+                accepted += 1;
+                if accepted == 1 {
+                    bridge.send(json!({"type":"user","text":"And check Y", "trace_metadata":{"action":"steer_active_execution", "message_id":"msg-steer-2", "execution_id":"exe-steer"}}));
+                }
+            }
+            answer |= value.to_string().contains("Updated answer includes X");
+            if value.get("method").and_then(Value::as_str) == Some("turn/completed") {
+                break;
+            }
+        }
+        assert!(
+            accepted == 2 && answer,
+            "{} lost its steered answer",
+            harness.name()
+        );
+        bridge.send(json!({"type":"user","text":"too late", "trace_metadata":{"action":"steer_active_execution", "message_id":"msg-late", "execution_id":"exe-steer"}}));
+        loop {
+            let value = bridge.read_json(deadline);
+            if value["type"] == "centaur.steering_result" {
+                assert_eq!(value["status"], "not_active");
+                break;
+            }
+        }
+        bridge.finish_successfully();
+        let lines = std::fs::read_to_string(&log).unwrap();
+        assert!(!lines.contains("too late"));
+        if harness == Harness::Amp {
+            assert!(
+                lines.contains("\\\"steer\\\":true")
+                    || lines.contains("\"steer\":true")
+                    || lines.contains("\"steer\": true")
+            );
+        }
+        let _ = std::fs::remove_file(script_path);
+        let _ = std::fs::remove_file(log);
+    }
+}
+
+#[test]
 fn fake_claude_app_server_streams_codex_v2_notifications() {
     let fake_claude = concat!(
         "printf '%s\\n' ",
@@ -2092,6 +2268,15 @@ impl RawProcess {
 }
 
 fn validate_jsonrpc_value(value: &Value, allow_error: bool) {
+    if value.get("type").and_then(Value::as_str) == Some("centaur.steering_result") {
+        assert!(value["message_id"].is_string());
+        assert!(value["execution_id"].is_string());
+        assert!(matches!(
+            value["status"].as_str(),
+            Some("accepted" | "not_active" | "failed")
+        ));
+        return;
+    }
     let message: JSONRPCMessage =
         serde_json::from_value(value.clone()).expect("valid JSON-RPC message");
     match message {

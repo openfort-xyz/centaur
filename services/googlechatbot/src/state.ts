@@ -33,6 +33,8 @@ export type TranscriptEntry = {
 
 export type GoogleChatThreadState = {
   activeExecution?: boolean
+  activeExecutionId?: string
+  steeringAckExecutions?: Record<string, string>
   executedMessageIds?: string[]
   forwardedMessageIds?: string[]
   harnessType?: string | null
@@ -172,6 +174,7 @@ export async function updateThreadState(
   try {
     const current = (await state.get<GoogleChatThreadState>(key)) ?? {}
     const next = { ...current, ...update }
+    if (update.lastEventId !== undefined) next.lastEventId = Math.max(current.lastEventId ?? 0, update.lastEventId)
     if (next.forwardedMessageIds) {
       next.forwardedMessageIds = capIds([
         ...(current.forwardedMessageIds ?? []),
@@ -183,6 +186,9 @@ export async function updateThreadState(
         ...(current.executedMessageIds ?? []),
         ...(update.executedMessageIds ?? [])
       ])
+    }
+    if (update.steeringAckExecutions) {
+      next.steeringAckExecutions = { ...current.steeringAckExecutions, ...update.steeringAckExecutions }
     }
     if (update.steeringAckMessageNames) {
       next.steeringAckMessageNames = update.steeringAckMessageNames.length === 0
@@ -200,6 +206,43 @@ export async function updateThreadState(
     }
     await state.set(key, next)
     return next
+  } finally {
+    await state.releaseLock(lock)
+  }
+}
+
+/** Complete only the execution that owns this render, under the state lock. */
+export async function finishThreadExecution(
+  state: StateAdapter,
+  threadKey: string,
+  executionId?: string,
+  lastEventId?: number
+): Promise<string[]> {
+  const key = threadStateKey(threadKey)
+  const lock = await state.acquireLock(key, 30_000)
+  if (!lock) throw new Error(`Google Chat thread state is busy: ${threadKey}`)
+  try {
+    const current = (await state.get<GoogleChatThreadState>(key)) ?? {}
+    const names = (current.steeringAckMessageNames ?? []).filter(name =>
+      current.steeringAckExecutions?.[name] === executionId
+      || (!current.steeringAckExecutions?.[name] && !current.activeExecutionId)
+    )
+    const removed = new Set(names)
+    await state.set(key, {
+      ...current,
+      ...(current.activeExecutionId === executionId || !current.activeExecutionId
+        ? {
+            activeExecution: false,
+            activeExecutionId: undefined,
+            lastEventId: Math.max(current.lastEventId ?? 0, lastEventId ?? 0)
+          }
+        : {}),
+      steeringAckMessageNames: (current.steeringAckMessageNames ?? []).filter(name => !removed.has(name)),
+      steeringAckExecutions: Object.fromEntries(
+        Object.entries(current.steeringAckExecutions ?? {}).filter(([name]) => !removed.has(name))
+      )
+    })
+    return names
   } finally {
     await state.releaseLock(lock)
   }

@@ -1094,6 +1094,54 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    /// Reserve a steering attempt under the durable message row lock. An uncertain
+    /// attempt is never sent twice after a request timeout or process restart.
+    pub async fn claim_steering(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: Option<&str>,
+        message_id: &str,
+    ) -> Result<(bool, SessionEvent), SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("select message_id from session_messages where thread_key = $1 and message_id = $2 for update")
+            .bind(thread_key.as_str()).bind(message_id).fetch_one(&mut *tx).await?;
+        let existing = sqlx::query_as::<_, SessionEventRow>(
+            "select event_id, thread_key, execution_id, event_type, payload, created_at from session_events where thread_key = $1 and event_type in ('session.steering_requested', 'session.steering_result') and payload->>'message_id' = $2 order by event_id desc limit 1")
+            .bind(thread_key.as_str()).bind(message_id).fetch_optional(&mut *tx).await?;
+        if let Some(event) = existing {
+            tx.commit().await?;
+            return Ok((false, event.try_into()?));
+        }
+        let event = sqlx::query_as::<_, SessionEventRow>(
+            "insert into session_events (thread_key, execution_id, event_type, payload) values ($1, $2, 'session.steering_requested', $3) returning event_id, thread_key, execution_id, event_type, payload, created_at")
+            .bind(thread_key.as_str()).bind(execution_id)
+            .bind(serde_json::json!({"message_id": message_id, "execution_id": execution_id}))
+            .fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok((true, event.try_into()?))
+    }
+
+    pub async fn steering_belongs_to_session(
+        &self,
+        thread_key: &ThreadKey,
+        message_id: &str,
+        execution_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query_scalar("select exists (select 1 from session_messages m join session_executions e on e.thread_key = m.thread_key where m.thread_key = $1 and m.message_id = $2 and e.execution_id = $3)")
+            .bind(thread_key.as_str()).bind(message_id).bind(execution_id).fetch_one(&self.pool).await?)
+    }
+
+    pub async fn steering_result(
+        &self,
+        thread_key: &ThreadKey,
+        message_id: &str,
+    ) -> Result<Option<SessionEvent>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionEventRow>(
+            "select event_id, thread_key, execution_id, event_type, payload, created_at from session_events where thread_key = $1 and event_type = 'session.steering_result' and payload->>'message_id' = $2 order by event_id desc limit 1")
+            .bind(thread_key.as_str()).bind(message_id).fetch_optional(&self.pool).await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn list_events_after(
         &self,
         thread_key: &ThreadKey,

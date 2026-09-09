@@ -84,6 +84,9 @@ function installMockFetch(): {
         headers: { 'content-type': 'application/json' }
       })
     }
+    if (url.endsWith('/messages') && (body as { confirm_steering?: boolean })?.confirm_steering) {
+      return Response.json({ ok: true, steering: [{ message_id: 'msg-follow-up', execution_id: 'exec-1', status: 'accepted' }] })
+    }
     if (url.endsWith('/execute')) {
       return new Response(
         JSON.stringify({
@@ -972,6 +975,51 @@ describe('googlechatbot DM thread transcript', () => {
     expect(appended()).toHaveLength(appendsBefore)
   }, 30_000)
 
+  test('a follow-up reaches the active turn while the first handler is still rendering', async () => {
+    const baseFetch = globalThis.fetch
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/execute')) mock.activeThreads.push(DM_THREAD_KEY)
+      if (url.includes('/events?')) return new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller } }), { headers: { 'content-type': 'text/event-stream' } })
+      return baseFetch(input, init)
+    }) as typeof fetch
+    const state = createMemoryState()
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state }).app
+    await bot.request('/api/chat/events', dmEvent('concurrent-1', 'start a long task'))
+    await waitFor(() => streamController !== undefined)
+    try {
+      await bot.request('/api/chat/events', dmEvent('concurrent-2', 'also check X'))
+      await waitFor(() => mock.calls.some(call => call.url.endsWith('/messages') && (call.body as { confirm_steering?: boolean })?.confirm_steering === true))
+      expect(executes()).toHaveLength(1)
+      const steers = mock.calls.filter(call => (call.body as { confirm_steering?: boolean })?.confirm_steering)
+      expect(steers).toHaveLength(1)
+      expect(JSON.stringify(steers[0]!.body)).toContain('also check X')
+      expect(JSON.stringify(steers[0]!.body)).not.toContain('start a long task')
+    } finally {
+      mock.activeThreads.length = 0
+      streamController!.enqueue(new TextEncoder().encode('event: session.execution_completed\nid: 1\ndata: {"result":"Completed, including X."}\n\n'))
+      streamController!.close()
+    }
+    await waitFor(() => mock.calls.some(call => JSON.stringify(call.body ?? {}).includes('Completed, including X.')))
+    await waitFor(async () => (await state.get<GoogleChatThreadState>(threadStateKey(DM_THREAD_KEY)))?.activeExecution === false)
+  })
+
+  test('an update rejected at completion asks for another mention without executing', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    await state.set(threadStateKey(DM_THREAD_KEY), { activeExecution: true, activeExecutionId: 'exec-1' })
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/messages') && String(init?.body).includes('confirm_steering')) return Response.json({ steering: [{ message_id: 'msg-late', status: 'not_active' }] })
+      return baseFetch(input, init)
+    }) as typeof fetch
+    const bot = createGooglechatbot(loadConfig(CHATBOT_ENV), { state }).app
+    await bot.request('/api/chat/events', dmEvent('late-update', 'also check X'))
+    await waitFor(() => mock.calls.some(call => JSON.stringify(call.body ?? {}).includes('Mention me again with the update')))
+    expect(executes()).toHaveLength(0)
+  })
+
   test('a folded DM turn enters the transcript and only it is appended', async () => {
     const state = createMemoryState()
     await state.connect()
@@ -1010,7 +1058,7 @@ describe('googlechatbot DM thread transcript', () => {
         ?.steeringAckMessageNames?.length ?? 0) > 0
     )
     const steering = mock.calls.find(c =>
-      c.method === 'PATCH' && (c.body as { text?: string })?.text?.includes('running turn')
+      c.method === 'PATCH' && (c.body as { text?: string })?.text?.includes('running task')
     )
     expect(steering).toBeTruthy()
     expect(mock.calls.some(c => c.method === 'DELETE')).toBe(false)
