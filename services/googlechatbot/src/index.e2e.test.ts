@@ -311,16 +311,16 @@ describe('googlechatbot webhook e2e', () => {
     expect(work?.event).toBeUndefined()
   })
 
-  test('asks Chat for the sender identity once, then processes their events as usual', async () => {
+  test('an unsigned Add-on event never resolves its sender from the directory', async () => {
     const mock = installMockFetch()
     const state = createMemoryState()
     await state.connect()
     const runtime = createGooglechatbot(
-      loadConfig({ ...CHATBOT_ENV, GOOGLECHATBOT_REQUEST_USER_IDENTITY: 'true' }),
+      loadConfig({ ...CHATBOT_ENV, GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' }),
       { state }
     )
     await runtime.stateConnected
-    const addOnMessage = (id: string) => ({
+    const response = await runtime.app.request('/api/chat/events', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -332,7 +332,7 @@ describe('googlechatbot webhook e2e', () => {
           messagePayload: {
             space: { name: 'spaces/AAAA', spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true },
             message: {
-              name: `spaces/AAAA/messages/${id}`,
+              name: 'spaces/AAAA/messages/ID1',
               text: 'who am I',
               sender: { name: 'users/U9', displayName: 'Ninth', type: 'HUMAN' }
             }
@@ -340,18 +340,14 @@ describe('googlechatbot webhook e2e', () => {
         }
       })
     })
-
-    const first = await runtime.app.request('/api/chat/events', addOnMessage('ID1'))
-    expect(first.status).toBe(200)
-    expect(await first.json()).toEqual({ requesting_google_scopes: { all_scopes: true } })
-    // Not processed: Chat re-sends the event with the token after consent.
-    expect(await state.getList<string>(WORK_INDEX_KEY)).toEqual([])
-
-    // The same sender is not asked again within the TTL; the event runs.
-    const second = await runtime.app.request('/api/chat/events', addOnMessage('ID2'))
-    expect(second.status).toBe(200)
-    expect(await second.json()).toEqual({})
-    await waitFor(() => mock.calls.some(c => c.url.includes('/api/session/')))
+    expect(response.status).toBe(200)
+    await waitFor(() => mock.calls.some(c => c.url.endsWith('/execute')))
+    expect(mock.calls.some(c => new URL(c.url).hostname === 'people.googleapis.com')).toBe(false)
+    const execute = mock.calls.find(c => c.url.endsWith('/execute'))?.body as {
+      metadata?: Record<string, unknown>
+    }
+    expect(execute.metadata?.googlechat_requester_email).toBeUndefined()
+    expect(execute.metadata?.user_email).toBeUndefined()
     mock.restore()
   })
 

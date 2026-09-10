@@ -65,19 +65,19 @@ Attachment and reaction routes require message-qualified resources. DM setup
 and first send use one api-rs request, but separate Google calls. A failed send
 can leave the DM created.
 
-Add-on events carry a user identity token only after the sender consented to
-the app's identity scopes, and Google never prompts on its own. With
-`GOOGLECHATBOT_REQUEST_USER_IDENTITY` the bot answers a human message that has
-no user token and no consent record with `requesting_google_scopes`, once per
-sender per TTL, and Chat re-sends the event with the token
-(`identity-request.ts`). Slack has no equivalent: its user identity comes with
-every event.
+Google sends no Add-on user token to a standalone HTTP Chat app, and
+`requesting_google_scopes` only makes Chat re-send the same event. The bot
+resolves the sender of a Google-signed Add-on MESSAGE from `users/<id>` to their
+primary email with the People API directory lookup, as
+`GOOGLECHATBOT_DIRECTORY_LOOKUP_USER` over domain-wide delegation
+(`sender-lookup.ts`, `ChatEdgeClient.lookupSenderEmail`). Slack has no
+equivalent: its user identity comes with every event.
 
 Personal grants in shared spaces diverge from Slack because every Chat session
 principal is a space, including a 1:1 DM. api-rs binds a per-user
 `gchat-user-<email slug>-<sha256[:12]>` principal (kind `gchat_user`) as the requester of every
-Chat turn, DM or group, from the Add-on-verified, allowlisted sender email the
-bot sends on `/execute` as `googlechat_requester_email` with
+Chat turn, DM or group, from the allowlisted sender email (Add-on token or
+directory lookup) the bot sends on `/execute` as `googlechat_requester_email` with
 `googlechat_request_verified`. The Console hoists that principal's hand-granted
 non-broker static secrets into the turn's proxy config, which is how a
 per-person desktop token follows its owner into a group; Slack, GitHub and

@@ -20,6 +20,10 @@ const COUNTERS: CounterSpec[] = [
     help: 'Session-metadata identity claims by outcome and suppression reason.'
   },
   {
+    name: 'googlechatbot_sender_lookup_total',
+    help: 'Directory lookups of a signed Add-on sender id by outcome.'
+  },
+  {
     name: 'googlechatbot_session_api_operations_total',
     help: 'api-rs session API calls by operation and outcome.'
   },

@@ -1493,3 +1493,86 @@ describe('ChatEdgeClient delegated Drive downloads', () => {
     }
   })
 })
+
+describe('ChatEdgeClient sender email lookup', () => {
+  async function lookupClient(env: Record<string, string>) {
+    const pair = await generateRsaKeyPair()
+    const pkcs8 = await crypto.subtle.exportKey('pkcs8', pair.privateKey)
+    const privateKey = [
+      '-----BEGIN PRIVATE KEY-----',
+      Buffer.from(pkcs8).toString('base64'),
+      '-----END PRIVATE KEY-----'
+    ].join('\n')
+    return new ChatEdgeClient(loadConfig({
+      GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
+        client_email: 'bot@example.iam.gserviceaccount.com',
+        private_key: privateKey
+      }),
+      ...env
+    }))
+  }
+
+  test('reads the primary directory email as the lookup user and caches it', async () => {
+    const calls: string[] = []
+    let assertion: Record<string, unknown> = {}
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        const jwt = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        assertion = JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString())
+        return Response.json({ access_token: 'directory-token', expires_in: 3600 })
+      }
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer directory-token')
+      return Response.json({
+        emailAddresses: [
+          { value: 'alias@example.com', metadata: { primary: false } },
+          { value: 'ada@example.com', metadata: { primary: true } }
+        ]
+      })
+    }) as unknown as typeof fetch
+
+    const client = await lookupClient({ GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' })
+    expect(await client.lookupSenderEmail('users/123456')).toBe('ada@example.com')
+    expect(await client.lookupSenderEmail('users/123456')).toBe('ada@example.com')
+    expect(assertion.sub).toBe('reader@example.com')
+    expect(assertion.scope).toBe('https://www.googleapis.com/auth/directory.readonly')
+    const people = calls.filter(url => url.startsWith('https://people.googleapis.com/v1/people/123456?'))
+    expect(people).toHaveLength(1)
+    expect(people[0]).toContain('personFields=emailAddresses')
+    expect(people[0]).toContain('sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE')
+  })
+
+  test('is off without a lookup user and null for ids the directory does not know', async () => {
+    let fetched = 0
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetched += 1
+      if (String(input).includes('oauth2.googleapis.com/token')) {
+        return Response.json({ access_token: 'directory-token', expires_in: 3600 })
+      }
+      return new Response('{"error":{"code":404}}', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const off = await lookupClient({})
+    expect(await off.lookupSenderEmail('users/123456')).toBeNull()
+    expect(fetched).toBe(0)
+
+    const on = await lookupClient({ GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' })
+    expect(await on.lookupSenderEmail('users/not-numeric')).toBeNull()
+    expect(fetched).toBe(0)
+    expect(await on.lookupSenderEmail('users/777')).toBeNull()
+    expect(await on.lookupSenderEmail('users/777')).toBeNull()
+    expect(fetched).toBe(2)
+  })
+
+  test('surfaces other People API failures to the caller', async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).includes('oauth2.googleapis.com/token')) {
+        return Response.json({ access_token: 'directory-token', expires_in: 3600 })
+      }
+      return new Response('{"error":{"code":403}}', { status: 403 })
+    }) as unknown as typeof fetch
+    const client = await lookupClient({ GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' })
+    await expect(client.lookupSenderEmail('users/1')).rejects.toThrow('People API lookup failed: 403')
+  })
+})

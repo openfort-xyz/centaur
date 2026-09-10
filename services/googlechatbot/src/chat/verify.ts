@@ -146,8 +146,8 @@ export function verifyChatRequest(opts: {
   }
   const allowedDomains = opts.config.GOOGLECHATBOT_ALLOWED_DOMAIN
   if (allowedDomains.length > 0) {
-    // Chat Event User resources have no email. Only a separately verified
-    // Workspace Add-on userIdToken can satisfy an email-domain policy.
+    // Chat Event User resources have no email. Only a verified Add-on
+    // userIdToken or the directory lookup can satisfy an email-domain policy.
     const emailParts = (opts.userEmail ?? '').trim().split('@')
     const domain = emailParts.length === 2 ? emailParts[1]?.toLowerCase() : undefined
     if (
@@ -210,8 +210,9 @@ export type IdentityEmission =
  * An empty allowlist is a suppression reason, never a wildcard: the default is
  * '' (off), and "unset" must not mean "any domain may claim any identity".
  *
- * The email must come from the verified Add-on userIdToken. Chat Event User
- * resources do not expose email addresses.
+ * The email must come from the verified Add-on userIdToken or the directory
+ * lookup of a Google-signed sender id. Chat Event User resources do not
+ * expose email addresses.
  */
 export function resolveIdentityEmission(opts: {
   config: AppConfig
@@ -250,7 +251,8 @@ export type ResolvedSessionIdentity = {
 /**
  * Check signature status and the verified-token email's domain, then confirm
  * a one-human DM with Google before releasing identity metadata. The ingress
- * must supply email from its verified Add-on userIdToken, never the event body.
+ * must supply email from its verified Add-on userIdToken or the directory
+ * lookup of the signed sender id, never from the event body.
  *
  * Claimed space type can reject a request early but cannot authorize identity.
  * If no lookup runs, the returned spaceType remains the unconfirmed claim.
