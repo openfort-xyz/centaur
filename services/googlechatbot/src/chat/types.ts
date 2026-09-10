@@ -85,6 +85,9 @@ export type GoogleChatEnvelope = {
   authorizationEventObject?: {
     systemIdToken?: string
     userIdToken?: string
+    /** Scopes the sender has granted this add-on. Absent when they were
+     * never asked; Google only lists it once a consent flow has run. */
+    authorizedScopes?: string[]
   }
   space?: {
     name?: string

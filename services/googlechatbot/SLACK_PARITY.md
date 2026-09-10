@@ -65,6 +65,14 @@ Attachment and reaction routes require message-qualified resources. DM setup
 and first send use one api-rs request, but separate Google calls. A failed send
 can leave the DM created.
 
+Add-on events carry a user identity token only after the sender consented to
+the app's identity scopes, and Google never prompts on its own. With
+`GOOGLECHATBOT_REQUEST_USER_IDENTITY` the bot answers a human message that has
+no user token and no consent record with `requesting_google_scopes`, once per
+sender per TTL, and Chat re-sends the event with the token
+(`identity-request.ts`). Slack has no equivalent: its user identity comes with
+every event.
+
 Personal grants in shared spaces diverge from Slack because every Chat session
 principal is a space, including a 1:1 DM. api-rs binds a per-user
 `gchat-user-<email slug>-<sha256[:12]>` principal (kind `gchat_user`) as the requester of every

@@ -105,6 +105,17 @@ that turn only, so a person's desktop or credential follows them into a group
 without the space principal ever holding it. See
 [advanced permissioning](/secrets/advanced-permissioning).
 
+A Workspace Add-on event carries `userIdToken` only after the sender has
+consented to the app's identity scopes. An app that never asks never receives
+one, and every event stays anonymous. With `GOOGLECHATBOT_REQUEST_USER_IDENTITY`
+set to `true` (default `false`), the bot answers a human message that arrives
+with no user token and no consent record with `requesting_google_scopes`; Chat
+runs the consent flow, silently when a Workspace admin granted the scopes for
+the domain, and re-sends the same event with the token. Each sender is asked at
+most once per `GOOGLECHATBOT_IDENTITY_REQUEST_TTL_MS` (default 24 hours), and a
+sender who declined is not asked again by the bot. Set it through the chart's
+`googlechatbot.extraEnv`.
+
 `requireSignedRequests: false` exists only for local fixture development. Do not
 use it as a production rollback switch.
 
