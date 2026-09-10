@@ -342,7 +342,7 @@ describe('googlechatbot webhook e2e', () => {
     })
     expect(response.status).toBe(200)
     await waitFor(() => mock.calls.some(c => c.url.endsWith('/execute')))
-    expect(mock.calls.some(c => c.url.includes('people.googleapis.com'))).toBe(false)
+    expect(mock.calls.some(c => new URL(c.url).hostname === 'people.googleapis.com')).toBe(false)
     const execute = mock.calls.find(c => c.url.endsWith('/execute'))?.body as {
       metadata?: Record<string, unknown>
     }
