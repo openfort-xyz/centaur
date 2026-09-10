@@ -311,6 +311,50 @@ describe('googlechatbot webhook e2e', () => {
     expect(work?.event).toBeUndefined()
   })
 
+  test('asks Chat for the sender identity once, then processes their events as usual', async () => {
+    const mock = installMockFetch()
+    const state = createMemoryState()
+    await state.connect()
+    const runtime = createGooglechatbot(
+      loadConfig({ ...CHATBOT_ENV, GOOGLECHATBOT_REQUEST_USER_IDENTITY: 'true' }),
+      { state }
+    )
+    await runtime.stateConnected
+    const addOnMessage = (id: string) => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        authorizationEventObject: { systemIdToken: 'system-token-never-persisted' },
+        commonEventObject: { hostApp: 'CHAT', platform: 'WEB' },
+        chat: {
+          eventTime: NOW_ISO,
+          user: { name: 'users/U9', displayName: 'Ninth', type: 'HUMAN' },
+          messagePayload: {
+            space: { name: 'spaces/AAAA', spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true },
+            message: {
+              name: `spaces/AAAA/messages/${id}`,
+              text: 'who am I',
+              sender: { name: 'users/U9', displayName: 'Ninth', type: 'HUMAN' }
+            }
+          }
+        }
+      })
+    })
+
+    const first = await runtime.app.request('/api/chat/events', addOnMessage('ID1'))
+    expect(first.status).toBe(200)
+    expect(await first.json()).toEqual({ requesting_google_scopes: { all_scopes: true } })
+    // Not processed: Chat re-sends the event with the token after consent.
+    expect(await state.getList<string>(WORK_INDEX_KEY)).toEqual([])
+
+    // The same sender is not asked again within the TTL; the event runs.
+    const second = await runtime.app.request('/api/chat/events', addOnMessage('ID2'))
+    expect(second.status).toBe(200)
+    expect(await second.json()).toEqual({})
+    await waitFor(() => mock.calls.some(c => c.url.includes('/api/session/')))
+    mock.restore()
+  })
+
   test('only an exact bot annotation or slash command starts a named-space run', async () => {
     const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state: createMemoryState() })
     let identityLookups = 0

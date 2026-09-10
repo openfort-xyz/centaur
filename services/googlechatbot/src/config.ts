@@ -81,6 +81,17 @@ const EnvSchema = z.object({
   // Disable only for local fixtures. Production rollback must disable ingress.
   GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: strictBoolean,
 
+  // Ask Chat for the sender's identity when a Workspace Add-on event arrives
+  // without a user token. The bot answers the event with
+  // `requesting_google_scopes`; Chat runs the consent flow (silently when an
+  // admin granted the scopes for the domain) and re-sends the event with
+  // `userIdToken`. Once per sender per TTL, so a decline is not nagged.
+  GOOGLECHATBOT_REQUEST_USER_IDENTITY: z
+    .enum(['true', 'false', '1', '0'])
+    .default('false')
+    .transform(value => value === 'true' || value === '1'),
+  GOOGLECHATBOT_IDENTITY_REQUEST_TTL_MS: z.coerce.number().int().positive().default(86_400_000),
+
   // Inbound authentication contracts are not interchangeable. Keep the
   // issuer, audience, key set, and signer identity paired to the configured
   // Google surface. The project-number Chat API model remains the default for

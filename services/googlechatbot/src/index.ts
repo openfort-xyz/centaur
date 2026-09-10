@@ -23,6 +23,7 @@ import type {
   NormalizedChatEvent
 } from './chat/types'
 import { messageUtf8Bytes } from './chat/render'
+import { IDENTITY_REQUEST_RESPONSE, identityRequestKey, wantsUserIdentity } from './identity-request'
 import { logError, logInfo, logWarn } from './logging'
 import { resolveHarnessRollout } from './harness-rollout'
 import { addGauge, incr, renderMetrics, setGauge } from './metrics'
@@ -272,6 +273,26 @@ export function createGooglechatbot(
     }
 
     logChatEventShape(config, envelope)
+    if (wantsUserIdentity(config, envelope)) {
+      const sender = envelope.user?.name ?? envelope.message?.sender?.name ?? ''
+      const fresh = sender
+        ? await state.setIfNotExists(
+            identityRequestKey(sender),
+            'requested',
+            config.GOOGLECHATBOT_IDENTITY_REQUEST_TTL_MS
+          )
+        : false
+      if (fresh) {
+        // Not processed now: Chat re-sends the event with the token once the
+        // sender has consented, and that delivery runs the turn.
+        incr('googlechatbot_identity_requests_total', { outcome: 'requested' })
+        logInfo('googlechatbot_identity_requested', {
+          space_type: envelope.space?.spaceType ?? envelope.space?.type ?? 'UNKNOWN'
+        })
+        return c.json(IDENTITY_REQUEST_RESPONSE)
+      }
+      incr('googlechatbot_identity_requests_total', { outcome: 'throttled' })
+    }
     const action = googleChatWorkflowEvent(envelope, tokenCheck.userEmail)
     const key = chatDedupKey({
       eventTime: envelope.eventTime,
