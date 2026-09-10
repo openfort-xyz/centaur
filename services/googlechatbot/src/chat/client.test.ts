@@ -1540,7 +1540,7 @@ describe('ChatEdgeClient sender email lookup', () => {
     const people = calls.filter(url => url.startsWith('https://people.googleapis.com/v1/people/123456?'))
     expect(people).toHaveLength(1)
     expect(people[0]).toContain('personFields=emailAddresses')
-    expect(people[0]).toContain('sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE')
+    expect(people[0]).toContain('sources=READ_SOURCE_TYPE_PROFILE')
   })
 
   test('is off without a lookup user and null for ids the directory does not know', async () => {
