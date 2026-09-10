@@ -92,9 +92,9 @@ non-empty domain allowlist. Configuring `allowedDomain` for either Chat API mode
 therefore rejects every event by design.
 
 Google's request token does not bind the JSON body. Centaur therefore labels a
-space principal with a requester email only when it came from a separately
-verified Add-on `userIdToken`, passed the allowlist, matched the event user ID,
-and the 1:1 DM was confirmed with `spaces.get`. Legacy Chat API events create
+space principal with a requester email only when it came from a verified
+Add-on `userIdToken` or the directory lookup below, passed the allowlist,
+matched the event user ID, and the 1:1 DM was confirmed with `spaces.get`. Legacy Chat API events create
 sessions without human email identity. Shared spaces and group chats do not
 inherit a requester's personal credentials.
 
@@ -105,16 +105,18 @@ that turn only, so a person's desktop or credential follows them into a group
 without the space principal ever holding it. See
 [advanced permissioning](/secrets/advanced-permissioning).
 
-A Workspace Add-on event carries `userIdToken` only after the sender has
-consented to the app's identity scopes. An app that never asks never receives
-one, and every event stays anonymous. With `GOOGLECHATBOT_REQUEST_USER_IDENTITY`
-set to `true` (default `false`), the bot answers a human message that arrives
-with no user token and no consent record with `requesting_google_scopes`; Chat
-runs the consent flow, silently when a Workspace admin granted the scopes for
-the domain, and re-sends the same event with the token. Each sender is asked at
-most once per `GOOGLECHATBOT_IDENTITY_REQUEST_TTL_MS` (default 24 hours), and a
-sender who declined is not asked again by the bot. Set it through the chart's
-`googlechatbot.extraEnv`.
+Google does not attach `userIdToken` to the events of a standalone HTTP Chat
+app, whatever the Marketplace scopes say, and answering with
+`requesting_google_scopes` only makes Chat re-send the same event. The sender's
+email therefore comes from the Workspace directory: for a MESSAGE whose bearer
+verified as the add-on's service account, the bot resolves the sender's
+`users/<id>` with the People API (`people/<id>`, domain profile source) as
+`GOOGLECHATBOT_DIRECTORY_LOOKUP_USER` through domain-wide delegation with
+`https://www.googleapis.com/auth/directory.readonly`. The id is Google's own
+claim inside a Google-signed request, which is why it is trusted; unsigned
+requests and other ingress modes never resolve. Answers are cached for a day.
+Unset the user and every event stays anonymous. Outcomes are counted in
+`googlechatbot_sender_lookup_total`.
 
 `requireSignedRequests: false` exists only for local fixture development. Do not
 use it as a production rollback switch.

@@ -55,6 +55,12 @@ const EnvSchema = z.object({
   // target directly; fixed subjects remain only for these shared capabilities.
   GOOGLECHATBOT_REACTION_READ_USER: z.string().default(''),
   GOOGLECHATBOT_DRIVE_DOWNLOAD_USER: z.string().default(''),
+  // Workspace user the People API directory lookup runs as (scope
+  // directory.readonly). It turns a Google-signed Add-on event's sender
+  // `users/<id>` into their primary email, which is the sender identity: Chat
+  // never sends the Add-on `userIdToken` for a standalone HTTP Chat app. Unset
+  // leaves every event anonymous.
+  GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: z.string().default(''),
 
   CHAT_EVENTS_PATH: z.string().default('/api/chat/events'),
   CHAT_EVENT_DEDUP_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
@@ -80,17 +86,6 @@ const EnvSchema = z.object({
   // Verify the bearer using the selected ingress mode's issuer and audience.
   // Disable only for local fixtures. Production rollback must disable ingress.
   GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: strictBoolean,
-
-  // Ask Chat for the sender's identity when a Workspace Add-on event arrives
-  // without a user token. The bot answers the event with
-  // `requesting_google_scopes`; Chat runs the consent flow (silently when an
-  // admin granted the scopes for the domain) and re-sends the event with
-  // `userIdToken`. Once per sender per TTL, so a decline is not nagged.
-  GOOGLECHATBOT_REQUEST_USER_IDENTITY: z
-    .enum(['true', 'false', '1', '0'])
-    .default('false')
-    .transform(value => value === 'true' || value === '1'),
-  GOOGLECHATBOT_IDENTITY_REQUEST_TTL_MS: z.coerce.number().int().positive().default(86_400_000),
 
   // Inbound authentication contracts are not interchangeable. Keep the
   // issuer, audience, key set, and signer identity paired to the configured

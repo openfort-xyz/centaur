@@ -11,6 +11,7 @@ import type {
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1'
 const CHAT_UPLOAD_BASE = 'https://chat.googleapis.com/upload/v1'
 const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3'
+const PEOPLE_API_BASE = 'https://people.googleapis.com/v1'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 export const MAX_DRIVE_EXPORT_BYTES = 10 * 1024 * 1024
@@ -18,6 +19,9 @@ const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 const MAX_FETCH_ATTEMPTS = 3
 const MAX_RETRY_DELAY_MS = 30_000
 const SPACE_READ_INTERVAL_MS = Math.ceil(1_000 / 15)
+const SENDER_EMAIL_TTL_MS = 24 * 60 * 60 * 1000
+// The lookup sits on the webhook path, ahead of Chat's 30 s acknowledgement.
+const SENDER_LOOKUP_TIMEOUT_MS = 5_000
 
 export type ChatCredential =
   | 'app'
@@ -85,6 +89,10 @@ export class ChatEdgeClient {
   private readonly uploadUser: string
   private readonly reactionReadUser: string
   private readonly driveDownloadUser: string
+  private readonly directoryLookupUser: string
+  private directoryReadToken: string | null = null
+  private directoryReadTokenExpiry = 0
+  private readonly senderEmails = new Map<string, { email: string | null; expiry: number }>()
   private readonly apiTimeoutMs: number
   private readonly now: () => number
   private readonly sleep: (milliseconds: number) => Promise<void>
@@ -110,6 +118,7 @@ export class ChatEdgeClient {
     this.uploadUser = config.GOOGLECHATBOT_UPLOAD_USER
     this.reactionReadUser = config.GOOGLECHATBOT_REACTION_READ_USER
     this.driveDownloadUser = config.GOOGLECHATBOT_DRIVE_DOWNLOAD_USER
+    this.directoryLookupUser = config.GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
     if (config.GOOGLE_SERVICE_ACCOUNT_JSON) {
       try {
         const parsed = JSON.parse(config.GOOGLE_SERVICE_ACCOUNT_JSON) as {
@@ -234,6 +243,64 @@ export class ChatEdgeClient {
 
   canDownloadDriveAttachments(): boolean {
     return Boolean(this.serviceAccountEmail && this.privateKey && this.driveDownloadUser)
+  }
+
+  /**
+   * Primary email of a Chat sender from the Workspace directory, or null when
+   * the lookup is not configured or the directory has no such person.
+   *
+   * Chat events carry no email, and Google never attaches the Add-on
+   * `userIdToken` to a standalone HTTP Chat app's events. The numeric id in
+   * `users/<id>` is the same person id the People API uses, so the domain
+   * directory profile answers it. Runs as GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
+   * through domain-wide delegation with the read-only directory scope. Answers
+   * are cached per id; a lookup failure is thrown so the caller can log it.
+   */
+  async lookupSenderEmail(userName: string): Promise<string | null> {
+    if (!this.directoryLookupUser || !this.serviceAccountEmail || !this.privateKey) return null
+    const id = userName.startsWith('users/') ? userName.slice('users/'.length) : userName
+    if (!/^\d+$/.test(id)) return null
+    const cached = this.senderEmails.get(id)
+    if (cached && this.now() < cached.expiry) return cached.email
+
+    const token = await this.getDirectoryReadToken()
+    if (!token) return null
+    const url = `${PEOPLE_API_BASE}/people/${id}`
+      + '?personFields=emailAddresses&sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE'
+    const response = await fetchWithRetry(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` }
+    }, Math.min(this.apiTimeoutMs, SENDER_LOOKUP_TIMEOUT_MS), 'rate-limit-only')
+    const text = await boundedResponseText(
+      response,
+      MAX_JSON_RESPONSE_BYTES,
+      'People API response exceeded the size limit'
+    )
+    if (response.status === 404) {
+      this.senderEmails.set(id, { email: null, expiry: this.now() + SENDER_EMAIL_TTL_MS })
+      return null
+    }
+    if (!response.ok) throw new Error(`People API lookup failed: ${response.status} ${text}`)
+    const person = JSON.parse(text) as {
+      emailAddresses?: Array<{ value?: string; metadata?: { primary?: boolean } }>
+    }
+    const addresses = (person.emailAddresses ?? []).filter(entry => validEmail(entry.value ?? ''))
+    const email = (addresses.find(entry => entry.metadata?.primary) ?? addresses[0])?.value ?? null
+    this.senderEmails.set(id, { email, expiry: this.now() + SENDER_EMAIL_TTL_MS })
+    return email
+  }
+
+  private async getDirectoryReadToken(): Promise<string | null> {
+    if (this.directoryReadToken && Date.now() < this.directoryReadTokenExpiry - 60_000) {
+      return this.directoryReadToken
+    }
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/directory.readonly',
+      this.directoryLookupUser
+    )
+    this.directoryReadToken = grant.token
+    this.directoryReadTokenExpiry = grant.expiry
+    return grant.token
   }
 
   private async getDriveReadToken(): Promise<string | null> {

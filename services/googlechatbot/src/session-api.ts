@@ -31,7 +31,8 @@ export type GoogleChatTurnMessage = {
   isMention: boolean
   userId: string
   userName: string
-  /** Email from a verified Workspace Add-on userIdToken, never a Chat User field. */
+  /** Email from a verified Add-on userIdToken or the directory lookup of the
+   * Google-signed sender id, never a Chat User field. */
   userEmail?: string
   timestamp?: string
   /** Upload destination for the session-context block (executing turn only). */
@@ -196,7 +197,7 @@ export type RequesterIdentityClaim = {
   /** True ONLY when the request carried a valid Google signature — never
    * derived from a verification result's `ok`. */
   verified: boolean
-  /** Verified Workspace Add-on userIdToken email, when present. */
+  /** Verified sender email (Add-on userIdToken or directory lookup), when present. */
   userEmail?: string
   /** The space type THE BODY CLAIMS. A signed Chat request does not bind its
    * body, so this is only a pre-filter that saves an API call; what actually
@@ -431,7 +432,8 @@ export async function executeSession(
     harnessAssignment?: GoogleChatHarnessAssignment
     /** Who is asking this turn, for api-rs's per-turn requester principal.
      * `verified` must be the request's signature status, and `userEmail` the
-     * Add-on userIdToken email; the domain allowlist is applied here. Unlike
+     * Add-on userIdToken or directory-resolved email; the domain allowlist is
+     * applied here. Unlike
      * session identity, no DM confirmation is required: the requester
      * principal is per person, so a group turn binds the asker's own grants
      * without the space inheriting them. */
