@@ -252,7 +252,8 @@ export class ChatEdgeClient {
    * Chat events carry no email, and Google never attaches the Add-on
    * `userIdToken` to a standalone HTTP Chat app's events. The numeric id in
    * `users/<id>` is the same person id the People API uses, so the domain
-   * directory profile answers it. Runs as GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
+   * profile answers it (`people.get` accepts only ReadSourceType values; the
+   * directory-specific enum belongs to the list and search calls). Runs as GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
    * through domain-wide delegation with the read-only directory scope. Answers
    * are cached per id; a lookup failure is thrown so the caller can log it.
    */
@@ -266,7 +267,7 @@ export class ChatEdgeClient {
     const token = await this.getDirectoryReadToken()
     if (!token) return null
     const url = `${PEOPLE_API_BASE}/people/${id}`
-      + '?personFields=emailAddresses&sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE'
+      + '?personFields=emailAddresses&sources=READ_SOURCE_TYPE_PROFILE'
     const response = await fetchWithRetry(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` }
