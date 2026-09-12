@@ -258,11 +258,10 @@ RUN uv tool install "playwright==${PLAYWRIGHT_VERSION}" \
     && playwright --version | grep -F "${PLAYWRIGHT_VERSION}"
 
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
-# skills 1.5.25 (2026-09-08) prompts for the target agents when it detects
-# none, and a build has no TTY to answer, so name them. Pinned so the next
-# CLI change cannot break the image build again.
+# Pin the CLI and select the skill and agents so image builds cannot prompt.
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
-    npx -y skills@1.5.25 add vercel-labs/agent-browser -y -a claude-code -a codex -a amp -a pi
+    npx -y skills@1.5.25 add vercel-labs/agent-browser --skill agent-browser -y -a claude-code -a codex -a amp -a pi \
+    && test -s .agents/skills/agent-browser/SKILL.md
 # git-branch configures each writable clone with the publishing GitHub account.
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
 RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
