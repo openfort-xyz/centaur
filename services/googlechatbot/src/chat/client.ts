@@ -11,7 +11,7 @@ import type {
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1'
 const CHAT_UPLOAD_BASE = 'https://chat.googleapis.com/upload/v1'
 const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3'
-const PEOPLE_API_BASE = 'https://people.googleapis.com/v1'
+const ADMIN_DIRECTORY_API_BASE = 'https://admin.googleapis.com/admin/directory/v1'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 export const MAX_DRIVE_EXPORT_BYTES = 10 * 1024 * 1024
@@ -251,11 +251,22 @@ export class ChatEdgeClient {
    *
    * Chat events carry no email, and Google never attaches the Add-on
    * `userIdToken` to a standalone HTTP Chat app's events. The numeric id in
-   * `users/<id>` is the same person id the People API uses, so the domain
-   * profile answers it (`people.get` accepts only ReadSourceType values; the
-   * directory-specific enum belongs to the list and search calls). Runs as GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
-   * through domain-wide delegation with the read-only directory scope. Answers
-   * are cached per id; a lookup failure is thrown so the caller can log it.
+   * `users/<id>` is the same person id the Admin SDK uses, so `users.get`
+   * answers it directly.
+   *
+   * This used to call People API `people.get` with
+   * `sources=READ_SOURCE_TYPE_PROFILE`, which only ever reads the AUTHENTICATED
+   * user's own profile: it returned the email for GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
+   * and 200-with-no-emailAddresses for every other person, so every turn but
+   * that one user's went out anonymous and routed no desktop. `people.get` has
+   * no source that reads another domain member (the directory enum belongs to
+   * the list/search calls), and `people:listDirectoryPeople` depends on domain
+   * contact sharing being on. `users.get` is id-exact and needs neither.
+   *
+   * Runs as GOOGLECHATBOT_DIRECTORY_LOOKUP_USER through domain-wide delegation,
+   * so that user must hold the admin privilege to read users and the SA's DWD
+   * client must be authorized for admin.directory.user.readonly. Answers are
+   * cached per id; a lookup failure is thrown so the caller can log it.
    */
   async lookupSenderEmail(userName: string): Promise<string | null> {
     if (!this.directoryLookupUser || !this.serviceAccountEmail || !this.privateKey) return null
@@ -266,8 +277,7 @@ export class ChatEdgeClient {
 
     const token = await this.getDirectoryReadToken()
     if (!token) return null
-    const url = `${PEOPLE_API_BASE}/people/${id}`
-      + '?personFields=emailAddresses&sources=READ_SOURCE_TYPE_PROFILE'
+    const url = `${ADMIN_DIRECTORY_API_BASE}/users/${id}?projection=basic`
     const response = await fetchWithRetry(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` }
@@ -275,18 +285,15 @@ export class ChatEdgeClient {
     const text = await boundedResponseText(
       response,
       MAX_JSON_RESPONSE_BYTES,
-      'People API response exceeded the size limit'
+      'Admin SDK response exceeded the size limit'
     )
     if (response.status === 404) {
       this.senderEmails.set(id, { email: null, expiry: this.now() + SENDER_EMAIL_TTL_MS })
       return null
     }
-    if (!response.ok) throw new Error(`People API lookup failed: ${response.status} ${text}`)
-    const person = JSON.parse(text) as {
-      emailAddresses?: Array<{ value?: string; metadata?: { primary?: boolean } }>
-    }
-    const addresses = (person.emailAddresses ?? []).filter(entry => validEmail(entry.value ?? ''))
-    const email = (addresses.find(entry => entry.metadata?.primary) ?? addresses[0])?.value ?? null
+    if (!response.ok) throw new Error(`Admin SDK user lookup failed: ${response.status} ${text}`)
+    const user = JSON.parse(text) as { primaryEmail?: string }
+    const email = validEmail(user.primaryEmail ?? '') ? (user.primaryEmail as string) : null
     this.senderEmails.set(id, { email, expiry: this.now() + SENDER_EMAIL_TTL_MS })
     return email
   }
@@ -296,7 +303,7 @@ export class ChatEdgeClient {
       return this.directoryReadToken
     }
     const grant = await this.exchangeJwtForToken(
-      'https://www.googleapis.com/auth/directory.readonly',
+      'https://www.googleapis.com/auth/admin.directory.user.readonly',
       this.directoryLookupUser
     )
     this.directoryReadToken = grant.token

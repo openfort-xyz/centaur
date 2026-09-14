@@ -55,11 +55,13 @@ const EnvSchema = z.object({
   // target directly; fixed subjects remain only for these shared capabilities.
   GOOGLECHATBOT_REACTION_READ_USER: z.string().default(''),
   GOOGLECHATBOT_DRIVE_DOWNLOAD_USER: z.string().default(''),
-  // Workspace user the People API directory lookup runs as (scope
-  // directory.readonly). It turns a Google-signed Add-on event's sender
-  // `users/<id>` into their primary email, which is the sender identity: Chat
-  // never sends the Add-on `userIdToken` for a standalone HTTP Chat app. Unset
-  // leaves every event anonymous.
+  // Workspace user the Admin SDK directory lookup runs as (scope
+  // admin.directory.user.readonly, so this user needs the privilege to read
+  // users). It turns a Google-signed Add-on event's sender `users/<id>` into
+  // their primary email, which is the sender identity: Chat never sends the
+  // Add-on `userIdToken` for a standalone HTTP Chat app. Unset leaves every
+  // event anonymous — and so does a subject who is not an admin, which reads
+  // as "only that one user is ever identified".
   GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: z.string().default(''),
 
   CHAT_EVENTS_PATH: z.string().default('/api/chat/events'),

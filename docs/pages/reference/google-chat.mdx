@@ -110,13 +110,23 @@ app, whatever the Marketplace scopes say, and answering with
 `requesting_google_scopes` only makes Chat re-send the same event. The sender's
 email therefore comes from the Workspace directory: for a MESSAGE whose bearer
 verified as the add-on's service account, the bot resolves the sender's
-`users/<id>` with the People API (`people/<id>`, profile source) as
+`users/<id>` with the Admin SDK (`directory/v1/users/<id>`) as
 `GOOGLECHATBOT_DIRECTORY_LOOKUP_USER` through domain-wide delegation with
-`https://www.googleapis.com/auth/directory.readonly`. The id is Google's own
-claim inside a Google-signed request, which is why it is trusted; unsigned
-requests and other ingress modes never resolve. Answers are cached for a day.
-Unset the user and every event stays anonymous. Outcomes are counted in
+`https://www.googleapis.com/auth/admin.directory.user.readonly`. The id is
+Google's own claim inside a Google-signed request, which is why it is trusted;
+unsigned requests and other ingress modes never resolve. Answers are cached for
+a day. Unset the user and every event stays anonymous. Outcomes are counted in
 `googlechatbot_sender_lookup_total`.
+
+That subject must hold the admin privilege to read users, and the service
+account's DWD client must be authorized for that scope. If either is missing,
+every lookup answers `outcome="unknown"` and every turn goes out anonymous —
+which routes no desktop and surfaces as a 403 from `cua.fort.dev`, not as an
+auth error. This call previously used People API `people.get` with
+`sources=READ_SOURCE_TYPE_PROFILE`, which reads only the *impersonated user's
+own* profile: it answered 200 with no `emailAddresses` for everyone else, so
+`GOOGLECHATBOT_DIRECTORY_LOOKUP_USER` was the only person who could ever be
+identified.
 
 `requireSignedRequests: false` exists only for local fixture development. Do not
 use it as a production rollback switch.
