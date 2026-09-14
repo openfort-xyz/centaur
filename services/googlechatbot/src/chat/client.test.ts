@@ -1524,23 +1524,32 @@ describe('ChatEdgeClient sender email lookup', () => {
         return Response.json({ access_token: 'directory-token', expires_in: 3600 })
       }
       expect(new Headers(init?.headers).get('authorization')).toBe('Bearer directory-token')
-      return Response.json({
-        emailAddresses: [
-          { value: 'alias@example.com', metadata: { primary: false } },
-          { value: 'ada@example.com', metadata: { primary: true } }
-        ]
-      })
+      return Response.json({ primaryEmail: 'ada@example.com', name: { fullName: 'Ada' } })
     }) as unknown as typeof fetch
 
     const client = await lookupClient({ GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' })
     expect(await client.lookupSenderEmail('users/123456')).toBe('ada@example.com')
     expect(await client.lookupSenderEmail('users/123456')).toBe('ada@example.com')
     expect(assertion.sub).toBe('reader@example.com')
-    expect(assertion.scope).toBe('https://www.googleapis.com/auth/directory.readonly')
-    const people = calls.filter(url => url.startsWith('https://people.googleapis.com/v1/people/123456?'))
-    expect(people).toHaveLength(1)
-    expect(people[0]).toContain('personFields=emailAddresses')
-    expect(people[0]).toContain('sources=READ_SOURCE_TYPE_PROFILE')
+    expect(assertion.scope).toBe('https://www.googleapis.com/auth/admin.directory.user.readonly')
+    const users = calls.filter(url =>
+      url.startsWith('https://admin.googleapis.com/admin/directory/v1/users/123456?'))
+    expect(users).toHaveLength(1)
+    expect(users[0]).toContain('projection=basic')
+  })
+
+  // The bug this call was changed for: People API `people.get` answered 200 with
+  // no email for every user but the impersonated one, so a body that parses but
+  // carries no primaryEmail must read as "unknown", not as a crash or a stale hit.
+  test('treats a user record with no primary email as unknown', async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).includes('oauth2.googleapis.com/token')) {
+        return Response.json({ access_token: 'directory-token', expires_in: 3600 })
+      }
+      return Response.json({ id: '123456' })
+    }) as unknown as typeof fetch
+    const client = await lookupClient({ GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' })
+    expect(await client.lookupSenderEmail('users/123456')).toBeNull()
   })
 
   test('is off without a lookup user and null for ids the directory does not know', async () => {
@@ -1565,7 +1574,7 @@ describe('ChatEdgeClient sender email lookup', () => {
     expect(fetched).toBe(2)
   })
 
-  test('surfaces other People API failures to the caller', async () => {
+  test('surfaces other Admin SDK failures to the caller', async () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       if (String(input).includes('oauth2.googleapis.com/token')) {
         return Response.json({ access_token: 'directory-token', expires_in: 3600 })
@@ -1573,6 +1582,7 @@ describe('ChatEdgeClient sender email lookup', () => {
       return new Response('{"error":{"code":403}}', { status: 403 })
     }) as unknown as typeof fetch
     const client = await lookupClient({ GOOGLECHATBOT_DIRECTORY_LOOKUP_USER: 'reader@example.com' })
-    await expect(client.lookupSenderEmail('users/1')).rejects.toThrow('People API lookup failed: 403')
+    await expect(client.lookupSenderEmail('users/1'))
+      .rejects.toThrow('Admin SDK user lookup failed: 403')
   })
 })

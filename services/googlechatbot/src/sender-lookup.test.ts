@@ -73,7 +73,7 @@ describe('resolveSenderEmail', () => {
     expect(unknown).toBeUndefined()
     const failed = await resolveSenderEmail({
       lookup: async () => {
-        throw new Error('People API lookup failed: 500')
+        throw new Error('Admin SDK user lookup failed: 500')
       },
       verified: true,
       ingressMode: 'workspace_addon',
