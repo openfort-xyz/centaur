@@ -566,10 +566,11 @@ struct SandboxArgs {
         default_value = "mock"
     )]
     workload: SandboxWorkloadKind,
-    /// The default harness for warm sandboxes. Per-session sandboxes always
-    /// run their session's harness (pinned via container args); this only
-    /// decides what the warm pool boots ahead of time. Defaults to codex
-    /// to match the sandbox image's CMD.
+    /// The control plane's default harness: what the warm pool boots ahead of
+    /// time, and the harness workflow runs take when neither the caller nor the
+    /// workflow's own `AGENT_DEFAULTS` pins one. Per-session sandboxes always
+    /// run their session's harness (pinned via container args). Defaults to
+    /// codex to match the sandbox image's CMD.
     #[arg(
         long = "session-sandbox-harness",
         env = "SESSION_SANDBOX_HARNESS",
