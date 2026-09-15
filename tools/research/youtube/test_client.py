@@ -95,3 +95,32 @@ def test_get_transcript_raises_clear_error_when_no_public_captions_exist():
             client.get_transcript(video_id)
     finally:
         client.close()
+
+
+def test_data_api_host_does_not_collide_with_gsuite_oauth():
+    """The Data API base_url must stay off www.googleapis.com.
+
+    gsuite declares www.googleapis.com for its oauth_token secret, so
+    iron-proxy attaches that Bearer to anything hitting that host. Google then
+    prefers the Bearer over ?key= and rejects on scopes, making every Data API
+    call 403 no matter how valid the API key is. Regression guard for that.
+    """
+    client = YouTubeClient(api_key="test-key")
+    assert client.base_url.startswith("https://youtube.googleapis.com/")
+    assert "www.googleapis.com" not in client.base_url
+
+
+def test_declared_secret_host_matches_base_url():
+    """A mismatch here means the key silently never gets injected."""
+    import tomllib
+
+    manifest = tomllib.loads(
+        (Path(__file__).parent / "pyproject.toml").read_text()
+    )
+    hosts = {
+        host
+        for secret in manifest["tool"]["centaur"]["secrets"]
+        for host in secret.get("hosts", [])
+    }
+    base_host = YouTubeClient(api_key="x").base_url.split("/")[2]
+    assert base_host in hosts, f"{base_host} not declared in {hosts}"
