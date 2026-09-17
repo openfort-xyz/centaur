@@ -24,6 +24,7 @@ module Api
               google_chat_space_permissions: principal.effective_google_chat_space_permissions_payload,
               google_chat_dm_permissions: principal.effective_google_chat_dm_permissions_payload,
               oauth_credentials: oauth_credentials_payload(principal),
+              connected_tools: principal.connected_tool_names,
               permissions: permissions
             }
           }.to_json
