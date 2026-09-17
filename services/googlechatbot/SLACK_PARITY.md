@@ -136,6 +136,18 @@ preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
 
+### 2026-09-17 — 31 upstream commits, `3f899945..3d6bbcf1`
+
+| Upstream | Slack change | Google Chat disposition |
+| --- | --- | --- |
+| #1678 scheduled task eligibility | Tasks may be manual-only (no cron); the workflow re-reads the task from Console before the agent turn and again before the root Slack post, and skips when it is disabled or its delivery channel changed. | **Ported.** `_deliver_to_google_chat` takes the same eligibility check inside its `post_result` step, so a Chat space or DM delivery is skipped the same way. The DM space setup still runs first. Console model and form keep the Chat destination validation next to upstream's manual-only schedule. |
+| #1644, #1645 markdown in the durable fallback | The streaming-failure fallback posts and edits CommonMark instead of plain text. | **Not applicable.** Chat has no streaming fallback path; every final answer already goes through the Chat renderer. |
+| #1665, #1668, #1669 Slack access paths | The Slack context line tells the agent to use proxied methods in channels and `*-direct` in DMs; public channel history and files are allowed by default. | **Not applicable.** Slack tool and proxy policy only. The Google Chat context line is unchanged. |
+| #1675 Slack emoji reaction command | `slack react` adds a reaction. | **Not applicable.** Chat `reactions.create` is user-auth only (no `chat.bot` scope). |
+| #1672 proxy access to cluster services | The chart default `ironProxy.upstreamDenyCidrs` drops `10.43.0.0/16`. | **Shared.** centaur-vps sets its own deny list, so the deployed value does not change. The fork keeps `extraHttpsEgressCidrs`. |
+
+Merge mechanics: six conflicts. `console_workflow.py` and the scheduled task model/controller take upstream's eligibility gate and manual-only schedules while keeping the Chat delivery branches; `principal.rb` keeps both the Google Chat labels and upstream's `TOOL_LABEL`; the sandbox prompt keeps the Chat delivery sentence with upstream's manual-only wording; chart values take upstream's deny list plus the fork's `extraHttpsEgressCidrs`. No new numbered SQLx migrations, so the fork offset stays **+4**.
+
 ### 2026-09-07 — 26 upstream commits, `d8523f7a..d3143c35`
 
 | Upstream | Slack change | Google Chat disposition |

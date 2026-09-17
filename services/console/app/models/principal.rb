@@ -40,6 +40,7 @@ class Principal < ApplicationRecord
   GOOGLE_EMAIL_LABEL = "google_email".freeze
   GCHAT_USER_KIND = "gchat_user".freeze
   GOOGLE_CHAT_HUMAN_KINDS = %w[gchat_dm gchat_user].freeze
+  TOOL_LABEL = "centaur-tool".freeze
   SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
   UNKNOWN_KIND = "unknown".freeze
   KINDS = %w[
@@ -78,6 +79,21 @@ class Principal < ApplicationRecord
   # path collapse naturally because callers select distinct secret rows.
   def effective_grants
     Grant.where(principal_id: id).or(Grant.where(role_id: role_ids))
+  end
+
+  # Tools associated with credentials granted directly or through roles. Each
+  # credential's centaur-tool label names one tool.
+  def connected_tool_names
+    effective_grants
+      .includes(*Grant::GRANTABLE_ASSOCIATIONS)
+      .filter_map(&:grantable)
+      .filter_map do |credential|
+        label = credential.labels.to_h[TOOL_LABEL]
+        label.strip if label.is_a?(String)
+      end
+      .reject(&:blank?)
+      .uniq
+      .sort
   end
 
   # Static secrets this principal resolves to, via its effective grants.

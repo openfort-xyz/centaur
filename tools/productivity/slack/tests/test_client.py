@@ -54,6 +54,10 @@ class _FakeWebClient:
         channel = "D123" if kwargs["channel"].startswith("U") else kwargs["channel"]
         return {"channel": channel, "ts": "123.456"}
 
+    def reactions_add(self, **kwargs):
+        self.last_kwargs = kwargs
+        return {"ok": True}
+
     def chat_getPermalink(self, **kwargs):
         self.permalink_calls.append(kwargs)
         channel = kwargs["channel"]
@@ -147,6 +151,68 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     client._format_requester_attribution = lambda: ""  # type: ignore[method-assign]
     client.list_bot_channels = lambda **_: [{"id": "C123", "name": "paradigm-pulse"}]  # type: ignore[method-assign]
     return client, fake_web_client
+
+
+@pytest.mark.parametrize("emoji", ["pencil2", ":pencil2:", " :pencil2: "])
+def test_add_reaction_preserves_target_and_normalizes_emoji(emoji) -> None:
+    client, web_client = _make_client()
+
+    result = client.add_reaction("C1234567890", "1789546423.000001", emoji)
+
+    assert web_client.last_kwargs == {
+        "channel": "C1234567890",
+        "timestamp": "1789546423.000001",
+        "name": "pencil2",
+    }
+    assert result == {
+        "ok": True,
+        "channel": "C1234567890",
+        "ts": "1789546423.000001",
+        "name": "pencil2",
+        "added": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("channel", "timestamp", "emoji"),
+    [
+        ("general", "123.456", "pencil2"),
+        ("U1234567890", "123.456", "pencil2"),
+        ("C1234567890", "not-a-timestamp", "pencil2"),
+        ("C1234567890", "123.456", "::"),
+        ("C1234567890", "123.456", "two words"),
+    ],
+)
+def test_add_reaction_rejects_invalid_input_before_request(channel, timestamp, emoji) -> None:
+    client, web_client = _make_client()
+    with pytest.raises(ValueError):
+        client.add_reaction(channel, timestamp, emoji)
+    assert web_client.last_kwargs is None
+
+
+@pytest.mark.parametrize(
+    "error", ["already_reacted", "missing_scope", "message_not_found", "ratelimited"]
+)
+def test_add_reaction_handles_slack_errors(monkeypatch, error) -> None:
+    client, web_client = _make_client()
+    calls = []
+
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise _make_slack_error(error=error, status_code=429 if error == "ratelimited" else 200)
+
+    monkeypatch.setattr(web_client, "reactions_add", fail)
+    if error == "already_reacted":
+        assert client.add_reaction("C1234567890", "123.456", "pencil2")["added"] is False
+    else:
+        expected = {
+            "missing_scope": SlackAuthError,
+            "message_not_found": RuntimeError,
+            "ratelimited": SlackRateLimitError,
+        }[error]
+        with pytest.raises(expected):
+            client.add_reaction("C1234567890", "123.456", "pencil2")
+    assert len(calls) == 1
 
 
 def _make_slack_error(
@@ -548,24 +614,15 @@ def test_get_channel_history_proxy_validates_inputs() -> None:
 def test_list_channels_proxy_calls_centaur_api() -> None:
     client, _ = _make_client()
 
+    calls = []
+
     def fake_get_json(path, params):
         assert path == "/api/slack/channels"
-        assert params == {}
+        calls.append(params)
+        history_only = params["history_only"]
         return {
             "ok": True,
             "channels": [
-                {
-                    "id": "C222222222",
-                    "name": "random",
-                    "purpose": "",
-                    "topic": "Chat",
-                    "member_count": 3,
-                    "is_private": False,
-                    "is_member": True,
-                    "can_upload": True,
-                    "can_download": False,
-                    "can_read_history": False,
-                },
                 {
                     "id": "C111111111",
                     "name": "general",
@@ -578,7 +635,20 @@ def test_list_channels_proxy_calls_centaur_api() -> None:
                     "can_download": True,
                     "can_read_history": True,
                 },
+                *([] if history_only else [{
+                    "id": "C222222222",
+                    "name": "random",
+                    "purpose": "",
+                    "topic": "Chat",
+                    "member_count": 3,
+                    "is_private": False,
+                    "is_member": True,
+                    "can_upload": True,
+                    "can_download": False,
+                    "can_read_history": False,
+                }]),
             ],
+            "response_metadata": {"next_cursor": ""},
         }
 
     client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
@@ -589,6 +659,41 @@ def test_list_channels_proxy_calls_centaur_api() -> None:
     ]
     assert [channel["id"] for channel in client.list_channels_proxy(history_only=True)] == [
         "C111111111"
+    ]
+    assert calls == [
+        {"limit": 200, "cursor": None, "query": None, "history_only": False},
+        {"limit": 200, "cursor": None, "query": None, "history_only": True},
+    ]
+
+
+def test_list_channels_proxy_paginates_and_passes_query() -> None:
+    client, _ = _make_client()
+    calls = []
+
+    def fake_get_json(path, params):
+        assert path == "/api/slack/channels"
+        calls.append(params)
+        channel_id = "C111111111" if params["cursor"] is None else "G222222222"
+        return {
+            "ok": True,
+            "channels": [{
+                "id": channel_id,
+                "name": "alpha" if params["cursor"] is None else "beta",
+                "can_read_history": True,
+            }],
+            "response_metadata": {
+                "next_cursor": "1" if params["cursor"] is None else ""
+            },
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    channels = client.list_channels_proxy(limit=2, history_only=True, query="a")
+
+    assert [channel["id"] for channel in channels] == ["C111111111", "G222222222"]
+    assert calls == [
+        {"limit": 2, "cursor": None, "query": "a", "history_only": True},
+        {"limit": 1, "cursor": "1", "query": "a", "history_only": True},
     ]
 
 
