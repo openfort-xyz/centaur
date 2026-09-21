@@ -62,13 +62,24 @@ def send_message(
     console.print(f"[green]Message sent[/green] → {result.get('name', 'unknown')}")
 
 
+def _order_by(value: str | None) -> str | None:
+    if value is None:
+        return None
+    direction = value.strip().lower().removeprefix("createtime").strip()
+    if direction not in ("asc", "desc"):
+        raise typer.BadParameter(f"{value!r}: use ASC, DESC, 'createTime ASC' or 'createTime DESC'")
+    return f"createTime {direction.upper()}"
+
+
 @app.command()
 def list_messages(
     space_name: str = typer.Argument(..., help="Google Chat space resource name"),
     page_size: int = typer.Option(20, "--page-size", "-n", help="Number of messages per page"),
     page_token: str | None = typer.Option(None, "--page-token", help="Token from nextPageToken"),
     filter: str | None = typer.Option(None, "--filter", help="Google Chat message filter"),
-    order_by: str | None = typer.Option(None, "--order-by", help="Message order: ASC or DESC"),
+    order_by: str | None = typer.Option(
+        None, "--order-by", callback=_order_by, help="Message order by createTime: ASC or DESC"
+    ),
     all_pages: bool = typer.Option(False, "--all-pages", help="Follow nextPageToken automatically"),
     max_pages: int = typer.Option(20, "--max-pages", min=1, help="Safety cap with --all-pages"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
