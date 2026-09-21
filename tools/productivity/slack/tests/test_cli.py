@@ -177,7 +177,7 @@ def test_channels_calls_proxy_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [((), {"limit": 10, "query": "general"})]
-    assert "general" in result.output
+    assert json.loads(result.output)[0]["name"] == "general"
 
 
 def test_channels_direct_calls_direct_client(monkeypatch) -> None:
@@ -210,7 +210,7 @@ def test_channels_direct_calls_direct_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [("list_channels", (), {"limit": 10})]
-    assert "general" in result.output
+    assert json.loads(result.output)[0]["name"] == "general"
 
 
 def test_channel_members_calls_proxy_client(monkeypatch) -> None:
@@ -220,9 +220,7 @@ def test_channel_members_calls_proxy_client(monkeypatch) -> None:
         calls.append((args, kwargs))
         return [{"id": "U123456789", "name": "alice"}]
 
-    fake_client = types.SimpleNamespace(
-        get_channel_members_proxy=fake_get_channel_members_proxy
-    )
+    fake_client = types.SimpleNamespace(get_channel_members_proxy=fake_get_channel_members_proxy)
     monkeypatch.setitem(sys.modules, "slack.client", fake_client)
 
     result = CliRunner().invoke(
@@ -232,7 +230,7 @@ def test_channel_members_calls_proxy_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [(("C1234567890",), {"limit": 25})]
-    assert "alice" in result.output
+    assert json.loads(result.output) == [{"id": "U123456789", "name": "alice"}]
 
 
 def test_channel_members_direct_calls_direct_client(monkeypatch) -> None:
@@ -249,7 +247,7 @@ def test_channel_members_direct_calls_direct_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [(("eng-ai",), {})]
-    assert "alice" in result.output
+    assert json.loads(result.output) == [{"id": "U123456789", "name": "alice"}]
 
 
 def test_search_files_calls_proxy_client(monkeypatch) -> None:
@@ -282,7 +280,9 @@ def test_search_files_calls_proxy_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [(("C1234567890", "report"), {"max_results": 10})]
-    assert "report.pdf" in result.output
+    payload = json.loads(result.output)
+    assert payload["count"] == 1
+    assert payload["results"][0]["name"] == "report.pdf"
 
 
 def test_search_files_direct_calls_direct_client(monkeypatch) -> None:
@@ -315,12 +315,12 @@ def test_search_files_direct_calls_direct_client(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert calls == [(("report",), {"max_results": 10})]
-    assert "report.pdf" in result.output
+    payload = json.loads(result.output)
+    assert payload["count"] == 1
+    assert payload["results"][0]["name"] == "report.pdf"
 
 
-def test_upload_direct_requires_explicit_channel_and_thread(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_upload_direct_requires_explicit_channel_and_thread(monkeypatch, tmp_path: Path) -> None:
     upload = tmp_path / "chart.png"
     upload.write_bytes(b"png")
 
@@ -550,10 +550,111 @@ def test_help_explains_channel_and_dm_access_paths() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    assert "proxy-backed commands" in result.output
-    assert "Slack channels" in result.output
-    assert "Use commands ending in" in result.output
-    assert "Slack DMs" in result.output
+    assert "two access paths" in result.output
+    assert "Proxied commands omit" in result.output
+    assert "Slack channel chat surfaces" in result.output
+    assert "Direct commands end" in result.output
+    assert "actual user token" in result.output
+    assert "including in Slack DM chat surfaces and MCP" in result.output
+    assert "surface and credential context" in result.output
+    assert "search-direct" in result.output
+
+
+def test_search_uses_indexed_slack_client(monkeypatch) -> None:
+    calls = []
+
+    class FakeIndexedSlackClient:
+        def search_messages(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "status": "ok",
+                "results": [
+                    {
+                        "channel": "eng-infra",
+                        "user": "alice",
+                        "text": "database migration completed",
+                        "permalink": "https://example.slack.com/archives/C123/p123",
+                    }
+                ],
+            }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "slack.client",
+        types.SimpleNamespace(IndexedSlackClient=FakeIndexedSlackClient),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "search",
+            "database migration",
+            "--channels",
+            "eng-infra,C1234567890",
+            "--from",
+            "alice",
+            "--limit",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["results"][0]["text"] == "database migration completed"
+    assert calls == [
+        {
+            "query": "database migration",
+            "limit": 5,
+            "channels": ["eng-infra", "C1234567890"],
+            "from_user": "alice",
+        }
+    ]
+
+
+def test_search_direct_calls_native_search_client(monkeypatch) -> None:
+    calls = []
+
+    def fake_search_messages_direct(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [
+            {
+                "channel": "eng-infra",
+                "user": "alice",
+                "text": "deploy completed",
+                "permalink": "https://example.slack.com/archives/C123/p123",
+            }
+        ]
+
+    fake_client = types.SimpleNamespace(search_messages_direct=fake_search_messages_direct)
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "search-direct",
+            "deploy",
+            "--channels",
+            "eng-infra,C1234567890",
+            "--from",
+            "alice",
+            "--limit",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["count"] == 1
+    assert payload["results"][0]["text"] == "deploy completed"
+    assert calls == [
+        (
+            ("deploy",),
+            {
+                "max_results": 5,
+                "channels": ["eng-infra", "C1234567890"],
+                "from_user": "alice",
+            },
+        )
+    ]
 
 
 def test_thread_does_not_fall_back_when_api_server_fails(monkeypatch) -> None:
