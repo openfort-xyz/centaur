@@ -415,3 +415,22 @@ def test_cli_rejects_malformed_resource(monkeypatch) -> None:
     malformed = runner.invoke(cli.app, ["thread", "spaces/A/messages/M", "--json"])
     assert malformed.exit_code == 1
     assert isinstance(malformed.exception, ValueError)
+
+
+@pytest.mark.parametrize("value", ["DESC", "desc", "createTime DESC", "createTime desc"])
+def test_list_messages_normalizes_order_by(monkeypatch, value) -> None:
+    client = FakeClient()
+    monkeypatch.setattr(cli, "_client", lambda: client)
+    result = runner.invoke(cli.app, ["list-messages", "spaces/AAAA", "--order-by", value, "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert client.calls[0][2]["order_by"] == "createTime DESC"
+
+
+def test_list_messages_rejects_unknown_order_by(monkeypatch) -> None:
+    client = FakeClient()
+    monkeypatch.setattr(cli, "_client", lambda: client)
+    result = runner.invoke(cli.app, ["list-messages", "spaces/AAAA", "--order-by", "name DESC"])
+
+    assert result.exit_code == 2
+    assert client.calls == []
