@@ -227,9 +227,11 @@ RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=lo
 RUN curl -L https://foundry.paradigm.xyz | bash \
     && /home/agent/.foundry/bin/foundryup --install ${FOUNDRY_VERSION} \
     && for bin in forge cast anvil chisel; do \
-      rm -f "$HOME/.foundry/bin/$bin"; \
-      ln -s "$HOME/.foundry/versions/${FOUNDRY_VERSION}/$bin" "$HOME/.foundry/bin/$bin"; \
-    done
+      src="$(find "$HOME/.foundry/versions" -type f -name "$bin" | head -n1)"; \
+      [ -n "$src" ] || { echo "foundry: $bin not found under ~/.foundry/versions" >&2; exit 1; }; \
+      ln -sf "$src" "$HOME/.foundry/bin/$bin"; \
+    done \
+    && cast --version && forge --version && anvil --version
 RUN set -eux; \
     amp_platform="$(case "$(dpkg --print-architecture)" in \
       amd64) echo linux-x64 ;; \

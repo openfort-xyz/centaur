@@ -645,7 +645,7 @@ async fn create_or_get_session(
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
     let outcome = runtime
-        .create_or_get_session(
+        .create_or_get_admitted_session(
             &thread_key,
             &harness_type,
             request.persona_id.as_deref(),
@@ -870,8 +870,19 @@ async fn interrupt_session_execution(
     }))
 }
 
-async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let report = state.runtime()?.drain().await?;
+#[derive(Debug, Default, serde::Deserialize)]
+struct DrainQuery {
+    /// When true, stop every non-terminal sandbox. Defaults to false, which
+    /// stops only sandboxes durably known to be idle.
+    #[serde(default)]
+    force: bool,
+}
+
+async fn drain_sandboxes(
+    State(state): State<AppState>,
+    Query(query): Query<DrainQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let report = state.runtime()?.drain(query.force).await?;
     let failed = report
         .failed
         .iter()
@@ -881,6 +892,8 @@ async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, A
         "ok": report.failed.is_empty(),
         "stopped_count": report.stopped.len(),
         "stopped": report.stopped,
+        "busy_count": report.busy.len(),
+        "busy": report.busy,
         "failed": failed,
     })))
 }

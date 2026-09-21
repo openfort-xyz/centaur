@@ -2,47 +2,9 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
-import pytest
-
 from workflows import console_workflow
 
 ACTION_STEPS = ["agent_result", "post_result"]
-
-
-class FakeConsoleApi:
-    def __init__(self, async_client) -> None:
-        self.async_client = async_client
-        self.responses = []
-        self.requests = []
-        self.delivery_channel = "C0123456789"
-
-    def client(self, **kwargs):
-        assert kwargs == {"timeout": 10}
-        return self.async_client(transport=httpx.MockTransport(self.handle))
-
-    def handle(self, request):
-        self.requests.append(request)
-        assert request.headers["authorization"] == "Bearer test-key"
-        assert request.url.host == "console.test"
-        task_id = request.url.path.rsplit("/", 1)[-1]
-        task = self.responses.pop(0) if self.responses else {
-            "id": task_id,
-            "enabled": True,
-            "delivery_channel": self.delivery_channel,
-        }
-        if task is None:
-            return httpx.Response(404, json={"error": {"message": "not found"}})
-        return httpx.Response(200, json={"data": task})
-
-
-@pytest.fixture(autouse=True)
-def console_api(monkeypatch):
-    api = FakeConsoleApi(httpx.AsyncClient)
-    monkeypatch.setenv("IRON_CONTROL_URL", "http://console.test/")
-    monkeypatch.setenv("IRON_CONTROL_API_KEY", "test-key")
-    monkeypatch.setattr(console_workflow.httpx, "AsyncClient", api.client)
-    return api
 
 
 class FakeContext:
@@ -181,60 +143,6 @@ def test_handler_runs_one_scoped_agent_turn_and_delivers_its_text():
     assert result["delivery"]["ts"] == "123.1"
 
 
-def test_handler_skips_an_ineligible_task_before_starting_an_agent(console_api):
-    console_api.responses = [None]
-    context = FakeContext()
-
-    result = asyncio.run(
-        console_workflow.handler(
-            {
-                "prompt": "Summarize open incidents",
-                "principal": "console-user-author",
-                "channel": "C0123456789",
-                "scheduled_task_id": "tsk_123",
-            },
-            context,
-        )
-    )
-
-    assert result == {
-        "status": "skipped",
-        "reason": "scheduled_task_not_executable",
-        "scheduled_task_id": "tsk_123",
-    }
-    assert context.agent_calls == []
-    assert context.step_calls == ["agent_result"]
-    assert context.slack_calls == []
-
-
-def test_handler_rechecks_eligibility_before_slack_delivery(console_api):
-    executable = {
-        "id": "tsk_123",
-        "enabled": True,
-        "delivery_channel": "C0123456789",
-    }
-    console_api.responses = [executable, {**executable, "enabled": False}]
-    context = FakeContext()
-
-    result = asyncio.run(
-        console_workflow.handler(
-            {
-                "prompt": "Summarize open incidents",
-                "principal": "console-user-author",
-                "channel": "C0123456789",
-                "scheduled_task_id": "tsk_123",
-            },
-            context,
-        )
-    )
-
-    assert result["status"] == "skipped"
-    assert result["reason"] == "scheduled_task_not_executable"
-    assert len(context.agent_calls) == 1
-    assert context.step_calls == ACTION_STEPS
-    assert context.slack_calls == []
-
-
 def test_handler_treats_recurring_language_as_an_instruction_to_execute_now():
     context = FakeContext()
     task = (
@@ -312,20 +220,8 @@ def test_handler_threads_and_truncates_long_channel_results():
     assert result["delivery"]["ts"] == "123.1"
 
 
-def test_handler_posts_long_dm_results_as_replies_to_the_first_message(console_api):
+def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
     response_text = "a" * (console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH * 2 + 25)
-    console_api.responses = [
-        {
-            "id": "tsk_123",
-            "enabled": True,
-            "delivery_channel": "U0123456789",
-        },
-        {
-            "id": "tsk_123",
-            "enabled": True,
-            "delivery_channel": "U0123456789",
-        },
-    ]
     context = FakeContext(
         result_text=response_text,
         slack_response_channel="D0123456789",
@@ -416,7 +312,7 @@ def test_handler_delivers_canonical_result_text_instead_of_output_lines():
     ]
 
 
-def test_handler_does_not_repeat_checkpointed_slack_posts(console_api):
+def test_handler_does_not_repeat_checkpointed_slack_posts():
     context = FakeContext()
     footer = "Sent by <@U0123456789>'s scheduled task"
     params = {
@@ -428,10 +324,8 @@ def test_handler_does_not_repeat_checkpointed_slack_posts(console_api):
     }
 
     asyncio.run(console_workflow.handler(params, context))
-    console_api.responses = [None, None]
     asyncio.run(console_workflow.handler(params, context))
 
-    assert len(console_api.requests) == 2
     assert context.step_calls == ACTION_STEPS * 2
     assert context.slack_calls == [
         (
@@ -482,8 +376,7 @@ def test_handler_rejects_missing_required_input_before_starting_an_agent():
     assert context.slack_calls == []
 
 
-def test_handler_delivers_to_a_google_chat_space_with_chat_formatting(console_api):
-    console_api.delivery_channel = "spaces/AAQA42QLdws"
+def test_handler_delivers_to_a_google_chat_space_with_chat_formatting():
     context = FakeContext()
     footer = "Sent by author@example.com's scheduled task"
 
@@ -521,8 +414,7 @@ def test_handler_delivers_to_a_google_chat_space_with_chat_formatting(console_ap
     }
 
 
-def test_handler_threads_long_google_chat_results_under_the_first_message(console_api):
-    console_api.delivery_channel = "spaces/AAQA42QLdws"
+def test_handler_threads_long_google_chat_results_under_the_first_message():
     response_text = "x" * (console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH * 2 + 25)
     context = FakeContext(result_text=response_text)
 
@@ -560,8 +452,7 @@ def test_handler_threads_long_google_chat_results_under_the_first_message(consol
     assert result["delivery"]["messages_posted"] == 3
 
 
-def test_handler_resolves_the_author_dm_space_once_and_replays_checkpoints(console_api):
-    console_api.delivery_channel = "author@example.com"
+def test_handler_resolves_the_author_dm_space_once_and_replays_checkpoints():
     response_text = "a" * (console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH + 25)
     context = FakeContext(result_text=response_text)
     params = {
@@ -586,8 +477,7 @@ def test_handler_resolves_the_author_dm_space_once_and_replays_checkpoints(conso
     assert context.step_calls == ["agent_result", "dm_setup", "post_result", "post_result_reply_1"] * 2
 
 
-def test_handler_posts_unthreaded_google_chat_replies_without_a_thread_name(console_api):
-    console_api.delivery_channel = "spaces/AAQA42QLdws"
+def test_handler_posts_unthreaded_google_chat_replies_without_a_thread_name():
     response_text = "b" * (console_workflow.GCHAT_MESSAGE_CHUNK_MAX_LENGTH + 25)
     context = ThreadlessContext(result_text=response_text)
 
@@ -609,8 +499,7 @@ def test_handler_posts_unthreaded_google_chat_replies_without_a_thread_name(cons
     assert result["delivery"]["thread_name"] == ""
 
 
-def test_handler_uses_the_generic_footer_for_google_chat_without_an_author(console_api):
-    console_api.delivery_channel = "spaces/AAQA42QLdws"
+def test_handler_uses_the_generic_footer_for_google_chat_without_an_author():
     context = FakeContext()
 
     asyncio.run(
@@ -628,35 +517,6 @@ def test_handler_uses_the_generic_footer_for_google_chat_without_an_author(conso
     assert context.google_chat_calls == [
         ("spaces/AAQA42QLdws", "Daily summary\n\nSent by a scheduled task", {})
     ]
-
-
-def test_handler_rechecks_eligibility_before_google_chat_delivery(console_api):
-    executable = {
-        "id": "tsk_123",
-        "enabled": True,
-        "delivery_channel": "spaces/AAQA42QLdws",
-    }
-    console_api.responses = [executable, {**executable, "delivery_channel": "C0123456789"}]
-    context = FakeContext()
-
-    result = asyncio.run(
-        console_workflow.handler(
-            {
-                "prompt": "Summarize open incidents",
-                "principal": "console-user-author",
-                "channel": "spaces/AAQA42QLdws",
-                "author_email": "author@example.com",
-                "scheduled_task_id": "tsk_123",
-            },
-            context,
-        )
-    )
-
-    assert result["status"] == "skipped"
-    assert result["reason"] == "scheduled_task_not_executable"
-    assert len(context.agent_calls) == 1
-    assert context.step_calls == ACTION_STEPS
-    assert context.google_chat_calls == []
 
 
 def test_handler_still_routes_slack_shaped_destinations_to_slack():

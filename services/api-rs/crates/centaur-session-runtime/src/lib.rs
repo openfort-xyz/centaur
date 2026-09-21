@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io,
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
@@ -108,12 +108,14 @@ pub trait SessionPrincipalRegistrar: Send + Sync {
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Principal, IronControlError>;
 
     async fn register_requester(
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Option<Principal>, IronControlError>;
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError>;
@@ -125,20 +127,35 @@ impl SessionPrincipalRegistrar for SessionRegistrar {
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Principal, IronControlError> {
-        SessionRegistrar::register_session(self, thread_key, metadata).await
+        SessionRegistrar::resolve_session(self, thread_key, metadata, create_if_missing).await
     }
 
     async fn register_requester(
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Option<Principal>, IronControlError> {
-        SessionRegistrar::register_requester(self, thread_key, metadata).await
+        SessionRegistrar::resolve_requester(self, thread_key, metadata, create_if_missing).await
     }
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
         SessionRegistrar::get_principal(self, principal).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionPrincipalAdmission {
+    #[default]
+    Automatic,
+    Preapproved,
+}
+
+impl SessionPrincipalAdmission {
+    fn create_if_missing(self) -> bool {
+        matches!(self, Self::Automatic)
     }
 }
 
@@ -151,6 +168,7 @@ pub struct SessionRuntime {
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Arc<dyn SessionPrincipalRegistrar>,
+    session_principal_admission: SessionPrincipalAdmission,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
     session_title_generator: Option<SessionTitleGenerator>,
@@ -162,6 +180,10 @@ pub struct SessionRuntime {
     /// so an execution cannot start on a control plane that is about to
     /// exit and release its leases.
     shutting_down: Arc<AtomicBool>,
+    /// Serializes drains against the short execution admission window. A
+    /// drain takes the write side; execution paths hold a read guard until
+    /// their active row and stdout ownership are durable.
+    execution_admission: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -356,6 +378,9 @@ pub struct CreateOrGetSessionOutcome {
 pub struct DrainReport {
     pub stopped: Vec<String>,
     pub failed: Vec<DrainFailure>,
+    /// Sandboxes left running because they were active or could not be proven
+    /// idle. Only populated when the drain is not forced.
+    pub busy: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -969,6 +994,7 @@ impl SessionRuntime {
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: Arc::new(iron_control),
+            session_principal_admission: SessionPrincipalAdmission::default(),
             warm_pool: None,
             personas: None,
             session_title_generator: None,
@@ -977,7 +1003,16 @@ impl SessionRuntime {
             capacity: None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            execution_admission: Arc::new(RwLock::new(())),
         }
+    }
+
+    pub fn with_session_principal_admission(
+        mut self,
+        admission: SessionPrincipalAdmission,
+    ) -> Self {
+        self.session_principal_admission = admission;
+        self
     }
 
     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
@@ -1569,7 +1604,7 @@ impl SessionRuntime {
         let metadata = tool_host_session_metadata(principal_id, None, None);
         let principal = self
             .iron_control
-            .register_session(thread_key.as_str(), Some(&metadata))
+            .register_session(thread_key.as_str(), Some(&metadata), true)
             .await?;
         Ok(principal.id)
     }
@@ -1663,6 +1698,8 @@ impl SessionRuntime {
         self
     }
 
+    /// Create or load an internal session, automatically provisioning its
+    /// derived principal when no explicit principal is supplied.
     pub async fn create_or_get_session(
         &self,
         thread_key: &ThreadKey,
@@ -1671,20 +1708,44 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        self.create_or_get_session_with_principal(
+        self.create_or_get_session_with_principal_admission(
             thread_key,
             harness_type,
             persona_id,
             metadata,
             on_harness_conflict,
             None,
+            SessionPrincipalAdmission::Automatic,
         )
         .await
     }
 
-    /// Create or load a session and bind it to an existing iron-control
-    /// principal selected by foreign ID. When no foreign ID is supplied, the
-    /// session keeps the normal principal derived from its thread key.
+    /// Create or load an ingress session using the deployment's principal
+    /// admission policy. HTTP chat ingresses use this path; internal workflows
+    /// use [`Self::create_or_get_session`] or explicitly select a principal.
+    pub async fn create_or_get_admitted_session(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_admission(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+            self.session_principal_admission,
+        )
+        .await
+    }
+
+    /// Create or load an internal session and bind it to an existing
+    /// iron-control principal selected by foreign ID. When no foreign ID is
+    /// supplied, its derived principal is provisioned automatically.
     pub async fn create_or_get_session_with_principal(
         &self,
         thread_key: &ThreadKey,
@@ -1693,6 +1754,29 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_admission(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            principal_foreign_id,
+            SessionPrincipalAdmission::Automatic,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_or_get_session_with_principal_admission(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_foreign_id: Option<&str>,
+        admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
@@ -1727,7 +1811,11 @@ impl SessionRuntime {
                 Some(foreign_id) => self.iron_control.get_principal(foreign_id).await?,
                 None => {
                     self.iron_control
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
+                        .register_session(
+                            thread_key.as_str(),
+                            Some(&session_metadata),
+                            admission.create_if_missing(),
+                        )
                         .await?
                 }
             };
@@ -2018,7 +2106,15 @@ impl SessionRuntime {
     /// each sandbox is stopped independently so one failure does not abort the
     /// rest, and the [`DrainReport`] records which were stopped and which
     /// failed so the caller can surface partial failure.
-    pub async fn drain(&self) -> Result<DrainReport, SessionRuntimeError> {
+    ///
+    /// Without `force`, only sandboxes durably known to be idle are stopped.
+    /// Active, provisioning, and otherwise unknown sandboxes are left running
+    /// and reported as `busy`. With `force`, every non-terminal sandbox is
+    /// stopped regardless.
+    pub async fn drain(&self, force: bool) -> Result<DrainReport, SessionRuntimeError> {
+        // Block new execution admission while each sandbox's durable state is
+        // checked and acted on, closing the idle-check/stop race in this runtime.
+        let _admission = self.execution_admission.write().await;
         let observed = self.sandbox_runtime.manager.list_observed().await?;
         let mut report = DrainReport::default();
         for sandbox in observed {
@@ -2026,6 +2122,10 @@ impl SessionRuntime {
                 continue;
             }
             let id = sandbox.id.as_str().to_owned();
+            if !force && !self.store.sandbox_is_idle_for_drain(&id).await? {
+                report.busy.push(id);
+                continue;
+            }
             match self.sandbox_runtime.manager.stop(&sandbox.id).await {
                 Ok(()) => {
                     self.sandbox_pipes.remove(&id);
@@ -2201,6 +2301,7 @@ impl SessionRuntime {
     ) -> Result<SessionExecutionAttempt, SessionExecutionAttemptError> {
         let mut execution_id = persisted_execution_id.map(str::to_owned);
         let mut correlation_sandbox_id = None;
+        let admission = self.execution_admission.read().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionExecutionAttemptError::new(
                 execution_id,
@@ -2322,6 +2423,7 @@ impl SessionRuntime {
                     .await;
                 return Err(error);
             }
+            drop(admission);
             let execution_trace_span = info_span!(
                 parent: None,
                 "centaur.api_rs.session.execution",
@@ -2503,6 +2605,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ExecuteSessionInput,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        let _admission = self.execution_admission.read().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionRuntimeError::ShuttingDown);
         }
@@ -3360,7 +3463,11 @@ impl SessionRuntime {
     ) -> Option<String> {
         match self
             .iron_control
-            .register_requester(thread_key.as_str(), metadata)
+            .register_requester(
+                thread_key.as_str(),
+                metadata,
+                self.session_principal_admission.create_if_missing(),
+            )
             .await
         {
             Ok(principal) => principal.map(|principal| principal.id),
@@ -9226,12 +9333,49 @@ mod adoption_tests {
     #[derive(Clone, Copy)]
     struct TestSessionPrincipalRegistrar;
 
+    #[derive(Clone, Copy)]
+    struct AdmissionProbeRegistrar;
+
+    #[async_trait::async_trait]
+    impl SessionPrincipalRegistrar for AdmissionProbeRegistrar {
+        async fn register_session(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            create_if_missing: bool,
+        ) -> Result<Principal, IronControlError> {
+            if create_if_missing {
+                Err(IronControlError::PrincipalDerivation(
+                    centaur_iron_control::PrincipalDerivationError::MissingSlackTeamId,
+                ))
+            } else {
+                Err(IronControlError::SessionPrincipalNotPreapproved {
+                    foreign_id: "slack-channel-t123-c123".to_owned(),
+                })
+            }
+        }
+
+        async fn register_requester(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<Option<Principal>, IronControlError> {
+            Ok(None)
+        }
+
+        async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
+            Ok(test_principal(principal))
+        }
+    }
+
     #[async_trait::async_trait]
     impl SessionPrincipalRegistrar for TestSessionPrincipalRegistrar {
         async fn register_session(
             &self,
             _thread_key: &str,
             _metadata: Option<&Value>,
+            _create_if_missing: bool,
         ) -> Result<Principal, IronControlError> {
             Ok(test_principal("prn_test"))
         }
@@ -9240,6 +9384,7 @@ mod adoption_tests {
             &self,
             _thread_key: &str,
             _metadata: Option<&Value>,
+            _create_if_missing: bool,
         ) -> Result<Option<Principal>, IronControlError> {
             Ok(None)
         }
@@ -9257,6 +9402,72 @@ mod adoption_tests {
             labels: BTreeMap::new(),
             sandbox_observability_enabled: true,
         }
+    }
+
+    #[tokio::test]
+    async fn preapproved_admission_disables_principal_creation_before_store_access() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .expect("create lazy pool");
+        let runtime = SessionRuntime::new(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("test"),
+            ),
+            AdmissionProbeRegistrar,
+        )
+        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
+
+        let error = runtime
+            .create_or_get_admitted_session(
+                &ThreadKey::try_from("slack:T123:C123:1773364194.179929".to_owned()).unwrap(),
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(
+                IronControlError::SessionPrincipalNotPreapproved { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_sessions_keep_automatic_principal_creation() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .expect("create lazy pool");
+        let runtime = SessionRuntime::new(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("test"),
+            ),
+            AdmissionProbeRegistrar,
+        )
+        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
+
+        let error = runtime
+            .create_or_get_session(
+                &ThreadKey::try_from("workflow:internal:test".to_owned()).unwrap(),
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(IronControlError::PrincipalDerivation(_))
+        ));
     }
 
     type ProxyEnsure = (String, String, Option<String>, BTreeMap<String, String>);
@@ -11501,6 +11712,87 @@ mod adoption_tests {
             Some("Completed after reattach.")
         );
         assert_eq!(backend.opens(), 2);
+        reset_test_store(&store).await;
+    }
+
+    /// A drain issued during a rollout must not kill a sandbox whose session
+    /// still has an in-flight turn, unless the caller forces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_skips_busy_sandbox_unless_forced() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:drain-busy-{}", uuid::Uuid::new_v4())).unwrap();
+        // A session that owns a sandbox and has a running execution is "busy".
+        let _execution_id = orphaned_execution(&store, &thread_key, Some("sbx-busy"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status("sbx-busy", SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend.clone());
+
+        // An unforced drain leaves the busy sandbox running and reports it.
+        let report = runtime.drain(false).await.expect("drain");
+        assert_eq!(report.busy, vec!["sbx-busy".to_owned()]);
+        assert!(
+            report.stopped.is_empty(),
+            "busy sandbox must not be stopped"
+        );
+        assert!(backend.stopped().is_empty());
+
+        // A forced drain stops it regardless of the active execution.
+        let report = runtime.drain(true).await.expect("force drain");
+        assert!(report.busy.is_empty());
+        assert_eq!(report.stopped, vec!["sbx-busy".to_owned()]);
+        assert_eq!(backend.stopped(), vec!["sbx-busy".to_owned()]);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unforced_drain_only_stops_sandboxes_proven_idle() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let idle_thread =
+            ThreadKey::parse(format!("test:drain-idle-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &idle_thread,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create idle session");
+        store
+            .update_sandbox_id(&idle_thread, Some("sbx-idle"))
+            .await
+            .expect("assign idle sandbox");
+        store
+            .insert_ready_warm_sandbox("sbx-warm", "test-workload")
+            .await
+            .expect("insert ready warm sandbox");
+
+        let provisioning_thread =
+            ThreadKey::parse(format!("test:drain-provisioning-{}", uuid::Uuid::new_v4())).unwrap();
+        let _execution_id = orphaned_execution(&store, &provisioning_thread, None, true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        for sandbox_id in ["sbx-idle", "sbx-warm", "sbx-provisioning"] {
+            backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        }
+        let runtime = runtime_with(&store, backend.clone());
+
+        let report = runtime.drain(false).await.expect("drain");
+        assert_eq!(report.stopped.len(), 2);
+        assert!(report.stopped.contains(&"sbx-idle".to_owned()));
+        assert!(report.stopped.contains(&"sbx-warm".to_owned()));
+        assert_eq!(report.busy, vec!["sbx-provisioning".to_owned()]);
+        assert_eq!(backend.stopped().len(), 2);
+        assert!(!backend.stopped().contains(&"sbx-provisioning".to_owned()));
         reset_test_store(&store).await;
     }
 

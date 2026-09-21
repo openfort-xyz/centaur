@@ -136,6 +136,18 @@ preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
 
+### 2026-09-21 — 22 upstream commits, `3d6bbcf1..e8011275`
+
+| Upstream | Slack change | Google Chat disposition |
+| --- | --- | --- |
+| #1705 remove console workflow eligibility checks | The workflow no longer re-reads the task from Console before the agent turn or the root Slack post. | **Ported.** `_deliver_to_google_chat` drops the `post_result` eligibility check added in the 2026-09-17 window; the DM space setup and chunked posting are unchanged. |
+| #1707 limit console workflow checkpoints | The `agent_result` step stores only `execution_id` and a truncated `result_text`. | **Shared.** Same `run_agent`, which the Chat branch uses with the Chat prompt. |
+| #1690 preapproved session admission | `CENTAUR_SESSION_PRINCIPAL_ADMISSION=preapproved` rejects sessions whose principal does not exist; slackbotv2 reports the denial. | **Shared, default unchanged.** The default is `automatic`. `resolve_session` keeps the fork's `apply_gchat_identity` before the label merge. googlechatbot has no denial message; add one before enabling `preapproved`. |
+| #1684, #1694, #1697, #1700 Slack tooling | Slack search routing, MCP guidance, JSON CLI output, file share retries. | **Not applicable.** Slack tool and bot only. |
+| #1687, #1689 company context Slack rows | Company context reader can read scoped Slack rows. | **Shared.** Upstream migration `0055_company_context_reader_slack_rows.sql` is renumbered to `0059`; the fork offset becomes **+4** for this file. |
+
+Merge mechanics: three conflicts. `session.rs` keeps `apply_gchat_identity` with upstream's `existing` binding; `console_workflow.py` and its tests take upstream's removal of eligibility checks and keep the Chat delivery branch.
+
 ### 2026-09-17 — 31 upstream commits, `3f899945..3d6bbcf1`
 
 | Upstream | Slack change | Google Chat disposition |
