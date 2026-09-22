@@ -1,17 +1,23 @@
 """Notion REST API client."""
 
+import re
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
 from centaur_sdk import secret
 
+
+class NotionAPIError(RuntimeError):
+    """A rejection from the Notion API, carrying Notion's own explanation."""
+
+
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 
 class NotionClient:
-
     """Client for Notion's REST API."""
 
     def __init__(self, api_key: str | None = None):
@@ -37,9 +43,19 @@ class NotionClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Execute an HTTP request."""
+        """Execute an HTTP request.
+
+        Notion puts the useful part of a rejection in the body — which property it
+        objected to and why — while the status line only says 400. Surfacing the
+        raw HTTPStatusError hides exactly the sentence that tells you what to fix.
+        """
         resp = self._http.request(method, path, json=json, params=params)
-        resp.raise_for_status()
+        if resp.is_error:
+            try:
+                detail = resp.json().get("message") or resp.text
+            except ValueError:
+                detail = resp.text
+            raise NotionAPIError(f"Notion {resp.status_code}: {detail}")
         return resp.json()
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -399,6 +415,121 @@ class NotionClient:
         """Create a simple rich text array from plain text."""
         return [{"type": "text", "text": {"content": text}}]
 
+    # Notion only renders a real, notifying @mention for a rich_text node of type
+    # "mention". A person's name typed as plain text looks the same on the page and
+    # notifies nobody, so the syntax below is the difference between tagging
+    # someone and appearing to tag them.
+    MENTION_RE = re.compile(r"@\[([^\]]+)\]")
+
+    @staticmethod
+    def make_rich_text_with_mentions(
+        text: str, resolve_user: Callable[[str], str]
+    ) -> list[dict[str, Any]]:
+        """Turn ``@[Full Name]`` into user mentions, leaving the rest as text.
+
+        ``resolve_user`` maps a name to a Notion user id and is expected to raise
+        when the name is unknown or ambiguous: a mention that quietly degrades to
+        plain text is the failure this path exists to prevent.
+        """
+        parts: list[dict[str, Any]] = []
+        cursor = 0
+        for m in NotionClient.MENTION_RE.finditer(text):
+            if m.start() > cursor:
+                parts.append({"type": "text", "text": {"content": text[cursor : m.start()]}})
+            parts.append(
+                {
+                    "type": "mention",
+                    "mention": {"type": "user", "user": {"id": resolve_user(m.group(1))}},
+                }
+            )
+            cursor = m.end()
+        if cursor < len(text):
+            parts.append({"type": "text", "text": {"content": text[cursor:]}})
+        return parts or [{"type": "text", "text": {"content": text}}]
+
+    @staticmethod
+    def build_property_value(
+        prop_type: str, raw: str, resolve_user: Callable[[str], str] | None = None
+    ) -> dict[str, Any]:
+        """Shape one CLI ``Name=value`` pair into the payload Notion expects.
+
+        The type comes from the database schema rather than a guess, because the
+        API rejects a correctly named property carrying the wrong shape.
+        """
+        value = raw.strip()
+        if prop_type == "people":
+            if resolve_user is None:
+                raise ValueError("people properties need a user resolver")
+            names = [n.strip() for n in value.split(",") if n.strip()]
+            return {"people": [{"object": "user", "id": resolve_user(n)} for n in names]}
+        if prop_type in ("select", "status"):
+            return {prop_type: {"name": value}}
+        if prop_type == "multi_select":
+            return {"multi_select": [{"name": v.strip()} for v in value.split(",") if v.strip()]}
+        if prop_type == "date":
+            start, _, end = value.partition("..")
+            payload: dict[str, Any] = {"start": start.strip()}
+            if end.strip():
+                payload["end"] = end.strip()
+            return {"date": payload}
+        if prop_type == "checkbox":
+            return {"checkbox": value.lower() in ("1", "true", "yes", "y", "checked")}
+        if prop_type == "number":
+            return {"number": float(value) if value else None}
+        if prop_type == "relation":
+            return {"relation": [{"id": v.strip()} for v in value.split(",") if v.strip()]}
+        if prop_type in ("url", "email", "phone_number"):
+            return {prop_type: value or None}
+        if prop_type in ("rich_text", "title"):
+            return {prop_type: NotionClient.make_rich_text(value)}
+        raise ValueError(
+            f"property type '{prop_type}' cannot be set from the CLI (supported: title, "
+            "rich_text, people, select, status, multi_select, date, checkbox, number, "
+            "relation, url, email, phone_number)"
+        )
+
+    @staticmethod
+    def resolve_property_name(schema: dict[str, Any], name: str) -> str:
+        """Match a property name case-insensitively, or fail loudly.
+
+        Notion ignores an unknown property key on write, so a typo would otherwise
+        read as a clean success with the field left empty.
+        """
+        for key in schema:
+            if key.lower() == name.lower():
+                return key
+        raise KeyError(
+            f"no property named '{name}'. This database has: {', '.join(sorted(schema))}"
+        )
+
+    @staticmethod
+    def pick_user(users: list[dict[str, Any]], name: str) -> str:
+        """Resolve a person to a user id by name or email, or raise.
+
+        Bots share the workspace with people and cannot be assigned or mentioned,
+        so they are never candidates.
+        """
+        people = [u for u in users if u.get("type") == "person"]
+        needle = name.strip().lower()
+        exact = [
+            u
+            for u in people
+            if (u.get("name") or "").lower() == needle
+            or (u.get("person") or {}).get("email", "").lower() == needle
+        ]
+        if len(exact) == 1:
+            return exact[0]["id"]
+        if len(exact) > 1:
+            raise ValueError(f"'{name}' matches {len(exact)} people; use their email instead")
+        partial = [u for u in people if needle in (u.get("name") or "").lower()]
+        if len(partial) == 1:
+            return partial[0]["id"]
+        if len(partial) > 1:
+            names = ", ".join(sorted(u.get("name") or "?" for u in partial))
+            raise ValueError(f"'{name}' is ambiguous — matches: {names}")
+        known = ", ".join(sorted(u.get("name") or "?" for u in people))
+        raise ValueError(f"no workspace member matches '{name}'. Members: {known}")
+
     @staticmethod
     def make_paragraph_block(text: str) -> dict[str, Any]:
         """Create a paragraph block."""
@@ -438,7 +569,6 @@ class NotionClient:
             "type": "bulleted_list_item",
             "bulleted_list_item": {"rich_text": NotionClient.make_rich_text(text)},
         }
-
 
 
 def _client() -> NotionClient:
