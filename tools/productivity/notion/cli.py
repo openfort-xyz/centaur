@@ -82,6 +82,64 @@ def extract_id(url_or_id: str) -> str:
 # -----------------------------------------------------------------------------
 
 
+_SET_HELP = "Set a database property, e.g. --set 'Assignee=Jaume Alavedra'. Repeatable."
+_SET_OPTIONAL = typer.Option(None, "--set", "-s", help=_SET_HELP)
+_SET_REQUIRED = typer.Option(..., "--set", "-s", help=_SET_HELP)
+
+
+def _user_resolver(client):
+    """Name -> Notion user id, fetching the member list at most once."""
+    cache: dict[str, str] = {}
+    members: list[dict] = []
+
+    def resolve(name: str) -> str:
+        if name not in cache:
+            if not members:
+                members.extend(client.users().get("results", []))
+            cache[name] = client.pick_user(members, name)
+        return cache[name]
+
+    return resolve
+
+
+def _database_schema(client, page_or_db_id: str, is_database: bool) -> dict:
+    """Property schema for a database, or for the database a page lives in."""
+    if is_database:
+        return client.database(page_or_db_id).get("properties", {})
+    parent = client.page(page_or_db_id).get("parent", {})
+    db_id = parent.get("database_id")
+    if not db_id:
+        raise typer.BadParameter("properties can only be set on a page that lives in a database")
+    return client.database(db_id).get("properties", {})
+
+
+def _build_properties(client, schema: dict, pairs: list[str]) -> dict:
+    """Turn repeated ``--set 'Name=value'`` options into a properties payload."""
+    resolve = _user_resolver(client)
+    built: dict = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise typer.BadParameter(f"--set expects Name=value, got '{pair}'")
+        name, _, raw = pair.partition("=")
+        try:
+            key = client.resolve_property_name(schema, name.strip())
+            built[key] = client.build_property_value(schema[key]["type"], raw, resolve)
+        except (KeyError, ValueError) as exc:
+            raise typer.BadParameter(str(exc).strip("'")) from exc
+    return built
+
+
+def _rich_text(client, text: str):
+    """Rich text with ``@[Name]`` resolved to real mentions when present."""
+    if not client.MENTION_RE.search(text):
+        return client.make_rich_text(text)
+    resolve = _user_resolver(client)
+    try:
+        return client.make_rich_text_with_mentions(text, resolve)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 @app.command()
 def me():
     """Show authenticated bot info."""
@@ -394,6 +452,7 @@ def create_page(
     parent_id: str = typer.Option(..., "--parent", "-p", help="Parent page or database ID"),
     parent_type: str = typer.Option("page", "--parent-type", help="'page' or 'database'"),
     content: str = typer.Option(None, "--content", "-c", help="Initial content (paragraph)"),
+    sets: list[str] = _SET_OPTIONAL,
 ):
     """Create a new page.
 
@@ -401,6 +460,8 @@ def create_page(
         notion create-page "My Page" --parent PAGE_ID
         notion create-page "Task" --parent DATABASE_ID --parent-type database
         notion create-page "Notes" -p PAGE_ID -c "Initial content here"
+        notion create-page "Fix DNS" -p DB_ID --parent-type database \\
+            --set "Assignee=Jaume Alavedra" --set "Status=Not started" --set "Due=2026-09-23"
     """
     client = get_client()
     pid = extract_id(parent_id)
@@ -408,9 +469,13 @@ def create_page(
     if parent_type == "database":
         parent = {"database_id": pid}
         properties = {"title": {"title": client.make_rich_text(title)}}
+        if sets:
+            properties.update(_build_properties(client, _database_schema(client, pid, True), sets))
     else:
         parent = {"page_id": pid}
         properties = {"title": {"title": client.make_rich_text(title)}}
+        if sets:
+            raise typer.BadParameter("--set only applies to pages created in a database")
 
     children = []
     if content:
@@ -419,6 +484,27 @@ def create_page(
     result = client.create_page(parent, properties, children=children if children else None)
     console.print(f"[green]Created:[/] [bold]{client.extract_title(result)}[/]")
     console.print(f"ID: {result.get('id')}")
+    console.print(f"URL: {result.get('url')}")
+
+
+@app.command("set-props")
+def set_props(
+    page_id: str = typer.Argument(..., help="Page ID or URL"),
+    sets: list[str] = _SET_REQUIRED,
+):
+    """Set properties on an existing database page.
+
+    Examples:
+        notion set-props PAGE_ID --set "Assignee=Jaume Alavedra"
+        notion set-props PAGE_ID -s "Status=In progress" -s "Priority=High"
+    """
+    client = get_client()
+    pg_id = extract_id(page_id)
+    schema = _database_schema(client, pg_id, False)
+    result = client.update_page(pg_id, properties=_build_properties(client, schema, sets))
+    console.print(f"[green]Updated:[/] [bold]{client.extract_title(result)}[/]")
+    for pair in sets:
+        console.print(f"  {pair.partition('=')[0].strip()} -> {pair.partition('=')[2].strip()}")
     console.print(f"URL: {result.get('url')}")
 
 
@@ -439,21 +525,25 @@ def append_content(
         notion append PAGE_ID "New paragraph text"
         notion append PAGE_ID "Heading" --type heading1
         notion append PAGE_ID "Task item" -t todo
+        notion append PAGE_ID "Over to @[Jaume Alavedra] for the DNS change"
     """
     client = get_client()
     pg_id = extract_id(page_id)
 
-    if block_type == "paragraph":
-        block = client.make_paragraph_block(text)
-    elif block_type.startswith("heading"):
+    rich = _rich_text(client, text)
+    if block_type.startswith("heading"):
         level = int(block_type[-1]) if block_type[-1].isdigit() else 1
         block = client.make_heading_block(text, level)
+        block[f"heading_{level}"]["rich_text"] = rich
     elif block_type == "bullet":
         block = client.make_bullet_block(text)
+        block["bulleted_list_item"]["rich_text"] = rich
     elif block_type == "todo":
         block = client.make_todo_block(text)
+        block["to_do"]["rich_text"] = rich
     else:
         block = client.make_paragraph_block(text)
+        block["paragraph"]["rich_text"] = rich
 
     client.append_block_children(pg_id, [block])
     console.print(f"[green]Appended {block_type} block to page[/]")
@@ -586,12 +676,17 @@ def add_comment(
     page_id: str = typer.Argument(..., help="Page ID"),
     text: str = typer.Argument(..., help="Comment text"),
 ):
-    """Add a comment to a page."""
+    """Add a comment to a page.
+
+    Examples:
+        notion comment PAGE_ID "Shipped."
+        notion comment PAGE_ID "@[Jaume Alavedra] this one is yours"
+    """
     client = get_client()
     pid = extract_id(page_id)
     result = client.create_comment(
         parent={"page_id": pid},
-        rich_text=client.make_rich_text(text),
+        rich_text=_rich_text(client, text),
     )
     console.print("[green]Comment added[/]")
     console.print(f"ID: {result.get('id')}")
