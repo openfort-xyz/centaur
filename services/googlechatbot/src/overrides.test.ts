@@ -10,7 +10,7 @@ describe('extractMessageOverrides', () => {
 
   test('expands Claude aliases and implies the harness via shortcut flags', () => {
     const out = extractMessageOverrides('--opus refactor this')
-    expect(out.model).toBe('claude-opus-5')
+    expect(out.model).toBe('claude-opus-5-5')
     expect(out.harnessType).toBe('claudecode')
     expect(out.cleanedText).toBe('refactor this')
   })

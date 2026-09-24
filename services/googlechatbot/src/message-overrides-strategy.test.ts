@@ -27,7 +27,7 @@ function fakeResponsesApi(outputText: string, ok = true) {
 describe('createOpenAiMessageOverridesStrategy', () => {
   test('applies a validated LLM override and leaves the text unchanged', async () => {
     const fetchFn = fakeResponsesApi(
-      JSON.stringify({ harness: null, model: 'gpt-5.6-sol', provider: null, reasoning: 'max' })
+      JSON.stringify({ harness: null, model: 'gpt-6-sol', provider: null, reasoning: 'max' })
     )
     const strategy = createOpenAiMessageOverridesStrategy({
       apiKey: 'test-key',
@@ -37,11 +37,38 @@ describe('createOpenAiMessageOverridesStrategy', () => {
 
     const out = await strategy('use max effort and the sol model')
 
-    expect(out.model).toBe('gpt-5.6-sol')
+    expect(out.model).toBe('gpt-6-sol')
     expect(out.harnessType).toBe('codex')
     expect(out.reasoning).toBe('max')
     expect(out.cleanedText).toBe('use max effort and the sol model')
     expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  test('selects Sol and Luna while preserving explicit older generations', async () => {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-luna']) {
+      let request: any
+      const strategy = createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        model: 'gpt-5.4-nano',
+        fetch: (async (_url, init) => {
+          request = JSON.parse(init!.body as string)
+          return Response.json({
+            output: [{ content: [{ text: JSON.stringify({
+              harness: null, model, provider: null, reasoning: 'max'
+            }) }] }]
+          })
+        }) as typeof fetch
+      })
+      expect(await strategy(`use ${model}`)).toMatchObject({
+        model, harnessType: 'codex', reasoning: 'max'
+      })
+      expect(request.instructions).toContain('sol -> gpt-6-sol')
+      expect(request.instructions).toContain('luna -> gpt-6-luna')
+      expect(request.instructions).toContain('opus -> claude-opus-5-5')
+      expect(request.instructions).toContain('opus 5 -> claude-opus-5,')
+      expect(request.text.format.schema.properties.model.enum).toContain(model)
+      expect(request.text.format.schema.properties.model.enum).toContain('claude-opus-5-5')
+    }
   })
 
   test('selects claude-opus-4-7 and implies the claudecode harness', async () => {
@@ -64,7 +91,7 @@ describe('createOpenAiMessageOverridesStrategy', () => {
   // imply claudecode, otherwise the selection is discarded and the turn silently
   // falls back to the default harness. See SLACK_PARITY.md §8.
   test('selects the Opus 5 models and implies the claudecode harness', async () => {
-    for (const model of ['claude-opus-5', 'claude-opus-5-fast']) {
+    for (const model of ['claude-opus-5', 'claude-opus-5-fast', 'claude-opus-5-5']) {
       const fetchFn = fakeResponsesApi(
         JSON.stringify({ harness: null, model, provider: null, reasoning: null })
       )

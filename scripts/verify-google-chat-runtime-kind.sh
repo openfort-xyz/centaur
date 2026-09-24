@@ -35,6 +35,7 @@ kubectl --context "$context" -n "$namespace" expose deployment parity-centaur-po
 kubectl --context "$context" -n "$namespace" create secret generic centaur-infra-env \
   --from-literal=DATABASE_URL=postgresql://postgres:postgres@parity-centaur-postgres:5432/postgres \
   --from-literal=GOOGLE_SERVICE_ACCOUNT_JSON='{}' \
+  --from-literal=GOOGLECHATBOT_API_KEY=kind-test-ingress-key \
   --from-literal=GOOGLECHATBOT_INTERNAL_API_KEY=kind-test-internal-key
 
 # Keep the recovery smoke credential-free and production-code-free. The preload
@@ -340,11 +341,10 @@ while :; do
     parity-centaur-googlechatbot -o jsonpath='{.status.readyReplicas}')"
   if ruby -rjson -e '
       s=JSON.parse(STDIN.read)
-      # This credential-free harness cannot prove app ownership, so recovery
-      # must use the production fallback: create one stable final, then delete
-      # the original status. Live app-auth tests cover the PATCH path.
-      ok=s["executeCalls"] == 1 && s["streamCalls"] >= 2 && s["chatCreates"] == 2 &&
-        s["idempotentCreates"] == 2 && s["patches"] == 0 && s["deletes"] == 1 &&
+      # The mock exposes the app membership and the matching message sender,
+      # so recovery edits the owned status message into the single final.
+      ok=s["executeCalls"] == 1 && s["streamCalls"] >= 2 && s["chatCreates"] == 1 &&
+        s["idempotentCreates"] == 1 && s["patches"] == 1 && s["deletes"] == 0 &&
         s["visibleMessages"] == 1 && s["visibleFinal"] == 1 && s["thinkingVisible"] == 0
       exit(ok ? 0 : 1)
     ' <<<"$stats" && test "$obligations" = "0" && test "$ready" = "2"; then
