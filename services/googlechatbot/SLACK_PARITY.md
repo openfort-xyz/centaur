@@ -136,6 +136,30 @@ preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
 
+### 2026-09-24 — 14 upstream commits, `e8011275..adb8d2d1`
+
+| Upstream | Change | Google Chat disposition |
+| --- | --- | --- |
+| #1723, #1726 | GPT-6 Sol and Luna model selection, reasoning, pricing, and Codex version | **Ported.** The Chat strategy maps Sol/Luna to GPT-6, accepts both new model IDs, and preserves explicit GPT-5.6 requests. The per-turn reasoning filter accepts the same efforts as Slack. Pricing and the Codex image pin are shared. |
+| #1735 | Opus 5.5 default, aliases, pricing, and Claude Code version | **Ported.** Chat's `--opus`, `--model opus`, per-space defaults, and natural-language strategy select `claude-opus-5-5`. Explicit Opus 5 and Opus 5 Fast remain supported. The default metadata reads the shared harness config. |
+| #1724, #1732 | Slack direct lookups use user credentials; clarify DM uploads | **Not applicable.** These change Slack-only tools. Chat retains its scoped proxy, exact-space authorization, and server-side delegated credentials. |
+| #1702, #1728, #1734 | Workspace file creation destinations, Luma, and Pangram tools | **Shared.** Platform-independent tools, with no Chat transport change. |
+| #1729, #1730, #1711, #1712, #1714, #1715 | Kind sandbox CI, chart cleanup, dependency updates | **Shared.** The CI conflict keeps both `sandbox-e2e` and `googlechatbot-tests` in the aggregate check. Chat chart settings remain intact. |
+
+No numbered migrations were added; the fork's existing migration numbering is
+unchanged. The local Kind verifier now supplies the required dummy ingress API
+key alongside its existing internal key and expects the owned status message
+to be patched into the final reply. Local checks include 486 Chat tests, typecheck, signed fixture smoke,
+295 Slack tests with one existing skip, 211 changed-tool tests, migration order,
+21 Rust telemetry/pricing tests, and the parity ledger checker. These are local
+results, not live Workspace or
+production rollout evidence.
+The built Google Chat image
+`sha256:e8efb760927db352faaec3574dbcf4de5526f812ebc1acd4904a074b045dc7de`
+also passed `scripts/verify-google-chat-runtime-kind.sh` in a disposable local
+Kind cluster: auth/probes, active-turn recovery after killing the processing
+pod, one final reply, obligation cleanup, and two healthy replicas.
+
 ### 2026-09-21 — 22 upstream commits, `3d6bbcf1..e8011275`
 
 | Upstream | Slack change | Google Chat disposition |

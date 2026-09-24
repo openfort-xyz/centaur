@@ -23,7 +23,7 @@ describe('parseSpaceDefaults', () => {
       })
     )
     expect(parsed).toEqual({
-      AAAAeng: { harnessType: 'claudecode', model: 'claude-opus-5', reasoning: 'high' },
+      AAAAeng: { harnessType: 'claudecode', model: 'claude-opus-5-5', reasoning: 'high' },
       AAAAtriage: { harnessType: 'codex', reasoning: 'low' },
       AAAAbedrock: { harnessType: 'codex', model: 'gpt-5.2', provider: 'amazon-bedrock' }
     })

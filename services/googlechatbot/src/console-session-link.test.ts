@@ -336,3 +336,13 @@ describe('gpt-6-astra efforts', () => {
     expect(reasoningForModel('codex', 'gpt-5.6-sol', 'ultra')).toBeUndefined()
   })
 })
+
+for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+  test(`${model} preserves supported reasoning and rejects ultra`, () => {
+    for (const effort of ['none', 'low', 'medium', 'high', 'xhigh', 'max']) {
+      expect(reasoningForModel('codex', model, effort)).toBe(effort)
+    }
+    expect(reasoningForModel('codex', model, 'ultra')).toBeUndefined()
+    expect(reasoningForModel('codex', model, 'minimal')).toBeUndefined()
+  })
+}
