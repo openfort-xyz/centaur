@@ -1,15 +1,7 @@
-/**
- * Google Chat response metadata and optional "Open chat in Console" line.
- *
- * The first assistant message can include the Console link; metadata can be
- * shown on the first response, every response, or never. Chat has no
- * Slack-style `context` block appended at stop-stream time; the single-write
- * render (see renderer.ts) carries the widget on the answer card instead.
- */
+/** Google Chat response metadata and persona fallback notice. */
 
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
-import { stripTrailingSlashes } from './url'
 
 const HARNESS_DISPLAY_NAMES: Record<string, string> = {
   amp: 'Amp',
@@ -249,21 +241,6 @@ function reasoningDisplayName(reasoning: string | null | undefined): string | un
   return REASONING_DISPLAY_NAMES[key] ?? titleCase(key)
 }
 
-/**
- * Builds the Console session URL for a Chat thread key, or undefined when no
- * Console base URL is configured (in which case no line should render). The
- * thread key is the exact value googlechatbot sends as `thread_key` to the
- * session API, URL-encoded into the `thread` query parameter the Console reads.
- */
-function consoleSessionUrl(
-  consoleBaseUrl: string | null | undefined,
-  threadKey: string
-): string | undefined {
-  const base = consoleBaseUrl?.trim()
-  if (!base) return undefined
-  return `${stripTrailingSlashes(base)}/console/threads?thread=${encodeURIComponent(threadKey)}`
-}
-
 export type ChatTextParagraphWidget = {
   textParagraph: { text: string }
 }
@@ -280,12 +257,9 @@ export function personaFallbackNotice(
 }
 
 /**
- * Builds the optional Console link and response metadata widget. Metadata can
- * render without a Console URL; the Console link only renders when configured.
+ * Builds the response metadata widget or a persona fallback notice.
  */
-export function buildConsoleSessionWidget(params: {
-  consoleBaseUrl: string | null | undefined
-  threadKey: string
+export function buildResponseContextWidget(params: {
   harnessType?: string | null
   metadataEnabled?: boolean
   model?: string | null
@@ -293,13 +267,11 @@ export function buildConsoleSessionWidget(params: {
   reasoning?: string | null
   serviceTier?: string | null
 }): ChatTextParagraphWidget | undefined {
-  const url = consoleSessionUrl(params.consoleBaseUrl, params.threadKey)
   const includeMetadata = params.metadataEnabled === true
   const notice = params.notice?.trim()
-  if (!url && !includeMetadata && !notice) return undefined
+  if (!includeMetadata && !notice) return undefined
   const segments: string[] = []
   if (notice) segments.push(`⚠️ ${escapeChatHtml(notice)}`)
-  if (url) segments.push(`<a href="${url}">Open chat in Console</a>`)
   if (includeMetadata) {
     const model = params.model?.trim()
     if (model) segments.push(escapeChatHtml(modelDisplayName(model)))

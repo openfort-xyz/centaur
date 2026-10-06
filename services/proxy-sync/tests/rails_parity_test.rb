@@ -44,7 +44,62 @@ class RailsParityTest < ActionDispatch::IntegrationTest
     end
   end
 
+  test "Rust sync preserves Google Chat grants, reader revocation, and personal requester credentials" do
+    with_sync_services do
+      principal = principals(:acme_channel)
+      admin = principal.created_by
+      flags = GoogleChatSpacePermission::DEFAULT_ENABLED_ATTRIBUTES
+      direct = principal.google_chat_space_permissions.create!(space_name: "spaces/AAAA", **flags)
+      roles(:acme_infra).google_chat_space_permissions.create!(space_name: "spaces/BBBB", **flags)
+      principal.google_chat_dm_permissions.create!(target_identity: "z@example.com", setup_enabled: true)
+      roles(:acme_infra).google_chat_dm_permissions.create!(target_identity: "a@example.com", setup_enabled: true)
+      principal.update!(labels: principal.labels.merge("google_chat_reader_subjects" => JSON.generate({
+        "spaces/BBBB" => "legacy@example.com", "spaces/UNGRANTED" => "ignored@example.com"
+      })))
+      reader = Principal.create!(foreign_id: "parity-chat-dm", kind: "gchat_dm", created_by: admin,
+        labels: { "gchat_space_id" => "AAAA", "google_email" => " READER@EXAMPLE.COM " })
+      token = "iprx_#{'a' * 64}"
+      body = compare(token)
+      claims = google_chat_claims(body)
+      GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag|
+        assert_equal %w[spaces/AAAA spaces/BBBB], claims.fetch(flag.fetch(:claim).to_s)
+      end
+      assert_equal %w[a@example.com z@example.com], claims.fetch("dm_setup_targets")
+      assert_equal({ "spaces/AAAA" => "reader@example.com", "spaces/BBBB" => "legacy@example.com" }, claims.fetch("reader_subjects"))
+      compare(token, { config_hash: body.fetch("config_hash") })
+
+      # A reader's labels change without changing the granted principal's version.
+      reader.update!(labels: reader.labels.merge("google_email" => "next@example.com"))
+      changed = compare(token, { config_hash: body.fetch("config_hash") })
+      assert_equal "next@example.com", google_chat_claims(changed).dig("reader_subjects", "spaces/AAAA")
+      principal.update!(labels: principal.labels.merge("google_chat_reader_subjects" => {
+        "spaces/AAAA" => "ambiguous@example.com", "spaces/BBBB" => "legacy@example.com"
+      }))
+      refute google_chat_claims(compare(token)).fetch("reader_subjects").key?("spaces/AAAA")
+      direct.destroy!
+      revoked = compare(token)
+      assert_equal [ "spaces/BBBB" ], google_chat_claims(revoked).fetch("send_spaces")
+
+      requester = Principal.create!(foreign_id: "parity-chat-user", kind: "gchat_user", created_by: admin)
+      secret = StaticSecret.new(foreign_id: "parity-desktop", created_by: admin,
+        inject_config: { "header" => "X-Desktop", "formatter" => "{{ .Value }}" })
+      secret.build_source(source_type: "env", config: { "var" => "PARITY_DESKTOP" })
+      secret.rules.build(host: "desktop.example.com")
+      secret.save!
+      Grant.create!(principal: requester, static_secret: secret, created_by: admin)
+      proxies(:acme_proxy).update!(requester_principal: requester)
+      assert_equal revoked.fetch("secrets").length + 1, compare(token).fetch("secrets").length
+      requester.update!(kind: "user")
+      assert_equal revoked.fetch("secrets").length, compare(token).fetch("secrets").length
+    end
+  end
+
   private
+
+  def google_chat_claims(body)
+    api_secret = body.fetch("secrets").find { |secret| secret.fetch("rules").any? { |rule| rule["host"] == "api.example" } }
+    JWT.decode(api_secret.fetch("source").fetch("value"), "parity-test-signing-key", true, algorithm: "HS256").first.fetch("google_chat")
+  end
 
   def with_sync_services
     binary = File.expand_path(ENV.fetch("PROXY_SYNC_BINARY"))

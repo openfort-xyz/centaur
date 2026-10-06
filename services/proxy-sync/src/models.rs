@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use active_record_encryption::ActiveRecordEncryption;
 use chrono::{DateTime, Utc};
@@ -34,6 +34,22 @@ pub(crate) struct ProxyRecord {
     pub(crate) console_user_email: Option<String>,
     pub(crate) console_user_id: Option<i64>,
     pub(crate) slack_history_channel_ids: Value,
+    pub(crate) google_chat: GoogleChatClaims,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct GoogleChatClaims {
+    pub(crate) send_spaces: Vec<String>,
+    pub(crate) update_spaces: Vec<String>,
+    pub(crate) delete_spaces: Vec<String>,
+    pub(crate) upload_spaces: Vec<String>,
+    pub(crate) download_spaces: Vec<String>,
+    pub(crate) history_spaces: Vec<String>,
+    pub(crate) member_spaces: Vec<String>,
+    pub(crate) reaction_spaces: Vec<String>,
+    pub(crate) dm_setup_targets: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) reader_subjects: BTreeMap<String, String>,
 }
 
 impl ProxyRecord {

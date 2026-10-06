@@ -8,7 +8,7 @@ use crate::{
     ApiError,
     database::permission_channels,
     identifiers::oid,
-    models::{AppState, Config, ProxyRecord},
+    models::{AppState, Config, GoogleChatClaims, ProxyRecord},
 };
 
 #[derive(Serialize)]
@@ -20,6 +20,7 @@ struct ApiJwtClaims {
     sub: String,
     capabilities: Capabilities,
     slack: SlackChannels,
+    google_chat: GoogleChatClaims,
 }
 
 #[derive(Serialize)]
@@ -107,6 +108,7 @@ pub(crate) async fn append_api_jwt(
             download_channels,
             history_channels,
         },
+        google_chat: proxy.google_chat.clone(),
     };
     let token = jwt(&claims, secret)?;
     config.secrets.push(json!({

@@ -50,13 +50,13 @@ import {
 } from './message-overrides-strategy'
 import { resolveSpaceDefault, spaceDefaultsFromConfig, type SpaceDefaults } from './space-defaults'
 import {
-  buildConsoleSessionWidget,
+  buildResponseContextWidget,
   personaFallbackNotice,
   defaultModelForHarness,
   effectiveReasoningForHarness,
   defaultServiceTierForHarness,
   reasoningForModel
-} from './console-session-link'
+} from './response-context'
 import { chatReplyLimits } from './constants'
 import { canFoldIntoActiveRun } from './fold-guard'
 import {
@@ -1070,6 +1070,7 @@ async function recoverFinalRender(
       await consumeRenderStream(client, stream, durableRenderTarget(work), renderState)
     }
     work.lastEventId = lastEventId
+    if (!renderState.terminal) renderState.error ??= renderState.streamError
     work.canonicalFinal = {
       answer: renderState.answer,
       ...(renderState.error ? { error: renderState.error } : {})
@@ -1205,7 +1206,9 @@ async function driveSession(
     overrides.provider
     ?? (overrides.harnessType ? undefined : valueOrUndefined(threadState.provider))
     ?? spaceDefault?.provider
-  const pinnedPersonaId = valueOrUndefined(threadState.personaId) ?? overrides.personaId ?? spaceDefault?.personaId
+  const pinnedPersonaId = Object.hasOwn(threadState, 'personaId')
+    ? valueOrUndefined(threadState.personaId)
+    : overrides.personaId ?? spaceDefault?.personaId
   const requestedHarnessType =
     resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS ?? 'codex'
   const harnessDefaultModel = defaultModelForHarness(
@@ -1362,11 +1365,7 @@ async function driveSession(
     work.executionId = execution.execution_id
     work.stage = 'rendering'
     await persistWork(durableState, work)
-    // "Open chat in Console" trailer on the FIRST assistant message in a
-    // thread (no earlier thread history = this event started the thread),
-    // mirroring slackbotv2's console-session-link. Undefined when no Console
-    // base URL is configured. `threadKey` (`chat:spaces:…`) is the exact value
-    // sent to the session API as `thread_key`, which the Console indexes by.
+    // Match Slack response metadata: first response, every response, or disabled.
     const isFirstAssistantMessage = !event.history_messages?.length
     // The persisted harness can differ from this turn's selected rollout
     // cohort when the thread predates the current rollout configuration.
@@ -1393,11 +1392,7 @@ async function driveSession(
       session.personaId
     )
     const consoleSessionWidget = isFirstAssistantMessage || includeResponseMetadata || fallbackNotice
-      ? buildConsoleSessionWidget({
-          consoleBaseUrl: isFirstAssistantMessage
-            ? config.CENTAUR_CONSOLE_PUBLIC_URL
-            : undefined,
-          threadKey,
+      ? buildResponseContextWidget({
           harnessType: effectiveHarnessType,
           metadataEnabled: includeResponseMetadata,
           model: effectiveModel,
@@ -1447,6 +1442,7 @@ async function driveSession(
         })
       }
     }
+    if (!state.terminal) state.error ??= state.streamError
     work.canonicalFinal = { answer: state.answer, ...(state.error ? { error: state.error } : {}) }
     await persistWork(durableState, work)
     const deliveryOutcome = await finalizeRender(client, target, state)

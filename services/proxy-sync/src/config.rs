@@ -469,6 +469,7 @@ mod tests {
             console_user_email: None,
             console_user_id: None,
             slack_history_channel_ids: json!([]),
+            google_chat: Default::default(),
         };
         let settings: Vec<PostgresSetting> = serde_json::from_value(json!([
             {"name": "app.tenant", "value_from": {"principal_label": "tenant"}},

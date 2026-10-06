@@ -23,6 +23,7 @@ fn generation_fingerprint(proxy: &ProxyRecord, token_windows: TokenWindows) -> O
         &proxy.console_user_email,
         proxy.console_user_id,
         &proxy.slack_history_channel_ids,
+        &proxy.google_chat,
         token_windows.api,
         token_windows.sandbox,
     ))
@@ -112,6 +113,7 @@ mod tests {
             console_user_email: Some("user@example.com".to_owned()),
             console_user_id: Some(13),
             slack_history_channel_ids: json!(["C12345678"]),
+            google_chat: Default::default(),
         }
     }
 
@@ -155,6 +157,11 @@ mod tests {
             |p| p.console_user_email = Some("other@example.com".to_owned()),
             |p| p.console_user_id = Some(23),
             |p| p.slack_history_channel_ids = json!([]),
+            |p| {
+                p.google_chat
+                    .reader_subjects
+                    .insert("spaces/DM".to_owned(), "reader@example.com".to_owned());
+            },
         ];
         for change in changes {
             let mut changed = proxy();

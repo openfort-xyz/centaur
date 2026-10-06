@@ -1,24 +1,21 @@
 import { describe, expect, test } from 'bun:test'
 import {
-  buildConsoleSessionWidget,
+  buildResponseContextWidget,
   defaultModelForHarness,
   defaultServiceTierForHarness,
   effectiveReasoningForHarness,
   personaFallbackNotice,
   reasoningForModel
-} from './console-session-link'
+} from './response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
 import codexConfig from '../../../harness/codex/config.toml'
 
-/** Harness/URL rendering is internal to the widget, so assert it through one. */
+/** Harness rendering is internal to the widget, so assert it through one. */
 function widgetText(params: {
-  consoleBaseUrl?: string | null
   harnessType?: string | null
   model?: string | null
 }): string | undefined {
-  return buildConsoleSessionWidget({
-    consoleBaseUrl: undefined,
-    threadKey: 'chat:spaces:A:1',
+  return buildResponseContextWidget({
     metadataEnabled: true,
     ...params
   })?.textParagraph.text
@@ -80,37 +77,9 @@ describe('defaultModelForHarness', () => {
   })
 })
 
-describe('console session URL', () => {
-  test('builds the /console/threads URL with an encoded thread key', () => {
-    expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: 'https://console.centaur.dev',
-        threadKey: 'chat:spaces:AAAA:spaces:AAAA:threads:BBBB',
-        metadataEnabled: false
-      })?.textParagraph.text
-    ).toBe(
-      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB">Open chat in Console</a>'
-    )
-  })
-
-  test('strips one or many trailing slashes from the base URL', () => {
-    expect(widgetText({ consoleBaseUrl: 'https://console.centaur.dev///' })).toBe(
-      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1">Open chat in Console</a>'
-    )
-  })
-
-  test('renders no link when no base URL is configured', () => {
-    expect(widgetText({ consoleBaseUrl: undefined })).toBeUndefined()
-    expect(widgetText({ consoleBaseUrl: null })).toBeUndefined()
-    expect(widgetText({ consoleBaseUrl: '   ' })).toBeUndefined()
-  })
-})
-
-describe('buildConsoleSessionWidget', () => {
-  test('builds a textParagraph with linked label, uppercased model then harness, middot separated', () => {
-    const widget = buildConsoleSessionWidget({
-      consoleBaseUrl: 'https://console.centaur.dev',
-      threadKey: 'chat:spaces:AAAA:spaces:AAAA:threads:BBBB',
+describe('buildResponseContextWidget', () => {
+  test('builds a textParagraph with model then harness, middot separated', () => {
+    const widget = buildResponseContextWidget({
       harnessType: 'codex',
       metadataEnabled: true,
       model: 'gpt-5.2'
@@ -118,27 +87,23 @@ describe('buildConsoleSessionWidget', () => {
     expect(widget).toEqual({
       textParagraph: {
         text:
-          '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB">Open chat in Console</a> · GPT 5.2 · Codex'
+          'GPT 5.2 · Codex'
       }
     })
   })
 
   test('omits the model segment when no model is provided', () => {
-    const widget = buildConsoleSessionWidget({
-      consoleBaseUrl: 'https://console.centaur.dev',
-      threadKey: 'chat:spaces:A:1',
+    const widget = buildResponseContextWidget({
       harnessType: 'claudecode',
       metadataEnabled: true
     })
     expect(widget?.textParagraph.text).toBe(
-      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1">Open chat in Console</a> · Claude Code'
+      'Claude Code'
     )
   })
 
   test('escapes HTML-significant characters in model and harness segments', () => {
-    const widget = buildConsoleSessionWidget({
-      consoleBaseUrl: 'https://console.centaur.dev',
-      threadKey: 'chat:spaces:A:1',
+    const widget = buildResponseContextWidget({
       harnessType: 'a<b&c',
       metadataEnabled: true,
       model: 'm<one>&two'
@@ -147,22 +112,18 @@ describe('buildConsoleSessionWidget', () => {
     expect(widget?.textParagraph.text).toContain('A&lt;b&amp;c')
   })
 
-  test('skips the widget entirely when no console base URL is set', () => {
+  test('skips the widget when metadata is disabled', () => {
     expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: undefined,
-        threadKey: 'chat:spaces:A:1',
+      buildResponseContextWidget({
         harnessType: 'codex',
         model: 'gpt-5.2'
       })
     ).toBeUndefined()
   })
 
-  test('renders metadata without a Console URL and can render the link alone', () => {
+  test('renders metadata only when enabled', () => {
     expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: undefined,
-        threadKey: 'chat:spaces:A:1',
+      buildResponseContextWidget({
         harnessType: 'codex',
         metadataEnabled: true,
         model: 'gpt-5.6-sol'
@@ -170,15 +131,11 @@ describe('buildConsoleSessionWidget', () => {
     ).toBe('Sol 5.6 · Codex')
 
     expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: 'https://console.centaur.dev',
-        threadKey: 'chat:spaces:A:1',
+      buildResponseContextWidget({
         metadataEnabled: false,
         model: 'gpt-5.6-sol'
       })?.textParagraph.text
-    ).toBe(
-      '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AA%3A1">Open chat in Console</a>'
-    )
+    ).toBeUndefined()
   })
 })
 
@@ -188,9 +145,7 @@ describe('response metadata controls', () => {
     expect(defaultServiceTierForHarness('codex')).toBe(serviceTier)
     expect(defaultServiceTierForHarness('nanocodex')).toBeUndefined()
     expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: undefined,
-        threadKey: 'chat:spaces:A:1',
+      buildResponseContextWidget({
         metadataEnabled: true,
         serviceTier: 'flex_tier'
       })?.textParagraph.text
@@ -271,11 +226,9 @@ describe('reasoningForModel', () => {
   })
 })
 
-describe('buildConsoleSessionWidget effort segment', () => {
+describe('buildResponseContextWidget effort segment', () => {
   test('appends the effort after the harness, middot separated', () => {
-    const widget = buildConsoleSessionWidget({
-      consoleBaseUrl: 'https://console.centaur.dev',
-      threadKey: 'chat:spaces:A:1',
+    const widget = buildResponseContextWidget({
       harnessType: 'nanocodex',
       metadataEnabled: true,
       model: 'gpt-5.2',
@@ -285,9 +238,7 @@ describe('buildConsoleSessionWidget effort segment', () => {
   })
 
   test('omits the segment when no effort applies', () => {
-    const widget = buildConsoleSessionWidget({
-      consoleBaseUrl: 'https://console.centaur.dev',
-      threadKey: 'chat:spaces:A:1',
+    const widget = buildResponseContextWidget({
       harnessType: 'claudecode',
       metadataEnabled: true,
       model: 'claude-opus-5'
@@ -298,7 +249,7 @@ describe('buildConsoleSessionWidget effort segment', () => {
 })
 
 // Upstream #1598 parity: api-rs may replace an unavailable requested persona;
-// the trailer says so even when neither the link nor metadata would render.
+// the trailer says so even when metadata is disabled.
 describe('persona fallback notice', () => {
   test('names the replacement or the absence of a persona', () => {
     expect(personaFallbackNotice(undefined, 'eng')).toBeUndefined()
@@ -312,18 +263,14 @@ describe('persona fallback notice', () => {
 
   test('renders the notice first, HTML-escaped, and alone if needed', () => {
     expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: undefined,
-        threadKey: 'chat:spaces:A:1',
+      buildResponseContextWidget({
         metadataEnabled: false,
         notice: 'Persona "<x>" isn\'t available. Continuing without a persona.'
       })?.textParagraph.text
     ).toBe('⚠️ Persona "&lt;x&gt;" isn\'t available. Continuing without a persona.')
 
     expect(
-      buildConsoleSessionWidget({
-        consoleBaseUrl: undefined,
-        threadKey: 'chat:spaces:A:1',
+      buildResponseContextWidget({
         harnessType: 'codex',
         metadataEnabled: true,
         model: 'gpt-6-astra',

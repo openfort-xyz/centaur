@@ -853,10 +853,11 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
 
   const post = async (
     env: Record<string, string>,
-    text: string
+    text: string,
+    state = createMemoryState()
   ): Promise<{ harness_type?: string; persona_id?: string }> => {
     const app = createGooglechatbot(loadConfig({ ...CHATBOT_ENV, ...env }), {
-      state: createMemoryState()
+      state
     }).app
     await app.request('/api/chat/events', {
       method: 'POST',
@@ -893,6 +894,20 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
     mock.calls.length = 0
     const override = await post(env, '--persona ops deploy the thing')
     expect(override.persona_id).toBe('ops')
+  })
+
+  test('a pinned persona, including no persona, survives new flags and space defaults', async () => {
+    for (const personaId of ['pinned', null]) {
+      mock.calls.length = 0
+      const state = createMemoryState()
+      await state.connect()
+      await state.set(threadStateKey('chat:spaces:AAAA:spaces:AAAA:messages:M1'), { personaId })
+      const body = await post(
+        { GOOGLECHATBOT_SPACE_DEFAULTS: JSON.stringify({ AAAA: { persona: 'eng' } }) },
+        '--persona ops deploy the thing', state
+      )
+      expect(body.persona_id).toBe(personaId ?? undefined)
+    }
   })
 
   test('an inline override takes precedence over the space default', async () => {

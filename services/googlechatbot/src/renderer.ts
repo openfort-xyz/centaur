@@ -111,6 +111,8 @@ const clientWriteSchedulers = new WeakMap<ChatEdgeClient, RendererWriteScheduler
 export type RenderState = {
   answer: string
   error: string | undefined
+  /** A reconnectable stream failure; only surface it if retries never finish. */
+  streamError?: string
   /** Short label for the current activity, shown in the `text` line. */
   statusLine: string
   lastSignature: string
@@ -143,11 +145,12 @@ export async function consumeRenderStream(
   try {
     for await (const event of stream) {
       captureStreamError(event, state)
+      if ((event.eventKind ?? event.event) === 'session.stream_error') continue
       await applyRendererEvents(client, target, state, state.mapper.process(event))
     }
   } catch (error) {
     // A transport drop is recoverable: leave terminal false so we resume.
-    state.error = state.error ?? errorText(error)
+    state.streamError = errorText(error)
     logError('googlechatbot_render_stream_failed', error)
   }
 }
@@ -158,6 +161,7 @@ export async function finalizeRender(
   target: RenderTarget,
   state: RenderState
 ): Promise<'updated' | 'created'> {
+  if (!state.terminal) state.error ??= state.streamError
   await applyRendererEvents(client, target, state, state.mapper.flush())
   return deliverFinal(client, target, state)
 }
@@ -439,7 +443,10 @@ function captureStreamError(event: RustSessionStreamEvent, state: RenderState): 
     const data = event.data
     if (data && typeof data === 'object' && 'error' in data) {
       const error = (data as { error?: unknown }).error
-      if (typeof error === 'string') state.error = state.error ?? error
+      if (typeof error === 'string') {
+        if (kind === 'session.stream_error') state.streamError = error
+        else state.error = state.error ?? error
+      }
     }
     // A real failure/cancellation is final — don't resume. A bare stream_error
     // is treated as transport noise and left resumable.

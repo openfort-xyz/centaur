@@ -71,6 +71,39 @@ function settledState(answer: string) {
 }
 
 describe('finalizeRender surface selection', () => {
+  test('a resumed success drops transport errors while failed or exhausted turns keep their errors', async () => {
+    for (const transport of ['socket', 'event']) {
+      for (const outcome of ['success', 'failed', 'exhausted']) {
+        const capture: Capture = {}
+        const client = stubClient(capture)
+        const state = createRenderState()
+        async function* dropped(): AsyncIterable<RustSessionStreamEvent> {
+          if (transport === 'event') {
+            yield { event: 'session.stream_error', data: { error: 'temporary socket failure' } }
+            return
+          }
+          throw new Error('temporary socket failure')
+        }
+        await consumeRenderStream(client, dropped(), target(), state)
+        expect(state.terminal).toBe(false)
+        expect(state.error).toBeUndefined()
+        if (outcome !== 'exhausted') {
+          async function* resumed(): AsyncIterable<RustSessionStreamEvent> {
+            yield {
+              event: outcome === 'success' ? 'session.execution_completed' : 'session.execution_failed',
+              data: outcome === 'success' ? { result_text: 'Recovered answer' } : { error: 'execution failed' }
+            } as RustSessionStreamEvent
+          }
+          await consumeRenderStream(client, resumed(), target(), state)
+        }
+        await finalizeRender(client, target(), state)
+        if (outcome === 'success') expect(capture.body?.text).toBe('Recovered answer')
+        else expect(capture.body?.text).toContain(outcome === 'failed' ? 'execution failed' : 'temporary socket failure')
+        if (outcome !== 'exhausted') expect(capture.body?.text).not.toContain('temporary socket failure')
+      }
+    }
+  })
+
   test('markdown answers go to the text surface (cards fragment inline spans)', async () => {
     const capture: Capture = {}
     const state = settledState(RICH_ANSWER)

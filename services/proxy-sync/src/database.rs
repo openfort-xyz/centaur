@@ -1,3 +1,9 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
+
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 
@@ -6,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     ApiError,
-    models::{Credential, CredentialData, CredentialKind, ProxyRecord},
+    models::{Credential, CredentialData, CredentialKind, GoogleChatClaims, ProxyRecord},
 };
 
 const CREDENTIALS_SQL: &str = include_str!("../sql/effective_credentials.sql");
@@ -42,7 +48,10 @@ pub(crate) async fn load_proxy(
     .fetch_optional(pool)
     .await
     .map_err(db_error)?;
-    Ok(row.map(|row| ProxyRecord {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut proxy = ProxyRecord {
         id: row.get("id"),
         name: row.get("name"),
         labels: row.get("labels"),
@@ -55,7 +64,106 @@ pub(crate) async fn load_proxy(
         console_user_email: row.get("console_user_email"),
         console_user_id: row.get("console_user_id"),
         slack_history_channel_ids: row.get("slack_history_channel_ids"),
-    }))
+        google_chat: GoogleChatClaims::default(),
+    };
+    if let Some(principal_id) = proxy.principal_id {
+        proxy.google_chat =
+            google_chat_claims(pool, principal_id, proxy.principal_field("labels")).await?;
+    }
+    Ok(Some(proxy))
+}
+
+async fn google_chat_claims(
+    pool: &PgPool,
+    principal_id: i64,
+    labels: &Value,
+) -> Result<GoogleChatClaims, ApiError> {
+    let rows = sqlx::query(
+        "SELECT space_name, bool_or(send_enabled) AS send, bool_or(update_enabled) AS update, \
+                bool_or(delete_enabled) AS delete, bool_or(upload_enabled) AS upload, \
+                bool_or(download_enabled) AS download, bool_or(history_enabled) AS history, \
+                bool_or(members_enabled) AS members, bool_or(reactions_enabled) AS reactions \
+         FROM google_chat_space_permissions \
+         WHERE principal_id = $1 OR role_id IN (SELECT role_id FROM principal_roles WHERE principal_id = $1) \
+         GROUP BY space_name ORDER BY space_name"
+    ).bind(principal_id).fetch_all(pool).await.map_err(db_error)?;
+    let mut claims = GoogleChatClaims::default();
+    let mut spaces = BTreeSet::new();
+    for row in rows {
+        let space: String = row.get("space_name");
+        for (flag, targets) in [
+            ("send", &mut claims.send_spaces),
+            ("update", &mut claims.update_spaces),
+            ("delete", &mut claims.delete_spaces),
+            ("upload", &mut claims.upload_spaces),
+            ("download", &mut claims.download_spaces),
+            ("history", &mut claims.history_spaces),
+            ("members", &mut claims.member_spaces),
+            ("reactions", &mut claims.reaction_spaces),
+        ] {
+            if row.get::<bool, _>(flag) {
+                targets.push(space.clone());
+                spaces.insert(space.clone());
+            }
+        }
+    }
+    claims.dm_setup_targets = sqlx::query_scalar(
+        "SELECT DISTINCT target_identity FROM google_chat_dm_permissions \
+         WHERE setup_enabled AND (principal_id = $1 OR role_id IN (SELECT role_id FROM principal_roles WHERE principal_id = $1)) \
+         ORDER BY target_identity"
+    ).bind(principal_id).fetch_all(pool).await.map_err(db_error)?;
+    let ids: Vec<_> = spaces
+        .iter()
+        .map(|space| space.trim_start_matches("spaces/"))
+        .collect();
+    let readers = sqlx::query(
+        "SELECT labels FROM principals WHERE kind = 'gchat_dm' AND labels ->> 'gchat_space_id' = ANY($1)"
+    ).bind(ids).fetch_all(pool).await.map_err(db_error)?;
+    let mut subjects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in readers {
+        let labels: Value = row.get("labels");
+        if let (Some(id), Some(email)) = (
+            labels["gchat_space_id"].as_str(),
+            labels["google_email"].as_str().and_then(reader_email),
+        ) {
+            subjects
+                .entry(format!("spaces/{id}"))
+                .or_default()
+                .insert(email);
+        }
+    }
+    let configured = &labels["google_chat_reader_subjects"];
+    let parsed;
+    let configured = if let Some(raw) = configured.as_str() {
+        parsed = serde_json::from_str::<Value>(raw).unwrap_or(Value::Null);
+        &parsed
+    } else {
+        configured
+    };
+    if let Some(configured) = configured.as_object() {
+        for (space, email) in configured {
+            if spaces.contains(space)
+                && let Some(email) = email.as_str().and_then(reader_email)
+            {
+                subjects.entry(space.clone()).or_default().insert(email);
+            }
+        }
+    }
+    claims.reader_subjects = subjects
+        .into_iter()
+        .filter_map(|(space, emails)| {
+            (emails.len() == 1).then(|| (space, emails.into_iter().next().unwrap()))
+        })
+        .collect();
+    Ok(claims)
+}
+
+fn reader_email(email: &str) -> Option<String> {
+    // Same address grammar as Console's URI::MailTo::EMAIL_REGEXP.
+    static EMAIL: OnceLock<Regex> = OnceLock::new();
+    let pattern = EMAIL.get_or_init(|| Regex::new(r"\A[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\z").unwrap());
+    let email = email.trim().to_lowercase();
+    pattern.is_match(&email).then_some(email)
 }
 
 pub(crate) async fn load_credentials(

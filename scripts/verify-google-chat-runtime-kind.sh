@@ -255,7 +255,14 @@ postgres_value() {
 # known before it is hard-killed. The shared mock preserves Chat/session state.
 processing_pod="$(kubectl --context "$context" -n "$namespace" get pods \
   -l app.kubernetes.io/component=googlechatbot \
-  -o jsonpath='{.items[0].metadata.name}')"
+  -o json | ruby -rjson -e '
+    pod = JSON.parse(STDIN.read).fetch("items").find do |item|
+      item.dig("metadata", "deletionTimestamp").nil? &&
+        item.dig("status", "containerStatuses")&.all? { |container| container["ready"] }
+    end
+    abort "no ready, non-terminating Google Chat replica" unless pod
+    puts pod.dig("metadata", "name")
+  ')"
 event_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 kubectl --context "$context" -n "$namespace" exec "$processing_pod" -- \
   env EVENT_TIME="$event_time" bun -e '
@@ -372,8 +379,21 @@ kubectl --context "$context" -n "$namespace" delete pod "$pod" --wait=false
 kubectl --context "$context" -n "$namespace" rollout status \
   deployment/parity-centaur-googlechatbot --timeout=120s
 
-ready="$(kubectl --context "$context" -n "$namespace" get deployment \
-  parity-centaur-googlechatbot -o jsonpath='{.status.readyReplicas}')"
-test "$ready" = "2"
+replacement_deadline=$((SECONDS + 120))
+while :; do
+  ready="$(kubectl --context "$context" -n "$namespace" get pods \
+    -l app.kubernetes.io/component=googlechatbot -o json | ruby -rjson -e '
+      puts JSON.parse(STDIN.read).fetch("items").count do |pod|
+        pod.dig("metadata", "deletionTimestamp").nil? &&
+          pod.dig("status", "conditions")&.any? { |condition| condition["type"] == "Ready" && condition["status"] == "True" }
+      end
+    ')"
+  test "$ready" = "2" && break
+  test "$SECONDS" -lt "$replacement_deadline" || {
+    echo "replacement did not restore two ready replicas: ready=$ready" >&2
+    exit 1
+  }
+  sleep 1
+done
 
 echo "verified live Kind runtime: auth/probes, exact active-turn recovery, one final, obligation cleanup, two replicas, pod replacement"

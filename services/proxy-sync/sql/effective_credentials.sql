@@ -24,6 +24,17 @@ WITH effective_grants AS (
     WHERE $2::bigint IS NOT NULL
       AND g.principal_id = $2
       AND g.role_id IS NULL
+
+    UNION ALL
+
+    -- Google Chat's space principal cannot hold the sender's personal statics.
+    -- Only its verified gchat_user requester may contribute direct non-broker grants.
+    SELECT g.*
+    FROM grants AS g
+    JOIN principals AS requester ON requester.id = g.principal_id AND requester.kind = 'gchat_user'
+    JOIN static_secrets AS ss ON ss.id = g.static_secret_id AND ss.broker_credential_id IS NULL
+    JOIN secret_sources AS source ON source.static_secret_id = ss.id AND source.source_type <> 'token_broker'
+    WHERE $2::bigint IS NOT NULL AND g.principal_id = $2 AND g.role_id IS NULL
 ),
 credential_refs AS (
     SELECT
