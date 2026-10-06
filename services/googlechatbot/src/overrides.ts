@@ -1,11 +1,11 @@
 /**
  * Inline message directives, shared in spirit with the Slack integration:
- *   --claude | --claude-code | --amp | --codex | --nanocodex | --hermes
+ *   --claude | --claude-code | --amp | --codex | --nanocodex | --hermes | --pi
  *                                                           pick the harness for the thread
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
  *   --model <name> (or --model=<name>)           pick the model within that harness
- *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex)
+ *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
  *   --persona <id> (or --persona=<id>)           pick the persona independently
  *
@@ -17,8 +17,7 @@
  * reasoning effort apply per turn via the blocks-protocol `model` / `reasoning`
  * fields; `--model` accepts either a full model id (claude-sonnet-4-6, gpt-5.2,
  * ...), an amp mode (deep/fast), or a Claude alias (fable/opus/sonnet/haiku)
- * which expands to the full id. Reasoning effort only affects the codex harness
- * (it maps to codex's `turn/start` `effort`); other harnesses ignore it. The
+ * which expands to the full id. Reasoning effort applies to Codex, Nanocodex, Claude Code, and Pi. The
  * provider rides the blocks-protocol `provider` field and is fixed when the
  * codex thread starts; `--bedrock` selects codex's built-in `amazon-bedrock`
  * provider (and implies the codex harness). Pair it with `--model <bedrock-id>`
@@ -51,7 +50,8 @@ const HARNESS_FLAGS: Record<string, string> = {
   claudecode: 'claudecode',
   codex: 'codex',
   hermes: 'hermes',
-  nanocodex: 'nanocodex'
+  nanocodex: 'nanocodex',
+  pi: 'pi'
 }
 
 // Provider flags select a model provider within the codex harness (and imply
@@ -95,6 +95,8 @@ const REASONING_FLAG_PATTERN = new RegExp(
   String.raw`(?:^|\s)-rsn${MODEL_VALUE_SEPARATOR}([A-Za-z-]+)${FLAG_VALUE_BOUNDARY}`,
   'i'
 )
+
+export const PERSONA_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 const PERSONA_FLAG_PATTERN = new RegExp(
   String.raw`(?:^|\s)--persona${MODEL_VALUE_SEPARATOR}([A-Za-z0-9][A-Za-z0-9._-]*)${FLAG_VALUE_BOUNDARY}`,
@@ -244,7 +246,7 @@ function stripMatch(text: string, match: RegExpExecArray): string {
 // source of the strategy's JSON-schema enums (see message-overrides-strategy),
 // so the schema the model is handed and the validation it is checked against
 // can never drift apart.
-export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex'])
+export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi'])
 export const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 export const STRATEGY_REASONING_EFFORTS = new Set([
   'none',
@@ -330,9 +332,9 @@ export function validateStrategyOverrides(
   if (modelRaw) {
     const modelHarness = STRATEGY_MODEL_HARNESSES[modelRaw.toLowerCase()]
     if (!modelHarness) return {}
-    if (harnessType && harnessType !== modelHarness) return {}
+    if (harnessType && harnessType !== modelHarness && harnessType !== 'pi') return {}
     model = modelRaw.toLowerCase()
-    harnessType = modelHarness
+    harnessType ??= modelHarness
   }
 
   const reasoningRaw = cleanString(raw.reasoning)
@@ -340,7 +342,7 @@ export function validateStrategyOverrides(
     const normalized = reasoningRaw.toLowerCase()
     if (!STRATEGY_REASONING_EFFORTS.has(normalized)) return {}
     reasoning =
-      harnessType === undefined || harnessType === 'codex' || harnessType === 'nanocodex'
+      harnessType === undefined || harnessType === 'codex' || harnessType === 'nanocodex' || harnessType === 'claudecode' || harnessType === 'pi'
         ? normalized
         : undefined
   }

@@ -18,7 +18,7 @@ const SYSTEM_PROMPT = [
   'Decide whether the Google Chat message asks to use a specific AI harness, model, provider, or reasoning effort.',
   'Return only canonical override values from the schema.',
   'Use null for every field when the message does not ask to change model selection.',
-  'Allowed harness values: codex, claudecode, amp, nanocodex, hermes.',
+  'Allowed harness values: codex, claudecode, amp, nanocodex, hermes, pi.',
   'Allowed provider values: responses, amazon-bedrock, openrouter.',
   'Allowed reasoning values: none, minimal, low, medium, high, xhigh, max, ultra.',
   'Treat inline flags such as "--claude", "--claude --model=fable", and "--fable" as model selection requests.',
@@ -33,6 +33,9 @@ const SYSTEM_PROMPT = [
   'For example, "use max effort and the sol model" should return model "gpt-6-sol" and reasoning "max".',
   'Do not treat ordinary discussion of model names as a selection request.'
 ].join('\n')
+
+const SELECTOR_TERM_PATTERN =
+  /(?<![a-z])(?:claude|claudecode|codex|amp|nanocodex|hermes|pi|opus|sonnet|haiku|fable|gpt|astra|sol|luna|terra|model|harness|provider|reasoning|effort|mode|bedrock|openrouter|think|thinking)(?:s|es)?(?![a-z])/i
 
 // Derived from the validation vocabulary in overrides.ts: a model the schema
 // admits but validation rejects would be silently discarded after the round
@@ -108,6 +111,8 @@ export function createOpenAiMessageOverridesStrategy(
     if (Object.values(explicitOverrides).some(value => value !== undefined)) {
       return { cleanedText, ...persona, ...explicitOverrides }
     }
+
+    if (!SELECTOR_TERM_PATTERN.test(cleanedText)) return { cleanedText, ...persona }
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), timeoutMs)

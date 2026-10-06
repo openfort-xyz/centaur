@@ -155,18 +155,14 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
             continue
         if tool_name in blocklist:
             continue
-        relative_package_dir = package_dir.relative_to(published)
-        target = tool_dir / relative_package_dir
-        previous = existing.get(tool_name)
-        if previous is not None:
-            # Sources are copied base-first, then overlays. A later source owns
-            # a duplicate name; otherwise an overlay can never override base.
+        if tool_name in existing:
             print(
-                f"overriding tool {tool_name}: {package_dir} replaces {previous}",
+                f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
                 file=sys.stderr,
             )
-            if previous != target:
-                _remove_path(previous)
+            continue
+        relative_package_dir = package_dir.relative_to(published)
+        target = tool_dir / relative_package_dir
         if target.exists() or target.is_symlink():
             _remove_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -518,11 +514,7 @@ method = sys.argv[3]
 payload = json.loads(sys.argv[4])
 
 module_path = project_dir / client_module
-# Prefixed, not the bare directory name: the tool package goes into sys.modules,
-# so a directory named after one of its own dependencies would displace that
-# dependency for the tool that needs it. tools/productivity/browser-use/ became
-# "browser_use" and hid the browser_use library from the client importing it.
-package_name = "_centaur_tool_" + project_dir.name.replace("-", "_")
+package_name = project_dir.name.replace("-", "_")
 if (project_dir / "__init__.py").is_file() and package_name.isidentifier() and module_path.suffix == ".py":
     package_path = project_dir / "__init__.py"
     package_spec = importlib.util.spec_from_file_location(

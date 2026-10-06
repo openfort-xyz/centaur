@@ -467,24 +467,19 @@ def append_content(
 @app.command("blocks")
 def get_blocks(
     block_id: str = typer.Argument(..., help="Block or page ID"),
-    limit: int = typer.Option(0, "--limit", "-n", help="Max results (0 = all)"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Get child blocks of a page or block.
 
-    Reads all pages before applying --limit. Keep pagination so callers that
-    rewrite a page do not lose children beyond the first API response.
-
     Examples:
         notion blocks PAGE_ID
         notion blocks BLOCK_ID --json
-        notion blocks PAGE_ID -n 20
     """
     client = get_client()
     bid = extract_id(block_id)
-    blocks = client.get_page_content(bid)
-    if limit:
-        blocks = blocks[:limit]
+    result = client.block_children(bid, page_size=limit)
+    blocks = result.get("results", [])
 
     if not blocks:
         console.print("[yellow]No blocks found.[/]")

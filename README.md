@@ -15,6 +15,15 @@
   <a href="#documentation">Documentation</a>
 </p>
 
+## Fork scope
+
+This fork follows upstream Centaur and adds Google Chat ingress, tools, grants,
+ETL, scheduled delivery, and the shared contracts those paths need. Maintain
+Slack and Google Chat parity by porting upstream improvements
+where Google Chat has an equivalent, with platform differences documented.
+Keep independent platform customizations upstream or in an organization overlay.
+GitHub runner compatibility is retained for this fork's CI.
+
 ## Features
 
 - **Slack-native agent conversations**: mention the bot in Slack and get progress plus final answers back in the thread.

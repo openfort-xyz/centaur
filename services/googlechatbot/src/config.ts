@@ -16,6 +16,7 @@ const EnvSchema = z.object({
 
   // Harness for new threads when no explicit harness flag is given.
   // (HarnessType wire value: codex | amp | claudecode | nanocodex | hermes).
+  CENTAUR_PI_MODEL: z.string().optional(),
   GOOGLECHATBOT_DEFAULT_HARNESS: z.string().default('codex'),
   GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: z.coerce.number().int().min(0).max(100).default(0),
 
@@ -116,14 +117,8 @@ const EnvSchema = z.object({
   GOOGLECHATBOT_SESSION_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   GOOGLECHATBOT_SESSION_STREAM_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 
-  // Public origin of the Console UI (same env name the Console and slackbotv2
-  // use). When set, the first assistant message in a Chat thread carries an
-  // "Open chat in Console · MODEL · Harness" line linking to the Console
-  // thread view. Unset = no line (matches slackbotv2).
-  CENTAUR_CONSOLE_PUBLIC_URL: z.string().optional(),
-
   // Append model, harness, and reasoning metadata to the first response,
-  // every response, or no responses. Independent of the optional Console link.
+  // every response, or no responses.
   GOOGLECHATBOT_RESPONSE_METADATA_MODE: z.enum(['first', 'always', 'never']).default('first'),
   // Include the baked Codex service tier when response metadata is rendered.
   GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED: z
@@ -132,12 +127,12 @@ const EnvSchema = z.object({
     .transform(value => value === 'true' || value === '1'),
 
   // Deployment defaults for the harness models (mirrored from sandbox.extraEnv
-  // by the chart, same as slackbotv2) so the Console-link line names the model
+  // by the chart, same as slackbotv2) so the response footer names the model
   // sandboxes actually run instead of the repo-baked default.
   CLAUDE_MODEL: z.string().optional(),
   CODEX_MODEL: z.string().optional(),
   // Deployment default effort for the Codex-family harnesses (Nanocodex shares
-  // Codex's policy), so the Console-link line names the effort that actually runs.
+  // Codex's policy), so the response footer names the effort that actually runs.
   CODEX_MODEL_REASONING_EFFORT: z.string().optional(),
 
   // Opt-in: continue a thread on a plain reply (no re-@mention), like Slack's

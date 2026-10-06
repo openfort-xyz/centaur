@@ -15,7 +15,7 @@ import install_tool_shims
 
 
 class CopyPublishedToolsTest(unittest.TestCase):
-    def test_copies_tool_dirs_and_later_source_replaces_duplicate_names(self) -> None:
+    def test_copies_tool_dirs_and_skips_duplicate_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             published = root / "published"
@@ -41,13 +41,13 @@ class CopyPublishedToolsTest(unittest.TestCase):
                 (target / "research" / "sensortower" / "pyproject.toml").read_text(),
                 "base\n",
             )
-            self.assertIn("overriding tool websearch", stderr.getvalue())
+            self.assertIn("skipping duplicate tool websearch", stderr.getvalue())
             self.assertEqual(
                 (target / "research" / "websearch" / "pyproject.toml").read_text(),
-                "new project\n",
+                "old project\n",
             )
-            self.assertEqual((target / "research" / "websearch" / "new.py").read_text(), "new\n")
-            self.assertFalse((target / "research" / "websearch" / "old.py").exists())
+            self.assertEqual((target / "research" / "websearch" / "old.py").read_text(), "old\n")
+            self.assertFalse((target / "research" / "websearch" / "new.py").exists())
             self.assertEqual((target / "research" / "company" / "pyproject.toml").read_text(), "company\n")
 
     def test_tool_allowlist_restricts_installed_tools(self) -> None:
@@ -125,7 +125,7 @@ class CopyPublishedToolsTest(unittest.TestCase):
             root = Path(tmp) / "tools"
             tools = [
                 ("infra", "vlogs", "vlogs", "vlogs"),
-                ("infra", "centaur_investigator", "centaur_investigator", "centaur-investigator"),
+                ("infra", "infra_probe", "infra_probe", "infra-probe"),
                 ("research", "websearch", "websearch", "websearch"),
             ]
             for category, dirname, project, script in tools:
@@ -137,12 +137,12 @@ class CopyPublishedToolsTest(unittest.TestCase):
 
             with mock.patch.dict(
                 "os.environ",
-                {"TOOL_BLOCKLIST": "vlogs,centaur_investigator,centaur-investigator"},
+                {"TOOL_BLOCKLIST": "vlogs,infra_probe,infra-probe"},
             ):
                 scripts = install_tool_shims._discover_scripts([root])
 
             self.assertNotIn("vlogs", scripts)
-            self.assertNotIn("centaur-investigator", scripts)
+            self.assertNotIn("infra-probe", scripts)
             self.assertIn("websearch", scripts)
 
 
@@ -441,92 +441,6 @@ class GeneratedShimTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), "package-loaded:ok")
-
-    def test_call_runner_does_not_shadow_a_same_named_dependency(self) -> None:
-        # A tool directory whose normalized name equals one of its own
-        # dependencies must not displace that dependency in sys.modules.
-        # browser-use/ -> browser_use hid the browser_use library from the
-        # tool that depends on it.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bin_dir = root / "bin"
-            fake_bin = root / "fake-bin"
-            site_dir = root / "site"
-            project_dir = root / "widget-lib"
-            bin_dir.mkdir()
-            fake_bin.mkdir()
-            site_dir.mkdir()
-            project_dir.mkdir()
-
-            # The real dependency, importable as widget_lib.
-            (site_dir / "widget_lib.py").write_text('Agent = "real-dependency"\n')
-
-            (project_dir / "__init__.py").write_text('"""Tool package."""\n')
-            (project_dir / "client.py").write_text(
-                "from widget_lib import Agent\n"
-                "\n"
-                "class Client:\n"
-                "    def ping(self, suffix):\n"
-                "        return f'{Agent}:{suffix}'\n"
-                "\n"
-                "def _client():\n"
-                "    return Client()\n"
-            )
-
-            index_path = bin_dir / ".centaur-tools.json"
-            index_path.write_text(
-                json.dumps(
-                    [
-                        {
-                            "name": "widget-lib",
-                            "project_dir": str(project_dir),
-                            "package": "widget-lib",
-                            "entrypoint": "cli:app",
-                            "client_module": "client.py",
-                        }
-                    ]
-                )
-                + "\n"
-            )
-            install_tool_shims._write_catalog(
-                bin_dir / "centaur-tools",
-                index_path,
-                str(Path(__file__).resolve().parents[2]),
-            )
-
-            fake_uvx = fake_bin / "uvx"
-            fake_uvx.write_text(
-                f"#!{sys.executable}\n"
-                "import subprocess\n"
-                "import sys\n"
-                "\n"
-                "args = sys.argv[1:]\n"
-                "if len(args) < 3 or args[0] != '--from' or args[2] != 'python':\n"
-                "    raise SystemExit(2)\n"
-                "raise SystemExit(subprocess.call([sys.executable, *args[3:]]))\n"
-            )
-            fake_uvx.chmod(0o755)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
-            env["PYTHONPATH"] = f"{site_dir}{os.pathsep}{env.get('PYTHONPATH', '')}"
-            env["CENTAUR_TOOL_ANALYTICS_LOG_PATH"] = "off"
-            result = subprocess.run(
-                [
-                    str(bin_dir / "centaur-tools"),
-                    "call",
-                    "widget-lib",
-                    "ping",
-                    json.dumps({"suffix": "ok"}),
-                ],
-                check=False,
-                env=env,
-                text=True,
-                capture_output=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), "real-dependency:ok")
 
 
 class RefreshInstallTest(unittest.TestCase):

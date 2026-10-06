@@ -116,7 +116,7 @@ module Console
           } }
         }
       end
-      assert_redirected_to console_threads_path
+      assert_redirected_to console_integrations_path
     end
   end
 end

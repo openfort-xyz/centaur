@@ -177,16 +177,7 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sOPENAI_API_KEY" .Values.secretManager.envPrefix }}
                   optional: true
-{{- $console := include "centaur.consoleValues" . | fromYaml -}}
-{{- if and $console.chat.enabled $console.publicUrl }}
-            # Public origin of the Console UI (matches the Console's own
-            # CENTAUR_CONSOLE_PUBLIC_URL). When chat is enabled, the first
-            # assistant message in a Chat thread gets an "Open chat in Console"
-            # line.
-            - name: CENTAUR_CONSOLE_PUBLIC_URL
-              value: {{ $console.publicUrl | quote }}
-{{- end }}
-{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" }}
+{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" "CENTAUR_PI_MODEL" }}
 {{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.googlechatbot.extraEnv $name)) }}
             # Mirror the deployer's harness default-model override
             # (sandbox.extraEnv) so the Chat Console-link line names the model

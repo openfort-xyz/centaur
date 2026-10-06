@@ -15,7 +15,7 @@ module ApiServer
         [ flag.fetch(:claim).to_s, google_chat_spaces.fetch(flag.fetch(:claim)).sort ]
       end.merge("dm_setup_targets" => principal.google_chat_dm_setup_targets.sort)
       reader_subjects = principal.google_chat_reader_subjects_by_space
-      google_chat_claims["reader_subjects"] = reader_subjects unless reader_subjects.empty?
+      google_chat_claims["reader_subjects"] = reader_subjects.sort.to_h unless reader_subjects.empty?
 
       CentaurJwt::WindowedToken.encode(
         subject_oid: principal.oid,

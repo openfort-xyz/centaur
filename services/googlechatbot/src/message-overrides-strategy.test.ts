@@ -119,7 +119,7 @@ describe('createOpenAiMessageOverridesStrategy', () => {
       model: 'gpt-5.4-nano'
     })
 
-    await strategy('deploy the thing')
+    await strategy('use the codex model to deploy the thing')
 
     const [calledUrl] = fetchFn.mock.calls[0] as unknown as [string, unknown]
     expect(calledUrl).toBe('https://example.test/v1/responses')
@@ -273,4 +273,14 @@ describe('persona flag with the OpenAI strategy', () => {
     expect(out.personaId).toBe('eng')
     expect(out.cleanedText).toBe('hello')
   })
+})
+
+
+test('ordinary messages skip the classifier and preserve persona flags', async () => {
+  const fetchFn = mock(() => { throw new Error('classifier must not run') })
+  const strategy = createOpenAiMessageOverridesStrategy({
+    apiKey: 'test-key', model: 'gpt-5.4-nano', fetch: fetchFn as unknown as typeof fetch
+  })
+  expect(await strategy('--persona eng deploy the thing')).toEqual({ cleanedText: 'deploy the thing', personaId: 'eng' })
+  expect(fetchFn).not.toHaveBeenCalled()
 })

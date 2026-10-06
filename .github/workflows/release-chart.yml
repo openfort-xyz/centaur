@@ -8,6 +8,7 @@ name: Release Chart
       - "contrib/chart/**"
       - "scripts/verify-google-chat-network-policy.sh"
       - ".github/workflows/release-chart.yml"
+  merge_group:
   push:
     branches:
       - main
@@ -69,7 +70,7 @@ jobs:
         run: scripts/verify-google-chat-network-policy.sh
 
       - name: Install yq
-        uses: mikefarah/yq@c14f446382944492701b16c1ddb48bb9dbe683e3 # v4.53.6
+        uses: mikefarah/yq@504fc38780cc46be8444ea1b72fb55919fc0bfb0 # v4.54.1
 
       - name: Validate chart version bump
         run: |
@@ -107,6 +108,7 @@ jobs:
         uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
         with:
           skip_existing: true
+          mark_as_latest: false
           charts_dir: contrib
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

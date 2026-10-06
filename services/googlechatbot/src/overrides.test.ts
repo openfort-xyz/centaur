@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { extractMessageOverrides } from './overrides'
+import { extractMessageOverrides, validateStrategyOverrides } from './overrides'
 
 describe('extractMessageOverrides', () => {
   test('extracts --model and strips it from the prompt', () => {
@@ -93,4 +93,15 @@ describe('persona and astra flags', () => {
   test('-rsn ultra is a recognized effort', () => {
     expect(extractMessageOverrides('go -rsn ultra').reasoning).toBe('ultra')
   })
+})
+
+
+test('Pi flags and strategy preserve the selected harness and effort', () => {
+  expect(extractMessageOverrides('--pi --model gpt-6-sol -rsn high hello')).toMatchObject({
+    harnessType: 'pi', model: 'gpt-6-sol', reasoning: 'high', cleanedText: 'hello'
+  })
+  expect(validateStrategyOverrides({ harness: 'pi', model: 'gpt-6-sol', reasoning: 'high' })).toMatchObject({
+    harnessType: 'pi', model: 'gpt-6-sol', reasoning: 'high'
+  })
+  expect(validateStrategyOverrides({ harness: 'claudecode', reasoning: 'high' }).reasoning).toBe('high')
 })

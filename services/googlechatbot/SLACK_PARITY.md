@@ -1,6 +1,6 @@
 # Google Chat and Slack parity status
 
-Source review date: 2026-09-07. Live evidence remains dated separately in the
+Source review date: 2026-10-06. Live evidence remains dated separately in the
 [verification ledger](../../docs/google-chat-parity-verification.md).
 
 Google Chat implements the planned integration, but complete parity remains
@@ -34,8 +34,8 @@ Use these documents for different purposes:
 | Rendering | Edit one thinking acknowledgement. Ordinary answers use Chat text, images use cards, and overflow uses stable message IDs. | Same-message rendering is recorded live. A missing acknowledgement permits replacement; ambiguous failures remain retry obligations. |
 | State and recovery | Persist accepted work, dedupe, overrides, DM transcripts, execution IDs, and final answers. Recover through leases and a recurring sweep. | Earlier Kind restart and policy checks are recorded; they do not prove every crash boundary on the current source. |
 | ETL | Shared-space projection, separate owner-scoped DM rows, resumable pagination, tombstones, retention, and metrics. | Ingestion is recorded live. Deletion convergence, RLS, and retention gates remain. |
-| Console | Space and DM grants, scheduled destinations, and thread visibility. | Automated coverage exists; narrow/wide keyboard interaction evidence remains. |
-| Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, and notice tests cover the September sync. |
+| Console | Space and DM grants and scheduled destinations. Upstream removed the Console chat UI. | Automated coverage exists; narrow/wide keyboard interaction evidence remains. |
+| Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona, including no persona; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, Pi, and notice tests cover the October sync. |
 
 ## Platform differences
 
@@ -135,6 +135,27 @@ results tied to an immutable commit or image digest. TEST-031 requires every
 preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
+
+### 2026-10-06 — 113 upstream commits, `adb8d2d1..d63acb7b`
+
+| Upstream change | Google Chat disposition |
+| --- | --- |
+| Pi harness (#1848, #1854), per-turn Claude reasoning (#1801), product-name footers (#1858) | **Ported.** Chat accepts Pi selectors, reports its configured default model, validates Claude/Pi reasoning, and uses the same model display names. Shared harness implementations come from upstream. |
+| Per-channel personas (#1841, #1863) | **Ported.** Space defaults accept a validated persona; an initial inline persona takes precedence, and an existing session's pinned persona (including no persona) remains authoritative. Ingress tests check creation and pinned-persona precedence. |
+| Skip the override classifier without selector terms (#1829) | **Ported.** Ordinary Chat messages bypass the classifier; explicit selectors and personas retain their behavior. |
+| Managed PostgreSQL and opt-in ParadeDB (#1817, #1824) | **Shared/ported.** Chat uses the shared database-egress helper. New search migrations become `0060`, and core migrations `0061`–`0063`; existing fork versions and legacy checksums remain stable. |
+| Remove Console chat UI (#1779), caller-supplied e-mail override (#1855), investigator/read-only role (#1891), Slack archive import (#1887), and local sandbox backend | **Shared/ported.** Accept the deletions. Remove the Chat footer link, its configuration, and the deleted-UI redirect expectation. Chat DM RLS tests use indexed source identity rather than the removed e-mail override. |
+| Dedicated proxy-sync (#1745, #1813) | **Ported.** The Rust service emits the same Chat JWT claims as Rails, merges direct and role grants, resolves delegated readers, invalidates cached hashes when readers change, and preserves the verified Chat requester's direct non-broker statics. A real Rails/Rust parity test covers grants, revocation, ambiguous readers, and requester isolation. |
+| Slack history channel IDs (#1857), unknown privacy (#1740), indexed-search DSN (#1860) | **Already equivalent/platform-specific.** Chat messages carry space-qualified resource names; exact grants and verified space types govern access. Chat search uses a bounded authorized API scan, so it has no indexed-search DSN. Import the shared company-context database helper. |
+| Slack late-file repair (#1851) and bot-trigger streaming recipient (#1765) | **Platform-specific.** These handle Slack file webhooks and Slack member-ID streaming. Chat resolves attachments during normalization and uses durable work retries; its renderer edits Chat messages without a Slack streaming recipient. |
+| Dependency updates, company-context, sandbox/runtime, skills, docs, and fake-Slack e2e | **Shared/ported.** Import upstream and align Chat's SDK/state adapters (4.40.0), Bun image, and common dependencies with Slack. The new state adapter incorporates the fork's expired-state patch. Retain Chat attachment-integrity dependencies. |
+| Replayed output and container compatibility | **Verified/fixed.** A reconnectable socket or stream error no longer contaminates a successful final answer; terminal execution failures and exhausted retries still surface errors. The container check kills a ready, non-terminating replica and checks one final reply after recovery. |
+| Depot runners (#1885) | **Fork infrastructure.** Use GitHub-hosted Ubuntu runners so this fork's CI can run. Retain the Chat CI job and image publication. |
+
+This sync also removes earlier fork changes unrelated to Google Chat: private
+HTTPS egress exceptions, custom sandbox packages, Attio/Notion and Drive helper
+changes, and Slack-specific fixes. The remaining fork changes support Chat or
+its shared contracts, migration numbering, documentation, and CI.
 
 ### 2026-09-24 — 14 upstream commits, `e8011275..adb8d2d1`
 
