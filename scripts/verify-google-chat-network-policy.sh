@@ -109,3 +109,25 @@ ruby -ryaml -e '
   abort "explicit signed-request opt-out not rendered" unless env["GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS"] == "false"
   puts "verified googlechatbot ingress isolation and bidirectional postgres policy"
 ' "$rendered"
+
+# The Google Chat state pool must also reach a managed core database.
+helm template parity contrib/chart \
+  --set googlechatbot.enabled=true \
+  --set googlechatbot.requireSignedRequests=false \
+  --set postgres.enabled=false \
+  --set 'externalDatabase.cidrs[0]=192.0.2.10/32' \
+  --set externalDatabase.port=5544 >"$rendered"
+ruby -ryaml -e '
+  docs = YAML.load_stream(File.read(ARGV.fetch(0))).compact
+  policy = docs.find { |doc| doc["kind"] == "NetworkPolicy" &&
+    doc.dig("spec", "podSelector", "matchLabels", "app.kubernetes.io/component") == "googlechatbot" }
+  abort "managed database egress missing" unless policy.dig("spec", "egress").any? { |rule|
+    rule.fetch("to", []).any? { |target| target.dig("ipBlock", "cidr") == "192.0.2.10/32" } &&
+    rule.fetch("ports", []).any? { |port| port["protocol"] == "TCP" && port["port"] == 5544 }
+  }
+  deployment = docs.find { |doc| doc["kind"] == "Deployment" &&
+    doc.dig("spec", "template", "metadata", "labels", "app.kubernetes.io/component") == "googlechatbot" }
+  env = deployment.dig("spec", "template", "spec", "containers", 0, "env")
+  abort "removed Console UI link still configured" if env.any? { |entry| entry["name"] == "CENTAUR_CONSOLE_PUBLIC_URL" }
+  puts "verified Google Chat managed database egress and removed Console link"
+' "$rendered"

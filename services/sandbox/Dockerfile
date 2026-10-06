@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && pip3 install --break-system-packages --no-compile \
     python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
-    python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 weasyprint==69.0 markdown==3.10.3 \
+    python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
     faster-whisper \
     asyncpg==0.30.0 \
     boto3>=1.40.0 \
@@ -89,10 +89,10 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
 ARG CLAUDE_CODE_VERSION=2.1.281
-ARG CODEX_VERSION=0.155.1
+ARG CODEX_VERSION=0.158.0
+ARG PI_CODING_AGENT_VERSION=1.0.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
-ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
@@ -150,13 +150,17 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
-      "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+      "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
+    && pi --version | grep -Fx "${PI_CODING_AGENT_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
+# Keep every pi run, the harness's and the agent's own, from phoning home.
+ENV PI_TELEMETRY=0 \
+    PI_SKIP_VERSION_CHECK=1
 
 # ── Hermes Agent (own venv; exposes `hermes` + the tui_gateway module) ───────
 # The hermes harness drives `python -m tui_gateway.entry` (see
@@ -260,13 +264,13 @@ RUN uv tool install "playwright==${PLAYWRIGHT_VERSION}" \
     && playwright --version | grep -F "${PLAYWRIGHT_VERSION}"
 
 # ── Agent skills + workspace setup (rarely changes) ─────────────────────────
-# Pin the CLI and select the skill and agents so image builds cannot prompt.
+# Codex installs into .agents/skills, which startup shares with every harness.
 RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked \
-    npx -y skills@1.5.25 add vercel-labs/agent-browser --skill agent-browser -y -a claude-code -a codex -a amp -a pi \
+    npx -y skills add vercel-labs/agent-browser --agent codex --skill agent-browser --yes \
     && test -s .agents/skills/agent-browser/SKILL.md
 # git-branch configures each writable clone with the publishing GitHub account.
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
-RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
+RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \

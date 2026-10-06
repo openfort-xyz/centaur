@@ -854,7 +854,7 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
   const post = async (
     env: Record<string, string>,
     text: string
-  ): Promise<{ harness_type?: string }> => {
+  ): Promise<{ harness_type?: string; persona_id?: string }> => {
     const app = createGooglechatbot(loadConfig({ ...CHATBOT_ENV, ...env }), {
       state: createMemoryState()
     }).app
@@ -869,7 +869,7 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
     const createSessionCall = mock.calls.find(
       c => c.method === 'POST' && /\/api\/session\/[^/]+$/.test(c.url)
     )
-    return (createSessionCall?.body ?? {}) as { harness_type?: string }
+    return (createSessionCall?.body ?? {}) as { harness_type?: string; persona_id?: string }
   }
 
   test('with neither an inline override nor a space default, the deployment default wins', async () => {
@@ -883,6 +883,16 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
       'deploy the thing'
     )
     expect(body.harness_type).toBe('claudecode')
+  })
+
+  test('space persona reaches session creation and an inline persona overrides it', async () => {
+    const env = { GOOGLECHATBOT_SPACE_DEFAULTS: JSON.stringify({ AAAA: { persona: 'eng', harness: 'pi' } }) }
+    const body = await post(env, 'deploy the thing')
+    expect(body.persona_id).toBe('eng')
+    expect(body.harness_type).toBe('pi')
+    mock.calls.length = 0
+    const override = await post(env, '--persona ops deploy the thing')
+    expect(override.persona_id).toBe('ops')
   })
 
   test('an inline override takes precedence over the space default', async () => {

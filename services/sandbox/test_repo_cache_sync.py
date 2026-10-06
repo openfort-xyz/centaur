@@ -161,45 +161,63 @@ class RepoCacheSyncTest(unittest.TestCase):
             self.assertTrue((target / ".git").is_dir())
             self.assertFalse(old.exists())
 
-    def test_sync_repo_follows_a_tag_moved_on_the_remote(self) -> None:
-        # A tag re-pointed on GitHub used to fail every fetch ("would clobber
-        # existing tag"), which removed the ready file and kept the repo-cache
-        # DaemonSet unready until someone deleted the cached tag by hand.
+    def test_sync_repo_updates_checkout_after_upstream_tag_moves(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            remote = root / "remote"
-            git = lambda *args: subprocess.run(
-                ["git", *args], check=True, text=True, capture_output=True,
-                env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
-                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"},
+            git_env = {
+                **os.environ,
+                "GIT_CONFIG_GLOBAL": str(root / "gitconfig"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", *args],
+                    check=True,
+                    env=git_env,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+
+            remote = root / "remotes" / "acme" / "docs.git"
+            git("init", "-q", "--bare", "-b", "main", str(remote))
+            git(
+                "config",
+                "--global",
+                f"url.file://{root / 'remotes'}/.insteadOf",
+                "https://github.com/",
             )
-            git("init", "-q", "-b", "main", str(remote))
-            git("-C", str(remote), "commit", "-q", "--allow-empty", "-m", "one")
-            git("-C", str(remote), "tag", "release")
+            work = root / "work"
+            git("clone", "-q", str(remote), str(work))
+            git("-C", str(work), "commit", "-q", "--allow-empty", "-m", "one")
+            git("-C", str(work), "tag", "v1")
+            git("-C", str(work), "push", "-q", "origin", "HEAD:main", "v1")
 
-            class LocalRemote(repo_cache_sync.RepoCacheSync):
-                def repository_url(self, repo: str) -> str:
-                    return str(remote)
-
-            sync = LocalRemote(
+            sync = repo_cache_sync.RepoCacheSync(
                 cache_dir=root / "cache",
-                repositories=["acme/app"],
+                repositories=["acme/docs"],
                 repository_refs={},
-                repository_visibilities={"acme/app": "public"},
+                repository_visibilities={"acme/docs": "public"},
                 sync_interval_seconds=30,
                 github_token_file=root / "missing-token",
             )
-            sync.sync_repo("acme/app")
+            sync.git_env = git_env
+            sync.sync_repo("acme/docs")
 
-            git("-C", str(remote), "commit", "-q", "--allow-empty", "-m", "two")
-            git("-C", str(remote), "tag", "-f", "release")
-            moved = git("-C", str(remote), "rev-parse", "release").stdout.strip()
+            git("-C", str(work), "commit", "-q", "--allow-empty", "-m", "two")
+            git("-C", str(work), "tag", "-f", "v1")
+            git("-C", str(work), "push", "-q", "--force", "origin", "HEAD:main", "v1")
+            head = git("-C", str(work), "rev-parse", "HEAD")
 
-            sync.sync_repo("acme/app")
+            sync.sync_repo("acme/docs")
 
-            target = sync.repository_target("acme/app")
-            cached = git("-C", str(target), "rev-parse", "release").stdout.strip()
-            self.assertEqual(cached, moved)
+            target = sync.repository_target("acme/docs")
+            self.assertEqual(git("-C", str(target), "rev-parse", "HEAD"), head)
+            self.assertEqual(git("-C", str(target), "rev-parse", "v1"), head)
 
     def test_run_forever_restores_repo_cache_umask(self) -> None:
         class StopAfterUmask(repo_cache_sync.RepoCacheSync):

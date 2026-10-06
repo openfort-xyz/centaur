@@ -1,5 +1,5 @@
 /**
- * Per-space default harness / model / provider / reasoning. Loaded from the
+ * Per-space default persona / harness / model / provider / reasoning. Loaded from the
  * `GOOGLECHATBOT_SPACE_DEFAULTS` env var: JSON keyed by Google Chat space id
  * (the `AAAA` in `spaces/AAAA`), each value an object normalized like the
  * inline flags (see `normalizeHarnessOverrides`). Mirrors slackbotv2's
@@ -13,12 +13,13 @@
  *
  * Fields are independent. Precedence (in index.ts): per-thread override, then
  * space default, then deployment default. Setting `harness` restarts a thread
- * onto it like `--claude`/`--codex`; `reasoning` only affects codex.
+ * onto it like `--claude`/`--codex`; `reasoning` applies to Codex, Nanocodex, Claude Code, and Pi.
+ * A space persona applies when the session is created.
  */
 
 import type { AppConfig } from './config'
 import { logWarn } from './logging'
-import { normalizeHarnessOverrides, type HarnessOverrides } from './overrides'
+import { normalizeHarnessOverrides, PERSONA_ID_PATTERN, type HarnessOverrides } from './overrides'
 
 export type SpaceDefaults = Record<string, HarnessOverrides>
 
@@ -49,12 +50,18 @@ export function parseSpaceDefaults(
     const key = spaceId.trim()
     if (!key) continue
     if (!isPlainObject(rawEntry)) {
-      onError?.(`space ${key}: expected an object of harness/model/provider/reasoning fields`)
+      onError?.(`space ${key}: expected an object of persona/harness/model/provider/reasoning fields`)
       continue
     }
     const overrides = normalizeHarnessOverrides(rawEntry, message => onError?.(`space ${key}: ${message}`))
-    if (!overrides.harnessType && !overrides.model && !overrides.provider && !overrides.reasoning) {
-      onError?.(`space ${key}: no usable harness/model/provider/reasoning fields`)
+    const persona = typeof rawEntry.persona === 'string' ? rawEntry.persona.trim() : ''
+    if (PERSONA_ID_PATTERN.test(persona)) {
+      overrides.personaId = persona
+    } else if (rawEntry.persona !== undefined) {
+      onError?.(`space ${key}: invalid persona id ${JSON.stringify(rawEntry.persona)}`)
+    }
+    if (!overrides.personaId && !overrides.harnessType && !overrides.model && !overrides.provider && !overrides.reasoning) {
+      onError?.(`space ${key}: no usable persona/harness/model/provider/reasoning fields`)
       continue
     }
     result[key] = overrides

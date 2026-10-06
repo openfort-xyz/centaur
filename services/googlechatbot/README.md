@@ -36,8 +36,8 @@ delivers one canonical final answer.
 
 The initial `--persona <id>` selection is pinned by api-rs for the session;
 later persona flags do not replace it. An unavailable requested persona produces
-a fallback notice. Helm supplies Console session links only when
-`console.chat.enabled` is true and `console.publicUrl` is configured.
+a fallback notice. The Console chat UI was removed upstream, so Helm no longer supplies
+Console session links. Response metadata still renders independently.
 
 ## Configuration
 

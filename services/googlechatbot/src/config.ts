@@ -16,6 +16,7 @@ const EnvSchema = z.object({
 
   // Harness for new threads when no explicit harness flag is given.
   // (HarnessType wire value: codex | amp | claudecode | nanocodex | hermes).
+  CENTAUR_PI_MODEL: z.string().optional(),
   GOOGLECHATBOT_DEFAULT_HARNESS: z.string().default('codex'),
   GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: z.coerce.number().int().min(0).max(100).default(0),
 

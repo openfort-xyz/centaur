@@ -1205,7 +1205,7 @@ async function driveSession(
     overrides.provider
     ?? (overrides.harnessType ? undefined : valueOrUndefined(threadState.provider))
     ?? spaceDefault?.provider
-  const pinnedPersonaId = valueOrUndefined(threadState.personaId) ?? overrides.personaId
+  const pinnedPersonaId = valueOrUndefined(threadState.personaId) ?? overrides.personaId ?? spaceDefault?.personaId
   const requestedHarnessType =
     resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS ?? 'codex'
   const harnessDefaultModel = defaultModelForHarness(
@@ -1738,6 +1738,7 @@ function isPlainTextOnlyRequest(text: string): boolean {
  * mirrored from sandbox.extraEnv by the chart), keyed by harness wire value. */
 function harnessDefaultModels(config: AppConfig): Record<string, string> {
   return {
+    ...(config.CENTAUR_PI_MODEL ? { pi: config.CENTAUR_PI_MODEL } : {}),
     ...(config.CLAUDE_MODEL ? { claudecode: config.CLAUDE_MODEL } : {}),
     // Nanocodex runs off the same CODEX_MODEL deployment override as Codex.
     ...(config.CODEX_MODEL

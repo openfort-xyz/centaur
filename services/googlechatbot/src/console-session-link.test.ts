@@ -118,7 +118,7 @@ describe('buildConsoleSessionWidget', () => {
     expect(widget).toEqual({
       textParagraph: {
         text:
-          '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB">Open chat in Console</a> · GPT-5.2 · Codex'
+          '<a href="https://console.centaur.dev/console/threads?thread=chat%3Aspaces%3AAAAA%3Aspaces%3AAAAA%3Athreads%3ABBBB">Open chat in Console</a> · GPT 5.2 · Codex'
       }
     })
   })
@@ -167,7 +167,7 @@ describe('buildConsoleSessionWidget', () => {
         metadataEnabled: true,
         model: 'gpt-5.6-sol'
       })?.textParagraph.text
-    ).toBe('GPT-5.6-SOL · Codex')
+    ).toBe('Sol 5.6 · Codex')
 
     expect(
       buildConsoleSessionWidget({
@@ -243,7 +243,8 @@ describe('effectiveReasoningForHarness', () => {
   })
 
   test('returns undefined for harnesses without a reasoning knob', () => {
-    expect(effectiveReasoningForHarness('claudecode', 'high')).toBeUndefined()
+    expect(effectiveReasoningForHarness('claudecode', 'high')).toBe('high')
+    expect(effectiveReasoningForHarness('pi', 'medium')).toBe('medium')
     expect(effectiveReasoningForHarness('amp', 'high')).toBeUndefined()
     expect(effectiveReasoningForHarness(undefined, 'high')).toBeUndefined()
   })
@@ -256,8 +257,12 @@ describe('reasoningForModel', () => {
     expect(reasoningForModel('codex', 'gpt-5.4-pro', 'high')).toBe('high')
   })
 
-  test('drops reasoning for non-Codex harnesses and unknown models', () => {
-    expect(reasoningForModel('claudecode', 'claude-opus-5', 'high')).toBeUndefined()
+  test('supports Claude effort and drops unknown Codex models', () => {
+    expect(reasoningForModel('claudecode', 'claude-opus-5', 'high')).toBe('high')
+    expect(reasoningForModel('claudecode', 'claude-haiku-4-5', 'high')).toBeUndefined()
+    expect(reasoningForModel('claudecode', 'claude-sonnet-4-6', 'xhigh')).toBeUndefined()
+    expect(reasoningForModel('pi', undefined, 'max')).toBe('max')
+    expect(reasoningForModel('pi', undefined, 'ultra')).toBeUndefined()
     expect(reasoningForModel('codex', 'gpt-unknown', 'high')).toBeUndefined()
   })
 
@@ -276,7 +281,7 @@ describe('buildConsoleSessionWidget effort segment', () => {
       model: 'gpt-5.2',
       reasoning: 'xhigh'
     })
-    expect(widget?.textParagraph.text).toContain('GPT-5.2 · Nanocodex · XHigh')
+    expect(widget?.textParagraph.text).toContain('GPT 5.2 · Nanocodex · XHigh')
   })
 
   test('omits the segment when no effort applies', () => {
@@ -287,7 +292,7 @@ describe('buildConsoleSessionWidget effort segment', () => {
       metadataEnabled: true,
       model: 'claude-opus-5'
     })
-    expect(widget?.textParagraph.text).toContain('CLAUDE-OPUS-5 · Claude Code')
+    expect(widget?.textParagraph.text).toContain('Opus 5 · Claude Code')
     expect(widget?.textParagraph.text).not.toContain('·  ·')
   })
 })
@@ -325,7 +330,7 @@ describe('persona fallback notice', () => {
         notice: 'n',
         reasoning: 'ultra'
       })?.textParagraph.text
-    ).toBe('⚠️ n · GPT-6-ASTRA · Codex · Ultra')
+    ).toBe('⚠️ n · Astra 6 · Codex · Ultra')
   })
 })
 

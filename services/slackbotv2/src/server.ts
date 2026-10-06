@@ -60,7 +60,6 @@ const options: SlackbotV2Options = {
     'SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT',
     0
   ),
-  consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
   responseMetadataMode: responseMetadataModeEnv('SLACKBOTV2_RESPONSE_METADATA_MODE'),
   responseServiceTierEnabled: booleanEnv('SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED', false),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
@@ -71,7 +70,8 @@ const options: SlackbotV2Options = {
     ...(optionalEnv('CLAUDE_MODEL') ? { claudecode: optionalEnv('CLAUDE_MODEL')! } : {}),
     ...(optionalEnv('CODEX_MODEL')
       ? { codex: optionalEnv('CODEX_MODEL')!, nanocodex: optionalEnv('CODEX_MODEL')! }
-      : {})
+      : {}),
+    ...(optionalEnv('CENTAUR_PI_MODEL') ? { pi: optionalEnv('CENTAUR_PI_MODEL')! } : {})
   },
   harnessDefaultReasoning: optionalEnv('CODEX_MODEL_REASONING_EFFORT')
     ? {

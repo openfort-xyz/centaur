@@ -1,10 +1,9 @@
 import { isJsonObject, stringValue } from './utils'
-import type { SlackbotV2Fetch } from './types'
 
 type ResolveSlackBotUserIdOptions = {
   botToken: string
   configuredBotUserId?: string
-  fetchFn?: SlackbotV2Fetch
+  fetchFn?: (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => Promise<Response>
   slackApiUrl?: string
   timeoutMs?: number
 }

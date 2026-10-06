@@ -96,3 +96,14 @@ describe('spaceDefaultsFromConfig', () => {
     expect(spaceDefaultsFromConfig(config)).toEqual({})
   })
 })
+
+
+test('space defaults accept persona-only entries and reject invalid identities', () => {
+  const errors: string[] = []
+  expect(parseSpaceDefaults(JSON.stringify({
+    AAAA: { persona: 'eng' }, BAD: { persona: '../eng' }, PI: { harness: 'pi', reasoning: 'high' }
+  }), error => errors.push(error))).toEqual({
+    AAAA: { personaId: 'eng' }, PI: { harnessType: 'pi', reasoning: 'high' }
+  })
+  expect(errors.some(error => error.includes('invalid persona id'))).toBe(true)
+})
