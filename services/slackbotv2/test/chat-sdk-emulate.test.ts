@@ -7,7 +7,7 @@ import {
   type ServerResponse
 } from 'node:http'
 import { connect } from 'node:net'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from 'bun:test'
 import { WebClient } from '@slack/web-api'
 import { createEmulator, type Emulator } from 'emulate'
 import { createMemoryState } from '@chat-adapter/state-memory'
@@ -527,6 +527,49 @@ describe('slackbotv2', () => {
   // The paragraph break (`\n\n`) after the model value is deliberate: the
   // unpatched chat SDK dropped it, gluing the value to the next word
   // (`fablefirst`); this exercises the patched extractPlainText end to end.
+  for (const scenario of ['classifier', 'harness flag', 'model flag', 'channel default', 'sticky thread', 'rollout', 'cleared model']) {
+    it(`does not route to a disabled harness via ${scenario}`, async () => {
+      const state = createMemoryState()
+      await state.connect()
+      bot = createTestBot({
+        state,
+        enabledHarnesses: ['codex', 'claudecode'],
+        defaultHarnessType: scenario === 'cleared model' ? 'claudecode' : undefined,
+        channelDefaults: scenario === 'channel default' || scenario === 'cleared model'
+          ? { [CHANNEL_ID]: { harnessType: 'amp', model: 'fast' } } : undefined,
+        codexNanocodexRolloutPercent: scenario === 'rollout' ? 100 : 0,
+        messageOverridesStrategy: scenario === 'classifier'
+          ? async () => ({ overrides: { harnessType: 'amp', model: 'fast' } }) : undefined
+      })
+      const parent = await postUserMessage('Harness policy thread context.')
+      if (scenario === 'sticky thread') {
+        await state.set(`thread-state:${threadKey(parent.ts)}`, {
+          harnessType: 'amp', model: 'fast', provider: 'responses'
+        })
+      }
+      const text = scenario === 'harness flag' ? '--amp --model fast review this'
+        : scenario === 'model flag' ? '--model fast review this'
+        : scenario === 'cleared model' ? '--codex review this'
+        : 'get average scanner fast runtime and scanner superfast runtime'
+      const mention = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: parent.ts })
+      expect(mention.response.status).toBe(200)
+      await mention.finished()
+      expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['codex'])
+      expect(codexApi.executes).toHaveLength(1)
+      const execute = codexApi.executes[0]!.body
+      expect(JSON.parse(execute.input_lines.at(-1)!).model).toBeUndefined()
+      expect(JSON.parse(execute.input_lines.at(-1)!).provider).toBeUndefined()
+      expect(execute.metadata.harness_type).toBe('codex')
+      if (scenario !== 'rollout') {
+        expect(await state.get(`thread-state:${threadKey(parent.ts)}`)).toEqual(
+          expect.objectContaining({ harnessType: 'codex' })
+        )
+      }
+      const replies = await slack.conversations.replies({ channel: CHANNEL_ID, ts: parent.ts })
+      expect(JSON.stringify(replies.messages?.filter(message => message.user === BOT_USER_ID)))
+        .not.toContain('Amp')
+    })
+  }
   it('pins sticky persona state without labeling a pinned mismatch as unavailable', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -1664,6 +1707,42 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('separates a clarification list from a later answer in the delivered Slack stream', async () => {
+    codexApi.autoRespond = false
+    const parent = await postUserMessage('Context before two assistant messages.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> fix the formatting`, {
+      threadTs: parent.ts
+    })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    const question = 'Does it stay chopped?\n- Stays chopped\n- Only during animation'
+    const answer = 'Opened draft PR to fix overlapping digits.'
+    for (const [id, text] of [['question', question], ['answer', answer]]) {
+      codexApi.emitOutputLines(key, [
+        JSON.stringify({ type: 'item.started', item: { id, type: 'agentMessage', phase: 'final_answer' } }),
+        JSON.stringify({ type: 'item.agentMessage.delta', itemId: id, delta: text }),
+        JSON.stringify({ type: 'item.completed', item: { id, type: 'agentMessage', phase: 'final_answer', text } })
+      ])
+    }
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-message-boundaries',
+      status: 'completed',
+      result_text: answer
+    })
+    await mention.finished()
+
+    expect(codexApi.executes).toHaveLength(1)
+    const transcripts = slackStreamTranscripts(slackApi.calls)
+    expect(transcripts).toHaveLength(1)
+    expect(transcripts[0]!.chunks
+      .filter(chunk => chunk.type === 'markdown_text')
+      .map(chunk => chunk.text).join('')).toBe(`${question}\n\n${answer}`)
+    expect(await threadText(parent.ts)).toContain(`${question}\n\n${answer}`)
+  })
+
   it('swaps the streamed message for the durable final answer when the live answer diverges', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -2587,6 +2666,79 @@ describe('slackbotv2', () => {
     ).toHaveLength(1)
   })
 
+  for (const plainText of [false, true]) {
+    it(`removes unresolved citations from ${plainText ? 'plain-text terminal replies' : 'streamed answers'}`, async () => {
+      codexApi.autoRespond = false
+
+      const parent = await postUserMessage('Context before an answer with citations.')
+      const prompt = plainText ? 'reply in plain text only' : 'answer with sources'
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${prompt}`, parent.ts)
+      const key = threadKey(parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: `Ev-slackbotv2-citations-${plainText}`,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> ${prompt}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await waitFor(() => codexApi.executes.length === 1)
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      await waitFor(() => codexApi.streamCount === 1)
+
+      const deltas = [
+        'CITATION_START \uE200ci',
+        'te\uE202turn0search8',
+        '\uE201 [Docs](https://example.com) ',
+        '\uE200cite:ship:turn0search7:walk',
+        'ing: CITATION_END :ship:'
+      ]
+      codexApi.emitOutputLine(key, JSON.stringify({
+        type: 'item.started',
+        item: { id: 'answer-citations', type: 'agentMessage', text: '', phase: 'final_answer' }
+      }))
+      for (const delta of deltas) {
+        codexApi.emitOutputLine(key, JSON.stringify({
+          type: 'item.agentMessage.delta',
+          itemId: 'answer-citations',
+          delta
+        }))
+      }
+      codexApi.emitSessionEvent(key, 'session.execution_completed', {
+        execution_id: 'exe-citations',
+        status: 'completed',
+        result_text: deltas.join('')
+      })
+
+      await Promise.all(waits)
+      if (plainText) {
+        const replies = await threadTexts(parent.ts)
+        expect(replies.filter(text => text.startsWith('CITATION_START'))).toEqual([
+          'CITATION_START  [Docs](https://example.com)  CITATION_END :ship:'
+        ])
+      } else {
+        const transcripts = slackStreamTranscripts(slackApi.calls)
+        expect(transcripts).toHaveLength(1)
+        expect(transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
+          .map(chunk => chunk.text).join('')).toBe(
+          'CITATION_START  [Docs](https://example.com)  CITATION_END :ship:'
+        )
+      }
+    })
+  }
+
   it('keeps each task on one bounded card as details grow and output expands', async () => {
     codexApi.autoRespond = false
 
@@ -3214,6 +3366,87 @@ describe('slackbotv2', () => {
     )
     expect(startsForThread).toHaveLength(1)
     expect(await threadText(parent.ts)).toContain('Single answer despite the sweep.')
+  })
+
+  it('keeps a timed-out recovery leased until it delivers the answer', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    const logs: CapturedLog[] = []
+    const parent = await postUserMessage('Context before a long recovery.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> recover slowly`, parent.ts)
+    const key = threadKey(parent.ts)
+    const leaseKey = `slackbotv2:render:lease:${key}`
+    const message = apiMessageFromSlackEvent({
+      isMention: true,
+      text: `<@${BOT_USER_ID}> recover slowly`,
+      threadId: key,
+      ts: mention.ts
+    })
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      executedMessageIds: [mention.ts],
+      forwardedMessageIds: [mention.ts],
+      historyForwarded: true,
+      lastEventId: 0,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-long-recovery',
+        message
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+
+    // Compress the two-minute lease and one-minute renewal interval while
+    // retaining real expiry, sweep retries, SSE replay, and Slack delivery.
+    const set = sharedState.set.bind(sharedState)
+    const setIfNotExists = sharedState.setIfNotExists.bind(sharedState)
+    const interval = globalThis.setInterval
+    const setSpy = spyOn(sharedState, 'set').mockImplementation(
+      (stateKey, value, ttlMs) => set(stateKey, value, stateKey === leaseKey ? 120 : ttlMs)
+    )
+    const claimSpy = spyOn(sharedState, 'setIfNotExists').mockImplementation(
+      (stateKey, value, ttlMs) =>
+        setIfNotExists(stateKey, value, stateKey === leaseKey ? 120 : ttlMs)
+    )
+    const intervalSpy = spyOn(globalThis, 'setInterval').mockImplementation(
+      ((...args: Parameters<typeof setInterval>) => {
+        const [handler, ms, ...rest] = args
+        return interval(handler, ms === 60_000 ? 30 : ms, ...rest)
+      }) as typeof setInterval
+    )
+    try {
+      bot = createTestBot({
+        logger: captureLogger(logs),
+        renderRecoveryThreadTimeoutMs: 120,
+        state: sharedState
+      })
+      await waitFor(() => codexApi.eventRequests.some(request => request.threadKey === key))
+      await waitFor(() => hasLog(logs, 'slackbotv2_render_recovery_thread_timeout'))
+      await sleep(1000)
+      expect(codexApi.eventRequests.filter(request => request.threadKey === key)).toHaveLength(1)
+      expect(await sharedState.get(leaseKey)).toBeDefined()
+      expect(hasLog(logs, 'slackbotv2_render_recovery_lease_skipped')).toBe(true)
+
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('One recovered answer.'))
+      await waitFor(async () => {
+        const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+        return threadState?.renderObligation === null && await sharedState.get(leaseKey) === null
+      }, 3000)
+      expect(slackApi.calls.filter(call =>
+        call.method === 'chat.startStream' && call.body.thread_ts === parent.ts
+      )).toHaveLength(1)
+      expect(slackApi.calls.filter(call => call.method === 'chat.stopStream')).toHaveLength(1)
+      expect(await threadText(parent.ts)).toContain('One recovered answer.')
+    } finally {
+      // Also unblock the stream when an assertion fails on the unfixed path.
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      if (threadState?.renderObligation) {
+        codexApi.emitOutputLines(key, sampleCodexOutputLines('One recovered answer.'))
+      }
+      intervalSpy.mockRestore()
+      claimSpy.mockRestore()
+      setSpy.mockRestore()
+    }
   })
 
   it('abandons an obligation after repeated non-retryable recovery failures', async () => {

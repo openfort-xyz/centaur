@@ -30,6 +30,7 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
+import { CitationTextFilter, stripUnresolvedCitations } from './citation-text'
 import { resolveHarnessRollout } from './harness-rollout'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
@@ -69,6 +70,8 @@ import { resolveChannelDefault } from './channel-defaults'
 import {
   extractMessageOverrides,
   extractPersonaOverride,
+  isHarnessEnabled,
+  validateStrategyOverrides,
   type HarnessOverrides
 } from './overrides'
 import { createFlagMessageOverridesStrategy } from './message-overrides-strategy'
@@ -1273,6 +1276,30 @@ async function syncThreadMessageToSession(
   // (unlike it) ridden on the input line to take effect. harness/model/provider
   // are sticky (effectiveOverrides); reasoning is per-turn.
   const channelDefault = resolveChannelDefault(input.options.channelDefaults, thread.id)
+  const selectedHarnessType =
+    effectiveOverrides.harnessType ?? channelDefault?.harnessType ??
+    input.options.defaultHarnessType ?? 'codex'
+  const modelHarness = validateStrategyOverrides({
+    model: stickyOverrideRaw(state, stickyOverridesUpdate, 'model') === null
+      ? undefined : effectiveOverrides.model ?? channelDefault?.model
+  }).harnessType ?? selectedHarnessType
+  if (!isHarnessEnabled(selectedHarnessType, input.options.enabledHarnesses) ||
+    !isHarnessEnabled(modelHarness, input.options.enabledHarnesses)) {
+    const fallbackHarness = input.options.defaultHarnessType ?? 'codex'
+    stickyOverridesUpdate = {
+      ...stickyOverridesUpdate,
+      harnessType: fallbackHarness,
+      model: null,
+      provider: null
+    }
+    effectiveOverrides.harnessType = fallbackHarness
+    effectiveOverrides.model = undefined
+    effectiveOverrides.provider = undefined
+    traceLog(input.options, 'slackbotv2_disabled_harness_reset', trace, {
+      disabled_harness: selectedHarnessType,
+      fallback_harness: fallbackHarness
+    })
+  }
   const resolvedHarnessType = effectiveOverrides.harnessType ?? channelDefault?.harnessType
   // A `null` sticky model/provider is a tombstone from a harness switch: honor
   // it, don't re-pair a stale channel default with the new harness. Only
@@ -1314,7 +1341,9 @@ async function syncThreadMessageToSession(
   const harnessRollout = resolveHarnessRollout({
     modelOverride,
     requestedHarness: effectiveHarnessType,
-    rolloutPercent: input.options.codexNanocodexRolloutPercent ?? 0,
+    rolloutPercent: isHarnessEnabled('nanocodex', input.options.enabledHarnesses)
+      ? input.options.codexNanocodexRolloutPercent ?? 0
+      : 0,
     threadId: thread.id
   })
   const rolloutSelected = harnessRollout.assignment !== undefined
@@ -2278,26 +2307,26 @@ async function recoverRenderObligations(
         })
         continue
       }
-      const releaseLease = async (): Promise<void> => {
-        const activeLeaseToken = await state.get<string>(renderRecoveryLeaseKey(threadId))
-        if (activeLeaseToken === leaseToken) await state.delete(renderRecoveryLeaseKey(threadId))
-      }
+      const releaseLease = renewRenderLease(state, threadId, leaseToken)
 
       // A single hung recovery (for example an event stream that never
       // produces a chunk) must not block every obligation queued behind it.
       // Race a deadline; on timeout move on and leave the attempt running
       // detached - it may still finish and clear the obligation, which is why
-      // the lease is kept so a later pass does not start a duplicate render.
+      // the lease is renewed until the detached attempt actually settles.
       const recovery = recoverRenderObligation(chat, state, options, threadId, obligation)
+        .finally(releaseLease)
       let outcome: { timedOut: true } | { timedOut: false; deferred: boolean }
+      let timeout: ReturnType<typeof setTimeout> | undefined
       try {
         outcome = await Promise.race([
           recovery.then(deferred => ({ timedOut: false as const, deferred })),
-          sleep(timeoutMs).then(() => ({ timedOut: true as const }))
+          new Promise<{ timedOut: true }>(resolve => {
+            timeout = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
+          })
         ])
-      } catch (error) {
-        await releaseLease()
-        throw error
+      } finally {
+        clearTimeout(timeout)
       }
       if (outcome.timedOut) {
         void recovery.catch(() => undefined)
@@ -2323,7 +2352,6 @@ async function recoverRenderObligations(
         )
         continue
       }
-      await releaseLease()
       if (outcome.deferred) {
         deferredCount += 1
         retryableDeferredCount += 1
@@ -2653,6 +2681,16 @@ async function acquireRenderLease(
   const key = renderRecoveryLeaseKey(threadId)
   const token = randomUUID()
   await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+  return renewRenderLease(state, threadId, token)
+}
+
+/** Renew an owned lease until the render settles, including after a sweep timeout. */
+function renewRenderLease(
+  state: StateAdapter,
+  threadId: string,
+  token: string
+): () => Promise<void> {
+  const key = renderRecoveryLeaseKey(threadId)
   const refresh = setInterval(() => {
     void state
       .get<string>(key)
@@ -2861,7 +2899,7 @@ class SlackRenderFallback {
   }
 
   text(): string {
-    const terminalText = this.terminalText.trim()
+    const terminalText = stripUnresolvedCitations(this.terminalText).trim()
     const markdownText = this.markdownText.trim()
     if (this.interrupted && !terminalText && markdownText === EMPTY_FINAL_ANSWER_TEXT) return ''
     return terminalText || markdownText
@@ -2906,9 +2944,17 @@ class SlackRenderFallback {
 async function* slackSafeChatSdkStream(
   stream: AsyncIterable<ChatSDKStreamChunk>
 ): AsyncIterable<ChatSDKStreamChunk> {
+  const citations = new CitationTextFilter()
   for await (const chunk of stream) {
+    if (chunk.type === 'markdown_text') {
+      const text = citations.append(chunk.text)
+      if (text) yield { ...chunk, text }
+      continue
+    }
     yield slackSafeChatSdkChunk(chunk)
   }
+  const text = citations.finish()
+  if (text) yield { type: 'markdown_text', text }
 }
 
 type SlackStreamTaskDisplayMode = NonNullable<SlackbotV2Options['streamTaskDisplayMode']>

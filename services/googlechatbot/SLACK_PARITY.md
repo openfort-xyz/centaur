@@ -1,6 +1,6 @@
 # Google Chat and Slack parity status
 
-Source review date: 2026-10-06. Live evidence remains dated separately in the
+Source review date: 2026-10-15. Live evidence remains dated separately in the
 [verification ledger](../../docs/google-chat-parity-verification.md).
 
 Google Chat implements the planned integration, but complete parity remains
@@ -280,6 +280,37 @@ Slack-touching upstream work and its Google Chat disposition.
 
 Remaining commits in the window (skills, MCP argument validation, DocSend,
 investigator, session cleanup, docs, CI) are platform-agnostic.
+
+### 2026-10-15 — focused parity ports, upstream `d63acb7b..a8078de5`
+
+This is a selective port, not an upstream merge. The upstream ancestry remains
+at `d63acb7b`; unrelated changes in this review window are intentionally not
+imported. Future syncs must account for the ports below.
+
+| Upstream change | Google Chat disposition |
+| --- | --- |
+| `4257592b` / paradigmxyz/centaur#1894 enabled-harness routing | **Ported.** `GOOGLECHATBOT_ENABLED_HARNESSES` validates the deployment allowlist. Disabled inline, sticky, and space defaults fall back with model/provider reset; disabled Nanocodex rollout is suppressed. Session creation rejects disabled requests/responses and restarts a disabled conflicting harness. Slack's original fix and tests are included. |
+| `80b669b5` / paradigmxyz/centaur#1814 GPT-6.1 Sol | **Ported/shared.** The classifier maps unqualified Sol to `gpt-6.1-sol`, preserving explicit GPT-6 Sol. GPT-6.1 Sol accepts ultra effort. Shared Codex startup binds the first-turn model and the sandbox pins the required CLI. |
+| `bf32a635` / paradigmxyz/centaur#1908 source citations | **Shared.** The harness resolves known citations to source links before either platform receives output. Includes upstream recorded protocol tests. |
+| `445b3db0` / paradigmxyz/centaur#1904 unresolved citations | **Ported.** Final Google Chat payloads strip unresolved native markers, including recovery payloads, while preserving resolved links. Google Chat has no text-delta delivery surface; filtering occurs before final text/card construction. |
+| `5e149b8a` / paradigmxyz/centaur#1742 OMP harness | **Ported/shared.** Import the shared OMP backend, API/runtime registration, credential-placeholder mapping, pinned CLI, persistent state, and upstream protocol fixtures. Google Chat adds `--omp`, classifier vocabulary, Pi-compatible effort validation, the OMP label, and `CENTAUR_OMP_MODEL` chart mirroring. Chart patch version `0.1.164` is required by CI for the model-mirroring template changes. |
+| `e22ead21` / paradigmxyz/centaur#1941 paragraph boundaries | **Shared.** Both transports use the corrected shared renderer: separate answer items retain a blank line; token deltas within an item still concatenate. |
+| `5747367a` / paradigmxyz/centaur#1942 recovery leases | **Already equivalent.** Google Chat's `processWorkObligation` holds a periodically renewed lease until its `finally` block, without detaching work on a sweep deadline. A regression test holds it past its original TTL. Import the Slack fix separately to retain the upstream reference behavior. This does not resolve the separately documented atomic-lease or pending-index findings. |
+| `9c77fc42` / paradigmxyz/centaur#1953 Codex child-agent notifications | **Shared.** Child-thread notifications cannot contaminate the root answer; upstream fixtures exercise the shared harness path. |
+
+Excluded from this focused port: company-context v2 ingestion/query/rollout work,
+Mercator onboarding, unrelated OAuth and credential-conflict changes, sandbox
+checkout/reaping fixes, generic proxy changes, dependency sweeps, workflow
+removal, and CI action upgrades. These may be considered in a later general
+upstream sync; their omission is not a claim that the fork is fully synced.
+
+Local validation: both ingress typechecks; 512 Google Chat tests including
+state tests against disposable PostgreSQL; signed Google Chat fixtures; 302
+Slack tests (one pre-existing skip); 45 shared renderer tests; Helm lint and
+rendering of OMP model mirroring; and the parity ledger. Rust checks, image
+builds, and Kind validation were not run locally because their toolchains are
+unavailable. Payload previews demonstrate paragraph/citation output, not live
+Workspace or same-release certification.
 
 ## Rollback
 

@@ -1,6 +1,6 @@
 /**
  * Inline message directives, shared in spirit with the Slack integration:
- *   --claude | --claude-code | --amp | --codex | --nanocodex | --hermes | --pi
+ *   --claude | --claude-code | --amp | --codex | --nanocodex | --hermes | --pi | --omp
  *                                                           pick the harness for the thread
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
@@ -51,7 +51,8 @@ const HARNESS_FLAGS: Record<string, string> = {
   codex: 'codex',
   hermes: 'hermes',
   nanocodex: 'nanocodex',
-  pi: 'pi'
+  pi: 'pi',
+  omp: 'omp'
 }
 
 // Provider flags select a model provider within the codex harness (and imply
@@ -246,7 +247,7 @@ function stripMatch(text: string, match: RegExpExecArray): string {
 // source of the strategy's JSON-schema enums (see message-overrides-strategy),
 // so the schema the model is handed and the validation it is checked against
 // can never drift apart.
-export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi'])
+export const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi', 'omp'])
 export const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 export const STRATEGY_REASONING_EFFORTS = new Set([
   'none',
@@ -282,6 +283,7 @@ export const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'gpt-5.6-terra': 'codex',
   'gpt-6-astra': 'codex',
   'gpt-6-sol': 'codex',
+  'gpt-6.1-sol': 'codex',
   'gpt-6-luna': 'codex'
 }
 
@@ -332,7 +334,7 @@ export function validateStrategyOverrides(
   if (modelRaw) {
     const modelHarness = STRATEGY_MODEL_HARNESSES[modelRaw.toLowerCase()]
     if (!modelHarness) return {}
-    if (harnessType && harnessType !== modelHarness && harnessType !== 'pi') return {}
+    if (harnessType && harnessType !== modelHarness && harnessType !== 'pi' && harnessType !== 'omp') return {}
     model = modelRaw.toLowerCase()
     harnessType ??= modelHarness
   }
@@ -342,7 +344,7 @@ export function validateStrategyOverrides(
     const normalized = reasoningRaw.toLowerCase()
     if (!STRATEGY_REASONING_EFFORTS.has(normalized)) return {}
     reasoning =
-      harnessType === undefined || harnessType === 'codex' || harnessType === 'nanocodex' || harnessType === 'claudecode' || harnessType === 'pi'
+      harnessType === undefined || harnessType === 'codex' || harnessType === 'nanocodex' || harnessType === 'claudecode' || harnessType === 'pi' || harnessType === 'omp'
         ? normalized
         : undefined
   }

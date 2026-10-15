@@ -10,6 +10,7 @@ import {
   markdownToChatMessage,
   messageUtf8Bytes
 } from './chat/render'
+import { stripUnresolvedCitations } from './citation-text'
 import { chatReplyLimits } from './constants'
 import { logError, logWarn } from './logging'
 import type {
@@ -292,6 +293,7 @@ export function finalMessageBodies(
   markdown: string,
   opts: { plainTextOnly?: boolean; threadName?: string; trailers?: GoogleChatCardWidget[] } = {}
 ): FinalMessageBody[] {
+  markdown = stripUnresolvedCitations(markdown)
   const rendered = markdownToChatMessage(markdown)
   const trailers = opts.trailers ?? []
   const needsCard = !opts.plainTextOnly && hasStandaloneImage(markdown)

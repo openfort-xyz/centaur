@@ -138,6 +138,21 @@ The production server waits for state before binding its port. Chat and control
 requests have bounded connect/request timeouts; the established SSE stream is
 not killed by its connect timeout.
 
+## Harness routing
+
+`GOOGLECHATBOT_ENABLED_HARNESSES` optionally restricts routing to known,
+comma-separated harness wire names (for example `codex,claudecode,omp`). Omit it
+to preserve unrestricted routing. The deployment default must be in the list;
+empty lists and unknown names fail startup. Disabled inline, sticky, or space
+selections fall back to the deployment default and clear model/provider
+selection. Nanocodex rollout cannot select a disabled harness, and session API
+responses cannot send execution to one.
+
+`--omp` selects the OMP harness and supports Pi-compatible reasoning levels.
+`CENTAUR_OMP_MODEL` sets its deployment model default and is mirrored from
+`sandbox.extraEnv` by the chart. Unqualified Sol requests in LLM override mode
+select `gpt-6.1-sol`; an explicit GPT-6 Sol request still selects `gpt-6-sol`.
+
 ## Verification
 
 ```bash

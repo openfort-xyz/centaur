@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { isHarnessEnabled, parseEnabledHarnesses } from './harness-routing'
 
 const strictBoolean = z
   .enum(['true', 'false', '1', '0'])
@@ -17,6 +18,8 @@ const EnvSchema = z.object({
   // Harness for new threads when no explicit harness flag is given.
   // (HarnessType wire value: codex | amp | claudecode | nanocodex | hermes).
   CENTAUR_PI_MODEL: z.string().optional(),
+  CENTAUR_OMP_MODEL: z.string().optional(),
+  GOOGLECHATBOT_ENABLED_HARNESSES: z.string().optional().transform(parseEnabledHarnesses),
   GOOGLECHATBOT_DEFAULT_HARNESS: z.string().default('codex'),
   GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: z.coerce.number().int().min(0).max(100).default(0),
 
@@ -174,7 +177,11 @@ const EnvSchema = z.object({
 export type AppConfig = z.infer<typeof EnvSchema>
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  return EnvSchema.parse(env)
+  const config = EnvSchema.parse(env)
+  if (!isHarnessEnabled(config.GOOGLECHATBOT_DEFAULT_HARNESS, config.GOOGLECHATBOT_ENABLED_HARNESSES)) {
+    throw new Error('GOOGLECHATBOT_DEFAULT_HARNESS must be enabled in GOOGLECHATBOT_ENABLED_HARNESSES')
+  }
+  return config
 }
 
 export function centaurApiKey(config: AppConfig): string | undefined {
