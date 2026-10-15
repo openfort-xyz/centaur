@@ -24,6 +24,7 @@ import type {
 } from './chat/types'
 import { messageUtf8Bytes } from './chat/render'
 import { logError, logInfo, logWarn } from './logging'
+import { isHarnessEnabled, resolveEnabledOverrides } from './harness-routing'
 import { resolveHarnessRollout } from './harness-rollout'
 import { resolveSenderEmail } from './sender-lookup'
 import { addGauge, incr, renderMetrics, setGauge } from './metrics'
@@ -1196,16 +1197,28 @@ async function driveSession(
   // Explicit harness/model/provider selections are sticky per thread. Reasoning
   // remains a per-turn override and is deliberately not persisted.
   const spaceDefault = resolveSpaceDefault(runtime.spaceDefaults, threadKey)
-  const resolvedHarnessType =
+  let resolvedHarnessType =
     overrides.harnessType ?? valueOrUndefined(threadState.harnessType) ?? spaceDefault?.harnessType
-  const resolvedModel =
+  let resolvedModel =
     overrides.model
     ?? (overrides.harnessType ? undefined : valueOrUndefined(threadState.model))
     ?? spaceDefault?.model
-  const resolvedProvider =
+  let resolvedProvider =
     overrides.provider
     ?? (overrides.harnessType ? undefined : valueOrUndefined(threadState.provider))
     ?? spaceDefault?.provider
+  const selectedOverrides = {
+    harnessType: resolvedHarnessType,
+    model: resolvedModel,
+    provider: resolvedProvider
+  }
+  const enabledOverrides = resolveEnabledOverrides(
+    selectedOverrides, config.GOOGLECHATBOT_DEFAULT_HARNESS, config.GOOGLECHATBOT_ENABLED_HARNESSES
+  )
+  const disabledHarnessReset = enabledOverrides !== selectedOverrides
+  resolvedHarnessType = enabledOverrides.harnessType
+  resolvedModel = enabledOverrides.model
+  resolvedProvider = enabledOverrides.provider
   const pinnedPersonaId = Object.hasOwn(threadState, 'personaId')
     ? valueOrUndefined(threadState.personaId)
     : overrides.personaId ?? spaceDefault?.personaId
@@ -1219,7 +1232,8 @@ async function driveSession(
   const harnessRollout = resolveHarnessRollout({
     modelOverride: resolvedModel !== harnessDefaultModel ? resolvedModel : undefined,
     requestedHarness: requestedHarnessType,
-    rolloutPercent: config.GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT,
+    rolloutPercent: isHarnessEnabled('nanocodex', config.GOOGLECHATBOT_ENABLED_HARNESSES)
+      ? config.GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT : 0,
     threadId: threadKey
   })
   const resolvedReasoning = reasoningForModel(
@@ -1360,6 +1374,9 @@ async function driveSession(
       ...(overrides.provider
         ? { provider: overrides.provider }
         : overrides.harnessType ? { provider: null } : {}),
+      ...(disabledHarnessReset
+        ? { harnessType: requestedHarnessType, model: null, provider: null }
+        : {}),
       ...(session.personaId !== undefined ? { personaId: session.personaId } : {})
     }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
     work.executionId = execution.execution_id
@@ -1735,6 +1752,7 @@ function isPlainTextOnlyRequest(text: string): boolean {
 function harnessDefaultModels(config: AppConfig): Record<string, string> {
   return {
     ...(config.CENTAUR_PI_MODEL ? { pi: config.CENTAUR_PI_MODEL } : {}),
+    ...(config.CENTAUR_OMP_MODEL ? { omp: config.CENTAUR_OMP_MODEL } : {}),
     ...(config.CLAUDE_MODEL ? { claudecode: config.CLAUDE_MODEL } : {}),
     // Nanocodex runs off the same CODEX_MODEL deployment override as Codex.
     ...(config.CODEX_MODEL

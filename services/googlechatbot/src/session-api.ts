@@ -1,4 +1,5 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
+import { isHarnessEnabled } from './harness-routing'
 import { createHash } from 'node:crypto'
 import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
@@ -228,6 +229,10 @@ export async function createSession(
     restartOnHarnessConflict?: boolean
   } = {}
 ): Promise<CreateSessionResult> {
+  const requested = harnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+  if (!isHarnessEnabled(requested, config.GOOGLECHATBOT_ENABLED_HARNESSES)) {
+    throw new Error(`Harness ${requested} is not enabled for this deployment`)
+  }
   const name = conversationName?.trim()
   const claim = requester?.identity
   const identity = claim
@@ -253,7 +258,7 @@ export async function createSession(
     incr('googlechatbot_session_identity_total', { outcome: 'emitted', reason: 'none' })
   }
   const body: CreateSessionRequest = {
-    harness_type: harnessType ?? 'codex',
+    harness_type: requested,
     ...(options.personaId ? { persona_id: options.personaId } : {}),
     metadata: {
       source: 'googlechatbot',
@@ -288,7 +293,9 @@ export async function createSession(
   } catch (error) {
     const existingHarness = existingHarnessFromConflict(error)
     if (!existingHarness) throw error
-    payload = await post({ ...body, harness_type: existingHarness })
+    payload = await post(isHarnessEnabled(existingHarness, config.GOOGLECHATBOT_ENABLED_HARNESSES)
+      ? { ...body, harness_type: existingHarness }
+      : { ...body, on_harness_conflict: 'restart' })
     const status = payload.status ?? payload.session?.status ?? ''
     if (options.restartOnHarnessConflict && status !== ACTIVE_SESSION_STATUS) {
       payload = await post({ ...body, on_harness_conflict: 'restart' })
@@ -296,6 +303,9 @@ export async function createSession(
   }
   const status = payload.status ?? payload.session?.status ?? ''
   const resolvedHarness = payload.harness_type?.trim()
+  if (resolvedHarness && !isHarnessEnabled(resolvedHarness, config.GOOGLECHATBOT_ENABLED_HARNESSES)) {
+    throw new Error(`Harness ${resolvedHarness} is not enabled for this deployment`)
+  }
   const harnessAssignment = options.harnessAssignment && resolvedHarness
     ? { ...options.harnessAssignment, cohort: resolvedHarness }
     : options.harnessAssignment

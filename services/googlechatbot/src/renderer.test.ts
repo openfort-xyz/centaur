@@ -71,6 +71,13 @@ function settledState(answer: string) {
 }
 
 describe('finalizeRender surface selection', () => {
+  test('live and recovered final bodies remove native markers but retain resolved source links', () => {
+    const bodies = finalMessageBodies('First paragraph.\n\nSecond paragraph. citeturn0search8 [Source](https://example.com)')
+    expect(bodies[0]?.text).toContain('First paragraph.\n\nSecond paragraph.')
+    expect(bodies[0]?.text).not.toContain('')
+    expect(bodies[0]?.text).toContain('https://example.com')
+  })
+
   test('a resumed success drops transport errors while failed or exhausted turns keep their errors', async () => {
     for (const transport of ['socket', 'event']) {
       for (const outcome of ['success', 'failed', 'exhausted']) {

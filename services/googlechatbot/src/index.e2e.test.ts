@@ -910,6 +910,36 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
     }
   })
 
+  test.each([
+    ['--amp --model deep run this', {}],
+    ['run this', { GOOGLECHATBOT_SPACE_DEFAULTS: JSON.stringify({ AAAA: { harness: 'amp', model: 'deep' } }) }]
+  ])('disabled selections fall back before session creation (%s)', async (text, env) => {
+    const body = await post({ ...env, GOOGLECHATBOT_ENABLED_HARNESSES: 'codex' }, text)
+    expect(body.harness_type).toBe('codex')
+  })
+
+  test('disabled sticky harness and Nanocodex rollout cannot bypass the deployment gate', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    await state.set(threadStateKey('chat:spaces:AAAA:spaces:AAAA:messages:M1'), {
+      harnessType: 'amp', model: 'deep', provider: 'openrouter'
+    })
+    const body = await post({
+      GOOGLECHATBOT_ENABLED_HARNESSES: 'codex',
+      GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: '100'
+    }, 'run this', state)
+    expect(body.harness_type).toBe('codex')
+    await waitFor(() => mock.calls.some(call => call.url.endsWith('/execute')))
+    const execution = mock.calls.find(call => call.url.endsWith('/execute'))?.body
+    expect(JSON.stringify(execution)).not.toContain('deep')
+    expect(JSON.stringify(execution)).not.toContain('openrouter')
+  })
+
+  test('the OMP selector reaches the durable session API', async () => {
+    const body = await post({}, '--omp run this')
+    expect(body.harness_type).toBe('omp')
+  })
+
   test('an inline override takes precedence over the space default', async () => {
     const body = await post(
       { GOOGLECHATBOT_SPACE_DEFAULTS: JSON.stringify({ AAAA: { harness: 'claude' } }) },
