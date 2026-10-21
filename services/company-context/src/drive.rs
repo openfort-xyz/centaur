@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -12,8 +15,9 @@ use crate::{
     config::{
         Config, FOLDER_MIME_TYPE, GOOGLE_DOC_EXPORT_MIME_TYPE, GOOGLE_DOC_MIME_TYPE, PDF_MIME_TYPE,
     },
-    credentials::ConsoleCredentials,
+    credentials::{ConsoleCredentials, GoogleProduct},
     errors::rejected,
+    telemetry,
 };
 
 const DRIVE_REQUEST_ATTEMPTS: u32 = 4;
@@ -184,7 +188,7 @@ impl DriveClient {
             request = request.query(&[("driveId", drive_id)]);
         }
         let response = self
-            .send(request, credential_id)
+            .send(request, credential_id, "changes.startPageToken")
             .await?
             .json::<StartPageToken>()
             .await
@@ -207,7 +211,7 @@ impl DriveClient {
         if let Some(page_token) = page_token {
             request = request.query(&[("pageToken", page_token)]);
         }
-        self.send(request, credential_id)
+        self.send(request, credential_id, "drives.list")
             .await?
             .json::<SharedDrivePage>()
             .await
@@ -310,7 +314,7 @@ impl DriveClient {
             request = request.query(&[("pageToken", page_token)]);
         }
         let page = self
-            .send(request, credential_id)
+            .send(request, credential_id, "files.list")
             .await?
             .json::<FilePage>()
             .await
@@ -343,7 +347,7 @@ impl DriveClient {
             }
             None => request.query(&[("includeItemsFromAllDrives", "false")]),
         };
-        self.send(request, credential_id)
+        self.send(request, credential_id, "changes.list")
             .await?
             .json::<ChangePage>()
             .await
@@ -359,6 +363,7 @@ impl DriveClient {
             .download_bounded(
                 request,
                 credential_id,
+                "files.download",
                 self.max_pdf_bytes,
                 "PDF exceeds the configured byte limit",
             )
@@ -377,6 +382,7 @@ impl DriveClient {
         self.download_bounded(
             request,
             credential_id,
+            "files.export",
             self.max_extracted_bytes,
             "exported Google Doc exceeds the configured byte limit",
         )
@@ -387,10 +393,11 @@ impl DriveClient {
         &self,
         request: RequestBuilder,
         credential_id: i64,
+        operation: &'static str,
         max_bytes: usize,
         limit_error: &'static str,
     ) -> Result<Vec<u8>> {
-        let response = self.send(request, credential_id).await?;
+        let response = self.send(request, credential_id, operation).await?;
         if response
             .content_length()
             .is_some_and(|length| length > max_bytes as u64)
@@ -409,60 +416,99 @@ impl DriveClient {
         Ok(bytes)
     }
 
-    async fn send(&self, request: RequestBuilder, credential_id: i64) -> Result<reqwest::Response> {
-        for attempt in 1..=DRIVE_REQUEST_ATTEMPTS {
-            let access_token = self
-                .credentials
-                .google_credential(credential_id)
-                .await?
-                .access_token;
-            let response = request
-                .try_clone()
-                .context("clone Google Drive request for retry")?
-                .bearer_auth(access_token)
-                .send()
-                .await
-                .context("send Google Drive request")?;
-            let status = response.status();
-            if attempt < DRIVE_REQUEST_ATTEMPTS
-                && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-            {
-                let delay = if status == StatusCode::TOO_MANY_REQUESTS {
-                    retry_after_delay(&response).unwrap_or_else(|| server_retry_delay(attempt))
-                } else {
-                    server_retry_delay(attempt)
-                };
-                warn!(
-                    event = "company_context_drive_request_retry",
-                    credential_id,
-                    attempt,
-                    status = status.as_u16(),
-                    delay_ms = delay.as_millis()
-                );
-                sleep(delay).await;
-                continue;
-            }
-            if is_permanent_drive_status(status) {
-                return Err(rejected(format!(
-                    "Google Drive request was rejected with status {status}"
-                )));
-            }
-            if status == StatusCode::FORBIDDEN {
-                let body = response
-                    .bytes()
-                    .await
-                    .context("read Google Drive error response")?;
-                if is_export_size_limit_error(&body) {
-                    return Err(rejected("Google Doc exceeds Drive's export size limit"));
-                }
-                bail!("Google Drive request failed with status {status}");
-            }
-            return response
-                .error_for_status()
-                .context("Google Drive request failed");
-        }
-        unreachable!("Drive request loop always returns on its final attempt")
+    async fn send(
+        &self,
+        request: RequestBuilder,
+        credential_id: i64,
+        operation: &'static str,
+    ) -> Result<reqwest::Response> {
+        send_google(
+            &self.credentials,
+            request,
+            credential_id,
+            GoogleProduct::Drive,
+            operation,
+            &[],
+        )
+        .await
     }
+}
+
+/// Sends a Google API request with the credential's current access token,
+/// retrying rate limits and server errors. Statuses in `passthrough` are
+/// returned to the caller instead of being treated as failures.
+pub(crate) async fn send_google(
+    credentials: &ConsoleCredentials,
+    request: RequestBuilder,
+    credential_id: i64,
+    product: GoogleProduct,
+    operation: &'static str,
+    passthrough: &[StatusCode],
+) -> Result<reqwest::Response> {
+    let upstream = product.upstream();
+    for attempt in 1..=DRIVE_REQUEST_ATTEMPTS {
+        let access_token = credentials
+            .google_credential(credential_id, product)
+            .await?
+            .access_token;
+        let started = Instant::now();
+        let response = request
+            .try_clone()
+            .context("clone Google API request for retry")?
+            .bearer_auth(access_token)
+            .send()
+            .await;
+        telemetry::upstream_response(upstream, operation, started, &response);
+        let response = response.context("send Google API request")?;
+        let status = response.status();
+        if passthrough.contains(&status) {
+            return Ok(response);
+        }
+        if attempt < DRIVE_REQUEST_ATTEMPTS
+            && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+        {
+            let delay = if status == StatusCode::TOO_MANY_REQUESTS {
+                telemetry::upstream_retry(upstream, "rate_limited");
+                retry_after_delay(&response).unwrap_or_else(|| server_retry_delay(attempt))
+            } else {
+                telemetry::upstream_retry(upstream, "server_error");
+                server_retry_delay(attempt)
+            };
+            warn!(
+                event = "company_context_google_request_retry",
+                upstream,
+                credential_id,
+                attempt,
+                status = status.as_u16(),
+                delay_ms = delay.as_millis()
+            );
+            sleep(delay).await;
+            continue;
+        }
+        if is_permanent_drive_status(status) {
+            return Err(rejected(format!(
+                "Google {} request was rejected with status {status}",
+                product.name()
+            )));
+        }
+        if status == StatusCode::FORBIDDEN {
+            let body = response
+                .bytes()
+                .await
+                .context("read Google API error response")?;
+            if is_export_size_limit_error(&body) {
+                return Err(rejected("Google Doc exceeds Drive's export size limit"));
+            }
+            bail!(
+                "Google {} request failed with status {status}",
+                product.name()
+            );
+        }
+        return response
+            .error_for_status()
+            .context("Google API request failed");
+    }
+    unreachable!("Google request loop always returns on its final attempt")
 }
 
 #[derive(Deserialize)]

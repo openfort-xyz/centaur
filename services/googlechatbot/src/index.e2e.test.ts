@@ -35,6 +35,8 @@ function installMockFetch(): {
   listed: unknown[]
   /** Thread keys whose session create reports a run already in flight. */
   activeThreads: string[]
+  /** Extra fields merged into every session create response. */
+  sessionFields: Record<string, unknown>
   restore: () => void
 } {
   const realFetch = globalThis.fetch
@@ -42,6 +44,7 @@ function installMockFetch(): {
   const answers: Array<{ threadKey: string; answer: string }> = []
   const listed: unknown[] = []
   const activeThreads: string[] = []
+  const sessionFields: Record<string, unknown> = {}
   let messageSeq = 0
 
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
@@ -111,7 +114,7 @@ function installMockFetch(): {
     }
     if (method === 'POST' && /\/api\/session\/[^/]+$/.test(url)) {
       const active = activeThreads.some(key => decodeURIComponent(url).includes(key))
-      return new Response(JSON.stringify({ status: active ? 'executing' : 'idle' }), {
+      return new Response(JSON.stringify({ status: active ? 'executing' : 'idle', ...sessionFields }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
       })
@@ -128,6 +131,7 @@ function installMockFetch(): {
     calls,
     answers,
     listed,
+    sessionFields,
     activeThreads,
     restore: () => {
       globalThis.fetch = realFetch
@@ -918,21 +922,32 @@ describe('googlechatbot harness resolution precedence (message-overrides-strateg
     expect(body.harness_type).toBe('codex')
   })
 
-  test('disabled sticky harness and Nanocodex rollout cannot bypass the deployment gate', async () => {
+  test('disabled sticky harness cannot bypass the deployment gate', async () => {
     const state = createMemoryState()
     await state.connect()
     await state.set(threadStateKey('chat:spaces:AAAA:spaces:AAAA:messages:M1'), {
       harnessType: 'amp', model: 'deep', provider: 'openrouter'
     })
-    const body = await post({
-      GOOGLECHATBOT_ENABLED_HARNESSES: 'codex',
-      GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: '100'
-    }, 'run this', state)
+    const body = await post({ GOOGLECHATBOT_ENABLED_HARNESSES: 'codex' }, 'run this', state)
     expect(body.harness_type).toBe('codex')
     await waitFor(() => mock.calls.some(call => call.url.endsWith('/execute')))
     const execution = mock.calls.find(call => call.url.endsWith('/execute'))?.body
     expect(JSON.stringify(execution)).not.toContain('deep')
     expect(JSON.stringify(execution)).not.toContain('openrouter')
+  })
+
+  test('a persona-pinned model drops the sticky model and provider', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    await state.set(threadStateKey('chat:spaces:AAAA:spaces:AAAA:messages:M1'), {
+      model: 'deep', provider: 'openrouter'
+    })
+    mock.sessionFields.persona_model = 'gpt-6.1-sol'
+    await post({}, 'run this', state)
+    await waitFor(() => mock.calls.some(call => call.url.endsWith('/execute')))
+    const execution = JSON.stringify(mock.calls.find(call => call.url.endsWith('/execute'))?.body)
+    expect(execution).not.toContain('deep')
+    expect(execution).not.toContain('openrouter')
   })
 
   test('the OMP selector reaches the durable session API', async () => {

@@ -145,8 +145,9 @@ comma-separated harness wire names (for example `codex,claudecode,omp`). Omit it
 to preserve unrestricted routing. The deployment default must be in the list;
 empty lists and unknown names fail startup. Disabled inline, sticky, or space
 selections fall back to the deployment default and clear model/provider
-selection. Nanocodex rollout cannot select a disabled harness, and session API
-responses cannot send execution to one.
+selection. Session API responses cannot send execution to a disabled harness.
+A persona that pins a model for the thread's harness overrides model and
+provider selections, and the footer names the pinned model.
 
 `--omp` selects the OMP harness and supports Pi-compatible reasoning levels.
 `CENTAUR_OMP_MODEL` sets its deployment model default and is mirrored from

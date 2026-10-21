@@ -59,8 +59,6 @@ spec:
             # still override). Mirrors the other bots: driven by sandbox.harnessEngine.
             - name: GOOGLECHATBOT_DEFAULT_HARNESS
               value: {{ .Values.sandbox.harnessEngine | quote }}
-            - name: GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT
-              value: {{ .Values.googlechatbot.codexNanocodexRolloutPercent | quote }}
             - name: GOOGLECHATBOT_THREAD_HISTORY_LIMIT
               value: {{ .Values.googlechatbot.threadHistoryLimit | quote }}
             - name: GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES
@@ -197,6 +195,15 @@ spec:
           ports:
             - containerPort: 3002
               name: http
+          # The bot waits for Postgres before binding; give it two minutes
+          # before liveness can restart it.
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 3002
+            periodSeconds: 5
+            failureThreshold: 24
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health/ready

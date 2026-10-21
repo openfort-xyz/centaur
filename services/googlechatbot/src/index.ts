@@ -25,7 +25,6 @@ import type {
 import { messageUtf8Bytes } from './chat/render'
 import { logError, logInfo, logWarn } from './logging'
 import { isHarnessEnabled, resolveEnabledOverrides } from './harness-routing'
-import { resolveHarnessRollout } from './harness-rollout'
 import { resolveSenderEmail } from './sender-lookup'
 import { addGauge, incr, renderMetrics, setGauge } from './metrics'
 import {
@@ -1229,13 +1228,6 @@ async function driveSession(
     harnessDefaultModels(config)
   )
   const requestedModel = resolvedModel ?? harnessDefaultModel
-  const harnessRollout = resolveHarnessRollout({
-    modelOverride: resolvedModel !== harnessDefaultModel ? resolvedModel : undefined,
-    requestedHarness: requestedHarnessType,
-    rolloutPercent: isHarnessEnabled('nanocodex', config.GOOGLECHATBOT_ENABLED_HARNESSES)
-      ? config.GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT : 0,
-    threadId: threadKey
-  })
   const resolvedReasoning = reasoningForModel(
     requestedHarnessType,
     requestedModel,
@@ -1247,7 +1239,7 @@ async function driveSession(
       config,
       threadKey,
       conversationName(event),
-      harnessRollout.harnessType,
+      requestedHarnessType,
       {
         userId: event.user_id,
         userName: event.user_name,
@@ -1259,9 +1251,6 @@ async function driveSession(
         }
       },
       {
-        ...(harnessRollout.assignment
-          ? { harnessAssignment: harnessRollout.assignment }
-          : {}),
         // api-rs pins the first persisted persona for the thread's lifetime;
         // re-sending the pinned one keeps it across a harness restart.
         ...(pinnedPersonaId ? { personaId: pinnedPersonaId } : {}),
@@ -1304,13 +1293,24 @@ async function driveSession(
     // user messages into any active execution, so a turn that loses the
     // check-then-execute race above would be steered into the other run and
     // then folded again below. Appended after the run is ours.
+    // A persona-pinned model overrides any model or provider selection. api-rs
+    // ignores both on a pinned thread; don't send them, so a rejected pin isn't
+    // blamed on a sticky model.
+    const personaModel = session.personaModel
+    const turnReasoning = personaModel
+      ? reasoningForModel(
+          session.harnessType ?? requestedHarnessType,
+          personaModel,
+          overrides.reasoning ?? spaceDefault?.reasoning
+        )
+      : resolvedReasoning
     let execution
     try {
       execution = await executeSession(config, threadKey, execute, {
         overrides: {
-          model: resolvedModel,
-          provider: resolvedProvider,
-          reasoning: resolvedReasoning
+          model: personaModel ? undefined : resolvedModel,
+          provider: personaModel ? undefined : resolvedProvider,
+          reasoning: turnReasoning
         },
         // Include history in the execution input so a replacement sandbox has
         // prior context. Durable message rows do not seed a new harness turn.
@@ -1321,12 +1321,7 @@ async function driveSession(
           verified: identity.verified,
           ...(event.user_email ? { userEmail: event.user_email } : {})
         },
-        // A/B provenance for the harness api-rs actually persisted, so the
-        // execution metadata records the cohort (upstream #1178 parity).
-        ...(session.harnessType ? { harnessType: session.harnessType } : {}),
-        ...(session.harnessAssignment
-          ? { harnessAssignment: session.harnessAssignment }
-          : {})
+        ...(session.harnessType ? { harnessType: session.harnessType } : {})
       })
     } catch (error) {
       // The activeExecution check above is read-then-act: a run that starts
@@ -1384,21 +1379,21 @@ async function driveSession(
     await persistWork(durableState, work)
     // Match Slack response metadata: first response, every response, or disabled.
     const isFirstAssistantMessage = !event.history_messages?.length
-    // The persisted harness can differ from this turn's selected rollout
-    // cohort when the thread predates the current rollout configuration.
+    // The persisted harness can differ from this turn's selection when the
+    // thread predates it or a persona pins one.
     const effectiveHarnessType =
       session.harnessType ?? resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
     // Without an explicit --model/--opus/... override the harness runs its
     // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
     // config); show that instead of dropping the model entirely.
     const effectiveModel =
-      resolvedModel ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
+      personaModel ?? resolvedModel ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
     // Codex/Nanocodex run an effort level even when this turn asked for none;
     // show the one the harness actually applies (Nanocodex folds Minimal into
     // Low). Undefined for the Claude/Amp harnesses, which drop the segment.
     const effectiveReasoning = effectiveReasoningForHarness(
       effectiveHarnessType,
-      resolvedReasoning,
+      turnReasoning,
       harnessDefaultReasoning(config)
     )
     const includeResponseMetadata =
@@ -1416,7 +1411,7 @@ async function driveSession(
           notice: fallbackNotice,
           reasoning: effectiveReasoning,
           serviceTier:
-            config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED && !resolvedProvider
+            config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED && (personaModel || !resolvedProvider)
               ? defaultServiceTierForHarness(effectiveHarnessType)
               : undefined
         })
