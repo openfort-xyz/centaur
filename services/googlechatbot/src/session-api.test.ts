@@ -109,8 +109,6 @@ describe('createSession', () => {
     expect(result.activeExecution).toBe(false)
   })
 
-  // The bot owns rollout selection, but api-rs still reports the harness it
-  // persisted so old threads keep their original cohort.
   test('surfaces the harness api-rs actually persisted', async () => {
     stubFetch({ status: 'idle', harness_type: 'nanocodex' })
     const result = await createSession(
@@ -122,29 +120,13 @@ describe('createSession', () => {
     expect(result.harnessType).toBe('nanocodex')
   })
 
-  test('records the Google Chat-owned A/B assignment', async () => {
-    stubFetch({ status: 'idle', harness_type: 'nanocodex' })
-    const assignment = {
-      experiment: 'codex_nanocodex_ab',
-      requestedHarness: 'codex',
-      cohort: 'nanocodex',
-      rolloutPercent: 50
-    }
-    const result = await createSession(
-      loadConfig({}),
-      'chat:spaces:AAAA:threads:T1',
-      undefined,
-      'nanocodex',
-      undefined,
-      { harnessAssignment: assignment }
-    )
-    expect(result.harnessAssignment).toEqual({
-      ...assignment,
-      cohort: 'nanocodex'
-    })
+  test('surfaces the model a persona pins', async () => {
+    stubFetch({ status: 'idle', harness_type: 'claude', persona_model: 'claude-opus-5-5' })
+    const result = await createSession(loadConfig({}), 'chat:spaces:AAAA:threads:T1')
+    expect(result.personaModel).toBe('claude-opus-5-5')
   })
 
-  test('keeps an existing rollout cohort on harness conflict', async () => {
+  test('keeps an existing harness on harness conflict', async () => {
     const requests: Record<string, unknown>[] = []
     globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
       requests.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>)
@@ -161,21 +143,11 @@ describe('createSession', () => {
       loadConfig({}),
       'chat:spaces:AAAA:threads:T1',
       undefined,
-      'nanocodex',
-      undefined,
-      {
-        harnessAssignment: {
-          experiment: 'codex_nanocodex_ab',
-          requestedHarness: 'codex',
-          cohort: 'nanocodex',
-          rolloutPercent: 50
-        }
-      }
+      'nanocodex'
     )
 
     expect(requests.map(request => request.harness_type)).toEqual(['nanocodex', 'codex'])
     expect(result.harnessType).toBe('codex')
-    expect(result.harnessAssignment?.cohort).toBe('codex')
   })
 
   test('restarts an idle session when an explicit harness override conflicts', async () => {

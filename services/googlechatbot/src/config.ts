@@ -21,7 +21,6 @@ const EnvSchema = z.object({
   CENTAUR_OMP_MODEL: z.string().optional(),
   GOOGLECHATBOT_ENABLED_HARNESSES: z.string().optional().transform(parseEnabledHarnesses),
   GOOGLECHATBOT_DEFAULT_HARNESS: z.string().default('codex'),
-  GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT: z.coerce.number().int().min(0).max(100).default(0),
 
   // api-rs (the Rust Centaur API) the bot drives sessions against.
   CENTAUR_API_URL: z.string().url().default('http://127.0.0.1:8080'),

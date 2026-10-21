@@ -1,6 +1,6 @@
 # Google Chat and Slack parity status
 
-Source review date: 2026-10-15. Live evidence remains dated separately in the
+Source review date: 2026-10-21. Live evidence remains dated separately in the
 [verification ledger](../../docs/google-chat-parity-verification.md).
 
 Google Chat implements the planned integration, but complete parity remains
@@ -35,7 +35,7 @@ Use these documents for different purposes:
 | State and recovery | Persist accepted work, dedupe, overrides, DM transcripts, execution IDs, and final answers. Recover through leases and a recurring sweep. | Earlier Kind restart and policy checks are recorded; they do not prove every crash boundary on the current source. |
 | ETL | Shared-space projection, separate owner-scoped DM rows, resumable pagination, tombstones, retention, and metrics. | Ingestion is recorded live. Deletion convergence, RLS, and retention gates remain. |
 | Console | Space and DM grants and scheduled destinations. Upstream removed the Console chat UI. | Automated coverage exists; narrow/wide keyboard interaction evidence remains. |
-| Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona, including no persona; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, Pi, and notice tests cover the October sync. |
+| Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona, including no persona; a persona-pinned model overrides model/provider selections; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, Pi, and notice tests cover the October sync. |
 
 ## Platform differences
 
@@ -82,7 +82,8 @@ directory lookup) the bot sends on `/execute` as `googlechat_requester_email` wi
 non-broker static secrets into the turn's proxy config, which is how a
 per-person desktop token follows its owner into a group; Slack, GitHub and
 console requesters keep upstream's always-available-wrapper-only hoist. The
-gate is `requester.kind == gchat_user` in `PrincipalSyncConfigSnapshot`.
+gate is `requester.kind = 'gchat_user'` in proxy-sync's
+`sql/effective_credentials.sql`.
 Because that turn now carries one person's grants, the bot folds a follow-up
 into a running turn only from the same verified sender (`fold-guard.ts`); in a
 DM everything folds, in a shared space anyone else gets a "still running"
@@ -135,6 +136,23 @@ results tied to an immutable commit or image digest. TEST-031 requires every
 preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
+
+### 2026-10-21 — 87 upstream commits, `d63acb7b..4bf5d61d`
+
+Fork #194 had already ported #1894, #1814, #1908, #1904, #1742, #1941, #1942,
+and #1953 by hand; this merge replaces those copies with upstream's originals,
+so slackbotv2 and the shared packages match upstream.
+
+| Upstream change | Google Chat disposition |
+| --- | --- |
+| Remove the Codex/Nanocodex A/B rollout (#1967) | **Ported.** `GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT`, `harness-rollout.ts`, the `harness_assignment` metadata, and the chart value are removed. |
+| Personas pin a model or harness (#1966, #1969) | **Ported.** `createSession` reads `persona_model`; a pinned thread sends no model/provider override, recomputes reasoning for the pinned model, and the footer names it. api-rs enforces the pin. |
+| Keep replies through deploys (#1999) | **Partly ported.** `googlechatbot.yaml` gains the startup probe. No SIGTERM drain: Chat work is durable and restart recovery replays it. |
+| Assistant status after steering (#1963), native Stop button (#1973), remove bot reactions (#2001) | **Platform-specific.** Chat has no assistant status or Stop API, and reaction writes are user-auth only; steering keeps the held acknowledgement bubble. |
+| Slack Connect allowlist (#2000, #2006) | **Platform-specific.** Chat admission is the verified domain allowlist and exact space grants. Migration `0060` imports as `0064` (fork offset +4). |
+| Admin changes from a DM (#1991, #1994, #1996) | **Not ported.** The gate is `slack_dm` plus the home-workspace channel catalog. A `gchat_dm` branch keyed on the verified `google_email` link is a follow-up. |
+| Proxy sync served only by proxy-sync (#1933, #1934) | **Ported.** Rails' snapshot class, warm/prune jobs, and the Rails/Rust parity harness are deleted. The `gchat_user` direct non-broker hoist already lives in `sql/effective_credentials.sql`; `integration_tests.rs` now covers it, and the Chat JWT claim test reads `PrincipalSyncConfig`. |
+| token-broker (#1970), Microsoft OAuth (#1924), shared OAuth apps (#1910), company-context Slack/Calendar/import sync, Mercator, dependency and CI updates | **Shared.** Chat's Bun image, `hono`, and type packages follow Slack's bumps by hand because dependabot does not cover `services/googlechatbot`. The new `e2e.yml` and `token-broker-checks` use GitHub-hosted runners; CI, Justfile, and image publishing build both token-broker and googlechatbot. |
 
 ### 2026-10-06 — 113 upstream commits, `adb8d2d1..d63acb7b`
 

@@ -71,14 +71,21 @@ const PG_CLIENT_PASSWORD_ENV: &str = "IRON_PROXY_PG_CLIENT_PASSWORD";
 // Anthropic 401s when the first call beat the poll by ~350ms).
 //
 // The claim barrier asks the proxy directly: POST /v1/sync (immediate
-// out-of-band sync), then poll GET /v1/status until the applied principal
-// matches. Proxy images without the managed-mode management API never answer
+// out-of-band sync), then poll GET /v1/status until the proxy reports the
+// principal and a sync that started after the assignment committed. Proxy images without the managed-mode management API never answer
 // on the management port; after PROXY_ACK_PROBE_WINDOW of failed probes the
 // barrier falls back to the blind delay that covers a full poll interval plus
 // apply latency (the pre-barrier behavior).
 const PROXY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
-const PROXY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PROXY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROXY_ACK_PROBE_WINDOW: Duration = Duration::from_secs(2);
+// A reassigned proxy already reports a config, possibly with the same
+// principal (requester or label changes). The first sync completing after the
+// barrier starts may have begun before the assignment committed; the second
+// starts after the first finishes, so it carries the new config. A cold proxy
+// is registered with its principal before the pod exists, so any sync counts.
+const REASSIGN_FRESH_SYNCS: usize = 2;
+const COLD_CREATE_FRESH_SYNCS: usize = 0;
 const PROXY_REASSIGN_FALLBACK_DELAY: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Debug)]
@@ -105,6 +112,11 @@ pub struct IronProxyConfig {
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
     pub control_plane_pod_labels: BTreeMap<String, String>,
+    pub proxy_sync_pod_labels: BTreeMap<String, String>,
+    /// In-cluster company-context API that proxies may reach on behalf of
+    /// sandboxes, and the labels of its pods. Unset allows no such egress.
+    pub company_context_url: Option<String>,
+    pub company_context_pod_labels: BTreeMap<String, String>,
     pub resources: Option<ResourceRequirements>,
 }
 
@@ -137,6 +149,15 @@ impl IronProxyConfig {
             control_plane_pod_labels: BTreeMap::from([(
                 "app.kubernetes.io/component".to_owned(),
                 "console".to_owned(),
+            )]),
+            proxy_sync_pod_labels: BTreeMap::from([(
+                "app.kubernetes.io/component".to_owned(),
+                "proxy-sync".to_owned(),
+            )]),
+            company_context_url: None,
+            company_context_pod_labels: BTreeMap::from([(
+                "app.kubernetes.io/component".to_owned(),
+                "company-context".to_owned(),
             )]),
             resources: None,
         }
@@ -203,7 +224,6 @@ struct ProxySyncEnv {
     proxy_id: String,
     control_url: String,
     token: String,
-    config_hash: Option<String>,
 }
 
 struct ControlPlaneEgressTarget {
@@ -382,11 +402,24 @@ impl AgentSandboxBackend {
             &self.config.namespace,
             iron_proxy.control_plane_pod_labels.clone(),
         );
+        let proxy_sync_target = control_plane_egress_target(
+            &sync.control_url,
+            &self.config.namespace,
+            iron_proxy.proxy_sync_pod_labels.clone(),
+        );
+        let mut control_targets = vec![control_target, proxy_sync_target];
+        if let Some(url) = &iron_proxy.company_context_url {
+            control_targets.push(control_plane_egress_target(
+                url,
+                &self.config.namespace,
+                iron_proxy.company_context_pod_labels.clone(),
+            ));
+        }
         for policy in build_iron_proxy_network_policies(
             id,
             resolved,
             iron_proxy,
-            &control_target,
+            &control_targets,
             self.config.otlp_egress.as_ref(),
             resolved.observability_enabled,
         ) {
@@ -415,12 +448,8 @@ impl AgentSandboxBackend {
             .await
             .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
         self.wait_until_proxy_running(resolved).await?;
-        self.wait_for_cold_proxy_principal_applied(
-            id,
-            &resolved.principal_id,
-            sync.config_hash.as_deref(),
-        )
-        .await;
+        self.wait_for_cold_proxy_principal_applied(id, &resolved.principal_id)
+            .await;
         Ok(())
     }
 
@@ -454,7 +483,6 @@ impl AgentSandboxBackend {
             proxy_id: proxy.id,
             control_url: iron_control.control_url.clone(),
             token,
-            config_hash: proxy.config_hash,
         })
     }
 
@@ -756,7 +784,7 @@ impl AgentSandboxBackend {
             .insert(id.as_str().to_owned(), proxy.id);
         self.patch_iron_control_principal_annotation(id, principal_id, requester_principal_id)
             .await?;
-        self.wait_for_proxy_principal_applied(id, principal_id, proxy.config_hash.as_deref())
+        self.wait_for_proxy_principal_applied(id, principal_id)
             .await;
         Ok(())
     }
@@ -790,14 +818,14 @@ impl AgentSandboxBackend {
             }
 
             let iron_control = &self.config.iron_control;
-            let proxy = iron_control
+            iron_control
                 .client
                 .assign_proxy_principal(&proxy_id, principal_id, requester_principal_id, labels)
                 .await
                 .map_err(|err| SandboxError::backend_source("iron-control assign proxy", err))?;
             self.patch_iron_control_principal_annotation(id, principal_id, requester_principal_id)
                 .await?;
-            self.wait_for_proxy_principal_applied(id, principal_id, proxy.config_hash.as_deref())
+            self.wait_for_proxy_principal_applied(id, principal_id)
                 .await;
             return Ok(());
         }
@@ -921,15 +949,10 @@ impl AgentSandboxBackend {
     /// managed-mode management API fall back to a fixed delay. Never fails the
     /// claim: managed proxies fail closed until synced, so the worst case is a
     /// brief 503 window rather than a failed execution.
-    async fn wait_for_proxy_principal_applied(
-        &self,
-        id: &SandboxId,
-        principal_id: &str,
-        config_hash: Option<&str>,
-    ) {
+    async fn wait_for_proxy_principal_applied(&self, id: &SandboxId, principal_id: &str) {
         let started = Instant::now();
         match self
-            .proxy_principal_ack(id, principal_id, config_hash, "claim barrier")
+            .proxy_principal_ack(id, principal_id, REASSIGN_FRESH_SYNCS, "claim barrier")
             .await
         {
             Ok(ProxyAck::Applied) => {
@@ -977,15 +1000,15 @@ impl AgentSandboxBackend {
     /// returns. Ask the proxy to report the requested principal's config before
     /// creating the sandbox pod. If the management API cannot prove readiness,
     /// fall back to the fixed delay instead of failing the sandbox create.
-    async fn wait_for_cold_proxy_principal_applied(
-        &self,
-        id: &SandboxId,
-        principal_id: &str,
-        config_hash: Option<&str>,
-    ) {
+    async fn wait_for_cold_proxy_principal_applied(&self, id: &SandboxId, principal_id: &str) {
         let started = Instant::now();
         match self
-            .proxy_principal_ack(id, principal_id, config_hash, "cold create barrier")
+            .proxy_principal_ack(
+                id,
+                principal_id,
+                COLD_CREATE_FRESH_SYNCS,
+                "cold create barrier",
+            )
             .await
         {
             Ok(ProxyAck::Applied) => {
@@ -1032,7 +1055,7 @@ impl AgentSandboxBackend {
         &self,
         id: &SandboxId,
         principal_id: &str,
-        config_hash: Option<&str>,
+        fresh_syncs: usize,
         barrier: &'static str,
     ) -> SandboxResult<ProxyAck> {
         let endpoint = match self.proxy_management_endpoint(id).await {
@@ -1060,7 +1083,7 @@ impl AgentSandboxBackend {
             &client,
             &endpoint,
             principal_id,
-            config_hash,
+            fresh_syncs,
             PROXY_ACK_TIMEOUT,
             PROXY_ACK_PROBE_WINDOW,
             PROXY_ACK_POLL_INTERVAL,
@@ -1251,14 +1274,15 @@ struct ProxyManagementEndpoint {
 }
 
 /// Applied control-plane state served by the proxy's `GET /v1/status`.
+/// iron-proxy stamps `last_sync_at` with its own clock after applying a sync.
 #[derive(serde::Deserialize)]
 struct ProxyManagedStatus {
-    #[serde(default)]
-    config_hash: Option<String>,
     #[serde(default)]
     principal_id: String,
     #[serde(default)]
     synced_once: bool,
+    #[serde(default)]
+    last_sync_at: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1278,36 +1302,27 @@ fn proxy_fallback_delay_remaining(elapsed: Duration) -> Duration {
 }
 
 /// Poll the proxy's management API until it reports `principal_id`'s config
-/// applied. `probe_window` bounds how long an entirely-unresponsive
-/// management API is probed before concluding the image predates managed
-/// status support; any successful response within the window commits to
-/// waiting out the full `ack_timeout`.
+/// applied by at least `fresh_syncs` syncs completed after the first status
+/// read, poking an immediate sync for each. `probe_window` bounds how long an
+/// entirely-unresponsive management API is probed before concluding the image
+/// predates managed status support; any successful response within the window
+/// commits to waiting out the full `ack_timeout`.
 async fn wait_for_proxy_ack(
     client: &reqwest::Client,
     endpoint: &ProxyManagementEndpoint,
     principal_id: &str,
-    config_hash: Option<&str>,
+    fresh_syncs: usize,
     ack_timeout: Duration,
     probe_window: Duration,
     poll_interval: Duration,
 ) -> ProxyAck {
     let started = Instant::now();
-    let mut poked = false;
     let mut management_confirmed = false;
+    // The last sync seen; `None` until the first status read.
+    let mut last_sync: Option<Option<String>> = None;
+    let mut syncs_seen = 0;
+    let mut poke_pending = true;
     loop {
-        // Poke an immediate out-of-band sync so the barrier does not ride the
-        // proxy's 5s poll cadence; retried until it lands (the status poll
-        // below still converges without it, just slower).
-        if !poked {
-            poked = matches!(
-                client
-                    .post(format!("{}/v1/sync", endpoint.base_url))
-                    .bearer_auth(&endpoint.api_key)
-                    .send()
-                    .await,
-                Ok(response) if response.status().is_success()
-            );
-        }
         let status = client
             .get(format!("{}/v1/status", endpoint.base_url))
             .bearer_auth(&endpoint.api_key)
@@ -1317,16 +1332,36 @@ async fn wait_for_proxy_ack(
             && response.status().is_success()
         {
             management_confirmed = true;
-            if let Ok(status) = response.json::<ProxyManagedStatus>().await
-                && status.synced_once
-                && status.principal_id == principal_id
-                && status
-                    .config_hash
-                    .as_deref()
-                    .is_none_or(|applied_hash| config_hash.is_none_or(|hash| applied_hash == hash))
-            {
-                return ProxyAck::Applied;
+            if let Ok(status) = response.json::<ProxyManagedStatus>().await {
+                match &last_sync {
+                    None => last_sync = Some(status.last_sync_at.clone()),
+                    Some(previous) if *previous != status.last_sync_at => {
+                        syncs_seen += 1;
+                        last_sync = Some(status.last_sync_at.clone());
+                        poke_pending = true;
+                    }
+                    Some(_) => {}
+                }
+                if syncs_seen >= fresh_syncs
+                    && status.synced_once
+                    && status.principal_id == principal_id
+                {
+                    return ProxyAck::Applied;
+                }
             }
+        }
+        // Poke an immediate out-of-band sync so the barrier does not ride the
+        // proxy's poll cadence; retried until it lands (the status poll still
+        // converges without it, just slower).
+        if poke_pending && last_sync.is_some() {
+            poke_pending = !matches!(
+                client
+                    .post(format!("{}/v1/sync", endpoint.base_url))
+                    .bearer_auth(&endpoint.api_key)
+                    .send()
+                    .await,
+                Ok(response) if response.status().is_success()
+            );
         }
         let elapsed = started.elapsed();
         if !management_confirmed && elapsed >= probe_window {
@@ -1735,7 +1770,7 @@ fn build_iron_proxy_network_policies(
     id: &SandboxId,
     resolved: &ResolvedIronProxy,
     iron_proxy: &IronProxyConfig,
-    control_target: &ControlPlaneEgressTarget,
+    control_targets: &[ControlPlaneEgressTarget],
     otlp_egress: Option<&OtlpEgressTarget>,
     observability_enabled: bool,
 ) -> Vec<NetworkPolicy> {
@@ -1782,7 +1817,7 @@ fn build_iron_proxy_network_policies(
                 ]),
                 egress: Some(proxy_egress_rules(
                     iron_proxy,
-                    control_target,
+                    control_targets,
                     otlp_egress,
                     observability_enabled,
                 )),
@@ -1799,20 +1834,20 @@ fn sandbox_to_proxy_ports(resolved: &ResolvedIronProxy) -> Vec<NetworkPolicyPort
 
 fn proxy_egress_rules(
     iron_proxy: &IronProxyConfig,
-    control_target: &ControlPlaneEgressTarget,
+    control_targets: &[ControlPlaneEgressTarget],
     otlp_egress: Option<&OtlpEgressTarget>,
     observability_enabled: bool,
 ) -> Vec<NetworkPolicyEgressRule> {
-    // Upstream egress: 443/5432 for normal traffic, plus the iron-control port
-    // (deduped) so a sync-mode proxy can reach the control plane. Public
-    // upstreams are always constrained away from private/cluster CIDRs; any
-    // intra-cluster destination must be added as an explicit rule below.
+    // Console and proxy-sync can use different pods and ports. Allow both
+    // explicitly; public upstream rules exclude private/cluster CIDRs.
     let upstream_ports = vec![network_port(443), network_port(5432)];
     let mut rules = vec![dns_egress_rule()];
-    rules.push(egress_to(
-        vec![control_target.peer.clone()],
-        vec![network_port(control_target.port)],
-    ));
+    for target in control_targets {
+        rules.push(egress_to(
+            vec![target.peer.clone()],
+            vec![network_port(target.port)],
+        ));
+    }
     rules.push(egress_to(
         vec![all_namespaces_peer()],
         vec![network_port(PG_LISTENER_PORT)],
@@ -2656,7 +2691,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
 
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync, no_scheduling());
@@ -2691,7 +2725,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
 
         // The sandbox sees only the certificate, never the private key.
@@ -2749,7 +2782,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
 
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync, no_scheduling());
@@ -2766,7 +2798,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
 
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, no_scheduling());
@@ -2803,7 +2834,7 @@ mod tests {
             &id,
             &resolved,
             &iron_proxy,
-            &control_target(),
+            &[control_target()],
             None,
             true,
         );
@@ -2838,7 +2869,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
 
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, no_scheduling());
@@ -2855,7 +2885,7 @@ mod tests {
             &id,
             &resolved,
             &iron_proxy,
-            &control_target(),
+            &[control_target()],
             None,
             false,
         );
@@ -2886,7 +2916,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
         let node_selector = BTreeMap::from([("workload".to_owned(), "centaur-sandbox".to_owned())]);
         let annotations = BTreeMap::from([
@@ -2956,7 +2985,6 @@ mod tests {
             proxy_id: "iprx_test".to_owned(),
             control_url: "http://console:3000".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync, no_scheduling());
         let pod_spec = pod.spec.unwrap();
@@ -3014,7 +3042,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             Some(&target),
             true,
         );
@@ -3043,7 +3071,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             None,
             true,
         );
@@ -3076,7 +3104,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             Some(&target),
             false,
         );
@@ -3153,7 +3181,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target(),
+            &[control_target()],
             None,
             false,
         );
@@ -3193,7 +3221,6 @@ mod tests {
             proxy_id: "proxy-id".to_owned(),
             control_url: "http://iron-control".to_owned(),
             token: "proxy-token".to_owned(),
-            config_hash: None,
         };
 
         let env = iron_proxy_env_vars(&iron_proxy, &resolved(), &sync);
@@ -3248,7 +3275,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             None,
             true,
         );
@@ -3356,11 +3383,14 @@ mod tests {
     }
 
     /// Stub of the proxy management API from iron-proxy's managed mode:
-    /// `POST /v1/sync` -> 202, `GET /v1/status` -> the bootstrap principal for
-    /// the first `mismatches` calls, then the claimed principal.
+    /// `POST /v1/sync` -> 202, completing the first `completable_syncs` syncs
+    /// immediately (each advances `last_sync_at`), `GET /v1/status` ->
+    /// the bootstrap principal for the first `mismatches` calls, then the
+    /// claimed principal.
     async fn spawn_management_stub(
         api_key: &str,
         mismatches: usize,
+        completable_syncs: usize,
     ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -3374,6 +3404,7 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let sync_calls = Arc::new(AtomicUsize::new(0));
         let status_calls = Arc::new(AtomicUsize::new(0));
+        let completed_syncs = Arc::new(AtomicUsize::new(0));
         let auth = format!("authorization: bearer {}", api_key.to_lowercase());
         let handle = tokio::spawn({
             let sync_calls = sync_calls.clone();
@@ -3395,6 +3426,9 @@ mod tests {
                         ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned())
                     } else if request.starts_with("post /v1/sync") {
                         sync_calls.fetch_add(1, Ordering::SeqCst);
+                        if completed_syncs.load(Ordering::SeqCst) < completable_syncs {
+                            completed_syncs.fetch_add(1, Ordering::SeqCst);
+                        }
                         ("202 Accepted", r#"{"status":"sync requested"}"#.to_owned())
                     } else if request.starts_with("get /v1/status") {
                         let calls = status_calls.fetch_add(1, Ordering::SeqCst);
@@ -3403,10 +3437,11 @@ mod tests {
                         } else {
                             "prin_claimed"
                         };
+                        let synced = completed_syncs.load(Ordering::SeqCst);
                         (
                             "200 OK",
                             format!(
-                                r#"{{"config_hash":"h","principal_id":"{principal}","principal_status":"active","synced_once":true,"last_sync_at":"2026-06-12T00:00:00Z"}}"#
+                                r#"{{"config_hash":"h","principal_id":"{principal}","principal_status":"active","synced_once":true,"last_sync_at":"2026-06-12T00:00:{synced:02}Z"}}"#
                             ),
                         )
                     } else {
@@ -3435,7 +3470,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_ack_waits_until_claimed_principal_is_applied() {
-        let (base_url, sync_calls, server) = spawn_management_stub("test-key", 2).await;
+        let (base_url, sync_calls, server) = spawn_management_stub("test-key", 2, usize::MAX).await;
         let endpoint = ProxyManagementEndpoint {
             base_url,
             api_key: "test-key".to_owned(),
@@ -3445,7 +3480,7 @@ mod tests {
             &barrier_client(),
             &endpoint,
             "prin_claimed",
-            None,
+            REASSIGN_FRESH_SYNCS,
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(10),
@@ -3454,15 +3489,16 @@ mod tests {
 
         assert_eq!(ack, ProxyAck::Applied);
         assert!(
-            sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "the barrier should poke an immediate out-of-band sync"
+            sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= REASSIGN_FRESH_SYNCS,
+            "the barrier should poke an immediate sync for each fresh sync"
         );
         server.abort();
     }
 
     #[tokio::test]
     async fn proxy_ack_times_out_when_principal_never_applies() {
-        let (base_url, _sync_calls, server) = spawn_management_stub("test-key", usize::MAX).await;
+        let (base_url, _sync_calls, server) =
+            spawn_management_stub("test-key", usize::MAX, usize::MAX).await;
         let endpoint = ProxyManagementEndpoint {
             base_url,
             api_key: "test-key".to_owned(),
@@ -3472,7 +3508,7 @@ mod tests {
             &barrier_client(),
             &endpoint,
             "prin_claimed",
-            None,
+            REASSIGN_FRESH_SYNCS,
             Duration::from_millis(400),
             Duration::from_millis(200),
             Duration::from_millis(25),
@@ -3484,25 +3520,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_ack_rejects_matching_principal_with_stale_config_hash() {
-        let (base_url, _sync_calls, server) = spawn_management_stub("test-key", 0).await;
+    async fn proxy_ack_waits_for_syncs_started_after_a_reassignment() {
+        // The proxy already reports the right principal, as after a requester
+        // or label change. One completed sync may have started before the
+        // assignment committed, so it is not enough.
+        let (base_url, sync_calls, server) = spawn_management_stub("test-key", 0, 1).await;
         let endpoint = ProxyManagementEndpoint {
             base_url,
             api_key: "test-key".to_owned(),
         };
 
-        let ack = wait_for_proxy_ack(
+        let reassigned = wait_for_proxy_ack(
             &barrier_client(),
             &endpoint,
             "prin_claimed",
-            Some("sha256:expected"),
+            REASSIGN_FRESH_SYNCS,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .await;
+        let cold = wait_for_proxy_ack(
+            &barrier_client(),
+            &endpoint,
+            "prin_claimed",
+            COLD_CREATE_FRESH_SYNCS,
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_millis(10),
         )
         .await;
 
-        assert_eq!(ack, ProxyAck::TimedOut);
+        assert_eq!(reassigned, ProxyAck::TimedOut);
+        assert_eq!(cold, ProxyAck::Applied);
+        assert!(sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
         server.abort();
     }
 
@@ -3522,7 +3573,7 @@ mod tests {
             &barrier_client(),
             &endpoint,
             "prin_claimed",
-            None,
+            REASSIGN_FRESH_SYNCS,
             Duration::from_secs(2),
             Duration::from_millis(300),
             Duration::from_millis(50),

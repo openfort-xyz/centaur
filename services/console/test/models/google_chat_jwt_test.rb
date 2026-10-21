@@ -129,7 +129,7 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
     end
   end
 
-  test "proxy sync snapshot carries effective Google Chat claims" do
+  test "proxy sync config carries effective Google Chat claims" do
     principal = principals(:acme_channel)
     principal.google_chat_space_permissions.create!(space_name: "spaces/AAAA", send_enabled: true)
     roles(:acme_infra).google_chat_dm_permissions.create!(
@@ -140,7 +140,7 @@ class GoogleChatJwtTest < ActiveSupport::TestCase
       "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
       "CENTAUR_API_URL" => "http://api.internal:8080"
     ) do
-      config = PrincipalSyncConfigSnapshot.config_for(principal)
+      config = PrincipalSyncConfig.config_for(principal)
       token = config.fetch("secrets").find do |secret|
         secret.dig("inject", "header") == "Authorization" && secret.dig("source", "type") == "control_plane"
       end.dig("source", "value")

@@ -916,6 +916,7 @@ class CompanyContextClient:
             )
             keyword_results = results[:candidate_limit]
             vector_results: list[dict[str, Any]] = []
+            vector_error = None
             if embeddings_available:
                 try:
                     query_embedding = await self._query_embedding_async(query)
@@ -929,10 +930,11 @@ class CompanyContextClient:
                         occurred_after=occurred_after,
                         occurred_before=occurred_before,
                     )
-                except Exception:
+                except Exception as exc:
                     # Embedding generation and vector search are optional. Any
                     # incompatibility falls back to lexical search.
                     vector_results = []
+                    vector_error = str(exc)
 
             if vector_results:
                 results = _reciprocal_rank_fusion(
@@ -971,6 +973,8 @@ class CompanyContextClient:
                 response["google_docs_error"] = google_docs_error
             if granola_error:
                 response["granola_error"] = granola_error
+            if vector_error:
+                response["vector_error"] = vector_error
             return response
         finally:
             await conn.close()
@@ -1085,6 +1089,8 @@ class CompanyContextClient:
             source,
             source_type,
         )
+        # Bind the query vector as text: a vector-typed parameter makes asyncpg
+        # introspect the type with set_config, which iron-proxy rejects.
         rows = await conn.fetch(
             """
             SELECT
@@ -1102,7 +1108,7 @@ class CompanyContextClient:
                 d.occurred_at,
                 d.source_updated_at,
                 d.metadata,
-                1 - (e.embedding <=> $1::vector) AS vector_similarity
+                1 - (e.embedding <=> $1::text::vector) AS vector_similarity
             FROM company_context_document_embeddings e
             JOIN company_context_documents d
               ON d.document_id = e.company_context_document_id
@@ -1113,7 +1119,7 @@ class CompanyContextClient:
               AND ($4::text IS NULL OR d.source_type = $4)
               AND ($5::timestamptz IS NULL OR d.occurred_at >= $5)
               AND ($6::timestamptz IS NULL OR d.occurred_at < $6)
-            ORDER BY e.embedding <=> $1::vector,
+            ORDER BY e.embedding <=> $1::text::vector,
                      d.source_updated_at DESC NULLS LAST,
                      d.document_id ASC
             LIMIT $7
@@ -1156,7 +1162,7 @@ class CompanyContextClient:
                         d.source_created_at,
                         d.source_modified_at,
                         d.metadata,
-                        1 - (e.embedding <=> $1::vector) AS vector_similarity
+                        1 - (e.embedding <=> $1::text::vector) AS vector_similarity
                     FROM company_context_document_embeddings e
                     JOIN google_docs_context_documents d
                       ON d.document_id = e.google_docs_context_document_id
@@ -1165,7 +1171,7 @@ class CompanyContextClient:
                       AND e.model = $2
                       AND ($3::timestamptz IS NULL OR d.source_modified_at >= $3)
                       AND ($4::timestamptz IS NULL OR d.source_modified_at < $4)
-                    ORDER BY e.embedding <=> $1::vector,
+                    ORDER BY e.embedding <=> $1::text::vector,
                              d.source_modified_at DESC NULLS LAST,
                              d.document_id ASC
                     LIMIT $5
@@ -1211,7 +1217,7 @@ class CompanyContextClient:
                         d.occurred_at,
                         d.source_updated_at,
                         d.metadata,
-                        1 - (e.embedding <=> $1::vector) AS vector_similarity
+                        1 - (e.embedding <=> $1::text::vector) AS vector_similarity
                     FROM company_context_document_embeddings e
                     JOIN granola_context_documents d
                       ON d.document_id = e.granola_context_document_id
@@ -1220,7 +1226,7 @@ class CompanyContextClient:
                       AND e.model = $2
                       AND ($3::timestamptz IS NULL OR d.occurred_at >= $3)
                       AND ($4::timestamptz IS NULL OR d.occurred_at < $4)
-                    ORDER BY e.embedding <=> $1::vector,
+                    ORDER BY e.embedding <=> $1::text::vector,
                              d.occurred_at DESC NULLS LAST,
                              d.source_updated_at DESC NULLS LAST,
                              d.document_id ASC

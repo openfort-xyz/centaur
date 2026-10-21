@@ -3,7 +3,6 @@ import { isHarnessEnabled } from './harness-routing'
 import { createHash } from 'node:crypto'
 import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
-import type { GoogleChatHarnessAssignment } from './harness-rollout'
 import { logWarn } from './logging'
 import { addGauge, incr } from './metrics'
 import type { ChatSpaceType, NormalizedChatEvent, NormalizedPart } from './chat/types'
@@ -103,6 +102,7 @@ type CreateSessionResponse = {
   harness_type?: string
   persona_id?: string | null
   unavailable_requested_persona_id?: string
+  persona_model?: string | null
 }
 
 export type CreateSessionResult = {
@@ -112,8 +112,8 @@ export type CreateSessionResult = {
   activeExecution: boolean
   /** The harness persisted by api-rs. */
   harnessType?: string
-  /** The Google Chat-owned experiment/cohort used for this thread. */
-  harnessAssignment?: GoogleChatHarnessAssignment
+  /** The model the session's persona pins for its harness. */
+  personaModel?: string
   /** The persona persisted by api-rs. Null means the session has no persona. */
   personaId?: string | null
   /** The unavailable persona api-rs replaced while creating the session. */
@@ -224,7 +224,6 @@ export async function createSession(
   harnessType?: string,
   requester?: SessionRequester,
   options: {
-    harnessAssignment?: GoogleChatHarnessAssignment
     personaId?: string
     restartOnHarnessConflict?: boolean
   } = {}
@@ -271,9 +270,6 @@ export async function createSession(
       // `user_email` is credential-bearing, and only it is withheld when the
       // gate fails; the other two describe the request and always ship.
       ...identityMetadata(identity),
-      ...(options.harnessAssignment
-        ? { harness_assignment: harnessAssignmentMetadata(options.harnessAssignment) }
-        : {}),
       // api-rs reads this as the session principal's display name.
       ...(name ? { googlechat_conversation_name: name } : {})
     }
@@ -306,26 +302,15 @@ export async function createSession(
   if (resolvedHarness && !isHarnessEnabled(resolvedHarness, config.GOOGLECHATBOT_ENABLED_HARNESSES)) {
     throw new Error(`Harness ${resolvedHarness} is not enabled for this deployment`)
   }
-  const harnessAssignment = options.harnessAssignment && resolvedHarness
-    ? { ...options.harnessAssignment, cohort: resolvedHarness }
-    : options.harnessAssignment
+  const personaModel = payload.persona_model?.trim()
   const unavailableRequestedPersonaId = payload.unavailable_requested_persona_id?.trim()
   return {
     status,
     activeExecution: status === ACTIVE_SESSION_STATUS,
     ...(resolvedHarness ? { harnessType: resolvedHarness } : {}),
-    ...(harnessAssignment ? { harnessAssignment } : {}),
+    ...(personaModel ? { personaModel } : {}),
     ...('persona_id' in payload ? { personaId: payload.persona_id ?? null } : {}),
     ...(unavailableRequestedPersonaId ? { unavailableRequestedPersonaId } : {})
-  }
-}
-
-function harnessAssignmentMetadata(assignment: GoogleChatHarnessAssignment): JsonObject {
-  return {
-    experiment: assignment.experiment,
-    requested_harness: assignment.requestedHarness,
-    cohort: assignment.cohort,
-    rollout_percent: assignment.rolloutPercent
   }
 }
 
@@ -439,7 +424,6 @@ export async function executeSession(
     history?: GoogleChatTurnMessage[]
     /** Harness api-rs persisted for this thread (see CreateSessionResult). */
     harnessType?: string
-    harnessAssignment?: GoogleChatHarnessAssignment
     /** Who is asking this turn, for api-rs's per-turn requester principal.
      * `verified` must be the request's signature status, and `userEmail` the
      * Add-on userIdToken or directory-resolved email; the domain allowlist is
@@ -455,10 +439,7 @@ export async function executeSession(
     metadata: sessionMetadata(threadKey, message, {
       action: 'execute',
       ...requesterMetadata(config, opts.requester),
-      ...(opts.harnessType ? { harness_type: opts.harnessType } : {}),
-      ...(opts.harnessAssignment
-        ? { harness_assignment: harnessAssignmentMetadata(opts.harnessAssignment) }
-        : {})
+      ...(opts.harnessType ? { harness_type: opts.harnessType } : {})
     }),
     input_lines: toCodexInputLines(
       config,
