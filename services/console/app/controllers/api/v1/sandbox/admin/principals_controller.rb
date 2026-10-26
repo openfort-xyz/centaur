@@ -22,6 +22,51 @@ module Api
             render json: { data: principals.map { |principal| record_payload(principal) } }
           end
 
+          # POST /api/v1/sandbox/admin/principals
+          #
+          # Creates only Slack channel, Slack user, and workflow principals, with
+          # the foreign ID api-rs derives at session start or for
+          # WORKFLOW_PRINCIPAL = True, so the caller cannot choose a foreign ID,
+          # kind, or Console-user link.
+          def create
+            principal = case data_params[:kind]
+            when "slack_channel"
+              id = data_params[:slack_channel_id].to_s.strip.upcase
+              raise ActionController::BadRequest, "slack_channel_id must be a C… or G… channel ID" unless id.start_with?("C", "G")
+
+              Principal.new(kind: "slack_channel", foreign_id: "slack-channel-#{id.downcase}",
+                            name: "Slack Channel #{id}", slack_channel_id: id)
+            when "slack_dm"
+              id = data_params[:slack_user_id].to_s.strip.upcase
+              team = current_proxy.principal.slack_team_id
+              Principal.new(kind: "slack_dm", foreign_id: "slack-user-#{team.downcase}-#{id.downcase}",
+                            name: "Slack User #{id} (team #{team})", slack_user_id: id, slack_team_id: team)
+            when "workflow"
+              name = data_params[:workflow_name]
+              raise ActionController::BadRequest, "workflow_name must be a WORKFLOW_NAME" unless name.is_a?(String) && name.present?
+
+              Principal.new(kind: "workflow", foreign_id: "workflow-#{workflow_slug(name)}", name: "Workflow #{name}",
+                            labels: { "managed-by" => "centaur", "workflow_name" => name })
+            else
+              raise ActionController::BadRequest, "kind must be slack_channel, slack_dm, or workflow"
+            end
+            principal.created_by = current_user
+
+            Principal.transaction do
+              principal.apply_default_sandbox_capabilities!
+              principal.save!
+              # api-rs adds this only to principals it creates itself.
+              if principal.slack_channel_id
+                principal.slack_channel_permissions.create!(
+                  channel_id: principal.slack_channel_id, **SlackChannelPermission::DEFAULT_ENABLED_ATTRIBUTES
+                )
+              end
+            end
+            render status: :created, json: { data: record_payload(principal) }
+          rescue ActiveRecord::RecordInvalid => e
+            render_validation_error(e.record)
+          end
+
           # GET /api/v1/sandbox/admin/principals/:id/effective_grants
           #
           # Secrets granted directly or through roles, as on the Console
@@ -66,6 +111,11 @@ module Api
           end
 
           private
+
+          # Matches api-rs's slugify for workflow principal foreign IDs.
+          def workflow_slug(name)
+            name.downcase.gsub(/[^a-z0-9]+/, "-").delete_prefix("-").delete_suffix("-").presence || "x"
+          end
 
           def effective_grant_payload(kind, secret, sources)
             roles = sources.filter_map { |source| source[:role] }.uniq
