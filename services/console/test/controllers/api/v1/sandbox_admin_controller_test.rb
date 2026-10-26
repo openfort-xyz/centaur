@@ -131,6 +131,8 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
       [
         { sandbox_sessions_read_enabled: nil },
         { sandbox_sessions_read_enabled: "maybe" },
+        { sandbox_sessions_read_enabled: true, sandbox_workflows_read_enabled: [] },
+        { sandbox_repo_cache: { mode: "all" } },
         { sandbox_repo_cache: true },
         {}
       ].each do |data|
