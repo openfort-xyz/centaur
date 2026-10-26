@@ -4,6 +4,7 @@ import httpx
 import pytest
 from client import (
     SANDBOX_ADMIN_GRANTS_PATH,
+    SANDBOX_ADMIN_PG_DSN_SECRETS_PATH,
     SANDBOX_ADMIN_PRINCIPALS_PATH,
     SANDBOX_ADMIN_ROLES_PATH,
     SANDBOX_ADMIN_SECRETS_PATH,
@@ -373,3 +374,53 @@ def test_admin_slack_external_teams_add_and_remove_one_team_id():
         ("POST", SANDBOX_ADMIN_SLACK_EXTERNAL_TEAMS_PATH, {"data": {"team_id": "T0PARTNER"}}),
         ("DELETE", f"{SANDBOX_ADMIN_SLACK_EXTERNAL_TEAMS_PATH}/E0GRID", None),
     ]
+
+
+def test_admin_create_principal_posts_a_slack_channel_or_user_identity():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return json_response({"data": {"id": "prn_new"}}, 201)
+
+    client = make_client(handler)
+    assert client.admin_create_principal(slack_channel_id="C0NEW") == {"id": "prn_new"}
+    client.admin_create_principal(slack_user_id="U0NEW")
+
+    assert requests == [
+        (
+            "POST",
+            SANDBOX_ADMIN_PRINCIPALS_PATH,
+            {"data": {"kind": "slack_channel", "slack_channel_id": "C0NEW"}},
+        ),
+        (
+            "POST",
+            SANDBOX_ADMIN_PRINCIPALS_PATH,
+            {"data": {"kind": "slack_dm", "slack_user_id": "U0NEW"}},
+        ),
+    ]
+
+
+def test_admin_update_secret_patches_only_the_given_fields_at_its_kind_path():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.url.path == SANDBOX_ADMIN_SECRETS_PATH:
+            return json_response(
+                {
+                    "data": [
+                        {"id": "pgs_1", "grant_key": "pg_dsn_secret_id", "foreign_id": "partner"}
+                    ]
+                }
+            )
+        return json_response({"data": {"id": "pgs_1"}})
+
+    make_client(handler).admin_update_secret("partner", {"role": "writer"})
+
+    assert requests[-1] == (
+        "PATCH",
+        f"{SANDBOX_ADMIN_PG_DSN_SECRETS_PATH}/pgs_1",
+        {"data": {"role": "writer"}},
+    )

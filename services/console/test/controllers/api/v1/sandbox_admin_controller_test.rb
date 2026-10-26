@@ -131,6 +131,8 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
       [
         { sandbox_sessions_read_enabled: nil },
         { sandbox_sessions_read_enabled: "maybe" },
+        { sandbox_sessions_read_enabled: true, sandbox_workflows_read_enabled: [] },
+        { sandbox_repo_cache: { mode: "all" } },
         { sandbox_repo_cache: true },
         {}
       ].each do |data|
@@ -225,6 +227,143 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
       assert_response :forbidden
     end
     assert_equal %w[E0GRID], api.team_ids
+  end
+
+  test "an admin's Slack DM sandbox creates channel and user principals with session-derived identities" do
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_channel", slack_channel_id: " c0new12345 " } }, headers: headers, as: :json
+      assert_response :created
+      channel = Principal.find_by_oid!(json_body.dig("data", "id"))
+      assert_equal [ "slack-channel-c0new12345", "slack_channel", "C0NEW12345", nil ],
+                   [ channel.foreign_id, channel.kind, channel.slack_channel_id, channel.slack_team_id ]
+      assert_equal users(:acme_admin), channel.created_by
+      permission = channel.slack_channel_permissions.sole
+      assert_equal "C0NEW12345", permission.channel_id
+      assert permission.upload_enabled && permission.download_enabled && permission.history_enabled
+
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_dm", slack_user_id: "U0NEWUSER1" } }, headers: headers, as: :json
+      assert_response :created
+      user = Principal.find_by_oid!(json_body.dig("data", "id"))
+      assert_equal [ "slack-user-t0123456789-u0newuser1", "slack_dm", "U0NEWUSER1", "T0123456789" ],
+                   [ user.foreign_id, user.kind, user.slack_user_id, user.slack_team_id ]
+
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_channel", slack_channel_id: "C0NEW12345" } }, headers: headers, as: :json
+      assert_response :unprocessable_entity
+    end
+  end
+
+  test "sandbox admin principal creation accepts only Slack channel and user identities" do
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      [
+        [ { kind: "console_user", slack_channel_id: "C0NEW12345" }, :bad_request ],
+        [ { kind: "slack_channel", slack_channel_id: "D0NEW12345" }, :bad_request ],
+        [ { kind: "slack_dm", slack_user_id: "C0NEW12345" }, :unprocessable_entity ]
+      ].each do |data, status|
+        assert_no_difference "Principal.count" do
+          post "/api/v1/sandbox/admin/principals", params: { data: data }, headers: headers, as: :json
+        end
+        assert_response status, data.inspect
+      end
+    end
+
+    with_token(dm_proxy_for(users(:member_user))) do |headers|
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_channel", slack_channel_id: "C0NEW12345" } }, headers: headers, as: :json
+    end
+    assert_response :forbidden
+    assert_not Principal.exists?(foreign_id: "slack-channel-c0new12345")
+  end
+
+  test "an admin's Slack DM sandbox creates a workflow principal with the WORKFLOW_PRINCIPAL foreign ID" do
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "workflow", workflow_name: "Nightly_Report" } }, headers: headers, as: :json
+      assert_response :created
+      principal = Principal.find_by_oid!(json_body.dig("data", "id"))
+      assert_equal [ "workflow-nightly-report", "workflow", "Workflow Nightly_Report" ],
+                   [ principal.foreign_id, principal.kind, principal.name ]
+      assert_equal "Nightly_Report", principal.labels["workflow_name"]
+
+      post "/api/v1/sandbox/admin/principals", params: { data: { kind: "workflow" } }, headers: headers, as: :json
+      assert_response :bad_request
+    end
+  end
+
+  test "an admin's Slack DM sandbox creates a Postgres DSN secret from another's source under another role" do
+    original = pg_dsn_secrets(:acme_analytics_pg)
+
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      get "/api/v1/sandbox/admin/pg_dsn_secrets/#{original.oid}", headers: headers
+      assert_response :ok
+      dsn = json_body.dig("data", "dsn")
+
+      post "/api/v1/sandbox/admin/pg_dsn_secrets",
+           params: { data: { foreign_id: "pg-analytics-writer", name: "analytics writer", database: "analytics",
+                             role: "writer", dsn: dsn } },
+           headers: headers, as: :json
+      assert_response :created
+      copy = PgDsnSecret.find_by_oid!(json_body.dig("data", "id"))
+      assert_equal [ "writer", "env", { "var" => "PG_ANALYTICS_DSN" }, users(:acme_admin) ],
+                   [ copy.role, copy.dsn_source.source_type, copy.dsn_source.config, copy.created_by ]
+
+      patch "/api/v1/sandbox/admin/pg_dsn_secrets/#{copy.oid}", params: { data: { role: "auditor" } },
+                                                                 headers: headers, as: :json
+      assert_response :ok
+      copy.reload
+      assert_equal [ "auditor", "analytics", "env" ], [ copy.role, copy.database, copy.dsn_source.source_type ]
+    end
+  end
+
+  test "an admin's Slack DM sandbox edits a static secret's fields and keeps its source" do
+    secret = static_secrets(:acme_staging_api_key)
+    secret.create_source!(source_type: "control_plane", secret: "value-set-by-operator")
+
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      patch "/api/v1/sandbox/admin/static_secrets/#{secret.oid}",
+            params: { data: { description: "Partner API", rules: [ { host: "api.partner.example" } ] } },
+            headers: headers, as: :json
+      assert_response :ok
+      secret.reload
+      assert_equal [ "Partner API", { "header" => "X-Api-Key", "formatter" => "{{ .Value }}" }, %w[api.partner.example] ],
+                   [ secret.description, secret.inject_config, secret.rules.map(&:host) ]
+      assert_equal "control_plane", secret.source.source_type
+
+      patch "/api/v1/sandbox/admin/static_secrets/#{secret.oid}",
+            params: { data: { source: { source_type: "aws_sm", config: { secret_id: "partner/api-key" } } } },
+            headers: headers, as: :json
+      assert_response :ok
+      assert_equal [ "aws_sm", { "secret_id" => "partner/api-key" } ], [ secret.reload.source.source_type, secret.source.config ]
+    end
+  end
+
+  test "sandbox admin secret writes refuse inline values and OAuth credentials" do
+    secret = static_secrets(:acme_staging_api_key)
+    oauth_secret = static_secrets(:acme_managed_gmail_secret)
+
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      [
+        { source: { source_type: "control_plane", secret: "pasted", config: {} } },
+        { source: { source_type: "token_broker", config: { credential_id: "managed-gmail" } } }
+      ].each do |data|
+        patch "/api/v1/sandbox/admin/static_secrets/#{secret.oid}", params: { data: data }, headers: headers, as: :json
+        assert_response :forbidden, data.inspect
+      end
+      assert_nil secret.reload.source
+
+      patch "/api/v1/sandbox/admin/static_secrets/#{oauth_secret.oid}",
+            params: { data: { rules: [ { host: "elsewhere.example" } ] } }, headers: headers, as: :json
+      assert_response :forbidden
+    end
+
+    with_token(dm_proxy_for(users(:member_user))) do |headers|
+      patch "/api/v1/sandbox/admin/static_secrets/#{secret.oid}",
+            params: { data: { description: "changed" } }, headers: headers, as: :json
+    end
+    assert_response :forbidden
+    assert_equal "Staging API key", secret.reload.description
   end
 
   test "admin endpoints reject requests without a sandbox token" do

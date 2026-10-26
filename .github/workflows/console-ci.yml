@@ -39,14 +39,14 @@ jobs:
             changed_files="$(git diff --name-only origin/main...HEAD)"
           fi
 
-          if printf '%s\n' "${changed_files}" | grep -Eq '^(services/console/|services/token-broker/providers\.json$|\.github/workflows/console-ci\.yml$)'; then
+          if printf '%s\n' "${changed_files}" | grep -Eq '^(services/console/|crates/centaur-token-broker/providers\.json$|\.github/workflows/console-ci\.yml$)'; then
             echo "relevant=true" >>"${GITHUB_OUTPUT}"
           else
             echo "relevant=false" >>"${GITHUB_OUTPUT}"
           fi
 
   scan_ruby:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        uses: ruby/setup-ruby@824c0e29fdfc7d689c191c27acc969d2d04b7dd8 # v1.331.0
         with:
           working-directory: services/console
           bundler-cache: true
@@ -71,7 +71,7 @@ jobs:
           fi
 
   scan_js:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -80,7 +80,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        uses: ruby/setup-ruby@824c0e29fdfc7d689c191c27acc969d2d04b7dd8 # v1.331.0
         with:
           working-directory: services/console
           bundler-cache: true
@@ -89,7 +89,7 @@ jobs:
         run: bin/importmap audit
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
     env:
@@ -99,7 +99,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        uses: ruby/setup-ruby@824c0e29fdfc7d689c191c27acc969d2d04b7dd8 # v1.331.0
         with:
           working-directory: services/console
           bundler-cache: true
@@ -118,7 +118,7 @@ jobs:
         run: bin/rubocop -f github
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -139,7 +139,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libvips libpq-dev
 
       - name: Set up Ruby
-        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        uses: ruby/setup-ruby@824c0e29fdfc7d689c191c27acc969d2d04b7dd8 # v1.331.0
         with:
           working-directory: services/console
           bundler-cache: true

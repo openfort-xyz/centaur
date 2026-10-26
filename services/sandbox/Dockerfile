@@ -67,6 +67,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
+ARG NODE_VERSION=24.22.1
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -82,7 +83,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
       | tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null \
-    && apt-get update && apt-get install -y --no-install-recommends gh nodejs docker-ce-cli google-cloud-cli \
+    && apt-get update && apt-get install -y --no-install-recommends gh "nodejs=${NODE_VERSION}-1nodesource1" docker-ce-cli google-cloud-cli \
+    && node --version | grep -Fx "v${NODE_VERSION}" \
     && gcloud --version >/dev/null \
     && bq version >/dev/null \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
@@ -91,7 +93,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
-ARG CLAUDE_CODE_VERSION=2.1.281
+ARG CLAUDE_CODE_VERSION=2.1.310
 ARG CODEX_VERSION=0.160.1
 ARG PI_CODING_AGENT_VERSION=1.0.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
@@ -206,9 +208,9 @@ WORKDIR /home/agent
 ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.foundry/bin:/home/agent/.bun/bin:${PATH}"
 
 ARG FOUNDRY_VERSION=v1.7.0
-ARG AMP_CLI_VERSION=0.0.1774529752-g94f44d
+ARG AMP_CLI_VERSION=0.0.1792995770-gba80ba
 ARG MANIM_VERSION=0.20.1
-ARG BUN_VERSION=bun-v1.3.14
+ARG BUN_VERSION=bun-v1.4.4
 ARG OMP_VERSION=18.8.6
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
@@ -278,7 +280,7 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
 # Keep Playwright in uv's image-backed cache so isolated tool environments do
 # not download its large Python driver package on first use. Browser binaries
 # are intentionally omitted because DocSend connects to Browserbase over CDP.
-ARG PLAYWRIGHT_VERSION=1.62.0
+ARG PLAYWRIGHT_VERSION=1.64.1
 RUN uv tool install "playwright==${PLAYWRIGHT_VERSION}" \
     && playwright --version | grep -F "${PLAYWRIGHT_VERSION}"
 
@@ -295,6 +297,20 @@ RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/github ~/workspace \
     && git config --global core.hooksPath /opt/centaur/git-hooks \
     && git config --global --add safe.directory '*' \
     && git config --global user.useConfigOnly true
+
+# harness-server is a member of the repo-wide Cargo workspace, so the build
+# needs the workspace manifest, lockfile, and every crate's sources. Build it
+# in its own stage so only the binary reaches the sandbox image.
+FROM toolchain AS harness-server-build
+
+WORKDIR /home/agent/centaur-src
+COPY --chown=1001:1001 Cargo.toml Cargo.lock ./
+COPY --chown=1001:1001 crates/ crates/
+RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
+    --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
+    --mount=type=cache,target=/home/agent/.cache/harness-server-target,uid=1001,gid=1001,sharing=locked \
+    CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
+    cargo +stable install --locked --path crates/harness-server --root /home/agent/harness-server
 
 # ==============================================================================
 # Final thin stage: only frequently-changing local files below.
@@ -328,18 +344,10 @@ COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
-COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
+COPY --link --chown=1001:1001 --from=harness-server-build /home/agent/harness-server/bin/harness-server /home/agent/.local/bin/harness-server
 
 USER agent
 WORKDIR /home/agent
-
-# Keep harness-server source as a real image input so crate changes invalidate
-# the install layer. Do not COPY into /tmp; that can clobber /tmp's sticky bit.
-RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
-    --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
-    --mount=type=cache,target=/home/agent/.cache/harness-server-target,uid=1001,gid=1001,sharing=locked \
-    CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
-    cargo +stable install --locked --path /opt/centaur/harness-server-src --root /home/agent/.local
 
 # No RUN instructions after these — all repo-local content at the very end.
 COPY --link --chown=1001:1001 .agents/skills/ /home/agent/.agents/skills/

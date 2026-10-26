@@ -1008,7 +1008,7 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
             conn = await asyncpg.connect(database_url, database=database)
             migration_dir = (
                 Path(__file__).resolve().parents[2]
-                / "services/api-rs/crates/centaur-session-sqlx/migrations"
+                / "crates/centaur-session-sqlx/migrations"
             )
             for migration in sorted(migration_dir.glob("*.sql")):
                 await conn.execute(migration.read_text())
@@ -1094,7 +1094,7 @@ def test_retention_db_age_batch_cleanup_and_idempotency():
             conn = await asyncpg.connect(database_url, database=database)
             migration_dir = (
                 Path(__file__).resolve().parents[2]
-                / "services/api-rs/crates/centaur-session-sqlx/migrations"
+                / "crates/centaur-session-sqlx/migrations"
             )
             for migration in sorted(migration_dir.glob("*.sql")):
                 await conn.execute(migration.read_text())
