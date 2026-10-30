@@ -1,6 +1,6 @@
 # Google Chat and Slack parity status
 
-Source review date: 2026-10-21. Live evidence remains dated separately in the
+Source review date: 2026-10-30. Live evidence remains dated separately in the
 [verification ledger](../../docs/google-chat-parity-verification.md).
 
 Google Chat implements the planned integration, but complete parity remains
@@ -8,6 +8,12 @@ unverified. The August release records include signed named-space ingress,
 same-message rendering, scoped operations, files, and shared/DM ETL. They do
 not certify later changes or the remaining auth-mode, action/form, deletion,
 large-file, Console browser, quota, RLS, retention, and same-release gates.
+
+The [October functional parity evidence](../../docs/google-chat-functional-parity-evidence.md)
+records real Chrome checks for original-message reactions, both Stop paths,
+contextual participation and silence, DM administration and bot restart recovery.
+The final native cancellation wording rollout and real Chrome recheck passed.
+These checks do not close the unrelated older 31-gate matrix.
 
 Use these documents for different purposes:
 
@@ -33,9 +39,9 @@ Use these documents for different purposes:
 | Mutations | Update/delete verify app or configured delegated ownership. Uploads are authored by the delegated uploader. | Representative mutations and exact small-file transfer are recorded; full boundary tests remain. |
 | Rendering | Edit one thinking acknowledgement. Ordinary answers use Chat text, images use cards, and overflow uses stable message IDs. | Same-message rendering is recorded live. A missing acknowledgement permits replacement; ambiguous failures remain retry obligations. |
 | State and recovery | Persist accepted work, dedupe, overrides, DM transcripts, execution IDs, stop intent, Stop-card bindings, and final answers. Per-obligation lock-based leases, a renewed per-thread handoff lock, an authoritative pending-work query on Postgres, bounded concurrent sweeps, and a bounded SIGTERM drain. | Postgres tests cover index eviction, successor ownership, and handoff waiting; built-image Kind and live rollout proof are recorded separately. |
-| Cancellation and steering | Mentioned `stop` and a Stop card interrupt the live execution while the stream stays open; stop intent persisted first covers the startup race; stale cards cannot stop newer executions. Same-requester mentioned follow-ups steer the live run; other requesters are refused. | Open-stream regressions in `stop-steering.e2e.test.ts`; the parent's independent signed harness; card structure and cards-only PATCH verified against the live API. |
-| Contextual replies | Mention opts the thread in until stop; exact-space poller collects unmentioned messages; Decisions classifier; silent on decline/error; never steers an active run. | `proactive.e2e.test.ts`, `proactive-poll.test.ts`; the `>` createTime filter verified live. Live automatic replies need a deployed bot with a classifier key. |
-| Turn-start reaction | Delegated actor with `chat.messages.reactions` adds and removes a reaction on the original message; failures never block the turn. | Mocked create/delete regressions. The live OAuth exchange for that scope returned `unauthorized_client` in the current Workspace configuration: the actor grant is a deployment prerequisite, not passed evidence. |
+| Cancellation and steering | Mentioned `stop` and a Stop card interrupt the live execution while the stream stays open; stop intent persisted first covers the startup race; stale cards cannot stop newer executions. Same-requester mentioned follow-ups steer the live run; other requesters are refused. | Open-stream and startup/stale regressions pass. Real Chrome Stop-button and text-command tests cancelled executions in 1.129 and 1.030 seconds; cleanup and neutral-wording release status are in the functional evidence. |
+| Contextual replies | Mention opts the thread in until stop; exact-space poller collects unmentioned messages; Decisions classifier; silent on decline/error; never steers an active run. | `proactive.e2e.test.ts` and polling tests pass. A deployed real unmentioned follow-up returned its exact sentinel; Stop and closure stayed silent, and a fresh mention re-enabled participation. Provider quality limits are recorded separately. |
+| Turn-start reaction | Delegated actor with `chat.messages.reactions` adds and removes a reaction on the original message; failures never block the turn. | The approved exact-scope grant resolved the initial authorization failure. Real original-message eyes and terminal cleanup passed in both approved destinations; reactions remain attributed to the configured delegated user. |
 | ETL | Shared-space projection, separate owner-scoped DM rows, resumable pagination, tombstones, retention, and metrics. | Ingestion is recorded live. Deletion convergence, RLS, and retention gates remain. |
 | Console | Space and DM grants and scheduled destinations. Upstream removed the Console chat UI. | Automated coverage exists; narrow/wide keyboard interaction evidence remains. |
 | Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona, including no persona; a persona-pinned model overrides model/provider selections; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, Pi, and notice tests cover the October sync. |
