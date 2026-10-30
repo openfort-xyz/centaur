@@ -4,6 +4,10 @@ Google Chat ingress and private Google API client for Centaur. It verifies Chat
 events, durably hands agent turns to api-rs, and replaces one thinking message
 with the canonical final answer.
 
+The [functional parity evidence](../../docs/google-chat-functional-parity-evidence.md)
+records the October 30 source, image checks, Chrome live results and remaining
+provider or rollout limits.
+
 Google Chat has no `@chat-adapter/*` transport, so this service owns the Chat
 wire formats and REST calls. It still uses the shared Chat SDK Postgres state
 adapter for durable dedupe, thread state, leases, and render obligations.

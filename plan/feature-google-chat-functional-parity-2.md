@@ -72,10 +72,10 @@ Implement functional parity against upstream `5e94d92e0fcefae03a799c3a018e6f6cd0
 |------|-------------|-----------|------|
 | TASK-011 | Install root pnpm dependencies with the frozen lockfile. Run googlechatbot type checks, complete service tests, signed smoke, affected shared package/Slack regressions, classifier evaluations, Console focused checks and git diff --check. | yes | 2026-10-30 |
 | TASK-012 | Build the changed googlechatbot runtime image using the repository Dockerfile. Extend scripts/verify-google-chat-runtime-kind.sh or a focused sibling to exercise real Postgres, HTTP ingress, open SSE, cancellation, event dedupe, restart and exactly one canonical final on the built image in explicit isolated Kind context. | yes | 2026-10-30 |
-| TASK-013 | Resolve the requested Chat resource. With the existing authorized test identity, verify actual Google reaction/create/delete and card payload acceptance. Verify classifier decisions with the configured provider. Record separate gates for any feature that cannot run on the new code without an authorized deployment. | pending | |
+| TASK-013 | Resolve the requested Chat resource. With the existing authorized test identity, verify actual Google reaction/create/delete and card payload acceptance. Verify classifier decisions with the configured provider. Record separate gates for any feature that cannot run on the new code without an authorized deployment. | yes | 2026-10-30 |
 | TASK-014 | Review the complete diff and connected callers. Fix failures, rerun affected checks, then write docs/google-chat-functional-parity-evidence.md with source hashes, runtime image digest, commands, observations, test counts and explicit missing gates. Update README.md, SLACK_PARITY.md and operator docs to match actual behavior. | yes | 2026-10-30 |
 
-The final corrected local candidate passed 577 Google Chat tests across 28 files, all seven packaged PostgreSQL proof scenarios, and the exact-image two-replica Kind recovery check. Workspace add-on callback routing, human clicker verification, startup Stop ordering, cached classification policy and stale recovery ownership are corrected and covered by regressions. Provider evaluations ran and exposed inferred Claude effort differing from upstream Slack. The user approved the direct correction after Claude Code exhausted its quota. The correction, regression, affected checks, final packaged proof and exact-image Kind recovery all pass; TASK-007 and TASK-011 are complete. Provider decision mismatches remain documented as quality limitations, including the shared upstream holdout failures. TASK-013 remains pending for deployment and candidate-driven live execution verification; real reaction create/delete now passes after the approved grant. Corrected disabled Stop cards were accepted and removed by Google in both approved destinations; no callback was exercised. The evidence record identifies the exact final source and images. Source PR #198 is merged and the approved credential/delegation setup is complete; deployment has not started.
+The implementation is deployed and Chrome live checks prove reactions, both manual Stop paths, contextual participation and silence, mention re-entry, read-only DM administration and restart recovery with one execution/final. TASK-007 and TASK-011 are complete. The native cancellation wording defect found live is corrected in PR #200, with 578 Google Chat tests, seven packaged PostgreSQL scenarios and exact-image Kind recovery passing. TASK-013 is complete: its production release and final Chrome recheck passed, including the neutral interrupted result and an unmentioned contextual follow-up on the corrected release. Provider quota and semantic-classifier limits remain explicit in the evidence record.
 
 ## 3. Alternatives
 
@@ -131,21 +131,17 @@ The final corrected local candidate passed 577 Google Chat tests across 28 files
 - [Google interaction events](https://developers.google.com/workspace/chat/receive-respond-interactions)
 - [Google space event subscriptions](https://developers.google.com/workspace/events/guides/events-chat)
 
-Publication and rollout were approved on 2026-10-30. Source PR #198 merged as
-`a6fe14effd3c497f86aba2f56e3157024623ee12` and passed all six image-release
-CI gates. Classifier API access is configured. The precise reaction-write scope
-was added while preserving all existing scopes; real create/delete passed in
-both approved destinations. Candidate-driven live execution remains pending.
-The evidence record contains Google/upstream provider results and the focused
-direct correction approved after Claude Code's exhausted weekly quota; it is now verified.
+Publication, precise classifier/reaction setup and deployment were approved on
+2026-10-30. Source PRs #198 and #199 and the first scanned six-image production
+release are merged and deployed. Chrome checks prove original-message reactions,
+both manual Stop paths, contextual replies and deliberate silence, fresh mention
+re-entry, read-only DM administration with durable exit code zero, and production
+restart recovery with one execution, one final and zero pending obligations.
 
-
-Follow-up on 2026-10-30: source PR #199 and the six-image production release are
-merged and deployed. Chrome checks prove contextual replies, Stop cancellation,
-original-message reactions and cleanup, silence after Stop and closure, fresh
-mention re-entry, and a read-only DM admin command with durable exit code zero.
-A live cancellation wording defect is reproduced and fixed in the shared mapper,
-with 578 Google Chat tests, packaged PostgreSQL proof and exact-image Kind
-recovery passing. Its release and live recheck remain open, as does the controlled
-production restart test. Claude's weekly provider quota blocks Claude-backed
-turns; live transport tests explicitly use Codex without changing the default.
+PR #200 corrects the native cancellation wording defect found live. All 578
+Google Chat tests, packaged PostgreSQL scenarios, exact-image Kind recovery and
+the six required checks on its merged SHA pass. Its production image release and
+final Chrome Stop recheck passed. The corrected bubble reads exactly
+"Execution interrupted"; cancellation took 1.238 seconds and cleanup completed. Claude's weekly provider quota blocks
+Claude-backed turns; controlled live tests explicitly use Codex without changing
+the deployment default. Classifier quality limits remain in the evidence record.
