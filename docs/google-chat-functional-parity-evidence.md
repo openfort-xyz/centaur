@@ -1,16 +1,16 @@
 # Google Chat functional parity evidence
 
-The packaged candidate was verified locally on 2026-10-30, including the Workspace add-on Stop payload contract. The user subsequently approved publication, deployment and access setup. Live functional parity remains unproven because the candidate is not deployed and final image release plus candidate-driven live checks remain pending. The inferred Claude-effort difference found by provider evaluation is corrected below.
+The implementation was deployed on 2026-10-30 after the approved publication and access setup. Real Google Workspace checks now prove original-message reactions, an authenticated Stop click, cancellation, contextual follow-ups without mentions, silence after Stop, and re-entry after a fresh mention. A cancellation wording defect found live is corrected in this follow-up and awaits its own rollout and live recheck. Restart recovery remains a separate live gate.
 
-Plan: [feature-google-chat-functional-parity-2.md](../plan/feature-google-chat-functional-parity-2.md). Source baseline: `8f40438219fee79e26e834eacbffdc64dc49ce74`. Upstream comparison: `5e94d92e0fcefae03a799c3a018e6f6cd03d9f1d`. Implementation used Claude Code 2.1.312 with canonical model `claude-fable-5-1`, confirmed in CLI model-usage results. Fable applied the last ownership correction before reaching its weekly usage limit. After the quota limit, the user explicitly approved Codex applying the focused inferred Claude-effort correction directly. The rest of the implementation was written using the requested Fable model.
+Plan: [feature-google-chat-functional-parity-2.md](../plan/feature-google-chat-functional-parity-2.md). Source baseline: `8f40438219fee79e26e834eacbffdc64dc49ce74`. Upstream comparison: `5e94d92e0fcefae03a799c3a018e6f6cd03d9f1d`. Implementation used Claude Code 2.1.312 with canonical model `claude-fable-5-1`, confirmed in CLI model-usage results. Fable applied the last ownership correction before reaching its weekly usage limit. After the quota limit, the user explicitly approved Codex applying the focused inferred Claude-effort correction directly and continued verification fixes. The native interrupted-turn correction below was also applied by Codex. The original implementation was written using the requested Fable model.
 
-The tested implementation fingerprint is `1ccae8187d38d6bbf5daa0a5fd2f39d155e5011686528af1046732d4de695c9a`, SHA-256 of the sorted path/content-hash manifest for 67 changed files, excluding this evidence file and the plan. All 67 file hashes were rechecked after verification and matched. Earlier candidate image IDs, counts and fingerprints are superseded by this record. This fingerprint describes the corrected review candidate, using a sorted path-to-file-SHA256 JSON object with comma/colon separators and no spaces. Both this evidence file and the plan are excluded. The source was subsequently published through PR #198 and merged as `a6fe14effd3c497f86aba2f56e3157024623ee12`; a CI-only path filter addition makes shared harness changes run API tests. All six required production image-release checks passed on that main commit. No final image release or deployment has started.
+The tested implementation fingerprint is `1ccae8187d38d6bbf5daa0a5fd2f39d155e5011686528af1046732d4de695c9a`, SHA-256 of the sorted path/content-hash manifest for 67 changed files, excluding this evidence file and the plan. All 67 file hashes were rechecked after verification and matched. Earlier candidate image IDs, counts and fingerprints are superseded by this record. This fingerprint describes the corrected review candidate, using a sorted path-to-file-SHA256 JSON object with comma/colon separators and no spaces. Both this evidence file and the plan are excluded. The source was subsequently published through PR #198 and merged as `a6fe14effd3c497f86aba2f56e3157024623ee12`; a CI-only path filter addition makes shared harness changes run API tests. All six required production image-release checks passed on that main commit. The subsequent source release is recorded below; this fingerprint identifies the earlier candidate, before the native interrupted-turn correction.
 
 ## Approved rollout progress
 
 Publication and rollout were approved on 2026-10-30. [Source PR #198](https://github.com/openfort-xyz/centaur/pull/198) is merged. The existing classifier credential passed a real Decisions request with HTTP 200 and was connected through the deployment's existing shared-secret mechanism. No credential value was printed or committed.
 
-The reaction-write delegation was updated through the user-prepared Chrome Admin page. All 11 existing scopes were preserved; only `https://www.googleapis.com/auth/chat.messages.reactions` was added. The console confirmed 12 scopes. The candidate client then created and deleted a real eyes reaction in each approved destination. These are actual Google API calls, recorded in `/tmp/centaur-parity-google-reaction-approved-result.json`. This replaces the earlier authorization blocker below; candidate-driven automatic reaction cleanup is still a separate live gate.
+The reaction-write delegation was updated through the user-prepared Chrome Admin page. All 11 existing scopes were preserved; only `https://www.googleapis.com/auth/chat.messages.reactions` was added. The console confirmed 12 scopes. The candidate client then created and deleted a real eyes reaction in each approved destination. These are actual Google API calls, recorded in `/tmp/centaur-parity-google-reaction-approved-result.json`. This replaces the earlier authorization blocker below; candidate-driven automatic reaction cleanup subsequently passed during the live cancellation check below.
 
 Provider-backed evaluations now ran with the original datasets and shipped production classifiers. No prompts were tuned on holdout cases.
 
@@ -45,16 +45,16 @@ The sandbox test ran packaged Pi 1.4.0 and harness-server with `claude-fable-5-1
 
 | Requirement | Concrete local evidence | Live evidence or remaining gate |
 | --- | --- | --- |
-| REQ-001, manual Stop | Signed ingress interrupts the fixture execution while its SSE remains open. Delayed session creation starts no execution; delayed execute is interrupted. Status edits retain the control and terminal output removes it. Stale controls cannot interrupt or disable a successor, including equal event timestamps. | Corrected disabled cards were accepted in the approved shared space and DM. Candidate callbacks and executions are not deployed. |
-| REQ-002, contextual participation | Mention enables participation; classified follow-up can reply; decline/error stays silent; active execution cannot be steered by an unmentioned message. Stop disables participation. A delayed pre-Stop mention cannot re-enable it; a fresh post-Stop mention can. Cached decisions recheck current opt-in, runtime enablement and exact space policy at recovery/handoff boundaries. | Provider evaluation results are recorded above, including shared holdout mismatches. Live unmentioned-message behavior remains unverified. |
-| REQ-003, ordinary message collection | Bounded app-authenticated polling, exact spaces, pagination, nanosecond cursor, durable dedupe, bot suppression and verified requester tests pass. Failed acceptance does not advance the cursor. | Google accepted the candidate's strict greater-than nanosecond filter with HTTP 200. Candidate poller is not deployed. |
-| REQ-004, original-message reactions | Fixture OAuth/Google endpoints verify delegated actor, exact write scope, original trigger, create/delete and terminal cleanup. Rejected/missing delegation does not fail execution. Packaged proof created and deleted five fixture reactions. | After the approved scope addition, actual reaction create/delete passed in both approved destinations. Automatic cleanup during a candidate execution remains pending. Reactions are authored by the configured Workspace user. |
+| REQ-001, manual Stop | Signed ingress interrupts the fixture execution while its SSE remains open. Delayed session creation starts no execution; delayed execute is interrupted. Status edits retain the control and terminal output removes it. Stale controls cannot interrupt or disable a successor, including equal event timestamps. | A real Chrome Stop click cancelled a Codex execution in 1.129 seconds, removed its control and original-message reaction, and cleared pending work. Neutral cancellation wording awaits the follow-up rollout. |
+| REQ-002, contextual participation | Mention enables participation; classified follow-up can reply; decline/error stays silent; active execution cannot be steered by an unmentioned message. Stop disables participation. A delayed pre-Stop mention cannot re-enable it; a fresh post-Stop mention can. Cached decisions recheck current opt-in, runtime enablement and exact space policy at recovery/handoff boundaries. | Provider evaluation results are recorded above, including shared holdout mismatches. A real unmentioned follow-up returned the exact requested sentinel. An unmentioned request after Stop stayed silent with no execution. A fresh mention re-enabled participation; a closure message stayed silent. |
+| REQ-003, ordinary message collection | Bounded app-authenticated polling, exact spaces, pagination, nanosecond cursor, durable dedupe, bot suppression and verified requester tests pass. Failed acceptance does not advance the cursor. | Google accepted the candidate's strict greater-than nanosecond filter with HTTP 200. The deployed poller accepted the real unmentioned follow-up and produced one execution and one final response. |
+| REQ-004, original-message reactions | Fixture OAuth/Google endpoints verify delegated actor, exact write scope, original trigger, create/delete and terminal cleanup. Rejected/missing delegation does not fail execution. Packaged proof created and deleted five fixture reactions. | After the approved scope addition, actual reaction create/delete passed in both approved destinations. The live execution showed eyes on the original human message and removed them after Stop. Reactions are authored by the configured Workspace user. |
 | REQ-005, classifiers/models | Explicit flags, aliases, Decisions API contract, timeouts, unknown answers and failure behavior pass. Evaluation adapters call shipped Google classifiers using upstream Slack datasets. Fable 5.1, Sonnet 5.5, Haiku 5.5 and GPT-6.1 Terra mappings are covered. | Both provider-backed evaluations ran; results above expose the inferred Claude-effort parity correction. Unit fixtures do not establish model quality. |
-| REQ-006, drain/restart | Real PostgreSQL ownership checks, pending discovery beyond 2,000 later entries, monotonic Stop state, independent lease deadlines and bounded release pass. Exact-image Kind test killed the active owner during SSE with two replicas, recovered without re-execute, delivered one final, cleared obligations and restored two ready replicas. | Production rollout/restart was not performed. First rollout requires Recreate because old and new lease schemes do not coordinate. |
-| REQ-007, DM administration | Packaged Rails tests cover linked active admin success, verified current requester/email match, exact DM identity, shared-space/non-admin/disabled/mismatch/token/namespace denial and existing Slack policy. Thin Google permission commands reuse the existing API. | A read-only database transaction confirmed the approved DM already links the matching active admin and verified email. A new live DM-to-sandbox admin operation is pending. |
+| REQ-006, drain/restart | Real PostgreSQL ownership checks, pending discovery beyond 2,000 later entries, monotonic Stop state, independent lease deadlines and bounded release pass. Exact-image Kind test killed the active owner during SSE with two replicas, recovered without re-execute, delivered one final, cleared obligations and restored two ready replicas. | Production rollout completed with the expected source-pinned images. A live owner restart during a controlled execution remains pending. First rollout requires Recreate because old and new lease schemes do not coordinate. |
+| REQ-007, DM administration | Packaged Rails tests cover linked active admin success, verified current requester/email match, exact DM identity, shared-space/non-admin/disabled/mismatch/token/namespace denial and existing Slack policy. Thin Google permission commands reuse the existing API. | A read-only database transaction confirmed the approved DM already links the matching active admin and verified email. The approved Chrome DM invoked the read-only admin-principals command and returned the expected success sentinel. The durable command-execution event records exit code zero; identity records were excluded from the retained proof. |
 | REQ-008, retained behavior | Shared rendering tests and full Slack regressions pass. Pi validation/pricing, sandbox startup, model restrictions and existing parity ledger checks pass. Pi's GPT-6.1 Terra restriction follows upstream; supported harness alternatives remain available. | These support retention, not a claim that every older production behavior was retested live. |
-| SEC-001, verified event/action identity | Forged and unsigned ingress is rejected. Add-on cards bind to the verified human clicker in `chat.user`, not the bot author in `message.sender`. Wrong/missing human and malformed actions are rejected. Cancellation is bound to originating work/execution. | The real add-on callback has not been exercised against the candidate. |
-| SEC-002 and CON-001/002, authorized boundary | Local Kubernetes checks use a dedicated explicit context. Actual Google tests stayed in the approved AI space and operator DM. Evidence excludes private identifiers and credentials. | Source publication and the precise credential/delegation setup are approved and completed. Remote deployment and candidate-driven live verification remain pending. |
+| SEC-001, verified event/action identity | Forged and unsigned ingress is rejected. Add-on cards bind to the verified human clicker in `chat.user`, not the bot author in `message.sender`. Wrong/missing human and malformed actions are rejected. Cancellation is bound to originating work/execution. | The real authenticated Workspace add-on Stop callback cancelled the controlled execution successfully. |
+| SEC-002 and CON-001/002, authorized boundary | Local Kubernetes checks use a dedicated explicit context. Actual Google tests stayed in the approved AI space and operator DM. Evidence excludes private identifiers and credentials. | Source publication and the precise credential/delegation setup are approved and completed. The first production rollout and the real shared-space/DM checks above are complete. The cancellation wording fix and live restart check remain open. |
 
 ## Final checks
 
@@ -161,3 +161,52 @@ with 2,010 assertions, seven packaged real-PostgreSQL proof scenarios, and the
 exact-image Kind owner-crash/recovery test. All 32 runtime source files and the
 proof script match the final image byte-for-byte. The independent earlier
 cross-feature reproductions cover code unchanged by this correction.
+
+
+## Deployed checks and native cancellation follow-up
+
+Source PR #199 merged as `a4c906bb362c1b010a40cef6ffbbb46bb977e505`.
+All six production images were built, scanned and published by the normal
+release workflow. The infrastructure release merged and the Helm upgrade
+succeeded at 2026-10-30 10:52:56 UTC. All 32 runtime bot files and its packaged
+proof matched the published bot image, whose amd64 manifest is
+`sha256:67d6640b4c62bd7fbd2ce573e2e917e7fa4f10a3c0fbae237828dd9485d2e926`.
+All seven packaged PostgreSQL proof scenarios passed in that registry image.
+
+Live tests used Chrome in the two approved destinations. The default Claude
+account returned its weekly usage limit, so controlled tests explicitly selected
+Codex without changing the deployment default. The initial quota failure
+removed its reaction. A subsequent unmentioned contextual request started a
+Codex execution, displayed eyes on the original human message and a working
+Stop button. Clicking Stop cancelled the execution in 1.129 seconds. The bot
+removed the reaction and control, cleared obligations and disabled contextual
+participation. An unmentioned request after Stop stayed silent for more than
+two collection intervals. A fresh actual mention re-enabled participation and
+returned its exact sentinel; a further unmentioned follow-up returned its own
+exact sentinel. A closure message stayed silent.
+
+The stopped bubble incorrectly reported a successful empty execution. The
+recorded event sequence has a native `turn/completed` with `status: interrupted`
+and no items before the canonical `session.execution_cancelled` with only a
+reason. The mapper had already finalized an empty success and ignored the
+later cancellation. The shared mapper now supplies its existing neutral
+`Execution interrupted` text for that native terminal status when no final
+answer exists. A regression reproduces the real sequence and preserves partial
+answers. It failed on the deployed mapper and passed after the one-line fix.
+Both live delivery and recovery persist this canonical answer before delivery.
+
+The post-deploy health script passed eight checks. Its agent-turn check reported
+a timeout, but the durable execution finished after 2.65 seconds and its terminal
+result contains the Claude weekly-limit error. This is a provider-quota failure,
+not evidence of a hung runtime. The limit resets on 2026-10-31 at 18:00 UTC.
+No provider credentials, billing, deployment defaults or release gates were
+changed to bypass it.
+
+
+The cancellation follow-up passes all 578 Google Chat tests and 2,018 assertions
+across 28 files, the 45 shared-rendering tests, typechecking and the unchanged
+Slack suite with 312 passes and its one existing skip. Its local bot image is
+`sha256:b769c999f8e70311ad0082a6e2e929a5ba94889b5c07566df51fbfc74eafa286`.
+All seven packaged PostgreSQL scenarios and the exact-image Kind owner-crash
+check passed again with one execution, one final and zero pending obligations.
+The follow-up release and live cancellation recheck are still required.

@@ -312,6 +312,7 @@ export class CodexAppServerRendererEventMapper
 
     if (isTerminalCodexAppServerEvent(event)) {
       const resultText = terminalResultText(event)
+        || (event?.turn?.status === 'interrupted' ? 'Execution interrupted' : '')
       const willClose = Boolean(resultText || event?.type !== 'result')
       this.logCodexTerminalEventReceived(event, {
         resultText,

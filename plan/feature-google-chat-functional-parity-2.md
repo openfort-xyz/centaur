@@ -116,7 +116,7 @@ The final corrected local candidate passed 577 Google Chat tests across 28 files
 ## 7. Risks & Assumptions
 
 - **RISK-001**: A delegated reaction is authored by the chosen Workspace user, not the bot. This is a Google API constraint, not an identity equivalence claim.
-- **RISK-002**: New behavior cannot be proven in production before deploying it. Deployment is outside the current authorization; retain a precise unpassed gate if no isolated live route exists.
+- **RISK-002**: New behavior cannot be proven in production before deploying it. Deployment is now explicitly authorized; retain a precise unpassed gate until each live outcome is verified.
 - **RISK-003**: Automatic contextual replies consume classifier calls and can respond to human conversation if the decision policy is too permissive. Default to explicit opt-in and fail silent.
 - **RISK-004**: Existing direct-user credential grants make requester identity security-critical. New event and admin routes must preserve this boundary.
 - **ASSUMPTION-001**: Functional parity allows Google-native controls and explicitly attributed delegated reactions, while preserving equivalent user outcomes where the platform permits them.
@@ -138,3 +138,14 @@ was added while preserving all existing scopes; real create/delete passed in
 both approved destinations. Candidate-driven live execution remains pending.
 The evidence record contains Google/upstream provider results and the focused
 direct correction approved after Claude Code's exhausted weekly quota; it is now verified.
+
+
+Follow-up on 2026-10-30: source PR #199 and the six-image production release are
+merged and deployed. Chrome checks prove contextual replies, Stop cancellation,
+original-message reactions and cleanup, silence after Stop and closure, fresh
+mention re-entry, and a read-only DM admin command with durable exit code zero.
+A live cancellation wording defect is reproduced and fixed in the shared mapper,
+with 578 Google Chat tests, packaged PostgreSQL proof and exact-image Kind
+recovery passing. Its release and live recheck remain open, as does the controlled
+production restart test. Claude's weekly provider quota blocks Claude-backed
+turns; live transport tests explicitly use Codex without changing the default.

@@ -71,6 +71,35 @@ function settledState(answer: string) {
 }
 
 describe('finalizeRender surface selection', () => {
+  test('native interrupted turns keep a cancellation result after an empty completion', async () => {
+    for (const answer of ['', 'Partial answer']) {
+      const capture: Capture = {}
+      const state = createRenderState()
+      async function* interrupted(): AsyncIterable<RustSessionStreamEvent> {
+        if (answer) yield {
+          event: 'session.output.line',
+          data: JSON.stringify({ method: 'item/agentMessage/delta', params: {
+            threadId: 'thread-1', turnId: 'turn-1', itemId: 'answer-1', delta: answer
+          } })
+        }
+        yield {
+          event: 'session.output.line',
+          data: JSON.stringify({ method: 'turn/completed', params: {
+            threadId: 'thread-1', turn: { id: 'turn-1', items: [], status: 'interrupted', error: null }
+          } })
+        }
+        yield { event: 'session.execution_cancelled', data: { reason: 'turn_interrupted' } }
+      }
+      await consumeRenderStream(stubClient(capture), interrupted(), target(), state)
+      // Both live delivery and recovery persist this answer before finalization.
+      expect(state.answer).toBe(answer || 'Execution interrupted')
+      expect(state.terminal).toBe(true)
+      await finalizeRender(stubClient(capture), target(), state)
+      expect(capture.body?.text).toBe(answer || 'Execution interrupted')
+      expect(capture.body?.cardsV2).toEqual([])
+    }
+  })
+
   test('live and recovered final bodies remove native markers but retain resolved source links', () => {
     const bodies = finalMessageBodies('First paragraph.\n\nSecond paragraph. citeturn0search8 [Source](https://example.com)')
     expect(bodies[0]?.text).toContain('First paragraph.\n\nSecond paragraph.')
