@@ -52,7 +52,7 @@ Implement functional parity against upstream `5e94d92e0fcefae03a799c3a018e6f6cd0
 | TASK-004 | In services/googlechatbot/src/index.ts and state.ts, separate cancellation from render serialization; persist stop intent and bind action cancellation to the expected execution. Add Stop cards through chat/types.ts, renderer.ts and chat/client.ts as required. | yes | 2026-10-30 |
 | TASK-005 | Add upstream-equivalent proactivity classification, durable per-thread eligibility, configured space restrictions, identity resolution and bounded real event collection. Update config.ts, server.ts and chart values/templates/schema together. | yes | 2026-10-29 |
 | TASK-006 | Add optional delegated create/delete reaction support in chat/client.ts and token scope selection. Add initial-message acknowledgement and steering cleanup with a harmless fallback when delegation is absent or rejected. Update configuration, chart and tests. | yes | 2026-10-29 |
-| TASK-007 | Update overrides.ts, response-context.ts and message-overrides-strategy.ts to upstream selections/classifier contracts. Port relevant evaluation fixtures and regression cases without importing Slack transport dependencies. | yes | 2026-10-29 |
+| TASK-007 | Update overrides.ts, response-context.ts and message-overrides-strategy.ts to upstream selections/classifier contracts. Port relevant evaluation fixtures and regression cases without importing Slack transport dependencies. | yes | 2026-10-30 |
 | TASK-008 | Add bounded drain in server.ts and runtime lifecycle. Replace bounded rolling discovery with authoritative pending-work discovery and atomic ownership-checked leases. Verify concurrent ownership, expiry, crash and replay against real PostgreSQL. | yes | 2026-10-29 |
 
 ### Implementation Phase 3
@@ -70,12 +70,12 @@ Implement functional parity against upstream `5e94d92e0fcefae03a799c3a018e6f6cd0
 
 | Task | Description | Completed | Date |
 |------|-------------|-----------|------|
-| TASK-011 | Install root pnpm dependencies with the frozen lockfile. Run googlechatbot type checks, complete service tests, signed smoke, affected shared package/Slack regressions, classifier evaluations, Console focused checks and git diff --check. | pending | |
+| TASK-011 | Install root pnpm dependencies with the frozen lockfile. Run googlechatbot type checks, complete service tests, signed smoke, affected shared package/Slack regressions, classifier evaluations, Console focused checks and git diff --check. | yes | 2026-10-30 |
 | TASK-012 | Build the changed googlechatbot runtime image using the repository Dockerfile. Extend scripts/verify-google-chat-runtime-kind.sh or a focused sibling to exercise real Postgres, HTTP ingress, open SSE, cancellation, event dedupe, restart and exactly one canonical final on the built image in explicit isolated Kind context. | yes | 2026-10-30 |
 | TASK-013 | Resolve the requested Chat resource. With the existing authorized test identity, verify actual Google reaction/create/delete and card payload acceptance. Verify classifier decisions with the configured provider. Record separate gates for any feature that cannot run on the new code without an authorized deployment. | pending | |
 | TASK-014 | Review the complete diff and connected callers. Fix failures, rerun affected checks, then write docs/google-chat-functional-parity-evidence.md with source hashes, runtime image digest, commands, observations, test counts and explicit missing gates. Update README.md, SLACK_PARITY.md and operator docs to match actual behavior. | yes | 2026-10-30 |
 
-The final local candidate passed 576 Google Chat tests across 28 files, all seven packaged PostgreSQL proof scenarios, and the exact-image two-replica Kind recovery check. Workspace add-on callback routing, human clicker verification, startup Stop ordering, cached classification policy and stale recovery ownership are corrected and covered by regressions. TASK-011 remains pending only for provider-backed classifier evaluations. TASK-013 remains pending for authorized deployment, reaction-write authorization and live execution verification. Corrected disabled Stop cards were accepted and removed by Google in both approved destinations; no callback was exercised. The evidence record identifies the exact final source and images. No source commit, push, publication, deployment or OAuth grant was made.
+The final corrected local candidate passed 577 Google Chat tests across 28 files, all seven packaged PostgreSQL proof scenarios, and the exact-image two-replica Kind recovery check. Workspace add-on callback routing, human clicker verification, startup Stop ordering, cached classification policy and stale recovery ownership are corrected and covered by regressions. Provider evaluations ran and exposed inferred Claude effort differing from upstream Slack. The user approved the direct correction after Claude Code exhausted its quota. The correction, regression, affected checks, final packaged proof and exact-image Kind recovery all pass; TASK-007 and TASK-011 are complete. Provider decision mismatches remain documented as quality limitations, including the shared upstream holdout failures. TASK-013 remains pending for deployment and candidate-driven live execution verification; real reaction create/delete now passes after the approved grant. Corrected disabled Stop cards were accepted and removed by Google in both approved destinations; no callback was exercised. The evidence record identifies the exact final source and images. Source PR #198 is merged and the approved credential/delegation setup is complete; deployment has not started.
 
 ## 3. Alternatives
 
@@ -130,3 +130,11 @@ The final local candidate passed 576 Google Chat tests across 28 files, all seve
 - [Google reaction authentication](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages.reactions/create)
 - [Google interaction events](https://developers.google.com/workspace/chat/receive-respond-interactions)
 - [Google space event subscriptions](https://developers.google.com/workspace/events/guides/events-chat)
+
+Publication and rollout were approved on 2026-10-30. Source PR #198 merged as
+`a6fe14effd3c497f86aba2f56e3157024623ee12` and passed all six image-release
+CI gates. Classifier API access is configured. The precise reaction-write scope
+was added while preserving all existing scopes; real create/delete passed in
+both approved destinations. Candidate-driven live execution remains pending.
+The evidence record contains Google/upstream provider results and the focused
+direct correction approved after Claude Code's exhausted weekly quota; it is now verified.

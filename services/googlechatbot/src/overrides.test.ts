@@ -103,5 +103,18 @@ test('Pi flags and strategy preserve the selected harness and effort', () => {
   expect(validateStrategyOverrides({ harness: 'pi', model: 'gpt-6-sol', reasoning: 'high' })).toMatchObject({
     harnessType: 'pi', model: 'gpt-6-sol', reasoning: 'high'
   })
-  expect(validateStrategyOverrides({ harness: 'claudecode', reasoning: 'high' }).reasoning).toBe('high')
+})
+
+test('inferred Claude effort is dropped while explicit flags retain it', () => {
+  for (const reasoning of ['high', 'xhigh']) {
+    expect(validateStrategyOverrides({ harness: 'claudecode', reasoning })).toMatchObject({
+      harnessType: 'claudecode', reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'claude-fable-5-1', reasoning })).toMatchObject({
+      harnessType: 'claudecode', model: 'claude-fable-5-1', reasoning: undefined
+    })
+    expect(extractMessageOverrides(`--claude -rsn ${reasoning} go`)).toMatchObject({
+      harnessType: 'claudecode', reasoning, cleanedText: 'go'
+    })
+  }
 })
