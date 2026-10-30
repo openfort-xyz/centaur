@@ -107,7 +107,7 @@ jobs:
           set_output() {
             local name="$1"
             shift
-            if matches "$@"; then
+            if [[ "${{ github.event_name }}" == "push" ]] || matches "$@"; then
               echo "${name}=true" >>"${GITHUB_OUTPUT}"
             else
               echo "${name}=false" >>"${GITHUB_OUTPUT}"

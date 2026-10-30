@@ -348,7 +348,7 @@ export function validateStrategyOverrides(
     const normalized = reasoningRaw.toLowerCase()
     if (!STRATEGY_REASONING_EFFORTS.has(normalized)) return {}
     reasoning =
-      harnessType === undefined || harnessType === 'codex' || harnessType === 'nanocodex' || harnessType === 'claudecode' || harnessType === 'pi' || harnessType === 'omp'
+      harnessType === undefined || harnessType === 'codex' || harnessType === 'nanocodex' || harnessType === 'pi' || harnessType === 'omp'
         ? normalized
         : undefined
   }
