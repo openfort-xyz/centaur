@@ -11,3 +11,9 @@ export const chatReplyLimits = {
     maxBytes: 32_000
   }
 } as const
+
+/** The Stop button's action name. Chat API apps send it as
+ * `onClick.action.function`; Workspace Add-ons must send the app's own HTTP
+ * endpoint URL as `function` and carry the name as the `actionName`
+ * parameter. CARD_CLICKED events echo whichever shape was sent. */
+export const STOP_CARD_FUNCTION = 'centaur_stop'

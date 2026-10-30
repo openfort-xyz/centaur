@@ -32,7 +32,10 @@ Use these documents for different purposes:
 | Tools | Discovery, history, search, messages, reactions, DM setup/send, and files use scoped api-rs routes. | Search is bounded and reports truncation. No global user directory. |
 | Mutations | Update/delete verify app or configured delegated ownership. Uploads are authored by the delegated uploader. | Representative mutations and exact small-file transfer are recorded; full boundary tests remain. |
 | Rendering | Edit one thinking acknowledgement. Ordinary answers use Chat text, images use cards, and overflow uses stable message IDs. | Same-message rendering is recorded live. A missing acknowledgement permits replacement; ambiguous failures remain retry obligations. |
-| State and recovery | Persist accepted work, dedupe, overrides, DM transcripts, execution IDs, and final answers. Recover through leases and a recurring sweep. | Earlier Kind restart and policy checks are recorded; they do not prove every crash boundary on the current source. |
+| State and recovery | Persist accepted work, dedupe, overrides, DM transcripts, execution IDs, stop intent, Stop-card bindings, and final answers. Per-obligation lock-based leases, a renewed per-thread handoff lock, an authoritative pending-work query on Postgres, bounded concurrent sweeps, and a bounded SIGTERM drain. | Postgres tests cover index eviction, successor ownership, and handoff waiting; built-image Kind and live rollout proof are recorded separately. |
+| Cancellation and steering | Mentioned `stop` and a Stop card interrupt the live execution while the stream stays open; stop intent persisted first covers the startup race; stale cards cannot stop newer executions. Same-requester mentioned follow-ups steer the live run; other requesters are refused. | Open-stream regressions in `stop-steering.e2e.test.ts`; the parent's independent signed harness; card structure and cards-only PATCH verified against the live API. |
+| Contextual replies | Mention opts the thread in until stop; exact-space poller collects unmentioned messages; Decisions classifier; silent on decline/error; never steers an active run. | `proactive.e2e.test.ts`, `proactive-poll.test.ts`; the `>` createTime filter verified live. Live automatic replies need a deployed bot with a classifier key. |
+| Turn-start reaction | Delegated actor with `chat.messages.reactions` adds and removes a reaction on the original message; failures never block the turn. | Mocked create/delete regressions. The live OAuth exchange for that scope returned `unauthorized_client` in the current Workspace configuration: the actor grant is a deployment prerequisite, not passed evidence. |
 | ETL | Shared-space projection, separate owner-scoped DM rows, resumable pagination, tombstones, retention, and metrics. | Ingestion is recorded live. Deletion convergence, RLS, and retention gates remain. |
 | Console | Space and DM grants and scheduled destinations. Upstream removed the Console chat UI. | Automated coverage exists; narrow/wide keyboard interaction evidence remains. |
 | Session preferences | Model and reasoning overrides follow the shared harness vocabulary. api-rs pins the initial persona, including no persona; a persona-pinned model overrides model/provider selections; unavailable requested personas produce a fallback notice. | Persona, alias, reasoning, Pi, and notice tests cover the October sync. |
@@ -45,8 +48,9 @@ thinking acknowledgement after a successful final PATCH.
 
 The plan excludes Slack-only objects and several Google-native features,
 including a global user directory, App Home, dialogs, dynamic suggestions,
-link previews, named-space administration, membership writes, reaction writes,
-and pins. See CON-001 and CON-002 for the full exclusion list.
+link previews, named-space administration, membership writes, and pins.
+Reaction writes exist only as the explicitly configured delegated actor's
+turn-start reaction. See CON-001 and CON-002 for the full exclusion list.
 
 The Google Chat `feedback` command derives a bounded view from `dump`. It has
 no counterpart to the removed Slack feedback database or persona subsystem.
@@ -95,6 +99,7 @@ notice and their message is not appended. slackbotv2 folds every follow-up.
 | DM setup | Validated target email | `chat.spaces.create` |
 | Agent DM history | Console-selected reader for the exact space | `chat.messages.readonly` |
 | Shared reactions | `GOOGLECHATBOT_REACTION_READ_USER` | `chat.messages.reactions.readonly` |
+| Turn-start reaction | `GOOGLECHATBOT_REACTION_ACTOR_USER` | `chat.messages.reactions` |
 | DM ETL | Exact allowlisted owner | Message, space, membership, and reaction read scopes |
 | Drive attachment | `GOOGLECHATBOT_DRIVE_DOWNLOAD_USER` | `drive.readonly` |
 
@@ -125,8 +130,10 @@ indefinite retries and record abandonment in metrics.
 | Card | At most 100 widgets; no empty sections |
 
 These are per-operation limits, not an overall memory or queue-capacity bound. The
-[source review](../../docs/fork-upstream-review.md) records unresolved work-index
-and lease-ownership defects. Earlier recovery tests do not close those cases.
+work-index and lease-ownership defects recorded in the
+[source review](../../docs/fork-upstream-review.md) are closed by the authoritative
+pending-work query and the token-checked leases (see the README's recovery
+section and `state.test.ts`).
 
 ## Validation
 
@@ -136,6 +143,19 @@ results tied to an immutable commit or image digest. TEST-031 requires every
 preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
+
+### 2026-10-29 — focused functional ports, upstream `8f404382..5e94d92e`
+
+A selective port on top of the 2026-10-26 sync, not an upstream merge.
+
+| Upstream change | Google Chat disposition |
+| --- | --- |
+| Native Stop including the startup race (#1973) | **Ported.** Stop card on the acknowledgement plus the mentioned stop command; stop intent persisted before any lock; card bound to its acknowledgement and checked under the thread handoff lock; status edits keep the card, the final removes it. The cards-only PATCH carries placeholder text under `updateMask=cardsV2` because Google rejects an otherwise empty body (verified live). |
+| Proactive replies (#2081) | **Ported with a Google event source.** Upstream's classifier and eligibility rules; unmentioned messages are collected by a bounded exact-space poller over `spaces.messages.list` using `createTime > <cursor minus one nanosecond>` (`>=` is rejected by the API, verified live) with durable cursor and seen names. |
+| Eyes acknowledgement (#2083) | **Ported as a delegated reaction.** Requires `GOOGLECHATBOT_REACTION_ACTOR_USER` with `chat.messages.reactions`; authored by that user. Off by default. |
+| Decisions-API override classifier and evals (#2082, #2087) | **Ported.** Same instructions and questions with Google naming; `maxOutputTokens` removed; default model `gpt-6-luna`; `evals/` workspace runs both classifiers against the shipped Google code. |
+| Model aliases and GPT-6.1 Terra (#2068) | **Ported.** `--fable`/`--sonnet`/`--haiku` expand to Fable 5.1, Sonnet 5.5, Haiku 5.5; `gpt-6.1-terra` is selectable with ultra effort. The deployment's default execution model is unchanged. The shared harness-server, sandbox image, and Pi docs parts of #2068 are ported separately. |
+| Deploy drain (#1999) | **Ported.** Bounded SIGTERM drain, readiness fails at once, chart grace period and `Recreate` for the lease-scheme rollout. |
 
 ### 2026-10-21 — 87 upstream commits, `d63acb7b..4bf5d61d`
 
@@ -148,9 +168,9 @@ so slackbotv2 and the shared packages match upstream.
 | Remove the Codex/Nanocodex A/B rollout (#1967) | **Ported.** `GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT`, `harness-rollout.ts`, the `harness_assignment` metadata, and the chart value are removed. |
 | Personas pin a model or harness (#1966, #1969) | **Ported.** `createSession` reads `persona_model`; a pinned thread sends no model/provider override, recomputes reasoning for the pinned model, and the footer names it. api-rs enforces the pin. |
 | Keep replies through deploys (#1999) | **Partly ported.** `googlechatbot.yaml` gains the startup probe. No SIGTERM drain: Chat work is durable and restart recovery replays it. |
-| Assistant status after steering (#1963), native Stop button (#1973), remove bot reactions (#2001) | **Platform-specific.** Chat has no assistant status or Stop API, and reaction writes are user-auth only; steering keeps the held acknowledgement bubble. |
+| Assistant status after steering (#1963), native Stop button (#1973), remove bot reactions (#2001) | **Ported on 2026-10-29 (Stop).** Chat has no native Stop API; the equivalent is the Stop card on the thinking acknowledgement plus the mentioned stop command, both routed past render serialization with durable stop intent. Assistant status stays platform-specific; steering keeps the held acknowledgement bubble. |
 | Slack Connect allowlist (#2000, #2006) | **Platform-specific.** Chat admission is the verified domain allowlist and exact space grants. Migration `0060` imports as `0064` (fork offset +4). |
-| Admin changes from a DM (#1991, #1994, #1996) | **Not ported.** The gate is `slack_dm` plus the home-workspace channel catalog. A `gchat_dm` branch keyed on the verified `google_email` link is a follow-up. |
+| Admin changes from a DM (#1991, #1994, #1996) | **Ported on 2026-10-29.** `SandboxAdminAuthentication` admits a `gchat_dm` principal whose verified `google_email` matches the linked active admin and the turn's verified `gchat_user` requester; shared spaces, other users, disabled or non-admin users, missing identity, and cross-namespace access are refused, and Slack-only operations still require the Slack DM shape. |
 | Proxy sync served only by proxy-sync (#1933, #1934) | **Ported.** Rails' snapshot class, warm/prune jobs, and the Rails/Rust parity harness are deleted. The `gchat_user` direct non-broker hoist already lives in `sql/effective_credentials.sql`; `integration_tests.rs` now covers it, and the Chat JWT claim test reads `PrincipalSyncConfig`. |
 | token-broker (#1970), Microsoft OAuth (#1924), shared OAuth apps (#1910), company-context Slack/Calendar/import sync, Mercator, dependency and CI updates | **Shared.** Chat's Bun image, `hono`, and type packages follow Slack's bumps by hand because dependabot does not cover `services/googlechatbot`. The new `e2e.yml` and `token-broker-checks` use GitHub-hosted runners; CI, Justfile, and image publishing build both token-broker and googlechatbot. |
 

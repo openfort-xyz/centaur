@@ -1007,12 +1007,46 @@ googlechatbot:
   #     AAAAeng: { persona: eng, harness: claude, model: opus, reasoning: high }
   #     AAAAtriage: { reasoning: low }
   spaceDefaults: {}
+  # "llm" classifies the message with the OpenAI Decisions API (gpt-6-luna).
   messageOverridesStrategy:
     mode: flags
-    model: gpt-5.4-nano
+    model: gpt-6-luna
     openaiBaseUrl: https://api.openai.com/v1
     timeoutMs: 1500
-    maxOutputTokens: 300
+  # Contextual replies. A mention makes its thread eligible until a stop
+  # command; later unmentioned messages in that thread are classified and
+  # answered without a mention when the classifier says the bot should
+  # respond. Unlike Slack, Google pushes no unmentioned messages to the app, so
+  # the bot polls spaces.messages.list for exactly the listed spaces under its
+  # admin-approved chat.app.messages.readonly scope. `spaces` is required when
+  # enabled; there is no "every space" mode. The openai classifier reads
+  # OPENAI_API_KEY from the shared secret, or
+  # GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY via extraEnv.
+  proactivity:
+    enabled: false
+    classifier: openai
+    model: gpt-6-luna
+    openaiBaseUrl: https://api.openai.com/v1
+    spaces: []
+    timeoutMs: 2000
+    pollIntervalMs: 5000
+  # Optional reaction on the message that starts a turn, removed after the
+  # answer is posted. Google's reactions.create/delete reject app auth, so the
+  # reaction is authored by this Workspace user through domain-wide delegation
+  # of chat.messages.reactions (a separate subject from reactionReadUser, whose
+  # scope is read-only). Empty keeps the thinking message as the only signal.
+  reactionActorUser: ""
+  ackReaction: "👀"
+  # SIGTERM fails readiness at once, then waits this long for live turns; a
+  # turn still running afterwards is recovered from its durable obligation.
+  shutdown:
+    drainMs: 20000
+  terminationGracePeriodSeconds: 30
+  # Lock-based work leases replaced the cache-entry thread leases of earlier
+  # releases; the two schemes do not see each other. Recreate keeps an old and
+  # a new replica from driving the same obligation during the first rollout.
+  # RollingUpdate is safe again once every replica runs this scheme.
+  updateStrategy: Recreate
   # Public ingress for the webhook. Separate from the slackbotv2 ingress (which owns "/").
   ingress:
     enabled: false

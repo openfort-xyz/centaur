@@ -1109,7 +1109,14 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 
 ### Sandbox Admin Permission Management
 
-An active admin Console user's Slack DM sandbox may create Slack channel, Slack user, and workflow principals, create and edit static and Postgres DSN secrets whose sources reference an external store, inspect a principal's effective grants, manage its roles, direct secret grants, Slack channel permissions, and sandbox capabilities, and edit the Slack Connect allowlist with its sandbox entitlement JWT. The sandbox principal must be a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog. Other sandboxes, including channel, Slack Connect, and Console-user sessions, receive `403`. Request and response shapes match the corresponding admin endpoints.
+An active admin Console user's DM sandbox may create workflow principals, create and edit static and Postgres DSN secrets whose sources reference an external store, inspect a principal's effective grants, and manage its roles, direct secret grants, and sandbox capabilities with its sandbox entitlement JWT. From a Slack DM it may additionally create Slack channel and Slack user principals, manage Slack channel permissions, and edit the Slack Connect allowlist; those Slack-scoped operations return `403` from a Google Chat DM. From a Google Chat DM it may additionally manage Google Chat space permissions and email-targeted DM permissions; those return `403` from a Slack DM.
+
+The sandbox principal must be one of:
+
+- a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog;
+- a `gchat_dm` principal whose verified `google_email` label (stamped by api-rs only on signature-verified 1:1 DMs) is the linked admin's email, and whose proxy's current requester is the `gchat_user` principal with that same email.
+
+Other sandboxes, including channel, shared Google Chat space, Slack Connect, bare `gchat_user`, unverified or requester-less Google Chat DM, and Console-user sessions, receive `403`. Request and response shapes match the corresponding admin endpoints.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
@@ -1129,6 +1136,10 @@ An active admin Console user's Slack DM sandbox may create Slack channel, Slack 
 | `GET` | `/api/v1/sandbox/admin/secrets` | List grantable secrets of every kind with `id`, `grant_key`, `foreign_id`, `name`, `description`, and `labels`. `q` filters by name or foreign ID. |
 | `POST` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions` | Upsert one Slack channel permission (`data: { channel_id, upload_enabled, download_enabled, history_enabled }`). New permissions default omitted flags to `true`. |
 | `DELETE` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions/:channel_id` | Remove the principal's own permission for a channel. |
+| `POST` | `/api/v1/sandbox/admin/principals/:id/google_chat_space_permissions` | Google Chat DM only. Upsert one Google Chat space permission (`data: { space_name, send_enabled, update_enabled, delete_enabled, upload_enabled, download_enabled, history_enabled, members_enabled, reactions_enabled }`), as in the principal API. New permissions default omitted flags to `true`. |
+| `DELETE` | `/api/v1/sandbox/admin/principals/:id/google_chat_space_permissions/:space_id` | Google Chat DM only. Remove the principal's own permission for `spaces/:space_id`. |
+| `POST` | `/api/v1/sandbox/admin/principals/:id/google_chat_dm_permissions` | Google Chat DM only. Upsert one Google Chat DM permission (`data: { target_identity, setup_enabled }`); `target_identity` must be an email address. |
+| `DELETE` | `/api/v1/sandbox/admin/principals/:id/google_chat_dm_permissions/:target_identity` | Google Chat DM only. Remove the principal's own DM permission for that email. |
 | `PATCH` | `/api/v1/sandbox/admin/principals/:id/sandbox_access` | Update only the supplied `sandbox_repo_cache` and `sandbox_*_enabled` fields. Flags must be JSON booleans; other values return `400`. |
 | `GET` | `/api/v1/sandbox/admin/slack_external_teams` | List allowed Slack Connect workspace (`T…`) and Enterprise Grid org (`E…`) ids as `data: [id, …]`. The list is stored by api-rs; if it is unreachable the request returns `503`. |
 | `POST` | `/api/v1/sandbox/admin/slack_external_teams` | Allow one id (`data: { team_id }`) and return the updated list. Adding an allowed id changes nothing. Invalid ids return `422`. |

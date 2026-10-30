@@ -173,6 +173,7 @@ capability can be revoked independently:
 | --- | --- | --- |
 | `googlechatbot.uploadUser` | `chat.messages.create` | Upload a file and post it. Empty means uploads return 503. The message is authored by this user. |
 | `googlechatbot.reactionReadUser` | `chat.messages.reactions.readonly` | Read reactions. Empty means reaction reads return 503. |
+| `googlechatbot.reactionActorUser` | `chat.messages.reactions` | Add a reaction to the message that starts a turn and remove it when the turn ends. The reaction is authored by this user, never by the app. Empty disables reactions; the thinking message remains the acknowledgement. Without the DWD grant the token exchange fails with `unauthorized_client` and the bot disables reactions for the process. |
 | `googlechatbot.driveDownloadUser` | `drive.readonly` | Download Drive-backed Chat attachments. Empty or denied access degrades inbound content to metadata. |
 
 Live 1:1 DM turns use the bot's retained transcript and do not call Google's
@@ -193,6 +194,29 @@ and mints the delegated token.
 
 Keep each subject dedicated to its documented role. Do not grant a superset of
 the scopes above to one convenience account.
+
+## Stop, steering, and contextual replies
+
+- The thinking acknowledgement carries a Stop button. It and a mentioned
+  `stop` interrupt the active execution while the response stream is open.
+  In `workspace_addon` mode the button calls back to the exact
+  `googlechatbot.webhookAudience` endpoint (which must be an absolute https
+  URL; startup refuses otherwise) with an `actionName` parameter, as the
+  Add-on card contract requires; Chat API modes use the function name.
+  A stop received while the run is still starting prevents the execute. A
+  button from an earlier turn cannot interrupt a newer execution.
+- A mentioned follow-up from the person who started the running turn is
+  appended to that run (steering); anyone else in a shared space is told the
+  turn is still running.
+- `googlechatbot.proactivity` enables contextual replies in exact spaces only.
+  A mention opts its thread in until a stop. Because Google does not push
+  unmentioned messages to a Chat app, the bot polls `spaces.messages.list` for
+  the listed spaces under the admin-approved `chat.app.messages.readonly`
+  scope, then classifies each unmentioned message with the OpenAI Decisions
+  API before answering. Declines, classifier errors and timeouts, threads
+  without a prior mention, and messages seen while a run is active stay
+  silent. Enabling it requires the space list and `OPENAI_API_KEY` (or
+  `GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY`).
 
 ## Conversation and file behavior
 
@@ -282,6 +306,18 @@ repeated failures are bounded by the configured age and failure budget.
 
 The Helm chart uses separate liveness/readiness probes and enables Prometheus
 scrape annotations by default when googlechatbot is enabled.
+
+On SIGTERM readiness fails immediately and the bot waits up to
+`googlechatbot.shutdown.drainMs` (default 20 s, under
+`terminationGracePeriodSeconds: 30`) for live turns; anything still running
+is recovered by the next process. Pending work is discovered by querying the
+work records, so it cannot be lost behind the rolling index, and leases are
+token-checked locks that an expired owner cannot renew or release.
+
+The lock-based leases replaced the cache-entry thread leases of earlier
+releases. The chart sets `googlechatbot.updateStrategy: Recreate` so old and
+new replicas never process the same obligation during that first rollout;
+switch back to `RollingUpdate` once every replica runs the new scheme.
 
 ## Verify before production
 

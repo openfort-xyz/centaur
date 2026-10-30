@@ -5,6 +5,7 @@ import type {
   NormalizedBinaryPart,
   ChatSpaceResource,
   GoogleChatMessage,
+  GoogleChatReaction,
   UploadAttachmentResponse
 } from './types'
 
@@ -13,6 +14,7 @@ const CHAT_UPLOAD_BASE = 'https://chat.googleapis.com/upload/v1'
 const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3'
 const ADMIN_DIRECTORY_API_BASE = 'https://admin.googleapis.com/admin/directory/v1'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
+export const CARDS_ONLY_UPDATE_PLACEHOLDER_TEXT = 'cards-only update'
 export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 export const MAX_DRIVE_EXPORT_BYTES = 10 * 1024 * 1024
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -28,6 +30,7 @@ export type ChatCredential =
   | 'upload-user'
   | 'dm-setup-user'
   | 'reaction-reader'
+  | 'reaction-actor'
   | { kind: 'delegated-reader' | 'delegated-etl-reader'; subject: string }
 
 export type ChatPageOptions = {
@@ -77,6 +80,8 @@ export class ChatEdgeClient {
   private readonly dmSetupTokens = new Map<string, { token: string | null; expiry: number }>()
   private reactionReadToken: string | null = null
   private reactionReadTokenExpiry = 0
+  private reactionActorToken: string | null = null
+  private reactionActorTokenExpiry = 0
   private driveReadToken: string | null = null
   private driveReadTokenExpiry = 0
   // DWD read tokens are keyed by the impersonated user (the requester), since a
@@ -88,6 +93,7 @@ export class ChatEdgeClient {
   private readonly privateKey: string | null
   private readonly uploadUser: string
   private readonly reactionReadUser: string
+  private readonly reactionActorUser: string
   private readonly driveDownloadUser: string
   private readonly directoryLookupUser: string
   private directoryReadToken: string | null = null
@@ -117,6 +123,7 @@ export class ChatEdgeClient {
     this.quotaState = timing.quotaState
     this.uploadUser = config.GOOGLECHATBOT_UPLOAD_USER
     this.reactionReadUser = config.GOOGLECHATBOT_REACTION_READ_USER
+    this.reactionActorUser = config.GOOGLECHATBOT_REACTION_ACTOR_USER
     this.driveDownloadUser = config.GOOGLECHATBOT_DRIVE_DOWNLOAD_USER
     this.directoryLookupUser = config.GOOGLECHATBOT_DIRECTORY_LOOKUP_USER
     if (config.GOOGLE_SERVICE_ACCOUNT_JSON) {
@@ -241,6 +248,12 @@ export class ChatEdgeClient {
     return Boolean(this.serviceAccountEmail && this.privateKey && this.reactionReadUser)
   }
 
+  /** True when a delegated reaction author is configured. The read-only
+   * reaction subject is deliberately not reused: its scope cannot write. */
+  canWriteReactions(): boolean {
+    return Boolean(this.serviceAccountEmail && this.privateKey && this.reactionActorUser)
+  }
+
   canDownloadDriveAttachments(): boolean {
     return Boolean(this.serviceAccountEmail && this.privateKey && this.driveDownloadUser)
   }
@@ -336,6 +349,22 @@ export class ChatEdgeClient {
     )
     this.reactionReadToken = grant.token
     this.reactionReadTokenExpiry = grant.expiry
+    return grant.token
+  }
+
+  /** reactions.create/delete reject app auth; both run as the configured
+   * Workspace user under the read-write reaction scope. */
+  private async getReactionActorToken(): Promise<string | null> {
+    if (!this.canWriteReactions()) return null
+    if (this.reactionActorToken && Date.now() < this.reactionActorTokenExpiry - 60_000) {
+      return this.reactionActorToken
+    }
+    const grant = await this.exchangeJwtForToken(
+      'https://www.googleapis.com/auth/chat.messages.reactions',
+      this.reactionActorUser
+    )
+    this.reactionActorToken = grant.token
+    this.reactionActorTokenExpiry = grant.expiry
     return grant.token
   }
 
@@ -545,6 +574,7 @@ export class ChatEdgeClient {
       throw new ChatConfigurationError('DM setup credentials require a target email')
     }
     if (credential === 'reaction-reader') return this.getReactionReadToken()
+    if (credential === 'reaction-actor') return this.getReactionActorToken()
     return credential.kind === 'delegated-etl-reader'
       ? this.getUserEtlReadToken(credential.subject)
       : this.getUserReadToken(credential.subject)
@@ -607,6 +637,21 @@ export class ChatEdgeClient {
   ): Promise<GoogleChatMessage> {
     const path = `${messageName}?updateMask=${encodeURIComponent('text,cardsV2')}`
     return this.request('PATCH', path, update)
+  }
+
+  /** Replace only the cards of a message, leaving its text as it is. Used to
+   * take a Stop control off an acknowledgement whose text another writer owns. */
+  async updateMessageCards(
+    messageName: string,
+    cardsV2: NonNullable<GoogleChatMessage['cardsV2']>
+  ): Promise<GoogleChatMessage> {
+    // Google rejects a cards-only body as empty (HTTP 400) even though the mask
+    // excludes text, so send a placeholder the mask deliberately ignores; the
+    // message's real text is left untouched (verified against the live API).
+    return this.request('PATCH', `${messageName}?updateMask=cardsV2`, {
+      text: CARDS_ONLY_UPDATE_PLACEHOLDER_TEXT,
+      cardsV2
+    })
   }
 
   /**
@@ -800,6 +845,30 @@ export class ChatEdgeClient {
   ): Promise<ChatMembershipPage> {
     const id = spaceName.startsWith('spaces/') ? spaceName.slice('spaces/'.length) : spaceName
     return this.listNamedResource(`spaces/${id}`, 'members', opts)
+  }
+
+  /**
+   * React to a message as the delegated reaction actor.
+   * Path: POST /v1/{parent=spaces/*\/messages/*}/reactions
+   *
+   * User auth only (chat.messages.reactions); the Chat app itself cannot
+   * react, so the reaction is visibly authored by GOOGLECHATBOT_REACTION_ACTOR_USER.
+   */
+  async createReaction(messageName: string, unicode: string): Promise<GoogleChatReaction> {
+    if (!this.canWriteReactions()) {
+      throw new ChatConfigurationError('Google Chat reaction actor is not configured')
+    }
+    return this.request('POST', `${messageName}/reactions`, { emoji: { unicode } }, {
+      credential: 'reaction-actor'
+    })
+  }
+
+  /** Remove a reaction the actor created. Path: DELETE /v1/{name=…/reactions/*} */
+  async deleteReaction(reactionName: string): Promise<void> {
+    if (!this.canWriteReactions()) {
+      throw new ChatConfigurationError('Google Chat reaction actor is not configured')
+    }
+    await this.request('DELETE', reactionName, undefined, { credential: 'reaction-actor' })
   }
 
   async listMessageReactions(

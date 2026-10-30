@@ -139,7 +139,13 @@ export function verifyChatRequest(opts: {
   nowSeconds?: number
 }): ChatEnvelopeCheck {
   if (opts.userId) {
-    const envelopeUser = opts.envelope.message?.sender?.name ?? opts.envelope.user?.name
+    // The verified person must be the envelope's actor. For a MESSAGE that is
+    // the message's sender. For a card click, command, or form submission the
+    // contextual message is the one carrying the card, which this app
+    // authored, so the actor is the interacting `user`; a missing actor fails.
+    const envelopeUser = opts.envelope.type === 'MESSAGE'
+      ? opts.envelope.message?.sender?.name ?? opts.envelope.user?.name
+      : opts.envelope.user?.name
     if (envelopeUser !== opts.userId && envelopeUser !== `users/${opts.userId}`) {
       return { ok: false, status: 401, reason: 'user_id_mismatch' }
     }

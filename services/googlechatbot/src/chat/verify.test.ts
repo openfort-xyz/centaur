@@ -105,6 +105,41 @@ describe('verifyChatRequest', () => {
     })).toEqual({ ok: false, status: 401, reason: 'user_id_mismatch' })
   })
 
+  test('binds an interaction event to the interacting user, never the card author', () => {
+    const config = configWith({ GOOGLECHATBOT_ALLOWED_DOMAIN: '' })
+    const nowSeconds = Math.floor(new Date('2026-01-01T00:00:00Z').getTime() / 1000)
+    const click = (user?: { name?: string; type?: 'HUMAN' | 'BOT' }) => ({
+      type: 'CARD_CLICKED',
+      eventTime: '2026-01-01T00:00:00Z',
+      space: { name: 'spaces/AAAA', spaceType: 'DIRECT_MESSAGE' },
+      message: { name: 'spaces/AAAA/messages/CARD', sender: { name: 'users/APP', type: 'BOT' as const } },
+      ...(user ? { user } : {})
+    })
+    // The clicked card was authored by the app; the verified human is the actor.
+    expect(verifyChatRequest({ config, envelope: click({ name: 'users/U1', type: 'HUMAN' }), userId: 'U1', nowSeconds }))
+      .toEqual({ ok: true })
+    for (const type of ['SUBMIT_FORM', 'APP_COMMAND'] as const) {
+      expect(verifyChatRequest({ config, envelope: { ...click({ name: 'users/U1' }), type }, userId: 'U1', nowSeconds }))
+        .toEqual({ ok: true })
+    }
+    // Another verified human, or no actor at all, does not match the token.
+    expect(verifyChatRequest({ config, envelope: click({ name: 'users/U2', type: 'HUMAN' }), userId: 'U1', nowSeconds }))
+      .toEqual({ ok: false, status: 401, reason: 'user_id_mismatch' })
+    expect(verifyChatRequest({ config, envelope: click(), userId: 'U1', nowSeconds }))
+      .toEqual({ ok: false, status: 401, reason: 'user_id_mismatch' })
+    // A MESSAGE still binds its actual sender, so a spoofed `user` cannot pass.
+    expect(verifyChatRequest({
+      config,
+      envelope: {
+        ...envelopeAt('2026-01-01T00:00:00Z'),
+        message: { name: 'spaces/AAAA/messages/M1', sender: { name: 'users/U2', type: 'HUMAN' } },
+        user: { name: 'users/U1' }
+      },
+      userId: 'U1',
+      nowSeconds
+    })).toEqual({ ok: false, status: 401, reason: 'user_id_mismatch' })
+  })
+
   test('rejects events older than CHAT_EVENT_MAX_AGE_SECONDS as stale', () => {
     const config = configWith({
       GOOGLECHATBOT_ALLOWED_DOMAIN: '',

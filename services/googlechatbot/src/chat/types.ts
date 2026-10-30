@@ -205,6 +205,9 @@ export type ChatListMessage = {
   attachedGifs?: Array<{ uri?: string }>
   quotedMessageMetadata?: Record<string, unknown>
   cardsV2?: Array<Record<string, unknown>>
+  thread?: { name?: string }
+  slashCommand?: { commandId?: string }
+  annotations?: NonNullable<GoogleChatEnvelope['message']>['annotations']
   attachment?: Array<{
     name?: string
     contentName?: string
@@ -215,6 +218,13 @@ export type ChatListMessage = {
     attachmentDataRef?: { resourceName?: string }
     driveDataRef?: { driveFileId?: string }
   }>
+}
+
+/** spaces.messages.reactions resource; `name` is what a delete targets. */
+export type GoogleChatReaction = {
+  name?: string
+  user?: { name?: string }
+  emoji?: { unicode?: string }
 }
 
 export type GoogleChatMessage = {

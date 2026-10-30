@@ -5,6 +5,12 @@ module Api
         class PrincipalsController < ::Api::V1::PrincipalsController
           include SandboxAdminAuthentication
 
+          before_action :require_slack_admin_dm!,
+                        only: %i[upsert_slack_channel_permission destroy_slack_channel_permission]
+          before_action :require_google_admin_dm!,
+                        only: %i[upsert_google_chat_space_permission destroy_google_chat_space_permission
+                                 upsert_google_chat_dm_permission destroy_google_chat_dm_permission]
+
           SANDBOX_ACCESS_FLAGS = %w[
             sandbox_observability_enabled
             sandbox_sessions_read_enabled
@@ -27,9 +33,16 @@ module Api
           # Creates only Slack channel, Slack user, and workflow principals, with
           # the foreign ID api-rs derives at session start or for
           # WORKFLOW_PRINCIPAL = True, so the caller cannot choose a foreign ID,
-          # kind, or Console-user link.
+          # kind, or Console-user link. Slack principals are scoped to the
+          # admin's Slack workspace, so only a Slack DM may create them.
           def create
-            principal = case data_params[:kind]
+            kind = data_params[:kind]
+            if kind.to_s.start_with?("slack_")
+              require_slack_admin_dm!
+              return if performed?
+            end
+
+            principal = case kind
             when "slack_channel"
               id = data_params[:slack_channel_id].to_s.strip.upcase
               raise ActionController::BadRequest, "slack_channel_id must be a C… or G… channel ID" unless id.start_with?("C", "G")
@@ -107,6 +120,25 @@ module Api
           def destroy_slack_channel_permission
             principal = Principal.find_by_oid!(params[:id])
             principal.slack_channel_permissions.find_by!(channel_id: params[:channel_id].to_s.strip.upcase).destroy!
+            head :no_content
+          end
+
+          # DELETE /api/v1/sandbox/admin/principals/:id/google_chat_space_permissions/:space_id
+          #
+          # Keyed by the space id (the part after `spaces/`), as an admin names
+          # it, instead of the permission OID the operator API uses.
+          def destroy_google_chat_space_permission
+            principal = Principal.find_by_oid!(params[:id])
+            space_name = GoogleChatSpacePermission.normalize_resource_name("spaces/#{params[:space_id].to_s.strip}")
+            principal.google_chat_space_permissions.find_by!(space_name: space_name).destroy!
+            head :no_content
+          end
+
+          # DELETE /api/v1/sandbox/admin/principals/:id/google_chat_dm_permissions/:target_identity
+          def destroy_google_chat_dm_permission
+            principal = Principal.find_by_oid!(params[:id])
+            target = GoogleChatDmPermission.normalize_identity(params[:target_identity])
+            principal.google_chat_dm_permissions.find_by!(target_identity: target).destroy!
             head :no_content
           end
 

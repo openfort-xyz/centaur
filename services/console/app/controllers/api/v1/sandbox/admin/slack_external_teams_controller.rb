@@ -7,6 +7,8 @@ module Api
         class SlackExternalTeamsController < ::Api::BaseController
           include SandboxAdminAuthentication
 
+          before_action :require_slack_admin_dm!
+
           class_attribute :api_client_factory, default: -> { CentaurApiClient.new(timeout: 5) }
 
           # Later handlers win, so bad input still renders 400.

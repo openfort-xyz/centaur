@@ -309,7 +309,7 @@ while :; do
 done
 
 lease_expiry="$(postgres_value \
-  "SELECT floor(extract(epoch FROM max(expires_at)))::bigint FROM chat_state_cache WHERE key_prefix = 'centaur-googlechatbot' AND cache_key LIKE 'googlechatbot:work:lease:%'")"
+  "SELECT floor(extract(epoch FROM max(expires_at)))::bigint FROM chat_state_locks WHERE key_prefix = 'centaur-googlechatbot' AND thread_id LIKE 'googlechatbot:work:lease:%'")"
 test -n "$lease_expiry"
 kubectl --context "$context" -n "$namespace" delete pod "$processing_pod" \
   --grace-period=0 --force --wait=false

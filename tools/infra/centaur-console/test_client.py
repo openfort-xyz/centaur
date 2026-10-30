@@ -344,6 +344,67 @@ def test_admin_grant_secret_refuses_ambiguous_names():
         make_client(handler).admin_grant_secret("prn_123", "DB")
 
 
+def test_admin_google_space_permission_posts_flags_and_removes_by_space_id():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/prn_123":
+            return json_response({"data": {"id": "prn_123"}})
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return json_response({"data": {"space_name": "spaces/AAA", "send_enabled": False}}, 201)
+
+    client = make_client(handler)
+    assert client.admin_set_google_space_permission("prn_123", "AAA", send=False, history=True) == {
+        "space_name": "spaces/AAA",
+        "send_enabled": False,
+    }
+    client.admin_remove_google_space_permission("prn_123", "spaces/AAA")
+    with pytest.raises(ValueError):
+        client.admin_set_google_space_permission("prn_123", "AAA", publish=True)
+
+    permissions_path = f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/prn_123/google_chat_space_permissions"
+    assert requests == [
+        (
+            "POST",
+            permissions_path,
+            {"data": {"space_name": "spaces/AAA", "send_enabled": False, "history_enabled": True}},
+        ),
+        ("DELETE", f"{permissions_path}/AAA", None),
+    ]
+
+
+def test_admin_google_dm_permission_posts_an_email_target_and_removes_it():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/prn_123":
+            return json_response({"data": {"id": "prn_123"}})
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.raw_path.decode(), body))
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return json_response(
+            {"data": {"target_identity": "ada@example.com", "setup_enabled": True}}
+        )
+
+    client = make_client(handler)
+    client.admin_set_google_dm_permission("prn_123", "Ada@Example.com")
+    client.admin_remove_google_dm_permission("prn_123", "ada@example.com")
+
+    permissions_path = f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/prn_123/google_chat_dm_permissions"
+    assert requests == [
+        (
+            "POST",
+            permissions_path,
+            {"data": {"target_identity": "Ada@Example.com", "setup_enabled": True}},
+        ),
+        ("DELETE", f"{permissions_path}/ada%40example.com", None),
+    ]
+
+
 def test_admin_set_sandbox_access_sends_only_supplied_capabilities():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":

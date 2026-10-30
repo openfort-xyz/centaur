@@ -81,13 +81,14 @@ describe('upstream harness parity', () => {
   test('the existing Google Chat lease keeps renewing beyond its original TTL', async () => {
     const state = createMemoryState()
     await state.connect()
-    const release = await acquireLease(state, 'test:recovery:lease', 200, 10)
-    expect(release).not.toBeNull()
+    const lease = await acquireLease(state, 'test:recovery:lease', 200, 10)
+    expect(lease).not.toBeNull()
     try {
       await new Promise(resolve => setTimeout(resolve, 250))
       expect(await acquireLease(state, 'test:recovery:lease', 200, 10)).toBeNull()
+      expect(lease?.lost.aborted).toBe(false)
     } finally {
-      await release?.()
+      await lease?.release()
       await state.disconnect()
     }
   })

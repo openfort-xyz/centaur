@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { STOP_CARD_FUNCTION } from './constants'
 import { isHarnessEnabled, parseEnabledHarnesses } from './harness-routing'
 
 const strictBoolean = z
@@ -153,8 +154,9 @@ const EnvSchema = z.object({
 
   // How inline harness/model/provider/reasoning overrides are resolved from a
   // message: "flags" (default) parses literal --flags; "llm" additionally asks
-  // an OpenAI model to interpret natural-language requests ("use max effort
-  // and the sol model"), matching slackbotv2's SLACKBOTV2_MESSAGE_OVERRIDES_STRATEGY.
+  // the OpenAI Decisions API (gpt-6-luna) to interpret natural-language
+  // requests ("use max effort and the sol model"), matching slackbotv2's
+  // SLACKBOTV2_MESSAGE_OVERRIDES_STRATEGY.
   GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY: z
     .enum(['flags', 'llm'])
     .default('flags'),
@@ -162,9 +164,38 @@ const EnvSchema = z.object({
   // unset. Wired by the chart from the same secret key slackbotv2 reads.
   OPENAI_API_KEY: z.string().optional(),
   GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL: z.string().optional(),
-  GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL: z.string().default('gpt-5.4-nano'),
+  GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL: z.string().default('gpt-6-luna'),
   GOOGLECHATBOT_MESSAGE_OVERRIDES_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
-  GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().optional(),
+
+  // Contextual replies: a mention makes its thread eligible until a stop; later
+  // unmentioned messages in the exact listed spaces are classified and answered
+  // when the classifier says the bot should respond. Off by default, and never
+  // for every space: the space list is required when enabled. Unmentioned
+  // messages are collected by a bounded poller over spaces.messages.list, so
+  // the Chat app does not need the "receive all messages" configuration.
+  GOOGLECHATBOT_PROACTIVITY_ENABLED: z
+    .string()
+    .default('false')
+    .transform(value => value === 'true' || value === '1'),
+  GOOGLECHATBOT_PROACTIVITY_CLASSIFIER: z.enum(['openai']).default('openai'),
+  GOOGLECHATBOT_PROACTIVITY_MODEL: z.string().default('gpt-6-luna'),
+  GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY: z.string().optional(),
+  GOOGLECHATBOT_PROACTIVITY_OPENAI_BASE_URL: z.string().optional(),
+  GOOGLECHATBOT_PROACTIVITY_SPACES: z.string().default('').transform(parseSpaceList),
+  GOOGLECHATBOT_PROACTIVITY_TIMEOUT_MS: z.coerce.number().int().positive().default(2_000),
+  GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5_000),
+
+  // Optional reaction on the message that starts a turn, removed when the
+  // answer is posted. Google's reactions.create/delete reject app auth, so the
+  // reaction is authored by this delegated Workspace user (DWD scope
+  // chat.messages.reactions), never by the Chat app. Empty keeps the thinking
+  // acknowledgement as the only turn-start signal.
+  GOOGLECHATBOT_REACTION_ACTOR_USER: z.string().default(''),
+  GOOGLECHATBOT_ACK_REACTION: z.string().default('👀'),
+
+  // SIGTERM waits this long for in-flight turns before exiting; a turn still
+  // running is recovered by the next process from its durable obligation.
+  GOOGLECHATBOT_SHUTDOWN_DRAIN_MS: z.coerce.number().int().positive().default(20_000),
 
   // Per-space default harness/model/provider/reasoning, JSON keyed by Google
   // Chat space id. Mirrors slackbotv2's SLACKBOTV2_CHANNEL_DEFAULTS. See
@@ -180,9 +211,71 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!isHarnessEnabled(config.GOOGLECHATBOT_DEFAULT_HARNESS, config.GOOGLECHATBOT_ENABLED_HARNESSES)) {
     throw new Error('GOOGLECHATBOT_DEFAULT_HARNESS must be enabled in GOOGLECHATBOT_ENABLED_HARNESSES')
   }
+  if (config.GOOGLECHATBOT_INGRESS_MODE === 'workspace_addon' && !addonCallbackUrl(config)) {
+    throw new Error(
+      'GOOGLECHATBOT_WEBHOOK_AUDIENCE must be the Add-on endpoint as an absolute https URL in '
+      + 'workspace_addon mode; Add-on card callbacks are addressed to it'
+    )
+  }
+  if (config.GOOGLECHATBOT_PROACTIVITY_ENABLED) {
+    if (config.GOOGLECHATBOT_PROACTIVITY_SPACES.length === 0) {
+      throw new Error(
+        'GOOGLECHATBOT_PROACTIVITY_SPACES must list the exact spaces/<id> names when proactivity is enabled'
+      )
+    }
+    if (!proactivityApiKey(config)) {
+      throw new Error(
+        'GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY or OPENAI_API_KEY is required for the openai proactivity classifier'
+      )
+    }
+  }
   return config
+}
+
+/** Comma/space-separated `spaces/<id>` names; bare ids are normalized. */
+function parseSpaceList(value: string): string[] {
+  const spaces = value
+    .split(/[\s,]+/)
+    .map(part => part.trim())
+    .filter(Boolean)
+    .map(part => (part.startsWith('spaces/') ? part : `spaces/${part}`))
+  if (spaces.some(space => !/^spaces\/[A-Za-z0-9._-]{1,256}$/.test(space))) {
+    throw new Error('GOOGLECHATBOT_PROACTIVITY_SPACES must contain spaces/<id> resource names')
+  }
+  return [...new Set(spaces)]
+}
+
+export function proactivityApiKey(config: AppConfig): string | undefined {
+  return config.GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY || config.OPENAI_API_KEY || undefined
 }
 
 export function centaurApiKey(config: AppConfig): string | undefined {
   return config.GOOGLECHATBOT_API_KEY || config.CENTAUR_API_KEY || undefined
+}
+
+function addonCallbackUrl(config: AppConfig): string | undefined {
+  const raw = config.GOOGLECHATBOT_WEBHOOK_AUDIENCE?.trim()
+  if (!raw) return undefined
+  try {
+    const url = new URL(raw)
+    return url.protocol === 'https:' && url.hostname ? raw : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The Stop button's callback for this deployment's ingress contract. Chat API
+ * apps (project-number and URL modes) use the bare function name; a Workspace
+ * Add-on must address its own HTTP endpoint and carry the name as the
+ * `actionName` parameter, otherwise Google never delivers the click.
+ */
+export function stopCardAction(config: AppConfig): {
+  function: string
+  parameters?: Array<{ key: string; value: string }>
+} {
+  if (config.GOOGLECHATBOT_INGRESS_MODE !== 'workspace_addon') return { function: STOP_CARD_FUNCTION }
+  const url = addonCallbackUrl(config)
+  if (!url) throw new Error('workspace_addon Stop card requires a validated GOOGLECHATBOT_WEBHOOK_AUDIENCE')
+  return { function: url, parameters: [{ key: 'actionName', value: STOP_CARD_FUNCTION }] }
 }

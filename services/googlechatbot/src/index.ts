@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import type { StateAdapter } from 'chat'
-import type { AppConfig } from './config'
+import { stopCardAction, type AppConfig } from './config'
 import { ChatApiError, ChatEdgeClient, ChatOwnershipError } from './chat/client'
 import { EventDeduper, chatDedupKey } from './chat/dedup'
 import {
@@ -28,26 +28,43 @@ import { isHarnessEnabled, resolveEnabledOverrides } from './harness-routing'
 import { resolveSenderEmail } from './sender-lookup'
 import { addGauge, incr, renderMetrics, setGauge } from './metrics'
 import {
-  WORK_INDEX_KEY,
+  LeaseLostError,
+  acceptWork,
   acquireLease,
   assistantTurnMessage,
+  clearStopControl,
+  clearWorkStop,
   createDefaultState,
   ensureStateConnected,
+  listPendingWorkIds,
+  persistStopControl,
   persistWork,
+  requestWorkStop,
+  stopControlKey,
   threadStateKey,
   transcriptEntryFromTurn,
   transcriptHistoryMessages,
   updateThreadState,
+  withThreadHandoff,
   workKey,
   workLeaseKey,
+  workStopRequestedAt,
   type GoogleChatThreadState,
   type GoogleChatWorkObligation,
-  type StateConnectionStatus
+  type StateConnectionStatus,
+  type StopControl
 } from './state'
 import {
   messageOverridesStrategyFromConfig,
   type MessageOverridesStrategy
 } from './message-overrides-strategy'
+import {
+  createOpenAiProactiveClassifier,
+  decideWithTimeout,
+  type ProactiveClassifier,
+  type ProactiveThreadMessage
+} from './proactive-classifier'
+import { startProactivePoller } from './proactive-poll'
 import { resolveSpaceDefault, spaceDefaultsFromConfig, type SpaceDefaults } from './space-defaults'
 import {
   buildResponseContextWidget,
@@ -63,12 +80,15 @@ import {
   BUSY_STATUS,
   INITIAL_STATUS,
   STEERING_STATUS,
+  STOP_CARD_FUNCTION,
   consumeRenderStream,
   createRenderState,
-  finalizeRender
+  finalizeRender,
+  stopControlCards
 } from './renderer'
 import {
   type GoogleChatTurnMessage,
+  type InterruptSessionResponse,
   appendSessionMessages,
   classifyExecuteConflict,
   createSession,
@@ -109,11 +129,37 @@ type IdentityContext = {
   confirmSpace: (spaceName: string) => Promise<SpaceDmConfirmation>
 }
 
+/** Contextual replies: the classifier and the exact spaces it applies to. */
+export type ProactivityRuntime = {
+  classifier: ProactiveClassifier
+  spaces: readonly string[]
+  timeoutMs: number
+}
+
 /** Config-derived values resolved once at startup and reused for every turn. */
 type BotRuntime = {
   messageOverrides: MessageOverridesStrategy
   spaceDefaults: SpaceDefaults
+  proactivity?: ProactivityRuntime
+  /** Flipped when Google rejects the delegated reaction actor, so one
+   * misconfigured scope costs one failed call per process, not one per turn. */
+  reactionsDisabled: boolean
+  /** Background work started by webhooks, polling, and recovery; drained on
+   * shutdown so a reply in flight is not abandoned mid-render. */
+  background: Set<Promise<unknown>>
+  /** Obligations this process is driving, by work id, so a sweep neither
+   * re-launches them nor waits behind them. */
+  inFlightWork: Map<string, Promise<void>>
+  shuttingDown: boolean
 }
+
+/** Obligations a recovery sweep drives at once. A hung stream occupies one
+ * slot; the rest of the backlog keeps moving. */
+const RECOVERY_CONCURRENCY = 8
+
+const PROACTIVE_HISTORY_MESSAGES = 20
+const BOT_DISPLAY_NAME = 'Centaur'
+const STOPPED_BEFORE_START_TEXT = '⏹️ Stopped before the run started.'
 
 /** Ceiling on the spaces.get identity lookup. Far below
  * GOOGLECHATBOT_CHAT_API_TIMEOUT_MS (30s) because this call gates a live turn:
@@ -143,11 +189,14 @@ export type Googlechatbot = {
   state: StateAdapter
   stateConnected: Promise<void>
   stateStatus: StateConnectionStatus
+  /** Stop recurring work (recovery sweeps, polling), fail readiness, and wait
+   * up to `timeoutMs` for in-flight turns. Returns how many are still running. */
+  shutdown: (timeoutMs: number) => Promise<number>
 }
 
 export function createGooglechatbot(
   config: AppConfig,
-  options: { state?: StateAdapter } = {}
+  options: { state?: StateAdapter; proactivity?: ProactivityRuntime } = {}
 ): Googlechatbot {
   const stateStatus: StateConnectionStatus = { attempts: 0, connected: false }
   const hasDatabase = Boolean(
@@ -173,30 +222,55 @@ export function createGooglechatbot(
   const spaceVerifier = new SpaceDmVerifier(spaceName =>
     client.getSpace(spaceName, { timeoutMs: SPACE_LOOKUP_TIMEOUT_MS })
   )
+  const proactivity = options.proactivity ?? proactivityFromConfig(config)
   const runtime: BotRuntime = {
     messageOverrides: messageOverridesStrategyFromConfig(config),
-    spaceDefaults: spaceDefaultsFromConfig(config)
+    spaceDefaults: spaceDefaultsFromConfig(config),
+    ...(proactivity ? { proactivity } : {}),
+    reactionsDisabled: false,
+    background: new Set(),
+    inFlightWork: new Map(),
+    shuttingDown: false
+  }
+  const runInBackground = (promise: Promise<void>): void => {
+    runtime.background.add(promise)
+    const settle = () => runtime.background.delete(promise)
+    void promise.then(settle, (error: unknown) => {
+      settle()
+      logError('googlechatbot_event_processing_failed', error)
+    })
+  }
+  const launchWork = (work: GoogleChatWorkObligation, source: 'live' | 'recovery'): Promise<void> => {
+    const inFlight = runtime.inFlightWork.get(work.workId)
+    if (inFlight) return inFlight
+    const promise = processWorkObligation(config, client, runtime, state, spaceVerifier, work, source)
+      .finally(() => runtime.inFlightWork.delete(work.workId))
+    runtime.inFlightWork.set(work.workId, promise)
+    runInBackground(promise)
+    return promise
   }
 
   const app = new Hono()
 
+  const ready = () => stateStatus.connected && !runtime.shuttingDown
   app.get('/health/live', c =>
     c.json({ ok: true, service: 'googlechatbot', commit: process.env.COMMIT_SHA ?? 'local' })
   )
   app.get('/health/ready', c =>
     c.json(
       {
-        ok: stateStatus.connected,
+        ok: ready(),
         service: 'googlechatbot',
         database_connected: stateStatus.connected,
-        database_connect_attempts: stateStatus.attempts
+        database_connect_attempts: stateStatus.attempts,
+        shutting_down: runtime.shuttingDown
       },
-      stateStatus.connected ? 200 : 503
+      ready() ? 200 : 503
     )
   )
   // Compatibility path remains readiness, never liveness.
   app.get('/health', c =>
-    c.json({ ok: stateStatus.connected, service: 'googlechatbot' }, stateStatus.connected ? 200 : 503)
+    c.json({ ok: ready(), service: 'googlechatbot' }, ready() ? 200 : 503)
   )
   app.get('/metrics', c => c.text(renderMetrics(), 200, { 'content-type': 'text/plain; version=0.0.4' }))
 
@@ -313,12 +387,12 @@ export function createGooglechatbot(
       }
       // Durable acceptance precedes the synchronous 200. A process crash after
       // this write is recovered by the startup sweep; Google need not redeliver.
-      await persistWork(state, work)
+      await acceptWork(state, work)
       await deduper.complete(key)
       addGauge('googlechatbot_pending_render_obligations', 1)
       incr('googlechatbot_events_total', { outcome: 'accepted' })
       incr('googlechatbot_dedupe_total', { outcome: 'accepted' })
-      runInBackground(processWorkObligation(config, client, runtime, state, spaceVerifier, work))
+      void launchWork(work, 'live')
       return c.json({})
     } catch (error) {
       await deduper.release(key, dedupeToken).catch(() => undefined)
@@ -657,11 +731,57 @@ export function createGooglechatbot(
     }
   })
 
-  runInBackground(stateConnected.then(() => startRecoverySweeps(
-    config, client, runtime, state, spaceVerifier
-  )))
+  const stoppers: Array<() => void> = []
+  runInBackground(stateConnected.then(() => {
+    stoppers.push(startRecoverySweeps(config, runtime, state, launchWork))
+    if (runtime.proactivity) {
+      stoppers.push(startProactivePoller({
+        client,
+        config,
+        deduper,
+        spaces: runtime.proactivity.spaces,
+        state,
+        enqueue: work => {
+          addGauge('googlechatbot_pending_render_obligations', 1)
+          void launchWork(work, 'live')
+        }
+      }))
+    }
+  }))
 
-  return { app, client, state, stateConnected, stateStatus }
+  const shutdown = async (timeoutMs: number): Promise<number> => {
+    runtime.shuttingDown = true
+    for (const stop of stoppers) stop()
+    const deadline = Date.now() + timeoutMs
+    while (runtime.background.size > 0 && Date.now() < deadline) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        Promise.allSettled(runtime.background),
+        new Promise(resolve => {
+          timer = setTimeout(resolve, deadline - Date.now())
+        })
+      ])
+      clearTimeout(timer)
+    }
+    return runtime.background.size
+  }
+
+  return { app, client, state, stateConnected, stateStatus, shutdown }
+}
+
+function proactivityFromConfig(config: AppConfig): ProactivityRuntime | undefined {
+  if (!config.GOOGLECHATBOT_PROACTIVITY_ENABLED) return undefined
+  // loadConfig already required the key and the space list.
+  const apiKey = config.GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY || config.OPENAI_API_KEY || ''
+  return {
+    classifier: createOpenAiProactiveClassifier({
+      apiKey,
+      baseUrl: config.GOOGLECHATBOT_PROACTIVITY_OPENAI_BASE_URL,
+      model: config.GOOGLECHATBOT_PROACTIVITY_MODEL
+    }),
+    spaces: config.GOOGLECHATBOT_PROACTIVITY_SPACES,
+    timeoutMs: config.GOOGLECHATBOT_PROACTIVITY_TIMEOUT_MS
+  }
 }
 
 export async function settleBeforeDeadline<T>(
@@ -832,6 +952,39 @@ function internalFailure(c: Context, event: string, error: unknown): Response {
   return c.json({ error: 'Google Chat request failed' }, 502)
 }
 
+/** What an accepted obligation is, decided before any thread lease is taken so
+ * a cancellation never queues behind the render it is meant to interrupt. */
+type WorkKind = 'action' | 'stop-card' | 'stop-text' | 'turn'
+
+async function classifyWork(
+  config: AppConfig,
+  runtime: BotRuntime,
+  state: StateAdapter,
+  work: GoogleChatWorkObligation
+): Promise<WorkKind> {
+  if (!work.action && work.envelope) {
+    work.action = googleChatWorkflowEvent(work.envelope, work.identityUserEmail) ?? undefined
+  }
+  if (work.action) {
+    return work.action.payload.invoked_function === STOP_CARD_FUNCTION ? 'stop-card' : 'action'
+  }
+  // A cheap, non-persisted normalization (no attachment downloads) is enough
+  // to recognize a stop; the turn path normalizes again with the client.
+  const probe = work.event ?? (work.envelope ? await normalizeChatEnvelope(work.envelope) : null)
+  if (!probe || work.eventType === 'ADDED_TO_SPACE') return 'turn'
+  if (!isChatStopCommand(normalizedEventText(probe))) return 'turn'
+  if (probe.is_mention || (config.GOOGLECHATBOT_FOLLOW_UP_THREADS && isThreadReply(probe))) {
+    return 'stop-text'
+  }
+  // An unmentioned "stop" in a thread that is answering without mentions ends
+  // that participation; it is never worth a classifier call.
+  if (runtime.proactivity && proactiveSpaceAllowed(runtime.proactivity, probe.space_name)) {
+    const threadState = await state.get<GoogleChatThreadState>(threadStateKey(probe.thread_key))
+    if (threadState?.proactiveEligible === true) return 'stop-text'
+  }
+  return 'turn'
+}
+
 export async function processWorkObligation(
   config: AppConfig,
   client: ChatEdgeClient,
@@ -841,40 +994,39 @@ export async function processWorkObligation(
   initial: GoogleChatWorkObligation,
   source: 'live' | 'recovery' = 'live'
 ): Promise<void> {
-  const release = await acquireLease(
-    state,
-    workLeaseKeyFor(initial),
-    120_000,
-    60_000
-  )
-  if (!release) {
+  const loaded = (await state.get<GoogleChatWorkObligation>(workKey(initial.workId))) ?? initial
+  const kind = await classifyWork(config, runtime, state, loaded)
+  // One lease per obligation: it keeps live and recovery processing of this
+  // work exclusive and nothing more. Thread-level ordering lives in the
+  // handoff lock, so this lease can be held through rendering without
+  // blocking a later message's append or a stop.
+  const lease = await acquireLease(state, workLeaseKey(loaded.workId), 120_000, 60_000)
+  if (!lease) {
     incr('googlechatbot_recovery_total', { outcome: 'lease_skipped', source })
     return
   }
   try {
-    const work = (await state.get<GoogleChatWorkObligation>(workKey(initial.workId))) ?? initial
+    const work = (await state.get<GoogleChatWorkObligation>(workKey(initial.workId))) ?? loaded
     const age = Date.now() - Date.parse(work.acceptedAt)
     if (
       !Number.isFinite(age)
       || age > config.GOOGLECHATBOT_RECOVERY_MAX_OBLIGATION_AGE_MS
       || work.failures >= config.GOOGLECHATBOT_RECOVERY_FAILURE_BUDGET
     ) {
-      await finishWork(state, work)
+      await finishWork(client, state, work)
       incr('googlechatbot_recovery_total', { outcome: 'abandoned', source })
       return
     }
 
-    if (!work.action && work.envelope) {
-      work.action = googleChatWorkflowEvent(work.envelope, work.identityUserEmail) ?? undefined
-    }
-    if (work.action) {
-      await handleChatAction(config, work.action)
+    if (kind === 'action' || kind === 'stop-card') {
+      if (kind === 'stop-card') await handleStopCard(config, client, state, work)
+      else await handleChatAction(config, work.action!)
       await state.set(
         `googlechatbot:dedupe:${work.dedupeKey}`,
         'completed',
         config.CHAT_EVENT_DEDUP_TTL_MS
       )
-      await finishWork(state, work)
+      await finishWork(client, state, work)
       incr('googlechatbot_recovery_total', { outcome: 'completed', source })
       return
     }
@@ -887,22 +1039,35 @@ export async function processWorkObligation(
     }
     const event = work.event
     if (!event) {
-      await finishWork(state, work)
+      await finishWork(client, state, work)
+      return
+    }
+    if (kind === 'stop-text') {
+      await handleStopCommand(config, client, state, event)
+      await finishWork(client, state, work)
       return
     }
     if (work.eventType === 'ADDED_TO_SPACE') {
       await client.createMessage(event.space_name, { text: WELCOME_TEXT })
-      await finishWork(state, work)
+      await finishWork(client, state, work)
       return
     }
     const followUp = config.GOOGLECHATBOT_FOLLOW_UP_THREADS && isThreadReply(event)
-    if (!event.is_mention && !followUp) {
-      await finishWork(state, work)
-      return
-    }
-    if (isChatStopCommand(normalizedEventText(event))) {
-      await handleStopCommand(config, client, event)
-      await finishWork(state, work)
+    if (!event.is_mention && !followUp && !work.proactive) {
+      // A decision is made once; a recovered obligation keeps its answer.
+      if (!(await shouldReplyProactively(config, client, runtime, state, work, event))) {
+        await finishWork(client, state, work)
+        return
+      }
+      work.proactive = true
+      await persistWork(state, work)
+    } else if (work.proactive && !work.ackMessageName && !(await proactivePermitted(
+      runtime, (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key))) ?? {}, event
+    ))) {
+      // A stored positive decision is not authorization: the current
+      // policy (feature, exact space, thread opt-in, generation) decides.
+      incr('googlechatbot_proactive_decisions_total', { outcome: 'skip_policy' })
+      await finishWork(client, state, work)
       return
     }
 
@@ -911,7 +1076,7 @@ export async function processWorkObligation(
       try {
         const ack = await client.createMessage(
           event.space_name,
-          { text: INITIAL_STATUS },
+          { text: INITIAL_STATUS, cardsV2: stopControlCards(stopCardAction(config)) },
           { messageId, threadName: event.chat.thread_name }
         )
         work.ackMessageName = ack.name ?? `${event.space_name}/messages/${messageId}`
@@ -921,15 +1086,23 @@ export async function processWorkObligation(
       }
       work.stage = 'thinking'
       await persistWork(state, work)
+      await addAckReaction(client, config, runtime, state, work, event)
     }
 
     if (work.stage === 'final') {
-      await finishWork(state, work)
+      await finishWork(client, state, work)
       return
     }
+    // Re-bind the Stop button on every pass (idempotent) so a crash between
+    // the acknowledgement and this write still yields a working button.
+    await persistStopControl(state, work.ackMessageName, {
+      workId: work.workId,
+      threadKey: event.thread_key,
+      spaceName: event.space_name
+    })
     if (work.executionId || work.canonicalFinal) {
-      await recoverFinalRender(config, client, state, work)
-      await finishWork(state, work)
+      await recoverFinalRender(config, client, state, work, lease.lost)
+      await finishWork(client, state, work)
       incr('googlechatbot_recovery_total', { outcome: 'completed', source })
       return
     }
@@ -941,17 +1114,7 @@ export async function processWorkObligation(
           (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key)))?.transcript,
           event.message_id
         )
-      : await collectThreadHistory(client, {
-        spaceName: event.space_name,
-        threadName: event.chat.thread_name,
-        currentMessageName: event.message_id,
-        threadReply: event.chat.thread_reply,
-        botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
-        historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
-      }).catch(error => {
-        logWarn('googlechatbot_thread_history_failed', error)
-        return [] as NonNullable<NormalizedChatEvent['history_messages']>
-      })
+      : await sharedThreadHistory(config, client, work, event)
     if (history.length) event.history_messages = history
 
     await driveSession(
@@ -965,47 +1128,110 @@ export async function processWorkObligation(
         confirmSpace: spaceName => spaceVerifier.confirm(spaceName)
       },
       state,
-      work
+      work,
+      lease.lost
     )
-    await finishWork(state, work)
+    await finishWork(client, state, work)
     incr('googlechatbot_recovery_total', { outcome: 'completed', source })
   } catch (error) {
+    if (error instanceof LeaseLostError) {
+      // A successor owns this work now; it must not be finished or counted
+      // against the failure budget from here.
+      incr('googlechatbot_recovery_total', { outcome: 'lease_lost', source })
+      logWarn('googlechatbot_work_lease_lost', { source, work_id: initial.workId })
+      return
+    }
     const work = (await state.get<GoogleChatWorkObligation>(workKey(initial.workId))) ?? initial
     work.failures += 1
     await persistWork(state, work).catch(() => undefined)
     incr('googlechatbot_recovery_total', { outcome: 'failed', source })
     logError('googlechatbot_work_failed', error, { source, work_id: initial.workId })
   } finally {
-    await release()
+    await lease.release()
   }
 }
 
-function workLeaseKeyFor(work: GoogleChatWorkObligation): string {
-  if (work.action) return `${workKey(work.workId)}:lease`
-  if (work.event) return workLeaseKey(work.event.thread_key)
-  const spaceName = work.envelope?.space?.name
-  const resourceName = work.envelope?.thread?.name
-    ?? work.envelope?.message?.thread?.name
-    ?? work.envelope?.message?.name
-    ?? spaceName
-  return spaceName && resourceName
-    ? workLeaseKey(buildThreadKey(spaceName, resourceName))
-    : `${workKey(work.workId)}:lease`
+async function sharedThreadHistory(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  work: GoogleChatWorkObligation,
+  event: NormalizedChatEvent
+): Promise<NonNullable<NormalizedChatEvent['history_messages']>> {
+  return collectThreadHistory(client, {
+    spaceName: event.space_name,
+    threadName: event.chat.thread_name,
+    currentMessageName: event.message_id,
+    threadReply: event.chat.thread_reply,
+    botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
+    historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
+  }).catch(error => {
+    logWarn('googlechatbot_thread_history_failed', error)
+    return []
+  })
 }
 
-async function finishWork(state: StateAdapter, work: GoogleChatWorkObligation): Promise<void> {
+/** Every path through an obligation ends here, so this is where the delegated
+ * reaction (if any) comes off the original message, whatever the outcome. */
+async function finishWork(
+  client: ChatEdgeClient,
+  state: StateAdapter,
+  work: GoogleChatWorkObligation
+): Promise<void> {
+  if (work.ackReactionName) {
+    const reactionName = work.ackReactionName
+    try {
+      await client.deleteReaction(reactionName)
+      incr('googlechatbot_reactions_total', { operation: 'delete', outcome: 'ok' })
+    } catch (error) {
+      incr('googlechatbot_reactions_total', { operation: 'delete', outcome: 'failed' })
+      logWarn('googlechatbot_ack_reaction_delete_failed', error, { work_id: work.workId })
+    }
+  }
   await state.delete(workKey(work.workId))
+  await clearWorkStop(state, work.workId).catch(() => undefined)
   addGauge('googlechatbot_pending_render_obligations', -1)
+}
+
+/** React to the message that starts a turn as the delegated actor. Never
+ * blocks the turn: without an actor, or on any failure, the thinking
+ * acknowledgement remains the only signal. */
+async function addAckReaction(
+  client: ChatEdgeClient,
+  config: AppConfig,
+  runtime: BotRuntime,
+  state: StateAdapter,
+  work: GoogleChatWorkObligation,
+  event: NormalizedChatEvent
+): Promise<void> {
+  const emoji = config.GOOGLECHATBOT_ACK_REACTION.trim()
+  if (!emoji || runtime.reactionsDisabled || !client.canWriteReactions()) return
+  if (!/^spaces\/[^/]+\/messages\/[^/]+$/.test(event.message_id)) return
+  try {
+    const reaction = await client.createReaction(event.message_id, emoji)
+    if (!reaction.name) return
+    work.ackReactionName = reaction.name
+    await persistWork(state, work)
+    incr('googlechatbot_reactions_total', { operation: 'create', outcome: 'ok' })
+  } catch (error) {
+    if (error instanceof ChatApiError && error.status === 403) {
+      // The actor lacks chat.messages.reactions (or is not in the space).
+      // One failed call per process is enough to learn that.
+      runtime.reactionsDisabled = true
+      logWarn('googlechatbot_ack_reaction_auto_disabled', { status: error.status })
+    } else {
+      logWarn('googlechatbot_ack_reaction_create_failed', error, { work_id: work.workId })
+    }
+    incr('googlechatbot_reactions_total', { operation: 'create', outcome: 'failed' })
+  }
 }
 
 export async function recoverWorkObligations(
   config: AppConfig,
-  client: ChatEdgeClient,
   runtime: BotRuntime,
   state: StateAdapter,
-  spaceVerifier: SpaceDmVerifier
+  launch: (work: GoogleChatWorkObligation, source: 'recovery') => Promise<void>
 ): Promise<void> {
-  const ids = Array.from(new Set(await state.getList<string>(WORK_INDEX_KEY)))
+  const ids = await listPendingWorkIds(state, stateKeyPrefix(state, config))
   const pending: GoogleChatWorkObligation[] = []
   for (const id of ids) {
     const work = await state.get<GoogleChatWorkObligation>(workKey(id))
@@ -1014,42 +1240,60 @@ export async function recoverWorkObligations(
   setGauge('googlechatbot_pending_render_obligations', pending.length)
   incr('googlechatbot_recovery_total', { outcome: 'scan' })
   for (const work of pending) {
-    await processWorkObligation(config, client, runtime, state, spaceVerifier, work, 'recovery')
+    if (runtime.shuttingDown) return
+    if (runtime.inFlightWork.has(work.workId)) continue
+    // Bounded fan-out: launch up to RECOVERY_CONCURRENCY obligations and let
+    // them run in the background; the scan itself never waits on a render.
+    while (runtime.inFlightWork.size >= RECOVERY_CONCURRENCY) {
+      await Promise.race(runtime.inFlightWork.values()).catch(() => undefined)
+    }
+    void launch(work, 'recovery')
   }
 }
 
-async function startRecoverySweeps(
+/** The adapter's own prefix when it exposes one (an injected test adapter can
+ * differ from the deployment value), else the configured prefix. */
+function stateKeyPrefix(state: StateAdapter, config: AppConfig): string {
+  const prefix = (state as { keyPrefix?: unknown }).keyPrefix
+  return typeof prefix === 'string' && prefix ? prefix : config.GOOGLECHATBOT_STATE_KEY_PREFIX
+}
+
+function startRecoverySweeps(
   config: AppConfig,
-  client: ChatEdgeClient,
   runtime: BotRuntime,
   state: StateAdapter,
-  spaceVerifier: SpaceDmVerifier
-): Promise<void> {
+  launch: (work: GoogleChatWorkObligation, source: 'recovery') => Promise<void>
+): () => void {
   let running = false
   const sweep = async () => {
-    if (running) return
+    if (running || runtime.shuttingDown) return
     running = true
     try {
-      await recoverWorkObligations(config, client, runtime, state, spaceVerifier)
+      await recoverWorkObligations(config, runtime, state, launch)
     } finally {
       running = false
     }
   }
-  await sweep()
+  void sweep().catch(error => {
+    logError('googlechatbot_recovery_sweep_failed', error)
+  })
   const timer = setInterval(() => void sweep().catch(error => {
     logError('googlechatbot_recovery_sweep_failed', error)
   }), config.GOOGLECHATBOT_RECOVERY_SWEEP_INTERVAL_MS)
   timer.unref?.()
+  return () => clearInterval(timer)
 }
 
 async function recoverFinalRender(
   config: AppConfig,
   client: ChatEdgeClient,
   stateAdapter: StateAdapter,
-  work: GoogleChatWorkObligation
+  work: GoogleChatWorkObligation,
+  leaseLost: AbortSignal
 ): Promise<void> {
   if (!work.event) throw new Error('Google Chat work is missing its normalized event')
   const renderState = createRenderState()
+  const target = durableRenderTarget(config, stateAdapter, work)
   if (work.canonicalFinal) {
     renderState.answer = work.canonicalFinal.answer
     renderState.error = work.canonicalFinal.error
@@ -1058,6 +1302,7 @@ async function recoverFinalRender(
   } else {
     let lastEventId = 0
     for (let attempt = 0; attempt < MAX_RESUME_ATTEMPTS && !renderState.terminal; attempt += 1) {
+      leaseLost.throwIfAborted()
       const stream = await openSessionEventStream(
         config,
         work.event.thread_key,
@@ -1067,8 +1312,9 @@ async function recoverFinalRender(
           lastEventId = Math.max(lastEventId, id)
         }
       )
-      await consumeRenderStream(client, stream, durableRenderTarget(work), renderState)
+      await consumeRenderStream(client, stream, target, renderState)
     }
+    leaseLost.throwIfAborted()
     work.lastEventId = lastEventId
     if (!renderState.terminal) renderState.error ??= renderState.streamError
     work.canonicalFinal = {
@@ -1077,11 +1323,13 @@ async function recoverFinalRender(
     }
     await persistWork(stateAdapter, work)
   }
-  const outcome = await finalizeRender(client, durableRenderTarget(work), renderState)
+  leaseLost.throwIfAborted()
+  await clearStopControl(stateAdapter, target.ackMessageName)
+  const outcome = await finalizeRender(client, target, renderState)
   incr('googlechatbot_delivery_total', { outcome, source: 'recovery' })
   work.stage = 'final'
   await persistWork(stateAdapter, work)
-  await recordAssistantFinal(config, stateAdapter, work.event, durableRenderTarget(work), {
+  await recordAssistantFinal(config, stateAdapter, work.event, target, {
     outcome,
     answer: renderState.answer
   })
@@ -1090,14 +1338,28 @@ async function recoverFinalRender(
   })
 }
 
-function durableRenderTarget(work: GoogleChatWorkObligation) {
+function durableRenderTarget(config: AppConfig, state: StateAdapter, work: GoogleChatWorkObligation) {
   if (!work.event) throw new Error('Google Chat work is missing its normalized event')
+  const ackMessageName = work.ackMessageName ?? ''
   return {
     spaceName: work.event.space_name,
-    ackMessageName: work.ackMessageName ?? '',
+    ackMessageName,
     threadName: work.event.chat.thread_name,
-    fallbackMessageId: `client-centaur-${work.workId.replace(/-/g, '')}`
+    fallbackMessageId: `client-centaur-${work.workId.replace(/-/g, '')}`,
+    liveCards: () => liveStopCards(config, state, ackMessageName)
   }
+}
+
+/** The Stop button stays on the acknowledgement only while its binding exists;
+ * a stop or a final deletes the binding, so the next status edit drops it. */
+async function liveStopCards(
+  config: AppConfig,
+  state: StateAdapter,
+  ackMessageName: string
+): Promise<ReturnType<typeof stopControlCards>> {
+  if (!ackMessageName) return []
+  const control = await state.get<StopControl>(stopControlKey(ackMessageName)).catch(() => null)
+  return control ? stopControlCards(stopCardAction(config)) : []
 }
 
 export function googleChatWorkflowEvent(
@@ -1112,10 +1374,13 @@ export function googleChatWorkflowEvent(
       .map(parameter => [parameter.key as string, parameter.value])
   )
   const parameters = { ...legacyParameters, ...envelope.common?.parameters }
-  const parameterFunction = ['__action_method_name__', 'actionName', 'invokedFunction', 'function']
+  const parameterFunction = ['__action_method_name__', 'actionName', 'method', 'invokedFunction', 'function']
     .map(key => parameters[key])
     .find(value => typeof value === 'string')
-  const invokedFunction = envelope.common?.invokedFunction
+  // A Workspace Add-on click echoes the app's endpoint URL as the invoked
+  // function and carries the real name as a parameter; the URL can never
+  // mask or stand in for that name.
+  const invokedFunction = nonUrlFunctionName(envelope.common?.invokedFunction)
     ?? envelope.action?.actionMethodName
     ?? (typeof parameterFunction === 'string' ? parameterFunction : undefined)
     ?? (eventType === 'app_command' ? envelope.appCommandMetadata?.appCommandId : undefined)
@@ -1135,6 +1400,11 @@ export function googleChatWorkflowEvent(
     ...(envelope.user?.displayName ? { user_name: envelope.user.displayName } : {})
   }
   return { event_name: `google_chat.${eventType}.${invokedFunction}`, payload }
+}
+
+function nonUrlFunctionName(value: string | undefined): string | undefined {
+  if (!value || /^https?:\/\//i.test(value)) return undefined
+  return value
 }
 
 /** Compatibility helper retained for callers that only consume card clicks. */
@@ -1168,6 +1438,22 @@ async function handleChatAction(config: AppConfig, event: GoogleChatWorkflowEven
   }
 }
 
+/** The handoff decision for one accepted message, made under the thread's
+ * handoff lock: start an execution (and then render it outside the lock), or
+ * end here because the message steered, was refused, was stopped, or was an
+ * unmentioned reply that found a run already active. */
+type StartedTurn = {
+  execution: { execution_id: string }
+  session: Awaited<ReturnType<typeof createSession>>
+  execute: GoogleChatTurnMessage
+  overrides: Awaited<ReturnType<MessageOverridesStrategy>>
+  spaceDefault: ReturnType<typeof resolveSpaceDefault>
+  resolvedHarnessType: string | undefined
+  resolvedModel: string | undefined
+  resolvedProvider: string | undefined
+  turnReasoning: string | undefined
+}
+
 async function driveSession(
   config: AppConfig,
   client: ChatEdgeClient,
@@ -1176,17 +1462,88 @@ async function driveSession(
   ackMessageName: string,
   identity: IdentityContext,
   durableState: StateAdapter,
-  work: GoogleChatWorkObligation
+  work: GoogleChatWorkObligation,
+  leaseLost: AbortSignal
 ): Promise<void> {
+  const threadKey = event.thread_key
+  incr('googlechatbot_runs_total', { outcome: 'started' })
+  try {
+    // Session create, the active-execution check, and append-or-execute are
+    // one serialized decision per thread. Rendering below runs outside the
+    // lock, so a later mention can reach this execution while it streams.
+    const started = await withThreadHandoff(durableState, threadKey, lost =>
+      handoffTurn(config, client, runtime, event, ackMessageName, identity, durableState, work, lost)
+    )
+    if (!started) return
+    await renderTurn(config, client, event, ackMessageName, durableState, work, leaseLost, started)
+  } catch (error) {
+    if (error instanceof LeaseLostError) throw error
+    incr('googlechatbot_runs_total', { outcome: 'failed' })
+    incr('centaur_session_delivery_total', { delivery_status: 'failed' })
+    logError('googlechatbot_session_drive_failed', error)
+    // Once the canonical answer is durable, a Chat PATCH/create failure is a
+    // render obligation, not a new execution error. Leave it for recovery so
+    // the exact answer is retried with the stable fallback message ID.
+    if (work.canonicalFinal) throw error
+    work.canonicalFinal = { answer: '', error: error instanceof Error ? error.message : String(error) }
+    await persistWork(durableState, work)
+    await clearStopControl(durableState, ackMessageName)
+    const delivered = await deliverDriveError(client, event, ackMessageName, error)
+    if (!delivered) throw error
+    work.stage = 'final'
+    await persistWork(durableState, work)
+    await finishThreadRun(client, durableState, threadKey)
+  }
+}
+
+async function handoffTurn(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  runtime: BotRuntime,
+  event: NormalizedChatEvent,
+  ackMessageName: string,
+  identity: IdentityContext,
+  durableState: StateAdapter,
+  work: GoogleChatWorkObligation,
+  handoffLost: AbortSignal
+): Promise<StartedTurn | undefined> {
   const threadKey = event.thread_key
   const { execute, history } = turnMessagesFromEvent(event)
   const threadState =
     (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
+  // Every exit that starts no execution of its own also drops the Stop
+  // binding this acknowledgement was created with.
+  const noRun = async () => {
+    await clearStopControl(durableState, ackMessageName)
+    return undefined
+  }
   if (threadState.executedMessageIds?.includes(execute.id)) {
     await removeAck(client, ackMessageName)
     incr('googlechatbot_dedupe_total', { outcome: 'thread_duplicate' })
-    return
+    return noRun()
   }
+  if (work.proactive && !proactivePermitted(runtime, threadState, event)) {
+    // A stored positive decision is not authorization: the feature, the
+    // exact space list, the thread's opt-in (a stop clears it), and the
+    // generation (a run started since) are all re-checked here, under the
+    // lock, before any execution. Context for the next turn, never its own.
+    await skipProactiveTurn(client, ackMessageName, threadKey, execute.id)
+    return noRun()
+  }
+  // A mention (never an unmentioned reply) opts the thread into contextual
+  // replies until a stop. DMs are always addressed, so they never need it. A
+  // mention older than the thread's latest stop cannot undo that stop, so the
+  // opt-in is decided against the freshest state at the point it is written.
+  const sentAt = eventTimeMs(event, work)
+  const eligibilityFor = (current: GoogleChatThreadState): Partial<GoogleChatThreadState> =>
+    runtime.proactivity
+    && event.is_mention
+    && event.space_type !== 'DIRECT_MESSAGE'
+    && proactiveSpaceAllowed(runtime.proactivity, event.space_name)
+    && sentAt > (current.stopRequestedAt ?? 0)
+      ? { proactiveEligible: true, proactiveEligibleAt: sentAt }
+      : {}
+  const eligibility = eligibilityFor(threadState)
   // Inline directives (--model, -rsn, --bedrock, --claude, ...) are stripped from
   // the prompt and applied to the harness/turn, matching the Slack integration.
   // GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY=llm swaps the literal-flag parser
@@ -1233,260 +1590,399 @@ async function driveSession(
     requestedModel,
     overrides.reasoning ?? spaceDefault?.reasoning
   )
-  incr('googlechatbot_runs_total', { outcome: 'started' })
-  try {
-    const session = await createSession(
-      config,
-      threadKey,
-      conversationName(event),
-      requestedHarnessType,
-      {
-        userId: event.user_id,
-        userName: event.user_name,
-        identity: {
-          verified: identity.verified,
-          ...(event.user_email ? { userEmail: event.user_email } : {}),
-          spaceType: event.space_type,
-          confirmSpace: () => identity.confirmSpace(event.space_name)
-        }
-      },
-      {
-        // api-rs pins the first persisted persona for the thread's lifetime;
-        // re-sending the pinned one keeps it across a harness restart.
-        ...(pinnedPersonaId ? { personaId: pinnedPersonaId } : {}),
-        restartOnHarnessConflict: Boolean(overrides.harnessType)
+  const session = await createSession(
+    config,
+    threadKey,
+    conversationName(event),
+    requestedHarnessType,
+    {
+      userId: event.user_id,
+      userName: event.user_name,
+      identity: {
+        verified: identity.verified,
+        ...(event.user_email ? { userEmail: event.user_email } : {}),
+        spaceType: event.space_type,
+        confirmSpace: () => identity.confirmSpace(event.space_name)
       }
-    )
-
-    // Append only unforwarded messages to the active execution. Replaying the
-    // full DM transcript here would steer old turns again. Keep a steering
-    // notice until the active execution delivers its answer.
-    const forwarded = new Set(threadState.forwardedMessageIds ?? [])
-    const appended = [...history, execute].filter(message => !forwarded.has(message.id))
-    if (session.activeExecution) {
-      if (!canFoldIntoActiveRun(event, threadState)) {
-        await refuseFoldForOtherRequester(client, ackMessageName, threadKey, execute.id)
-        return
-      }
-      // In a shared space only the sender's own message steers the run. The
-      // listed thread history can hold other people's messages, including
-      // ones refused above, and steering those in would carry them into a
-      // turn that holds the starter's grants after all.
-      const steered = event.space_type === 'DIRECT_MESSAGE' ? appended : [execute]
-      await appendSessionMessages(config, threadKey, steered)
-      const held = await holdSteeringAck(client, ackMessageName)
-      await updateThreadState(durableState, threadKey, {
-        activeExecution: true,
-        forwardedMessageIds: steered.map(message => message.id),
-        ...(held ? { steeringAckMessageNames: [ackMessageName] } : {}),
-        ...dmTranscriptUpdate(event, execute)
-      }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
-      incr('googlechatbot_runs_total', { outcome: 'folded' })
-      logWarn('googlechatbot_folded_into_active_run', {
-        thread_key: threadKey,
-        message_id: execute.id
-      })
-      return
+    },
+    {
+      // api-rs pins the first persisted persona for the thread's lifetime;
+      // re-sending the pinned one keeps it across a harness restart.
+      ...(pinnedPersonaId ? { personaId: pinnedPersonaId } : {}),
+      restartOnHarnessConflict: Boolean(overrides.harnessType)
     }
+  )
 
-    // Deliberately NOT appended before the execute: api-rs forwards appended
-    // user messages into any active execution, so a turn that loses the
-    // check-then-execute race above would be steered into the other run and
-    // then folded again below. Appended after the run is ours.
-    // A persona-pinned model overrides any model or provider selection. api-rs
-    // ignores both on a pinned thread; don't send them, so a rejected pin isn't
-    // blamed on a sticky model.
-    const personaModel = session.personaModel
-    const turnReasoning = personaModel
-      ? reasoningForModel(
-          session.harnessType ?? requestedHarnessType,
-          personaModel,
-          overrides.reasoning ?? spaceDefault?.reasoning
-        )
-      : resolvedReasoning
-    let execution
-    try {
-      execution = await executeSession(config, threadKey, execute, {
-        overrides: {
-          model: personaModel ? undefined : resolvedModel,
-          provider: personaModel ? undefined : resolvedProvider,
-          reasoning: turnReasoning
-        },
-        // Include history in the execution input so a replacement sandbox has
-        // prior context. Durable message rows do not seed a new harness turn.
-        history,
-        // The person behind this turn, for their own per-user grants (their
-        // desktop, their credentials) in any space, DM or group.
-        requester: {
-          verified: identity.verified,
-          ...(event.user_email ? { userEmail: event.user_email } : {})
-        },
-        ...(session.harnessType ? { harnessType: session.harnessType } : {})
-      })
-    } catch (error) {
-      // The activeExecution check above is read-then-act: a run that starts
-      // between the check and this execute makes api-rs reject the second
-      // execute on its one-active-execution index (409 once api-rs types the
-      // conflict; an opaque 500 on older servers). Re-check and fold into the
-      // live run instead of erroring into the thread.
-      const folded = await foldIntoActiveRun(config, client, threadKey, execute, ackMessageName, error, {
-        conversationName: conversationName(event),
-        harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
-        // The other run started between the check and this execute, so read
-        // its requester fresh rather than from the state loaded above.
-        canFold: async () =>
-          canFoldIntoActiveRun(
-            event,
-            (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
-          )
-      })
-      if (folded === 'refused') return
-      if (folded) {
-        await updateThreadState(durableState, threadKey, {
-          forwardedMessageIds: [execute.id],
-          ...(folded.steeringAckHeld ? { steeringAckMessageNames: [ackMessageName] } : {}),
-          ...dmTranscriptUpdate(event, execute)
-        }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
-        return
-      }
-      throw error
+  // A stop recorded after this message was sent, or a Stop card bound to this
+  // very obligation, means the message must neither start a run nor steer an
+  // existing one. Stop intent is written without the handoff lock, so it is
+  // re-read after the session call. A stopped turn never opts the thread in;
+  // it ends contextual participation for its own generation (a mention sent
+  // after this one keeps its opt-in) and raises the cutoff to its own time.
+  handoffLost.throwIfAborted()
+  const latest = (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
+  if (work.proactive && !proactivePermitted(runtime, latest, event)) {
+    // A stop or a newer turn may have landed while the session call was held.
+    await skipProactiveTurn(client, ackMessageName, threadKey, execute.id)
+    return noRun()
+  }
+  const cardStopAt = await workStopRequestedAt(durableState, work.workId)
+  if (stopRequestedFor(latest, event, work) || cardStopAt !== null) {
+    // The cutoff is the STOP's own time (text: already in the thread state;
+    // card: the click's event time carried by the work-scoped marker), never
+    // this message's or the processing time: a mention sent after this one
+    // but before the stop must not run either, while one sent after the
+    // stop still runs and opts in.
+    const stopAt = Math.max(latest.stopRequestedAt ?? 0, cardStopAt ?? 0)
+    // Only the thread's current generation may promote its card's stop to
+    // thread state. Once a message newer than this one has executed or opted
+    // the thread in, this work is finalized as cancelled with no thread-wide
+    // effect: a stale card, even recovered later, cannot touch its successor.
+    // Ownership, not only clock order: this work never executed (or is not
+    // the active execution), so while another execution is active the thread
+    // is someone else's generation, even when timestamps tie or truncate.
+    const superseded =
+      (latest.lastExecutedAt ?? 0) > sentAt
+      || (latest.proactiveEligibleAt ?? 0) > sentAt
+      || (work.executionId
+        ? latest.activeExecutionId !== work.executionId
+        : latest.activeExecution === true)
+    await clearStopControl(durableState, ackMessageName)
+    await deliverStoppedBeforeStart(client, ackMessageName)
+    await updateThreadState(durableState, threadKey, {
+      executedMessageIds: [execute.id],
+      ...(superseded ? {} : { stopRequestedAt: stopAt }),
+      ...(!superseded && (latest.proactiveEligibleAt ?? 0) <= stopAt ? { proactiveEligible: false } : {}),
+      ...dmTranscriptUpdate(event, execute)
+    }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
+    work.stage = 'final'
+    await persistWork(durableState, work)
+    incr('googlechatbot_runs_total', { outcome: 'stopped_before_start' })
+    return undefined
+  }
+
+  // Append only unforwarded messages to the active execution. Replaying the
+  // full DM transcript here would steer old turns again. Keep a steering
+  // notice until the active execution delivers its answer.
+  const forwarded = new Set(threadState.forwardedMessageIds ?? [])
+  const appended = [...history, execute].filter(message => !forwarded.has(message.id))
+  if (session.activeExecution) {
+    if (work.proactive) {
+      // An unmentioned reply starts a run or does nothing; it never steers
+      // one. The next turn collects it as thread context.
+      await skipProactiveTurn(client, ackMessageName, threadKey, execute.id)
+      return noRun()
     }
-    // Slack's rule: session_messages records each human turn exactly once.
-    // The execution is already running, so a failed append must not abort the
-    // render loop: the DM transcript below is the context source and
-    // this append must persist only: execute already supplied the input.
-    await appendSessionMessagesBestEffort(config, threadKey, appended)
+    if (!canFoldIntoActiveRun(event, threadState)) {
+      await refuseFoldForOtherRequester(client, ackMessageName, threadKey, execute.id)
+      return noRun()
+    }
+    // In a shared space only the sender's own message steers the run. The
+    // listed thread history can hold other people's messages, including
+    // ones refused above, and steering those in would carry them into a
+    // turn that holds the starter's grants after all.
+    const steered = event.space_type === 'DIRECT_MESSAGE' ? appended : [execute]
+    handoffLost.throwIfAborted()
+    await appendSessionMessages(config, threadKey, steered)
+    const held = await holdSteeringAck(client, ackMessageName)
     await updateThreadState(durableState, threadKey, {
       activeExecution: true,
-      activeRequesterEmail: event.user_email ?? null,
-      executedMessageIds: [execute.id],
-      forwardedMessageIds: appended.map(message => message.id),
+      forwardedMessageIds: steered.map(message => message.id),
+      ...(held ? { steeringAckMessageNames: [ackMessageName] } : {}),
       ...dmTranscriptUpdate(event, execute),
-      ...(overrides.harnessType ? { harnessType: overrides.harnessType } : {}),
-      ...(overrides.model
-        ? { model: overrides.model }
-        : overrides.harnessType ? { model: null } : {}),
-      ...(overrides.provider
-        ? { provider: overrides.provider }
-        : overrides.harnessType ? { provider: null } : {}),
-      ...(disabledHarnessReset
-        ? { harnessType: requestedHarnessType, model: null, provider: null }
-        : {}),
-      ...(session.personaId !== undefined ? { personaId: session.personaId } : {})
+      ...eligibility
     }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
-    work.executionId = execution.execution_id
-    work.stage = 'rendering'
-    await persistWork(durableState, work)
-    // Match Slack response metadata: first response, every response, or disabled.
-    const isFirstAssistantMessage = !event.history_messages?.length
-    // The persisted harness can differ from this turn's selection when the
-    // thread predates it or a persona pins one.
-    const effectiveHarnessType =
-      session.harnessType ?? resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
-    // Without an explicit --model/--opus/... override the harness runs its
-    // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
-    // config); show that instead of dropping the model entirely.
-    const effectiveModel =
-      personaModel ?? resolvedModel ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
-    // Codex/Nanocodex run an effort level even when this turn asked for none;
-    // show the one the harness actually applies (Nanocodex folds Minimal into
-    // Low). Undefined for the Claude/Amp harnesses, which drop the segment.
-    const effectiveReasoning = effectiveReasoningForHarness(
-      effectiveHarnessType,
-      turnReasoning,
-      harnessDefaultReasoning(config)
-    )
-    const includeResponseMetadata =
-      config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'always' ||
-      (config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'first' && isFirstAssistantMessage)
-    const fallbackNotice = personaFallbackNotice(
-      session.unavailableRequestedPersonaId,
-      session.personaId
-    )
-    const consoleSessionWidget = isFirstAssistantMessage || includeResponseMetadata || fallbackNotice
-      ? buildResponseContextWidget({
-          harnessType: effectiveHarnessType,
-          metadataEnabled: includeResponseMetadata,
-          model: effectiveModel,
-          notice: fallbackNotice,
-          reasoning: effectiveReasoning,
-          serviceTier:
-            config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED && (personaModel || !resolvedProvider)
-              ? defaultServiceTierForHarness(effectiveHarnessType)
-              : undefined
-        })
-      : undefined
-    const target = {
-      spaceName: event.space_name,
-      ackMessageName,
-      threadName: event.chat.thread_name,
-      consoleSessionWidget,
-      plainTextOnly: isPlainTextOnlyRequest(execute.text),
-      fallbackMessageId: `client-centaur-${work.workId.replace(/-/g, '')}`
-    }
-
-    // Resume-on-drop: a dropped SSE connection leaves the answer half-written.
-    // Re-open from the last event id (api-rs replays only newer events) and keep
-    // accumulating into the same render state, so the final answer is delivered
-    // even if the stream breaks mid-run. Bounded to avoid spinning forever.
-    const state = createRenderState()
-    let lastEventId = 0
-    for (let attempt = 0; attempt < MAX_RESUME_ATTEMPTS && !state.terminal; attempt += 1) {
-      const stream = await openSessionEventStream(
-        config,
-        threadKey,
-        lastEventId,
-        execution.execution_id,
-        id => {
-          if (id > lastEventId) lastEventId = id
-        }
-      )
-      await consumeRenderStream(client, stream, target, state)
-      work.lastEventId = lastEventId
-      await persistWork(durableState, work)
-      await updateThreadState(durableState, threadKey, { lastEventId })
-      if (!state.terminal && attempt + 1 < MAX_RESUME_ATTEMPTS) {
-        incr('googlechatbot_render_resumes_total')
-        logWarn('googlechatbot_render_stream_resuming', {
-          thread_key: threadKey,
-          after_event_id: lastEventId,
-          attempt: attempt + 1
-        })
-      }
-    }
-    if (!state.terminal) state.error ??= state.streamError
-    work.canonicalFinal = { answer: state.answer, ...(state.error ? { error: state.error } : {}) }
-    await persistWork(durableState, work)
-    const deliveryOutcome = await finalizeRender(client, target, state)
-    incr('googlechatbot_delivery_total', { outcome: deliveryOutcome, source: 'live' })
-    work.stage = 'final'
-    await persistWork(durableState, work)
-    await recordAssistantFinal(config, durableState, event, target, {
-      outcome: deliveryOutcome,
-      answer: state.answer
+    incr('googlechatbot_runs_total', { outcome: 'folded' })
+    logWarn('googlechatbot_folded_into_active_run', {
+      thread_key: threadKey,
+      message_id: execute.id
     })
-    await finishThreadRun(client, durableState, threadKey, { lastEventId })
-    incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
-    // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
-    // aggregate both: the final answer is written once and visible.
-    incr('centaur_session_delivery_total', {
-      delivery_status: state.error ? 'error_visible' : 'answer_visible'
+    return noRun()
+  }
+
+  // Deliberately NOT appended before the execute: api-rs forwards appended
+  // user messages into any active execution, so a turn that loses the
+  // check-then-execute race above would be steered into the other run and
+  // then folded again below. Appended after the run is ours.
+  // A persona-pinned model overrides any model or provider selection. api-rs
+  // ignores both on a pinned thread; don't send them, so a rejected pin isn't
+  // blamed on a sticky model.
+  const personaModel = session.personaModel
+  const turnReasoning = personaModel
+    ? reasoningForModel(
+        session.harnessType ?? requestedHarnessType,
+        personaModel,
+        overrides.reasoning ?? spaceDefault?.reasoning
+      )
+    : resolvedReasoning
+  let execution
+  try {
+    handoffLost.throwIfAborted()
+    execution = await executeSession(config, threadKey, execute, {
+      overrides: {
+        model: personaModel ? undefined : resolvedModel,
+        provider: personaModel ? undefined : resolvedProvider,
+        reasoning: turnReasoning
+      },
+      // Include history in the execution input so a replacement sandbox has
+      // prior context. Durable message rows do not seed a new harness turn.
+      history,
+      // The person behind this turn, for their own per-user grants (their
+      // desktop, their credentials) in any space, DM or group.
+      requester: {
+        verified: identity.verified,
+        ...(event.user_email ? { userEmail: event.user_email } : {})
+      },
+      ...(session.harnessType ? { harnessType: session.harnessType } : {})
     })
   } catch (error) {
-    incr('googlechatbot_runs_total', { outcome: 'failed' })
-    incr('centaur_session_delivery_total', { delivery_status: 'failed' })
-    logError('googlechatbot_session_drive_failed', error)
-    // Once the canonical answer is durable, a Chat PATCH/create failure is a
-    // render obligation, not a new execution error. Leave it for recovery so
-    // the exact answer is retried with the stable fallback message ID.
-    if (work.canonicalFinal) throw error
-    work.canonicalFinal = { answer: '', error: error instanceof Error ? error.message : String(error) }
+    // The handoff lock serializes this bot's executes, but api-rs is the
+    // authority: an execution it still reports active rejects the second
+    // execute on its one-active-execution index (409 once api-rs types the
+    // conflict; an opaque 500 on older servers). Re-check and fold into the
+    // live run instead of erroring into the thread.
+    if (work.proactive && classifyExecuteConflict(error) !== 'unrelated') {
+      await skipProactiveTurn(client, ackMessageName, threadKey, execute.id)
+      return noRun()
+    }
+    const folded = await foldIntoActiveRun(config, client, threadKey, execute, ackMessageName, error, {
+      conversationName: conversationName(event),
+      harnessType: resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS,
+      // The other run started between the check and this execute, so read
+      // its requester fresh rather than from the state loaded above.
+      canFold: async () =>
+        canFoldIntoActiveRun(
+          event,
+          (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
+        )
+    })
+    if (folded === 'refused') return noRun()
+    if (folded) {
+      await updateThreadState(durableState, threadKey, {
+        forwardedMessageIds: [execute.id],
+        ...(folded.steeringAckHeld ? { steeringAckMessageNames: [ackMessageName] } : {}),
+        ...dmTranscriptUpdate(event, execute),
+        ...eligibility
+      }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
+      return noRun()
+    }
+    throw error
+  }
+  // Slack's rule: session_messages records each human turn exactly once.
+  // The execution is already running, so a failed append must not abort the
+  // render loop: the DM transcript below is the context source and
+  // this append must persist only: execute already supplied the input.
+  await appendSessionMessagesBestEffort(config, threadKey, appended)
+  await updateThreadState(durableState, threadKey, {
+    activeExecution: true,
+    activeExecutionId: execution.execution_id,
+    activeRequesterEmail: event.user_email ?? null,
+    executedMessageIds: [execute.id],
+    forwardedMessageIds: appended.map(message => message.id),
+    lastExecutedAt: sentAt,
+    ...eligibilityFor(latest),
+    ...dmTranscriptUpdate(event, execute),
+    ...(overrides.harnessType ? { harnessType: overrides.harnessType } : {}),
+    ...(overrides.model
+      ? { model: overrides.model }
+      : overrides.harnessType ? { model: null } : {}),
+    ...(overrides.provider
+      ? { provider: overrides.provider }
+      : overrides.harnessType ? { provider: null } : {}),
+    ...(disabledHarnessReset
+      ? { harnessType: requestedHarnessType, model: null, provider: null }
+      : {}),
+    ...(session.personaId !== undefined ? { personaId: session.personaId } : {})
+  }, config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT)
+  work.executionId = execution.execution_id
+  work.stage = 'rendering'
+  await persistWork(durableState, work)
+  return {
+    execution,
+    session,
+    execute,
+    overrides,
+    spaceDefault,
+    resolvedHarnessType,
+    resolvedModel,
+    resolvedProvider,
+    turnReasoning
+  }
+}
+
+async function renderTurn(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  event: NormalizedChatEvent,
+  ackMessageName: string,
+  durableState: StateAdapter,
+  work: GoogleChatWorkObligation,
+  leaseLost: AbortSignal,
+  started: StartedTurn
+): Promise<void> {
+  const threadKey = event.thread_key
+  const { execution, session, execute, resolvedHarnessType, resolvedModel, resolvedProvider, turnReasoning } = started
+  const personaModel = session.personaModel
+  // Match Slack response metadata: first response, every response, or disabled.
+  const isFirstAssistantMessage = !event.history_messages?.length
+  // The persisted harness can differ from this turn's selection when the
+  // thread predates it or a persona pins one.
+  const effectiveHarnessType =
+    session.harnessType ?? resolvedHarnessType ?? config.GOOGLECHATBOT_DEFAULT_HARNESS
+  // Without an explicit --model/--opus/... override the harness runs its
+  // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
+  // config); show that instead of dropping the model entirely.
+  const effectiveModel =
+    personaModel ?? resolvedModel ?? defaultModelForHarness(effectiveHarnessType, harnessDefaultModels(config))
+  // Codex/Nanocodex run an effort level even when this turn asked for none;
+  // show the one the harness actually applies (Nanocodex folds Minimal into
+  // Low). Undefined for the Claude/Amp harnesses, which drop the segment.
+  const effectiveReasoning = effectiveReasoningForHarness(
+    effectiveHarnessType,
+    turnReasoning,
+    harnessDefaultReasoning(config)
+  )
+  const includeResponseMetadata =
+    config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'always' ||
+    (config.GOOGLECHATBOT_RESPONSE_METADATA_MODE === 'first' && isFirstAssistantMessage)
+  const fallbackNotice = personaFallbackNotice(
+    session.unavailableRequestedPersonaId,
+    session.personaId
+  )
+  const consoleSessionWidget = isFirstAssistantMessage || includeResponseMetadata || fallbackNotice
+    ? buildResponseContextWidget({
+        harnessType: effectiveHarnessType,
+        metadataEnabled: includeResponseMetadata,
+        model: effectiveModel,
+        notice: fallbackNotice,
+        reasoning: effectiveReasoning,
+        serviceTier:
+          config.GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED && (personaModel || !resolvedProvider)
+            ? defaultServiceTierForHarness(effectiveHarnessType)
+            : undefined
+      })
+    : undefined
+  const target = {
+    spaceName: event.space_name,
+    ackMessageName,
+    threadName: event.chat.thread_name,
+    consoleSessionWidget,
+    plainTextOnly: isPlainTextOnlyRequest(execute.text),
+    fallbackMessageId: `client-centaur-${work.workId.replace(/-/g, '')}`,
+    liveCards: () => liveStopCards(config, durableState, ackMessageName)
+  }
+
+  // Resume-on-drop: a dropped SSE connection leaves the answer half-written.
+  // Re-open from the last event id (api-rs replays only newer events) and keep
+  // accumulating into the same render state, so the final answer is delivered
+  // even if the stream breaks mid-run. Bounded to avoid spinning forever.
+  const state = createRenderState()
+  let lastEventId = 0
+  for (let attempt = 0; attempt < MAX_RESUME_ATTEMPTS && !state.terminal; attempt += 1) {
+    leaseLost.throwIfAborted()
+    const stream = await openSessionEventStream(
+      config,
+      threadKey,
+      lastEventId,
+      execution.execution_id,
+      id => {
+        if (id > lastEventId) lastEventId = id
+      }
+    )
+    await consumeRenderStream(client, stream, target, state)
+    work.lastEventId = lastEventId
     await persistWork(durableState, work)
-    const delivered = await deliverDriveError(client, event, ackMessageName, error)
-    if (!delivered) throw error
-    work.stage = 'final'
-    await persistWork(durableState, work)
-    await finishThreadRun(client, durableState, threadKey)
+    await updateThreadState(durableState, threadKey, { lastEventId })
+    if (!state.terminal && attempt + 1 < MAX_RESUME_ATTEMPTS) {
+      incr('googlechatbot_render_resumes_total')
+      logWarn('googlechatbot_render_stream_resuming', {
+        thread_key: threadKey,
+        after_event_id: lastEventId,
+        attempt: attempt + 1
+      })
+    }
+  }
+  leaseLost.throwIfAborted()
+  if (!state.terminal) state.error ??= state.streamError
+  work.canonicalFinal = { answer: state.answer, ...(state.error ? { error: state.error } : {}) }
+  await persistWork(durableState, work)
+  // The button's binding goes first so a click racing the final finds
+  // nothing to stop, and the final itself replaces the card surface.
+  await clearStopControl(durableState, ackMessageName)
+  const deliveryOutcome = await finalizeRender(client, target, state)
+  incr('googlechatbot_delivery_total', { outcome: deliveryOutcome, source: 'live' })
+  work.stage = 'final'
+  await persistWork(durableState, work)
+  await recordAssistantFinal(config, durableState, event, target, {
+    outcome: deliveryOutcome,
+    answer: state.answer
+  })
+  await finishThreadRun(client, durableState, threadKey, { lastEventId })
+  incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
+  // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
+  // aggregate both: the final answer is written once and visible.
+  incr('centaur_session_delivery_total', {
+    delivery_status: state.error ? 'error_visible' : 'answer_visible'
+  })
+}
+
+/** Google's timestamp for the message behind this work, falling back to when
+ * the bot accepted it. Stops are ordered against this on the same clock. */
+function eventTimeMs(event: NormalizedChatEvent, work: GoogleChatWorkObligation): number {
+  const fromEvent = event.chat.event_time ? Date.parse(event.chat.event_time) : Number.NaN
+  return Number.isFinite(fromEvent) ? fromEvent : Date.parse(work.acceptedAt)
+}
+
+/** Whether a stop was requested after this message was sent. */
+function stopRequestedFor(
+  state: GoogleChatThreadState,
+  event: NormalizedChatEvent,
+  work: GoogleChatWorkObligation
+): boolean {
+  return (state.stopRequestedAt ?? 0) >= eventTimeMs(event, work)
+}
+
+/** An unmentioned message may start a run only while nothing newer has: a
+ * later execution already saw it as thread context. */
+/** Whether an unmentioned message may start a run right now, whatever any
+ * earlier classifier decision said: feature on, exact space, thread opted in
+ * (a stop clears it), and nothing newer has run. */
+function proactivePermitted(
+  runtime: BotRuntime,
+  state: GoogleChatThreadState,
+  event: NormalizedChatEvent
+): boolean {
+  return Boolean(runtime.proactivity)
+    && event.space_type !== 'DIRECT_MESSAGE'
+    && proactiveSpaceAllowed(runtime.proactivity!, event.space_name)
+    && state.proactiveEligible === true
+    && proactiveStillCurrent(state, event)
+}
+
+function proactiveStillCurrent(state: GoogleChatThreadState, event: NormalizedChatEvent): boolean {
+  if (state.activeExecution === true) return false
+  const sentAt = event.chat.event_time ? Date.parse(event.chat.event_time) : Number.NaN
+  return !Number.isFinite(sentAt) || (state.lastExecutedAt ?? 0) < sentAt
+}
+
+async function skipProactiveTurn(
+  client: ChatEdgeClient,
+  ackMessageName: string,
+  threadKey: string,
+  messageId: string
+): Promise<void> {
+  incr('googlechatbot_proactive_decisions_total', { outcome: 'skip_active_execution' })
+  logInfo('googlechatbot_proactive_handoff_skipped', { thread_key: threadKey, message_id: messageId })
+  await removeAck(client, ackMessageName)
+}
+
+async function deliverStoppedBeforeStart(client: ChatEdgeClient, ackMessageName: string): Promise<void> {
+  if (!ackMessageName) return
+  try {
+    await client.updateMessage(ackMessageName, { text: STOPPED_BEFORE_START_TEXT, cardsV2: [] })
+  } catch (error) {
+    logWarn('googlechatbot_stopped_ack_update_failed', error)
+    await removeAck(client, ackMessageName)
   }
 }
 
@@ -1556,22 +2052,28 @@ function normalizedEventText(event: NormalizedChatEvent): string {
 async function handleStopCommand(
   config: AppConfig,
   client: ChatEdgeClient,
+  state: StateAdapter,
   event: NormalizedChatEvent
 ): Promise<void> {
   const threadKey = event.thread_key
   const requester = event.user_name || event.user_id || 'unknown user'
-  const reason = `Interrupted from Google Chat by ${requester}`
   let text: string
   try {
-    const response = await interruptSessionExecution(config, threadKey, reason)
-    incr('googlechatbot_stop_commands_total', {
-      outcome: response.interrupted ? 'interrupted' : 'no_active_run'
+    const response = await requestStop(config, state, {
+      threadKey,
+      requestedAt: event.chat.event_time ? Date.parse(event.chat.event_time) : Date.now(),
+      reason: `Interrupted from Google Chat by ${requester}`
     })
-    text = response.interrupted
+    const interrupted = response !== 'stale' && response.interrupted
+    incr('googlechatbot_stop_commands_total', {
+      outcome: interrupted ? 'interrupted' : 'no_active_run',
+      source: 'text'
+    })
+    text = interrupted
       ? '⏹️ Stopped the current run.'
       : 'There is no active run in this thread to stop.'
   } catch (error) {
-    incr('googlechatbot_stop_commands_total', { outcome: 'failed' })
+    incr('googlechatbot_stop_commands_total', { outcome: 'failed', source: 'text' })
     logError('googlechatbot_stop_command_failed', error)
     const detail = error instanceof Error ? error.message : String(error)
     text = clampPlainText(`⚠️ Couldn't stop the run: ${detail}`)
@@ -1582,6 +2084,247 @@ async function handleStopCommand(
     })
   } catch (deliverError) {
     logError('googlechatbot_stop_reply_failed', deliverError)
+  }
+}
+
+/**
+ * The Stop button. Nothing in the click is trusted beyond what Google signed:
+ * the message the card sits on and the space. That message's durable binding
+ * names the work it may cancel; the binding is deleted at the turn's final
+ * and when a stop lands, so a button that outlived its turn finds nothing.
+ * The binding check and the interrupt run under the thread handoff lock, so
+ * no newer execution can start between them and be interrupted in its place.
+ */
+async function handleStopCard(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  state: StateAdapter,
+  work: GoogleChatWorkObligation
+): Promise<void> {
+  const payload = work.action!.payload
+  const ackMessageName = payload.message_name
+  const record = (outcome: string) =>
+    incr('googlechatbot_stop_commands_total', { outcome, source: 'card' })
+  if (!ackMessageName || !/^spaces\/[^/]+\/messages\/[^/]+$/.test(ackMessageName)) {
+    record('stale')
+    return
+  }
+  const control = await state.get<StopControl>(stopControlKey(ackMessageName))
+  if (!control || control.spaceName !== payload.space_name) {
+    record('stale')
+    logInfo('googlechatbot_stop_card_stale', { space_name: payload.space_name })
+    return
+  }
+  // Before the lock, the intent is scoped to the one obligation the card
+  // names: a turn of that work still starting sees it and does not execute,
+  // while a stale card can affect nothing newer. Thread-wide effects (the
+  // cutoff, proactive opt-out) are written only after the binding is
+  // validated under the handoff lock.
+  // Google's click time orders the stop against message times on one clock.
+  const clickedAt = Date.parse(work.envelope?.eventTime ?? work.acceptedAt)
+  const requestedAt = Number.isFinite(clickedAt) ? clickedAt : Date.now()
+  await requestWorkStop(state, control.workId, requestedAt)
+  const requester = payload.user_name || payload.user_id || 'unknown user'
+  let response: InterruptSessionResponse | 'stale'
+  try {
+    response = await requestStop(config, state, {
+      threadKey: control.threadKey,
+      requestedAt,
+      reason: `Interrupted from Google Chat by ${requester}`,
+      boundTo: async threadState => {
+        const target = await state.get<GoogleChatWorkObligation>(workKey(control.workId))
+        // Bound to its own execution: once that one is no longer the thread's
+        // active execution, the button is stale however it was delivered.
+        // A pending obligation (no execution yet) names no execution either:
+        // while another one is active it cannot authorize an interrupt. Its
+        // own turn still honours the work-scoped intent when it reaches the
+        // handoff.
+        if (
+          !target
+          || target.stage === 'final'
+          || (target.executionId
+            ? threadState.activeExecutionId !== target.executionId
+            : threadState.activeExecution === true)
+        ) {
+          return false
+        }
+        // The next status edit or the final drops the button (liveCards
+        // re-reads this binding); no Google call sits in front of the interrupt.
+        await clearStopControl(state, ackMessageName)
+        return true
+      }
+    })
+  } catch (error) {
+    record('failed')
+    logError('googlechatbot_stop_card_failed', error)
+    await replyInThread(client, payload, clampPlainText(
+      `⚠️ Couldn't stop the run: ${error instanceof Error ? error.message : String(error)}`
+    ))
+    return
+  }
+  if (response === 'stale') {
+    record('stale')
+    logInfo('googlechatbot_stop_card_stale', { space_name: payload.space_name })
+    return
+  }
+  record(response.interrupted ? 'interrupted' : 'no_active_run')
+  if (!response.interrupted) {
+    await replyInThread(client, payload, 'There is no active run in this thread to stop.')
+  }
+}
+
+/**
+ * A text stop persists its thread-wide intent first, outside any lock: a
+ * handoff that is still waiting on the session API reads it before it would
+ * execute, so the run never starts. A card stop persists only its work-scoped
+ * intent before the lock (see handleStopCard) and the thread-wide intent once
+ * its binding is validated. Then, under the thread handoff lock so no newer
+ * execution can slip in between, interrupt the execution that is active,
+ * unless it started from a message sent after this stop: an older stop never
+ * kills a newer turn. A stop also ends proactive replies until the next
+ * mention, unless it predates that mention.
+ */
+async function requestStop(
+  config: AppConfig,
+  state: StateAdapter,
+  stop: {
+    threadKey: string
+    requestedAt: number
+    reason: string
+    /** Extra binding for a Stop card, checked under the lock before any
+     * thread-wide effect; false means the card no longer names the active
+     * execution. */
+    boundTo?: (threadState: GoogleChatThreadState) => Promise<boolean>
+  }
+): Promise<InterruptSessionResponse | 'stale'> {
+  // The cutoff never moves backwards (updateThreadState keeps the max), and a
+  // stop older than the mention that opted the thread in leaves that opt-in.
+  const persistIntent = async () => {
+    const before = (await state.get<GoogleChatThreadState>(threadStateKey(stop.threadKey))) ?? {}
+    await updateThreadState(state, stop.threadKey, {
+      stopRequestedAt: stop.requestedAt,
+      ...(stop.requestedAt >= (before.proactiveEligibleAt ?? 0) ? { proactiveEligible: false } : {})
+    })
+  }
+  if (!stop.boundTo) await persistIntent()
+  return withThreadHandoff(state, stop.threadKey, async () => {
+    const threadState =
+      (await state.get<GoogleChatThreadState>(threadStateKey(stop.threadKey))) ?? {}
+    if (stop.boundTo) {
+      if (!(await stop.boundTo(threadState))) return 'stale'
+      await persistIntent()
+    }
+    const newerTurnActive =
+      threadState.activeExecution === true
+      && (threadState.lastExecutedAt ?? 0) > stop.requestedAt
+    if (newerTurnActive) {
+      logInfo('googlechatbot_stop_skipped_newer_turn', { thread_key: stop.threadKey })
+      return { interrupted: false }
+    }
+    return interruptSessionExecution(config, stop.threadKey, stop.reason)
+  })
+}
+
+async function replyInThread(
+  client: ChatEdgeClient,
+  payload: GoogleChatActionPayload,
+  text: string
+): Promise<void> {
+  try {
+    await client.createMessage(payload.space_name, { text }, {
+      ...(payload.thread_name ? { threadName: payload.thread_name } : {})
+    })
+  } catch (error) {
+    logError('googlechatbot_stop_reply_failed', error)
+  }
+}
+
+function proactiveSpaceAllowed(proactivity: ProactivityRuntime, spaceName: string): boolean {
+  return proactivity.spaces.includes(spaceName)
+}
+
+/**
+ * Whether an unmentioned message in an eligible thread should get a reply.
+ * Silent on every other outcome: the wrong space, a thread without a prior
+ * mention, an active run, an empty message, a decline, or a classifier error
+ * or timeout. The thread is re-checked after the decision because a stop or
+ * a new run may have landed while the classifier ran; the handoff lock makes
+ * the final check before any execution.
+ */
+async function shouldReplyProactively(
+  config: AppConfig,
+  client: ChatEdgeClient,
+  runtime: BotRuntime,
+  state: StateAdapter,
+  work: GoogleChatWorkObligation,
+  event: NormalizedChatEvent
+): Promise<boolean> {
+  const proactivity = runtime.proactivity
+  if (!proactivity) return false
+  const startedAt = Date.now()
+  const record = (outcome: string, fields: Record<string, unknown> = {}) => {
+    incr('googlechatbot_proactive_decisions_total', { outcome })
+    logInfo('googlechatbot_proactive_decision', {
+      outcome,
+      phase_ms: Date.now() - startedAt,
+      thread_key: event.thread_key,
+      ...fields
+    })
+  }
+  const skipReason = async () => {
+    if (event.space_type === 'DIRECT_MESSAGE' || !proactiveSpaceAllowed(proactivity, event.space_name)) {
+      return 'space'
+    }
+    const threadState = (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key))) ?? {}
+    if (threadState.proactiveEligible !== true) return 'not_eligible'
+    if (!proactiveStillCurrent(threadState, event)) return 'active_execution'
+    if (!normalizedEventText(event).trim()) return 'empty'
+    return undefined
+  }
+  const early = await skipReason()
+  if (early) {
+    record(`skip_${early}`)
+    return false
+  }
+  let decision
+  try {
+    const history = (await sharedThreadHistory(config, client, work, event))
+      .slice(-PROACTIVE_HISTORY_MESSAGES)
+      .map(message => proactiveThreadMessage(message))
+    decision = await decideWithTimeout(proactivity.classifier, {
+      botName: BOT_DISPLAY_NAME,
+      history,
+      message: {
+        author: event.user_name || event.user_id,
+        fromBot: false,
+        text: normalizedEventText(event)
+      }
+    }, proactivity.timeoutMs)
+  } catch (error) {
+    record('error', { error: error instanceof Error ? error.message : String(error) })
+    return false
+  }
+  if (!decision.respond) {
+    record('decline', { probability: decision.probability })
+    return false
+  }
+  const late = await skipReason()
+  if (late) {
+    record(`skip_${late}`, { probability: decision.probability })
+    return false
+  }
+  record('respond', { probability: decision.probability })
+  return true
+}
+
+function proactiveThreadMessage(
+  message: NonNullable<NormalizedChatEvent['history_messages']>[number]
+): ProactiveThreadMessage {
+  const userName = message.metadata?.user_name
+  return {
+    author: typeof userName === 'string' && userName ? userName : message.user_id ?? 'unknown',
+    fromBot: message.role === 'assistant',
+    text: message.parts.map(part => (part.type === 'text' ? part.text : '')).filter(Boolean).join('\n')
   }
 }
 
@@ -1714,6 +2457,7 @@ async function finishThreadRun(
   await updateThreadState(durableState, threadKey, {
     ...update,
     activeExecution: false,
+    activeExecutionId: null,
     activeRequesterEmail: null,
     steeringAckMessageNames: []
   })
@@ -1766,14 +2510,6 @@ function harnessDefaultReasoning(config: AppConfig): Record<string, string> {
 function conversationName(event: NormalizedChatEvent): string | undefined {
   if (event.space_type === 'DIRECT_MESSAGE') return event.user_name || undefined
   return undefined
-}
-
-/** Google gives synchronous handlers 30 seconds. Durable acceptance and the
- * empty JSON response happen first; the turn runs afterward. */
-function runInBackground(promise: Promise<void>): void {
-  void promise.catch((error: unknown) => {
-    logError('googlechatbot_event_processing_failed', error)
-  })
 }
 
 export function parseChatBody(rawBody: string): GoogleChatEnvelope | null {

@@ -23,6 +23,34 @@ export const INITIAL_STATUS = '_Centaur is thinking…_'
 export const STEERING_STATUS = '_Centaur · added to the running turn…_'
 export const BUSY_STATUS =
   "_Centaur · someone else's turn is still running in this thread. Ask again once it finishes._"
+export { STOP_CARD_FUNCTION } from './constants'
+
+/** How the Stop button calls back: a bare function name for Chat API apps,
+ * or the Add-on's exact HTTP endpoint plus an `actionName` parameter
+ * (https://developers.google.com/workspace/chat/convert, "Handle card
+ * interactions"). The click carries no trusted parameters either way: the
+ * bot binds the button to its turn through the message the card sits on. */
+export type StopCardAction = {
+  function: string
+  parameters?: Array<{ key: string; value: string }>
+}
+
+/** The Stop control shown on the acknowledgement while a turn is live. */
+export function stopControlCards(action: StopCardAction): NonNullable<GoogleChatMessage['cardsV2']> {
+  return [{
+    cardId: 'centaur-stop',
+    card: {
+      sections: [{
+        widgets: [{
+          buttonList: {
+            buttons: [{ text: '⏹ Stop', onClick: { action } }]
+          }
+        }]
+      }]
+    }
+  }]
+}
+
 const STATUS_FLUSH_INTERVAL_MS = 1_000
 const WRITE_INTERVAL_MS = 1_000
 const EMPTY_ANSWER_TEXT = 'Execution completed, but no final text was captured.'
@@ -60,6 +88,11 @@ export type RenderTarget = {
   plainTextOnly?: boolean
   /** Stable custom message ID makes fallback creation retry-safe after crashes. */
   fallbackMessageId?: string
+  /** Cards every status edit must keep on the acknowledgement (the Stop
+   * control). updateMessage PATCHes `text,cardsV2` together, so a status edit
+   * without them would silently strip the button. Re-read per edit so a stop
+   * that already landed is not re-added; the final replaces them. */
+  liveCards?: () => Promise<GoogleChatMessage['cardsV2']>
   /** Test seam; production uses one per-client, per-space write scheduler. */
   writeScheduler?: RendererWriteScheduler
 }
@@ -224,8 +257,9 @@ async function pulse(
   state.lastSignature = text
 
   try {
+    const cardsV2 = target.liveCards ? await target.liveCards() : undefined
     await rendererWrite(client, target).run(target.spaceName, () =>
-      client.updateMessage(target.ackMessageName, { text })
+      client.updateMessage(target.ackMessageName, { text, ...(cardsV2 ? { cardsV2 } : {}) })
     )
   } catch (error) {
     logWarn('googlechatbot_status_pulse_failed', error)
