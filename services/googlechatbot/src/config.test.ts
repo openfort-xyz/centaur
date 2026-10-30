@@ -12,6 +12,7 @@ describe('googlechatbot config', () => {
   test('accepts first-class Workspace Add-on authentication settings', () => {
     const config = loadConfig({
       GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: 'https://chat.example.test/api/chat/events',
       GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL: 'addon@example.iam.gserviceaccount.com',
       GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID: '123.apps.googleusercontent.com'
     })
@@ -23,6 +24,31 @@ describe('googlechatbot config', () => {
   test('allows an explicit local-development signature opt-out', () => {
     expect(loadConfig({ GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS: 'false' })
       .GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS).toBe(false)
+  })
+
+  test('a Workspace Add-on deployment addresses its Stop card to the validated endpoint', () => {
+    const { stopCardAction } = require('./config') as typeof import('./config')
+    const addon = loadConfig({
+      GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: 'https://chat.example.test/api/chat/events'
+    })
+    expect(stopCardAction(addon)).toEqual({
+      function: 'https://chat.example.test/api/chat/events',
+      parameters: [{ key: 'actionName', value: 'centaur_stop' }]
+    })
+    expect(stopCardAction(loadConfig({ GOOGLECHATBOT_PROJECT_NUMBER: '123' }))).toEqual({ function: 'centaur_stop' })
+    expect(stopCardAction(loadConfig({
+      GOOGLECHATBOT_INGRESS_MODE: 'chat_api_url',
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: 'https://chat.example.test/api/chat/events'
+    }))).toEqual({ function: 'centaur_stop' })
+    // No callback can be generated without a real https endpoint, so the
+    // deployment refuses to start rather than ship a dead button.
+    for (const audience of [undefined, '', 'chat.example.test/api', 'http://chat.example.test/api/chat/events']) {
+      expect(() => loadConfig({
+        GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+        ...(audience === undefined ? {} : { GOOGLECHATBOT_WEBHOOK_AUDIENCE: audience })
+      })).toThrow('GOOGLECHATBOT_WEBHOOK_AUDIENCE')
+    }
   })
 
   test('rejects a typo instead of silently disabling request signatures', () => {

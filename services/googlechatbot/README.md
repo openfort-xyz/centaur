@@ -26,13 +26,75 @@ domain, resolves the canonical app member, suppresses self/other-bot/ordinary
 unmentioned messages, and durably stores accepted messages or action events
 before returning `{}`.
 
-Google Chat has no streaming primitive. The bot creates one thinking message,
-applies bounded status edits while SSE is open, then PATCHes the final answer
-onto that acknowledgement. Ordinary answers use Chat text formatting; standalone
+Google Chat has no streaming primitive. The bot creates one thinking message
+carrying a Stop button, applies bounded status edits while SSE is open (each
+edit re-sends the button, because `updateMask=text,cardsV2` would otherwise
+strip it), then PATCHes the final answer onto that acknowledgement, which
+removes the button. Ordinary answers use Chat text formatting; standalone
 images use `cardsV2`, and a Console link may add a small card. Only overflow
 or a definitively missing acknowledgement uses a stable create. A Postgres-backed
 recovery sweep leases unfinished obligations after disconnects or restarts and
 delivers one canonical final answer.
+
+## Stop, steering, and serialization
+
+A mentioned `stop` (or any phrase `stop-command.ts` accepts) and the Stop
+button both interrupt the thread's active api-rs execution while the original
+response stream stays open; the live render then shows the interrupted
+result. The button's callback follows the ingress contract: Chat API modes
+(`chat_api_project`, `chat_api_url`) send the bare function name
+`centaur_stop`; a Workspace Add-on must address the app's own endpoint, so in
+`workspace_addon` mode the button's `function` is the validated
+`GOOGLECHATBOT_WEBHOOK_AUDIENCE` URL with an `actionName=centaur_stop`
+parameter, and the click arrives as a `buttonClickedPayload` whose
+`commonEventObject.invokedFunction` echoes that URL. A URL never names an
+action by itself. For a click, command, or form submission the contextual
+message is the card the app authored, so the verified Add-on user token is
+bound to the interacting `user`, never the card's sender; a MESSAGE is still
+bound to its actual sender. Stop intent is written to thread state before anything else, so a stop
+that lands while session creation or the execute call is still pending makes
+that turn finish as "Stopped before the run started" instead of executing.
+The button is bound to the acknowledgement it sits on through a durable record
+that is deleted at final and at stop; a click carries no trusted parameters,
+and the binding is checked under the thread's handoff lock, so a button from an
+earlier turn can never interrupt a newer execution. A stop whose Google event
+time predates the active turn's message is ignored.
+
+Each accepted obligation holds its own render lease (one process drives it,
+live or recovery). Thread ordering lives in a short, renewed handoff lock held
+only across session create, append-or-execute, and stop checks. A mentioned
+follow-up from the same verified requester therefore reaches the active
+execution (steering) while another process is still rendering it; a
+follow-up from anyone else in a shared space is refused with a "still
+running" notice, as before.
+
+## Contextual replies
+
+With `GOOGLECHATBOT_PROACTIVITY_ENABLED=true`, a mention in one of the exact
+`GOOGLECHATBOT_PROACTIVITY_SPACES` opts its thread in until a stop. Google
+pushes no unmentioned messages to a Chat app, so the bot polls
+`spaces.messages.list` for the listed spaces (every
+`GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS`, one poller per space across
+replicas, durable cursor, dedupe shared with the webhook, bot and mention
+messages skipped). Each collected message passes the same identity, domain,
+and timestamp checks as a webhook delivery. An unmentioned message in an
+eligible thread is classified with the OpenAI Decisions API using recent
+thread history; a decline, a classifier error or timeout, an ineligible
+thread, or a message seen while a run is active stays silent. An unmentioned
+message never steers an active execution and never starts one if a newer turn
+began after it was sent. A stop ends participation until the next mention.
+DMs are always addressed and never polled.
+
+## Original-message reaction
+
+Google's `spaces.messages.reactions.create` and `delete` reject app auth.
+When `GOOGLECHATBOT_REACTION_ACTOR_USER` names a Workspace user with a
+domain-wide-delegation grant for `chat.messages.reactions`, the bot reacts to
+the message that starts a turn as that user and removes the reaction when the
+turn ends, whatever the outcome. The reaction is visibly authored by that
+user, not the Chat app. Without an actor, or on any failure, the thinking
+message remains the only acknowledgement; a 403 disables further attempts for
+the process.
 
 The initial `--persona <id>` selection is pinned by api-rs for the session;
 later persona flags do not replace it. An unavailable requested persona produces
@@ -58,6 +120,15 @@ See `.env.example` and the `googlechatbot` Helm values. Important settings:
 | `GOOGLECHATBOT_ALLOWED_DOMAIN` | Additional comma/space-separated sender-domain filter. Empty is not an authentication control. |
 | `GOOGLECHATBOT_UPLOAD_USER` | Dedicated DWD upload subject; empty fails closed. |
 | `GOOGLECHATBOT_REACTION_READ_USER` | Dedicated DWD reaction-read subject; empty fails closed. |
+| `GOOGLECHATBOT_REACTION_ACTOR_USER` | DWD subject that writes the turn-start reaction (`chat.messages.reactions`); empty disables reactions. Never shares the read-only subject. |
+| `GOOGLECHATBOT_ACK_REACTION` | Unicode emoji for the turn-start reaction; default 👀. |
+| `GOOGLECHATBOT_PROACTIVITY_ENABLED` | Contextual replies in exact spaces; default `false`. |
+| `GOOGLECHATBOT_PROACTIVITY_SPACES` | Comma-separated `spaces/<id>` names; required when enabled. There is no all-spaces mode. |
+| `GOOGLECHATBOT_PROACTIVITY_CLASSIFIER` / `GOOGLECHATBOT_PROACTIVITY_MODEL` | `openai` on `gpt-6-luna` by default. |
+| `GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY` | Classifier key; falls back to `OPENAI_API_KEY`. Required when enabled. |
+| `GOOGLECHATBOT_PROACTIVITY_TIMEOUT_MS` / `GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS` | Decision deadline (default 2 s) and poll interval (default 5 s). |
+| `GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY` / `GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL` | `flags` (default) or `llm`, which classifies natural-language model requests with the OpenAI Decisions API on `gpt-6-luna`. |
+| `GOOGLECHATBOT_SHUTDOWN_DRAIN_MS` | How long SIGTERM waits for live turns; default 20 s. |
 | `GOOGLECHATBOT_DRIVE_DOWNLOAD_USER` | Dedicated DWD Drive-read subject; missing access degrades to attachment metadata. |
 | `GOOGLECHATBOT_THREAD_HISTORY_LIMIT` | Maximum prior thread messages collected per turn; default 50. |
 | `GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES` | Decoded attachment ceiling per executed turn; default 100 MiB. |
@@ -86,6 +157,7 @@ Operations that reject app auth use independent DWD subjects:
 | --- | --- |
 | `GOOGLECHATBOT_UPLOAD_USER` | `chat.messages.create` |
 | `GOOGLECHATBOT_REACTION_READ_USER` | `chat.messages.reactions.readonly` |
+| `GOOGLECHATBOT_REACTION_ACTOR_USER` | `chat.messages.reactions` (create and delete the turn-start reaction) |
 | `GOOGLECHATBOT_DRIVE_DOWNLOAD_USER` | `drive.readonly` |
 
 Uploads are authored by the impersonated upload user, not the Chat app. Keep
@@ -137,6 +209,30 @@ ceiling is 100 MiB; the agent CLI defaults to 10 MiB and refuses overwrite.
 The production server waits for state before binding its port. Chat and control
 requests have bounded connect/request timeouts; the established SSE stream is
 not killed by its connect timeout.
+
+On SIGTERM the bot fails readiness, keeps answering webhooks briefly, waits
+up to `GOOGLECHATBOT_SHUTDOWN_DRAIN_MS` for live turns, then exits. A turn
+still running is recovered by the next process from its durable obligation.
+Recovery discovers pending work by querying the work records themselves on
+Postgres (the rolling list index only serves in-memory test adapters), so an
+old unfinished obligation is never evicted from discovery by later work. Work
+and handoff leases use the state adapter's token-checked locks, and a lease's
+authority ends at a conservative deadline (the time its last renewal was
+issued plus the TTL) enforced by its own timer, so a renewal that hangs or
+answers late never stretches ownership past the row's real expiry; an expired
+owner cannot renew or release a successor's lease and stops mutating once it
+loses ownership. Sweeps launch up to eight obligations in the background so one
+hung stream cannot block the backlog.
+
+### Rolling out the lock-based leases
+
+Earlier releases leased a whole thread through a cache entry; this release
+leases each obligation through the locks table, and the two schemes do not
+see each other. The chart deploys googlechatbot with `updateStrategy:
+Recreate` so an old and a new replica never drive the same obligation during
+the first rollout; legacy obligations are ordinary work records and are
+recovered by the new process. `RollingUpdate` is safe again once every running
+replica uses this scheme.
 
 ## Harness routing
 

@@ -374,6 +374,222 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
     assert_response :unauthorized
   end
 
+  test "an admin's Google Chat DM sandbox manages roles, grants, secrets, access, and workflow principals" do
+    secret = static_secrets(:acme_staging_api_key)
+
+    with_token(gchat_dm_proxy_for(users(:acme_admin))) do |headers|
+      get "/api/v1/sandbox/admin/principals", headers: headers
+      assert_response :ok
+      assert_includes json_body.fetch("data").map { |principal| principal["id"] }, @channel.oid
+
+      get "/api/v1/sandbox/admin/roles/lookup/#{@role.foreign_id}", headers: headers
+      assert_response :ok
+      post "/api/v1/sandbox/admin/principals/#{@channel.oid}/roles",
+           params: { data: { role_id: json_body.dig("data", "id") } }, headers: headers, as: :json
+      assert_response :created
+      assert_includes @channel.reload.roles, @role
+      delete "/api/v1/sandbox/admin/principals/#{@channel.oid}/roles/#{@role.oid}", headers: headers
+      assert_response :no_content
+
+      get "/api/v1/sandbox/admin/secrets", params: { q: secret.name }, headers: headers
+      assert_response :ok
+      assert_includes json_body.fetch("data").map { |row| row["id"] }, secret.oid
+      post "/api/v1/sandbox/admin/grants",
+           params: { data: { principal_id: @channel.oid, static_secret_id: secret.oid } }, headers: headers, as: :json
+      assert_response :created
+      grant_id = json_body.dig("data", "id")
+      assert_equal users(:acme_admin), Grant.find_by_oid!(grant_id).created_by
+      get "/api/v1/sandbox/admin/principals/#{@channel.oid}/effective_grants", headers: headers
+      assert_response :ok
+      assert_includes json_body.fetch("data").map { |row| row["id"] }, secret.oid
+      get "/api/v1/sandbox/admin/principals/#{@channel.oid}/grants", headers: headers
+      assert_includes json_body.fetch("data").map { |grant| grant["id"] }, grant_id
+      delete "/api/v1/sandbox/admin/grants/#{grant_id}", headers: headers
+      assert_response :no_content
+      assert_not_includes @channel.reload.granted_static_secrets, secret
+
+      patch "/api/v1/sandbox/admin/static_secrets/#{secret.oid}",
+            params: { data: { description: "From Google Chat" } }, headers: headers, as: :json
+      assert_response :ok
+      assert_equal "From Google Chat", secret.reload.description
+
+      patch "/api/v1/sandbox/admin/principals/#{@channel.oid}/sandbox_access",
+            params: { data: { sandbox_workflows_write_enabled: true } }, headers: headers, as: :json
+      assert_response :ok
+      assert @channel.reload.sandbox_workflows_write_enabled
+
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "workflow", workflow_name: "Weekly_Digest" } }, headers: headers, as: :json
+      assert_response :created
+      assert_equal users(:acme_admin), Principal.find_by_oid!(json_body.dig("data", "id")).created_by
+    end
+  end
+
+  test "only a verified Google Chat DM linked to an active admin with a matching requester can change roles" do
+    admin = users(:acme_admin)
+    other_admin = users(:globex_admin)
+    proxies = {
+      "shared space" => gchat_proxy_for(admin, kind: "gchat_space"),
+      "bare Google requester principal" => gchat_proxy_for(admin, kind: "gchat_user"),
+      "unverified DM without an email" => gchat_dm_proxy_for(admin, email: nil),
+      "DM whose turn has no requester" => gchat_dm_proxy_for(admin, requester_email: nil),
+      "DM whose requester is another person" => gchat_dm_proxy_for(admin, requester_email: other_admin.email),
+      "DM whose requester is not a gchat_user principal" =>
+        gchat_dm_proxy_for(admin, requester_kind: "gchat_dm"),
+      "DM linked to an admin with a different email" => gchat_dm_proxy_for(admin, email: other_admin.email,
+                                                                               requester_email: other_admin.email),
+      "DM of a non-admin" => gchat_dm_proxy_for(users(:member_user)),
+      "DM of a disabled admin" => gchat_dm_proxy_for(users(:disabled_user).tap { |u| u.update!(admin: true) })
+    }
+
+    proxies.each do |label, proxy|
+      with_token(proxy) do |headers|
+        post "/api/v1/sandbox/admin/principals/#{@channel.oid}/roles",
+             params: { data: { role_id: @role.oid } }, headers: headers, as: :json
+      end
+      assert_response :forbidden, label
+    end
+    assert_not_includes @channel.reload.roles, @role
+  end
+
+  test "a Google Chat admin DM cannot run Slack-scoped operations" do
+    api = FakeSlackExternalTeamsApi.new(%w[T0PARTNER1])
+    with_slack_external_teams_api(api) do
+      with_token(gchat_dm_proxy_for(users(:acme_admin))) do |headers|
+        [
+          [ :post, "/api/v1/sandbox/admin/principals", { kind: "slack_channel", slack_channel_id: "C0NEW12345" } ],
+          [ :post, "/api/v1/sandbox/admin/principals", { kind: "slack_dm", slack_user_id: "U0NEWUSER1" } ],
+          [ :post, "/api/v1/sandbox/admin/principals/#{@channel.oid}/slack_channel_permissions",
+            { channel_id: "C0999999999" } ],
+          [ :delete, "/api/v1/sandbox/admin/principals/#{@channel.oid}/slack_channel_permissions/c0123456789", nil ],
+          [ :get, "/api/v1/sandbox/admin/slack_external_teams", nil ],
+          [ :post, "/api/v1/sandbox/admin/slack_external_teams", { team_id: "E0GRID" } ],
+          [ :delete, "/api/v1/sandbox/admin/slack_external_teams/T0PARTNER1", nil ]
+        ].each do |method, path, data|
+          assert_no_difference [ "Principal.count", "SlackChannelPermission.count" ] do
+            send(method, path, params: data && { data: data }, headers: headers, as: :json)
+          end
+          assert_response :forbidden, "#{method} #{path}"
+        end
+      end
+    end
+    assert_equal %w[T0PARTNER1], api.team_ids
+    assert_equal 0, api.replacements
+  end
+
+  test "an admin's Google Chat DM sandbox sets and removes Google Chat space and DM permissions" do
+    version = -> { @channel.reload.sync_config_cache_version }
+
+    with_token(gchat_dm_proxy_for(users(:acme_admin))) do |headers|
+      post "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_space_permissions",
+           params: { data: { space_name: "spaces/AAAA1111", send_enabled: false } }, headers: headers, as: :json
+      assert_response :created
+      permission = @channel.google_chat_space_permissions.find_by!(space_name: "spaces/AAAA1111")
+      assert_not permission.send_enabled
+      assert permission.history_enabled && permission.upload_enabled
+
+      post "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_space_permissions",
+           params: { data: { space_name: "SPACES/AAAA1111", history_enabled: false } }, headers: headers, as: :json
+      assert_response :ok
+      assert_equal [ false, false ], permission.reload.values_at(:send_enabled, :history_enabled)
+      assert_equal 1, @channel.google_chat_space_permissions.count
+
+      assert_changes version do
+        delete "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_space_permissions/AAAA1111",
+               headers: headers
+      end
+      assert_response :no_content
+      assert_not @channel.google_chat_space_permissions.exists?(space_name: "spaces/AAAA1111")
+
+      post "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_dm_permissions",
+           params: { data: { target_identity: " Ada@Example.com ", setup_enabled: true } }, headers: headers, as: :json
+      assert_response :created
+      assert_equal({ "target_identity" => "ada@example.com", "setup_enabled" => true }, json_body.fetch("data"))
+      assert @channel.google_chat_dm_permissions.exists?(target_identity: "ada@example.com")
+
+      delete "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_dm_permissions/Ada%40example.com",
+             headers: headers
+      assert_response :no_content
+      assert_not @channel.google_chat_dm_permissions.exists?(target_identity: "ada@example.com")
+    end
+  end
+
+  test "Google Chat permission changes reject bad targets, other principals' rows, and non-Google DMs" do
+    other = principals(:acme_user_alice)
+    other.google_chat_space_permissions.create!(space_name: "spaces/OTHER0001", send_enabled: true)
+    other.google_chat_dm_permissions.create!(target_identity: "other@example.com", setup_enabled: true)
+    space_path = "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_space_permissions"
+    dm_path = "/api/v1/sandbox/admin/principals/#{@channel.oid}/google_chat_dm_permissions"
+
+    with_token(gchat_dm_proxy_for(users(:acme_admin))) do |headers|
+      post space_path, params: { data: { space_name: "not a space" } }, headers: headers, as: :json
+      assert_response :unprocessable_entity
+      post space_path, params: { data: { space_name: "spaces/AAAA1111", send_enabled: false, update_enabled: false,
+                                         delete_enabled: false, upload_enabled: false, download_enabled: false,
+                                         history_enabled: false, members_enabled: false, reactions_enabled: false } },
+                       headers: headers, as: :json
+      assert_response :unprocessable_entity
+      post dm_path, params: { data: { target_identity: "users/123456", setup_enabled: true } }, headers: headers, as: :json
+      assert_response :unprocessable_entity
+      post dm_path, params: { data: { target_identity: "ada@example.com", setup_enabled: false } },
+                    headers: headers, as: :json
+      assert_response :unprocessable_entity
+
+      delete "#{space_path}/OTHER0001", headers: headers
+      assert_response :not_found
+      delete "#{dm_path}/other%40example.com", headers: headers
+      assert_response :not_found
+    end
+    assert other.google_chat_space_permissions.exists?(space_name: "spaces/OTHER0001")
+    assert other.google_chat_dm_permissions.exists?(target_identity: "other@example.com")
+    assert_empty @channel.google_chat_space_permissions
+    assert_empty @channel.google_chat_dm_permissions
+
+    requests = [
+      [ :post, space_path, { space_name: "spaces/AAAA1111" } ],
+      [ :delete, "#{space_path}/AAAA1111", nil ],
+      [ :post, dm_path, { target_identity: "ada@example.com", setup_enabled: true } ],
+      [ :delete, "#{dm_path}/ada%40example.com", nil ]
+    ]
+    { "Slack admin DM" => dm_proxy_for(users(:acme_admin)),
+      "non-admin Google DM" => gchat_dm_proxy_for(users(:member_user)) }.each do |label, proxy|
+      with_token(proxy) do |headers|
+        requests.each do |method, path, data|
+          send(method, path, params: data && { data: data }, headers: headers, as: :json)
+          assert_response :forbidden, "#{label} #{method} #{path}"
+        end
+      end
+    end
+    assert_empty @channel.google_chat_space_permissions
+    assert_empty @channel.google_chat_dm_permissions
+  end
+
+  test "a Google Chat admin token is bound to its proxy assignment and audience" do
+    proxy = gchat_dm_proxy_for(users(:acme_admin))
+    dm = proxy.principal
+
+    stale_headers = nil
+    with_token(proxy) { |headers| stale_headers = headers }
+    proxy.update!(principal: @channel)
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      post "/api/v1/sandbox/admin/principals/#{@channel.oid}/roles",
+           params: { data: { role_id: @role.oid } }, headers: stale_headers, as: :json
+    end
+    assert_response :unauthorized
+
+    proxy.update!(principal: dm)
+    foreign_headers = nil
+    with_env("CENTAUR_SANDBOX_ENTITLEMENTS_JWT_AUDIENCE" => "other-namespace") do
+      with_token(proxy) { |headers| foreign_headers = headers }
+    end
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      post "/api/v1/sandbox/admin/principals/#{@channel.oid}/roles",
+           params: { data: { role_id: @role.oid } }, headers: foreign_headers, as: :json
+    end
+    assert_response :unauthorized
+    assert_not_includes @channel.reload.roles, @role
+  end
+
   private
 
   # Stands in for api-rs, which stores the allowlist.
@@ -428,6 +644,33 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
     )
     Proxy.create!(name: "proxy-#{name}".downcase, principal: principal,
                   bearer_token_hash: Digest::SHA256.hexdigest(name))
+  end
+
+  # A signature-verified 1:1 Google Chat DM: api-rs stamps the requester's
+  # email on the DM space principal and binds the per-person gchat_user
+  # principal as the turn's requester. Passing nil for either omits it.
+  def gchat_dm_proxy_for(user, email: user.email, requester_email: email, requester_kind: "gchat_user")
+    requester = requester_email && gchat_principal(requester_kind, requester_email, "requester-#{requester_kind}")
+    gchat_proxy_for(user, kind: "gchat_dm", email: email, requester: requester)
+  end
+
+  def gchat_proxy_for(user, kind:, email: user.email, requester: nil)
+    principal = gchat_principal(kind, email, "dm-#{user.id}", console_user: user)
+    Proxy.create!(name: "proxy-#{principal.foreign_id}-#{SecureRandom.hex(4)}", principal: principal,
+                  requester_principal: requester, bearer_token_hash: Digest::SHA256.hexdigest(SecureRandom.hex(16)))
+  end
+
+  def gchat_principal(kind, email, slug, console_user: nil)
+    labels = { "gchat_space_id" => "SPACE#{slug.upcase.tr('-', '')}" }
+    labels["google_email"] = email if email
+    Principal.create!(
+      foreign_id: "gchat-#{kind}-#{slug}-#{SecureRandom.hex(4)}",
+      name: "Google Chat #{kind} #{slug}",
+      kind: kind,
+      labels: labels,
+      console_user: console_user,
+      created_by: users(:acme_admin)
+    )
   end
 
   def with_token(proxy)

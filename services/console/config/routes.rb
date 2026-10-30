@@ -280,7 +280,9 @@ Rails.application.routes.draw do
             delete :remove_editor, path: "editors"
           end
         end
-        # Permission management from an active Console admin's Slack DM.
+        # Permission management from an active Console admin's Slack or Google
+        # Chat DM. Platform permissions are removed by their target (channel id,
+        # space id, email) because the sandbox payloads carry no permission ids.
         namespace :admin do
           resources :principals, only: %i[index show create] do
             collection do
@@ -291,6 +293,11 @@ Rails.application.routes.draw do
               patch "sandbox_access", action: :update_sandbox_access
               post "slack_channel_permissions", action: :upsert_slack_channel_permission
               delete "slack_channel_permissions/:channel_id", action: :destroy_slack_channel_permission
+              post "google_chat_space_permissions", action: :upsert_google_chat_space_permission
+              delete "google_chat_space_permissions/:space_id", action: :destroy_google_chat_space_permission
+              post "google_chat_dm_permissions", action: :upsert_google_chat_dm_permission
+              delete "google_chat_dm_permissions/:target_identity", action: :destroy_google_chat_dm_permission,
+                     constraints: { target_identity: /[^\/]+/ }
             end
             resources :roles, only: %i[index create destroy], controller: :principal_roles
             resources :grants, only: %i[index], controller: :grantee_grants

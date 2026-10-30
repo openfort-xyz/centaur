@@ -35,7 +35,20 @@ const COUNTERS: CounterSpec[] = [
   { name: 'googlechatbot_dedupe_total', help: 'Durable event dedupe outcomes.' },
   { name: 'googlechatbot_recovery_total', help: 'Durable work recovery outcomes.' },
   { name: 'googlechatbot_upstream_timeouts_total', help: 'Upstream timeouts by operation.' },
-  { name: 'googlechatbot_delivery_total', help: 'Google Chat delivery attempts by outcome.' }
+  { name: 'googlechatbot_delivery_total', help: 'Google Chat delivery attempts by outcome.' },
+  {
+    name: 'googlechatbot_proactive_decisions_total',
+    help: 'Unmentioned messages in eligible threads by proactive decision outcome.'
+  },
+  {
+    name: 'googlechatbot_proactive_collected_total',
+    help: 'Messages listed by the proactive poller by disposition.'
+  },
+  { name: 'googlechatbot_proactive_poll_total', help: 'Proactive poll passes per space by outcome.' },
+  {
+    name: 'googlechatbot_reactions_total',
+    help: 'Delegated reaction writes on the original message by operation and outcome.'
+  }
 ]
 
 const GAUGES: CounterSpec[] = [

@@ -6,7 +6,7 @@ import { renderMetrics, resetMetrics } from './metrics'
 import { createMemoryState } from '@chat-adapter/state-memory'
 import {
   WORK_INDEX_KEY,
-  persistWork,
+  acceptWork,
   threadStateKey,
   workKey,
   type GoogleChatThreadState,
@@ -249,7 +249,7 @@ describe('googlechatbot webhook e2e', () => {
       stage: 'accepted',
       workId: crypto.randomUUID()
     }
-    await persistWork(state, work)
+    await acceptWork(state, work)
     await state.disconnect()
 
     const realConnect = state.connect.bind(state)
@@ -590,7 +590,7 @@ describe('googlechatbot webhook e2e', () => {
         stage: 'rendering',
         workId: crypto.randomUUID()
       }
-      await persistWork(state, work)
+      await acceptWork(state, work)
       await state.disconnect()
 
       const realConnect = state.connect.bind(state)
@@ -653,7 +653,7 @@ describe('googlechatbot webhook e2e', () => {
         stage,
         workId: crypto.randomUUID()
       }
-      await persistWork(state, work)
+      await acceptWork(state, work)
       await state.disconnect()
       const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })
       let deliveries = 0
@@ -698,9 +698,9 @@ describe('googlechatbot webhook e2e', () => {
       dedupeKey: 'stale', workId: crypto.randomUUID() }
     const exhausted = { ...actionable, action: undefined, failures: 5,
       dedupeKey: 'exhausted', workId: crypto.randomUUID() }
-    await persistWork(state, actionable)
-    await persistWork(state, stale)
-    await persistWork(state, exhausted)
+    await acceptWork(state, actionable)
+    await acceptWork(state, stale)
+    await acceptWork(state, exhausted)
     await state.disconnect()
 
     let dispatches = 0
@@ -1208,7 +1208,7 @@ describe('googlechatbot DM thread transcript', () => {
       stage: 'rendering',
       workId: crypto.randomUUID()
     }
-    await persistWork(state, work)
+    await acceptWork(state, work)
     await state.disconnect()
 
     const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })
@@ -1252,7 +1252,7 @@ describe('googlechatbot DM thread transcript', () => {
         stage: 'rendering',
         workId: crypto.randomUUID()
       }
-      await persistWork(state, work)
+      await acceptWork(state, work)
       await state.disconnect()
 
       const runtime = createGooglechatbot(loadConfig(CHATBOT_ENV), { state })

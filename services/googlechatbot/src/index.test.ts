@@ -670,6 +670,31 @@ describe('googleChatCardClickPayload', () => {
     expect(payload).toBeNull()
   })
 
+  test('an Add-on click echoing the endpoint URL resolves its action from the actionName parameter', () => {
+    const endpoint = 'https://chat.example.test/api/chat/events'
+    const click = (common: Record<string, unknown>) => parseChatBody(JSON.stringify({
+      commonEventObject: common,
+      chat: {
+        eventTime: '2026-01-01T00:00:00Z',
+        user: { name: 'users/U1' },
+        buttonClickedPayload: {
+          space: { name: 'spaces/AAAA', spaceType: 'DIRECT_MESSAGE' },
+          message: { name: 'spaces/AAAA/messages/ACK' }
+        }
+      }
+    }))!
+    expect(googleChatWorkflowEvent(click({ invokedFunction: endpoint, parameters: { actionName: 'centaur_stop' } })))
+      .toMatchObject({ event_name: 'google_chat.card_click.centaur_stop', payload: { invoked_function: 'centaur_stop' } })
+    expect(googleChatWorkflowEvent(click({ invokedFunction: endpoint, parameters: { method: 'approve' } })))
+      .toMatchObject({ payload: { invoked_function: 'approve' } })
+    // The URL alone names no action; nothing is dispatched or stopped.
+    expect(googleChatWorkflowEvent(click({ invokedFunction: endpoint }))).toBeNull()
+    expect(googleChatWorkflowEvent(click({ invokedFunction: 'http://chat.example.test/x', parameters: {} }))).toBeNull()
+    // A Chat API app's bare function name still wins over parameters.
+    expect(googleChatWorkflowEvent(click({ invokedFunction: 'approve', parameters: { actionName: 'centaur_stop' } })))
+      .toMatchObject({ payload: { invoked_function: 'approve' } })
+  })
+
   test('normalizes Workspace Add-ons button, command, and form payloads', () => {
     const fixtures = [
       {

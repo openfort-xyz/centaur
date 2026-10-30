@@ -627,6 +627,37 @@
           "enum": ["first", "always", "never"]
         },
         "responseServiceTierEnabled": { "type": "boolean" },
+        "messageOverridesStrategy": {
+          "type": "object",
+          "properties": {
+            "mode": { "type": "string", "enum": ["flags", "llm"] },
+            "model": { "type": "string", "minLength": 1 },
+            "openaiBaseUrl": { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "proactivity": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "classifier": { "type": "string", "enum": ["openai"] },
+            "model": { "type": "string", "minLength": 1 },
+            "openaiBaseUrl": { "type": "string" },
+            "spaces": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "timeoutMs": { "type": "integer", "minimum": 1 },
+            "pollIntervalMs": { "type": "integer", "minimum": 1000 }
+          }
+        },
+        "reactionActorUser": { "type": "string" },
+        "ackReaction": { "type": "string", "minLength": 1 },
+        "shutdown": {
+          "type": "object",
+          "properties": {
+            "drainMs": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "updateStrategy": { "type": "string", "enum": ["Recreate", "RollingUpdate"] },
         "ingress": {
           "type": "object",
           "properties": {
@@ -653,7 +684,6 @@
           "additionalProperties": { "type": "string" }
         },
         "resources": { "type": "object" }
-
       }
     },
     "externalDatabase": {

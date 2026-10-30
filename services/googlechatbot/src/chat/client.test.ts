@@ -1586,3 +1586,101 @@ describe('ChatEdgeClient sender email lookup', () => {
       .rejects.toThrow('Admin SDK user lookup failed: 403')
   })
 })
+
+describe('ChatEdgeClient Stop card and delegated reactions', () => {
+  const serviceAccount = JSON.stringify({
+    client_email: 'bot@example.iam.gserviceaccount.com',
+    private_key: 'fixture-only'
+  })
+
+  test('a cards-only update masks only cardsV2 and carries placeholder text Google ignores', async () => {
+    // Verified live: a body of just {cardsV2: []} is rejected as empty (400)
+    // even with updateMask=cardsV2, while a nonempty text under the same mask
+    // succeeds and leaves the message text unchanged.
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) })
+      return Response.json({ name: 'spaces/A/messages/M1', text: 'the final answer' })
+    }) as typeof fetch
+    const client = new ChatEdgeClient(loadConfig({}))
+    await client.updateMessageCards('spaces/A/messages/M1', [])
+    expect(requests).toHaveLength(1)
+    const url = new URL(requests[0]!.url)
+    expect(url.searchParams.get('updateMask')).toBe('cardsV2')
+    expect(requests[0]!.body.cardsV2).toEqual([])
+    expect(typeof requests[0]!.body.text).toBe('string')
+    expect((requests[0]!.body.text as string).length).toBeGreaterThan(0)
+    expect(Object.keys(requests[0]!.body).sort()).toEqual(['cardsV2', 'text'])
+  })
+
+  test('reactions are created and deleted as the delegated actor with the read-write scope', async () => {
+    const exchanges: Array<{ scope: string; sub?: string }> = []
+    const requests: Array<{ method: string; url: string; auth?: string; body?: unknown }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://oauth2.googleapis.com/token') {
+        const assertion = new URLSearchParams(String(init?.body)).get('assertion') ?? ''
+        const claims = JSON.parse(Buffer.from(assertion.split('.')[1]!, 'base64url').toString()) as {
+          scope: string
+          sub?: string
+        }
+        exchanges.push({ scope: claims.scope, ...(claims.sub ? { sub: claims.sub } : {}) })
+        return Response.json({ access_token: `token-${exchanges.length}`, expires_in: 3600 })
+      }
+      const headers = new Headers(init?.headers)
+      requests.push({
+        method: init?.method ?? 'GET',
+        url,
+        auth: headers.get('authorization') ?? undefined,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined
+      })
+      if ((init?.method ?? 'GET') === 'DELETE') return new Response(null, { status: 204 })
+      return Response.json({ name: 'spaces/A/messages/M1/reactions/R1', emoji: { unicode: '👀' } })
+    }) as typeof fetch
+    const pair = await generateRsaKeyPair()
+    const pkcs8 = await crypto.subtle.exportKey('pkcs8', pair.privateKey)
+    const privateKey = [
+      '-----BEGIN PRIVATE KEY-----',
+      Buffer.from(pkcs8).toString('base64'),
+      '-----END PRIVATE KEY-----'
+    ].join('\n')
+    const client = new ChatEdgeClient(loadConfig({
+      GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
+        client_email: 'bot@example.iam.gserviceaccount.com', private_key: privateKey
+      }),
+      GOOGLECHATBOT_REACTION_ACTOR_USER: 'actor@example.com',
+      GOOGLECHATBOT_REACTION_READ_USER: 'reader@example.com'
+    }))
+    expect(client.canWriteReactions()).toBe(true)
+
+    const reaction = await client.createReaction('spaces/A/messages/M1', '👀')
+    expect(reaction.name).toBe('spaces/A/messages/M1/reactions/R1')
+    await client.deleteReaction(reaction.name!)
+
+    expect(exchanges).toEqual([{
+      scope: 'https://www.googleapis.com/auth/chat.messages.reactions', sub: 'actor@example.com'
+    }])
+    expect(requests.map(r => [r.method, r.url, r.auth])).toEqual([
+      ['POST', 'https://chat.googleapis.com/v1/spaces/A/messages/M1/reactions', 'Bearer token-1'],
+      ['DELETE', 'https://chat.googleapis.com/v1/spaces/A/messages/M1/reactions/R1', 'Bearer token-1']
+    ])
+    expect(requests[0]!.body).toEqual({ emoji: { unicode: '👀' } })
+  })
+
+  test('without an actor the read-only reaction subject is never repurposed for writes', async () => {
+    let fetched = 0
+    globalThis.fetch = (async () => {
+      fetched += 1
+      return Response.json({})
+    }) as unknown as typeof fetch
+    const client = new ChatEdgeClient(loadConfig({
+      GOOGLE_SERVICE_ACCOUNT_JSON: serviceAccount,
+      GOOGLECHATBOT_REACTION_READ_USER: 'reader@example.com'
+    }))
+    expect(client.canReadReactions()).toBe(true)
+    expect(client.canWriteReactions()).toBe(false)
+    await expect(client.createReaction('spaces/A/messages/M1', '👀')).rejects.toBeInstanceOf(ChatConfigurationError)
+    await expect(client.deleteReaction('spaces/A/messages/M1/reactions/R1')).rejects.toBeInstanceOf(ChatConfigurationError)
+    expect(fetched).toBe(0)
+  })
+})

@@ -5,7 +5,7 @@ import { createGooglechatbot } from '../src/index'
 import { generateRsaKeyPair, signJwt } from '../src/chat/test-jwt'
 import {
   WORK_INDEX_KEY,
-  persistWork,
+  acceptWork,
   workKey,
   type GoogleChatWorkObligation
 } from '../src/state'
@@ -311,7 +311,7 @@ async function runRestartRenderSmoke(): Promise<void> {
     stage: 'rendering',
     workId: crypto.randomUUID()
   }
-  await persistWork(state, work)
+  await acceptWork(state, work)
   await state.disconnect()
 
   const connect = state.connect.bind(state)

@@ -27,6 +27,8 @@ metadata:
 {{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
 spec:
   replicas: {{ .Values.googlechatbot.replicaCount }}
+  strategy:
+    type: {{ .Values.googlechatbot.updateStrategy }}
   selector:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 6 }}
@@ -42,6 +44,7 @@ spec:
         centaur.ai/metrics: googlechatbot
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.googlechatbot.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
@@ -161,8 +164,33 @@ spec:
               value: {{ .Values.googlechatbot.messageOverridesStrategy.openaiBaseUrl | quote }}
             - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_TIMEOUT_MS
               value: {{ .Values.googlechatbot.messageOverridesStrategy.timeoutMs | quote }}
-            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS
-              value: {{ .Values.googlechatbot.messageOverridesStrategy.maxOutputTokens | quote }}
+            - name: GOOGLECHATBOT_PROACTIVITY_ENABLED
+              value: {{ .Values.googlechatbot.proactivity.enabled | quote }}
+{{- if .Values.googlechatbot.proactivity.enabled }}
+{{- if not .Values.googlechatbot.proactivity.spaces }}
+{{- fail "googlechatbot.proactivity.spaces must list the exact spaces when proactivity is enabled" }}
+{{- end }}
+            - name: GOOGLECHATBOT_PROACTIVITY_CLASSIFIER
+              value: {{ .Values.googlechatbot.proactivity.classifier | quote }}
+            - name: GOOGLECHATBOT_PROACTIVITY_MODEL
+              value: {{ .Values.googlechatbot.proactivity.model | quote }}
+            - name: GOOGLECHATBOT_PROACTIVITY_OPENAI_BASE_URL
+              value: {{ .Values.googlechatbot.proactivity.openaiBaseUrl | quote }}
+            - name: GOOGLECHATBOT_PROACTIVITY_SPACES
+              value: {{ join "," .Values.googlechatbot.proactivity.spaces | quote }}
+            - name: GOOGLECHATBOT_PROACTIVITY_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.proactivity.timeoutMs | quote }}
+            - name: GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS
+              value: {{ .Values.googlechatbot.proactivity.pollIntervalMs | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.reactionActorUser }}
+            - name: GOOGLECHATBOT_REACTION_ACTOR_USER
+              value: {{ .Values.googlechatbot.reactionActorUser | quote }}
+            - name: GOOGLECHATBOT_ACK_REACTION
+              value: {{ .Values.googlechatbot.ackReaction | quote }}
+{{- end }}
+            - name: GOOGLECHATBOT_SHUTDOWN_DRAIN_MS
+              value: {{ .Values.googlechatbot.shutdown.drainMs | quote }}
             - name: GOOGLECHATBOT_RESPONSE_METADATA_MODE
               value: {{ .Values.googlechatbot.responseMetadataMode | quote }}
             - name: GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED

@@ -23,6 +23,16 @@ ADMIN_WRITABLE_SECRET_PATHS = {
     "pg_dsn": SANDBOX_ADMIN_PG_DSN_SECRETS_PATH,
 }
 SANDBOX_ADMIN_SLACK_EXTERNAL_TEAMS_PATH = "/api/v1/sandbox/admin/slack_external_teams"
+GOOGLE_SPACE_PERMISSION_FLAGS = (
+    "send",
+    "update",
+    "delete",
+    "upload",
+    "download",
+    "history",
+    "members",
+    "reactions",
+)
 ADMIN_PAGE_LIMIT = 200
 
 
@@ -355,6 +365,56 @@ class ConsoleClient:
             method="DELETE",
         )
 
+    def admin_set_google_space_permission(
+        self, principal: str, space: str, **flags: bool | None
+    ) -> dict[str, Any]:
+        """Create or update a principal's Google Chat space permission.
+
+        `space` is `spaces/<id>` or the bare id. Flags are `send`, `update`,
+        `delete`, `upload`, `download`, `history`, `members`, and `reactions`;
+        new permissions default every unspecified flag to enabled.
+        """
+        data: dict[str, Any] = {"space_name": _google_space_name(space)}
+        for key, value in flags.items():
+            if key not in GOOGLE_SPACE_PERMISSION_FLAGS:
+                raise ValueError(f"unknown Google Chat space permission flag: {key}")
+            if value is not None:
+                data[f"{key}_enabled"] = value
+        principal_id = self._admin_principal_id(principal)
+        return self._admin_object(
+            f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/{principal_id}/google_chat_space_permissions",
+            method="POST",
+            json={"data": data},
+        )
+
+    def admin_remove_google_space_permission(self, principal: str, space: str) -> None:
+        """Remove a principal's own permission for a Google Chat space."""
+        principal_id = self._admin_principal_id(principal)
+        space_id = _google_space_name(space).removeprefix("spaces/")
+        self._admin_request(
+            f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/{principal_id}/google_chat_space_permissions/"
+            f"{quote(space_id, safe='')}",
+            method="DELETE",
+        )
+
+    def admin_set_google_dm_permission(self, principal: str, email: str) -> dict[str, Any]:
+        """Allow a principal to set up a Google Chat DM with the person at `email`."""
+        principal_id = self._admin_principal_id(principal)
+        return self._admin_object(
+            f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/{principal_id}/google_chat_dm_permissions",
+            method="POST",
+            json={"data": {"target_identity": email, "setup_enabled": True}},
+        )
+
+    def admin_remove_google_dm_permission(self, principal: str, email: str) -> None:
+        """Remove a principal's own Google Chat DM permission for `email`."""
+        principal_id = self._admin_principal_id(principal)
+        self._admin_request(
+            f"{SANDBOX_ADMIN_PRINCIPALS_PATH}/{principal_id}/google_chat_dm_permissions/"
+            f"{quote(email, safe='')}",
+            method="DELETE",
+        )
+
     def admin_set_sandbox_access(self, principal: str, **capabilities: Any) -> dict[str, Any]:
         """Update selected sandbox capabilities, such as sandbox_sessions_read_enabled."""
         data = {key: value for key, value in capabilities.items() if value is not None}
@@ -515,6 +575,12 @@ class ConsoleClient:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+def _google_space_name(space: str) -> str:
+    """`spaces/<id>` for a bare id or an already-qualified space name."""
+    space = space.strip()
+    return space if space.startswith("spaces/") else f"spaces/{space}"
 
 
 def _response_error_detail(response: httpx.Response) -> str:

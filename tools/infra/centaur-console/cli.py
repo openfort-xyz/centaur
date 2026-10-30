@@ -18,9 +18,11 @@ console = Console()
 admin_app = typer.Typer(
     help=(
         "Create Slack and workflow principals and static or pg_dsn secrets, and manage roles, "
-        "secret grants, Slack permissions, sandbox access, "
+        "secret grants, Slack and Google Chat permissions, sandbox access, "
         "and allowed Slack Connect workspaces. "
-        "Works only in an active Console admin's Slack DM."
+        "Works only in an active Console admin's Slack or Google Chat DM; "
+        "Slack principals, Slack permissions, and Slack Connect workspaces need a Slack DM, "
+        "and Google Chat space/DM permissions need a Google Chat DM."
     )
 )
 app.add_typer(admin_app, name="admin")
@@ -444,6 +446,81 @@ def admin_remove_slack_permission(
         client.admin_remove_slack_permission(principal, channel_id)
     console.print_json(
         json.dumps({"data": {"principal": principal, "channel_id": channel_id, "removed": True}})
+    )
+
+
+@admin_app.command("set-google-space-permission")
+def admin_set_google_space_permission(
+    principal: str = typer.Argument(..., help="Principal OID or foreign ID"),
+    space: str = typer.Argument(..., help="Google Chat space name (spaces/<id>) or id"),
+    send: bool | None = typer.Option(None, "--send/--no-send"),
+    update: bool | None = typer.Option(None, "--update/--no-update"),
+    delete: bool | None = typer.Option(None, "--delete/--no-delete"),
+    upload: bool | None = typer.Option(None, "--upload/--no-upload"),
+    download: bool | None = typer.Option(None, "--download/--no-download"),
+    history: bool | None = typer.Option(None, "--history/--no-history"),
+    members: bool | None = typer.Option(None, "--members/--no-members"),
+    reactions: bool | None = typer.Option(None, "--reactions/--no-reactions"),
+    url: str | None = URL_OPTION,
+    bearer_token: str | None = BEARER_TOKEN_OPTION,
+) -> None:
+    """Create or update a Google Chat space permission. New ones enable unspecified flags."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        result = client.admin_set_google_space_permission(
+            principal,
+            space,
+            send=send,
+            update=update,
+            delete=delete,
+            upload=upload,
+            download=download,
+            history=history,
+            members=members,
+            reactions=reactions,
+        )
+    console.print_json(json.dumps({"data": result}, default=str))
+
+
+@admin_app.command("remove-google-space-permission")
+def admin_remove_google_space_permission(
+    principal: str = typer.Argument(..., help="Principal OID or foreign ID"),
+    space: str = typer.Argument(..., help="Google Chat space name (spaces/<id>) or id"),
+    url: str | None = URL_OPTION,
+    bearer_token: str | None = BEARER_TOKEN_OPTION,
+) -> None:
+    """Remove a principal's own permission for a Google Chat space."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        client.admin_remove_google_space_permission(principal, space)
+    console.print_json(
+        json.dumps({"data": {"principal": principal, "space": space, "removed": True}})
+    )
+
+
+@admin_app.command("set-google-dm-permission")
+def admin_set_google_dm_permission(
+    principal: str = typer.Argument(..., help="Principal OID or foreign ID"),
+    email: str = typer.Argument(..., help="Email of the person the principal may DM"),
+    url: str | None = URL_OPTION,
+    bearer_token: str | None = BEARER_TOKEN_OPTION,
+) -> None:
+    """Allow a principal to set up a Google Chat DM with a person, by email."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        result = client.admin_set_google_dm_permission(principal, email)
+    console.print_json(json.dumps({"data": result}, default=str))
+
+
+@admin_app.command("remove-google-dm-permission")
+def admin_remove_google_dm_permission(
+    principal: str = typer.Argument(..., help="Principal OID or foreign ID"),
+    email: str = typer.Argument(..., help="Email of the person the principal may DM"),
+    url: str | None = URL_OPTION,
+    bearer_token: str | None = BEARER_TOKEN_OPTION,
+) -> None:
+    """Remove a principal's own Google Chat DM permission for a person."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        client.admin_remove_google_dm_permission(principal, email)
+    console.print_json(
+        json.dumps({"data": {"principal": principal, "email": email, "removed": True}})
     )
 
 
