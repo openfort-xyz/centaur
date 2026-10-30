@@ -153,6 +153,7 @@ jobs:
             '^\.github/workflows/ci\.yml$'
           set_output rust_api \
             '^Cargo\.(toml|lock)$' \
+            '^crates/harness-server/' \
             '^crates/absurd-sdk/' \
             '^crates/active-record-encryption/' \
             '^crates/centaur-' \
