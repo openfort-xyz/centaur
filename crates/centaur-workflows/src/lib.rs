@@ -38,6 +38,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+pub mod action_attestation;
 pub mod slack_button_feedback;
 pub mod slack_buttons;
 
@@ -56,8 +57,9 @@ const GOOGLECHATBOT_INTERNAL_API_KEY_ENV: &str = "GOOGLECHATBOT_INTERNAL_API_KEY
 const GOOGLE_CHAT_DWD_DM_SYNC_ENABLED_ENV: &str = "GOOGLE_CHAT_DWD_DM_SYNC_ENABLED";
 const GOOGLE_CHAT_DWD_DM_SUBJECTS_ENV: &str = "GOOGLE_CHAT_DWD_DM_SUBJECTS";
 const GOOGLE_CHAT_DWD_SUBJECT_HEADER: &str = "x-centaur-google-chat-dwd-subject";
-const WORKFLOW_HOST_SECRET_ENV_KEYS: [&str; 2] = [
+const WORKFLOW_HOST_SECRET_ENV_KEYS: [&str; 3] = [
     "GOOGLE_SERVICE_ACCOUNT_JSON",
+    "WORKFLOW_ACTION_ATTESTATION_KEY",
     GOOGLECHATBOT_INTERNAL_API_KEY_ENV,
 ];
 const DEFAULT_GOOGLECHATBOT_INTERNAL_URL: &str = "http://centaur-centaur-googlechatbot:3002";
@@ -5884,19 +5886,26 @@ mod tests {
         assert!(!is_workflow_host_secret_env_key(
             "GOOGLE_CHAT_DWD_DM_SUBJECTS"
         ));
+        assert!(is_workflow_host_secret_env_key(
+            "WORKFLOW_ACTION_ATTESTATION_KEY"
+        ));
+        assert!(is_workflow_host_secret_env_key(
+            "PROD_WORKFLOW_ACTION_ATTESTATION_KEY"
+        ));
         let mut command = Command::new("/bin/sh");
         command
             .args([
                 "-c",
-                "printf '%s|%s' \"${GOOGLE_SERVICE_ACCOUNT_JSON-unset}\" \"${GOOGLECHATBOT_INTERNAL_API_KEY-unset}\"",
+                "printf '%s|%s|%s' \"${GOOGLE_SERVICE_ACCOUNT_JSON-unset}\" \"${GOOGLECHATBOT_INTERNAL_API_KEY-unset}\" \"${WORKFLOW_ACTION_ATTESTATION_KEY-unset}\"",
             ])
             .env("GOOGLE_SERVICE_ACCOUNT_JSON", "service-account-secret")
-            .env("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-secret");
+            .env("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-secret")
+            .env("WORKFLOW_ACTION_ATTESTATION_KEY", "attestation-secret");
         scrub_workflow_host_secret_env(&mut command);
 
         let output = command.output().await.unwrap();
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"unset|unset");
+        assert_eq!(output.stdout, b"unset|unset|unset");
     }
 
     #[test]
