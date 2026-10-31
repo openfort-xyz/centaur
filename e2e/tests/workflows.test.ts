@@ -3,7 +3,7 @@
 // Python host's durable context methods, including an agent turn on a real
 // harness, and Slack buttons a workflow posts, clicked in Slack. Workflow files are written into the api-rs pod's workflow
 // directory, which is what WORKFLOW_DIRS points at on this stack.
-import { randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { expect, test } from 'bun:test'
 import {
   CHANNEL,
@@ -314,4 +314,48 @@ test('other Slack block actions reach workflows as events, without their respons
   })
   expect(JSON.stringify(event)).not.toContain('response_url')
   expect(JSON.stringify(event)).not.toContain('e2e-response-token')
+}, 120_000)
+
+
+test('opted-in workflow buttons attest the verified click and visible card', async () => {
+  const target = uniqueName('attested_target')
+  const asker = uniqueName('attested_asker')
+  const actionId = randomUUID()
+  const preview = 'Approve this exact fixture action?'
+  await addWorkflow(target, slackPoster(target, '    return params'))
+  await addWorkflow(asker, slackPoster(asker, `    from api.workflow_engine import Button
+    return await ctx.slack_buttons(
+        "ask", channel=params["channel"], text="${preview}", workflow="${target}",
+        input={"action_id": "${actionId}", "_attest_action": True},
+        buttons={"accept": Button("Accept and send", style="primary"), "cancel": Button("Cancel")},
+    )`))
+  const asked = await startRun(asker, { channel: CHANNEL.id })
+  const posted = (await waitForRun(asked.run_id, 'completed')).result.output
+  const message = await slack.message(CHANNEL, posted.ts)
+  const buttons = message.blocks?.flatMap(block => block.elements ?? []) ?? []
+  const accept = buttons.find(button => button.action_id?.endsWith(':accept'))?.action_id
+  const cancel = buttons.find(button => button.action_id?.endsWith(':cancel'))?.action_id
+  if (!accept || !cancel) throw new Error('fixture did not post both decision buttons')
+  expect((await slack.click(CHANNEL, posted.ts, accept, { as: USER_B })).status).toBe(200)
+  const started = await eventually('the attested target run', 30_000, async () => (await runsOf(target))[0])
+  const output = (await waitForRun(started.run_id, 'completed')).result.output
+  expect(output._attest_action).toBeUndefined()
+  const [version, encoded, signature] = output.action_attestation.split('.')
+  expect(version).toBe('v1')
+  expect(signature).toBe(createHmac('sha256', 'centaur-e2e-action-attestation-key')
+    .update(`${version}.${encoded}`).digest('base64url'))
+  const claims = JSON.parse(Buffer.from(encoded, 'base64url').toString())
+  const visible = createHash('sha256')
+  for (const field of [preview, 'Accept and send', accept, 'primary', 'Cancel', cancel, '']) {
+    const bytes = Buffer.from(field)
+    const size = Buffer.alloc(8)
+    size.writeBigUInt64BE(BigInt(bytes.length))
+    visible.update(size).update(bytes)
+  }
+  expect(claims).toMatchObject({
+    kind: 'workflow_action', workflow: target, action_id: actionId,
+    user_id: USER_B.id, channel_id: CHANNEL.id, message_ts: posted.ts,
+    action: 'accept', message_sha256: visible.digest('hex')
+  })
+  expect(claims.exp - claims.iat).toBe(900)
 }, 120_000)

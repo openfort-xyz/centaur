@@ -38,6 +38,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+pub mod action_attestation;
 pub mod slack_button_feedback;
 pub mod slack_buttons;
 
@@ -1917,6 +1918,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
 
+    scrub_action_attestation_env(&mut command);
     let mut child = command.spawn().map_err(|error| {
         WorkflowRuntimeError::Internal(format!(
             "failed to spawn Python workflow host {}: {error}",
@@ -3016,6 +3018,7 @@ async fn run_python_workflow_host_local(
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
 
+    scrub_action_attestation_env(&mut command);
     let mut child = command.spawn().map_err(|error| {
         WorkflowRuntimeError::Internal(format!(
             "failed to spawn Python workflow host {}: {error}",
@@ -4180,6 +4183,20 @@ where
     stdin.write_all(&line).await?;
     stdin.flush().await?;
     Ok(())
+}
+
+fn scrub_action_attestation_env(command: &mut Command) {
+    let names: Vec<_> = env::vars_os()
+        .map(|(name, _)| name)
+        .chain(command.as_std().get_envs().map(|(name, _)| name.to_owned()))
+        .filter(|name| {
+            name.to_str()
+                .is_some_and(|name| name.ends_with("WORKFLOW_ACTION_ATTESTATION_KEY"))
+        })
+        .collect();
+    for name in names {
+        command.env_remove(name);
+    }
 }
 
 fn python_workflow_host_path() -> PathBuf {
@@ -5920,5 +5937,22 @@ mod tests {
 
         set_execution_persona_metadata(&mut metadata, None);
         assert!(metadata.get("persona").is_none());
+    }
+}
+
+#[cfg(test)]
+mod action_attestation_env_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn python_host_does_not_receive_attestation_keys() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%s|%s' \"${WORKFLOW_ACTION_ATTESTATION_KEY-unset}\" \"${PROD_WORKFLOW_ACTION_ATTESTATION_KEY-unset}\""])
+            .env("WORKFLOW_ACTION_ATTESTATION_KEY", "fixture-secret")
+            .env("PROD_WORKFLOW_ACTION_ATTESTATION_KEY", "fixture-secret");
+        scrub_action_attestation_env(&mut command);
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"unset|unset");
     }
 }

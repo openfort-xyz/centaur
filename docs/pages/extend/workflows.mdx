@@ -248,6 +248,39 @@ A workflow using a dataclass `Input` can type this field as `ButtonClick` from
 
 The receiving workflow owns authorization, the message update, and the action:
 
+For a credential-holding backend that must distinguish verified clicks from ordinary
+workflow input, configure `WORKFLOW_ACTION_ATTESTATION_KEY` on API servers and that
+backend only. Use at least 32 random bytes and never pass this key into sandboxes or
+workflow hosts. The API's existing Secret environment wiring supports the setting.
+Workflow host startup removes the key, including prefixed environment variants.
+
+After ingress authorization and button-signature verification, the action-invoke
+endpoint replaces any input `action_attestation`. When input contains a UUID
+`action_id` and `_attest_action: true`, it supplies a proof formatted as
+`v1.<base64url-json-without-padding>.<base64url-hmac-sha256-without-padding>`.
+The MAC covers the exact UTF-8 `v1.<body>` bytes. Claims contain `kind` equal to
+`workflow_action`, `workflow`, `action_id`, the verified click's `id`, `action`,
+`user_id`, `team_id`, `channel_id`, `message_ts`, `action_ts`, `message_sha256`, and integer Unix `iat`
+and `exp` timestamps. Proofs expire after 900 seconds. Without the setting, no
+proof is produced and caller-supplied proof input is still discarded on this path.
+The reserved `_attest_action` marker is removed before starting the receiver.
+Without opt-in, existing workflow input schemas receive no additional field.
+
+`message_sha256` binds the visible card supplied in the verified interaction.
+Attestation accepts only the helper's section/actions card without attachments,
+extra visible blocks or URL/confirmation button overrides. The fallback text must
+match the section's Markdown. Hash the section text followed by each button's
+label, action ID and style in order, using an empty string for absent style.
+For each string, append its UTF-8 byte length as eight big-endian bytes, then its
+UTF-8 bytes, and SHA-256 the concatenation. Compare this with the backend's stored
+expected card. This prevents an edited preview or misleading button label from
+authorizing an action with the original signed button value.
+
+Ordinary workflow starts, schedules and child workflows do not generate this proof.
+An external backend must verify the MAC, expiry, original message, action and human
+permissions, then atomically consume its own business operation. This proof grants
+no provider permission and does not replace replay protection or authorization.
+
 ```python
 WORKFLOW_NAME = "review_release"
 

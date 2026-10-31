@@ -105,6 +105,7 @@ struct StaticCaller {
 pub struct ApiAuthConfig {
     static_callers: Arc<Vec<StaticCaller>>,
     jwt_secret: Arc<str>,
+    action_attestation_key: Option<Arc<str>>,
     jwt_audience: Arc<str>,
     jwt_issuer: Arc<str>,
 }
@@ -117,6 +118,15 @@ impl ApiAuthConfig {
         let jwt_issuer = optional_env("CENTAUR_API_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_API_JWT_ISSUER.to_owned());
 
+        let action_attestation_key = optional_env("WORKFLOW_ACTION_ATTESTATION_KEY");
+        if action_attestation_key
+            .as_ref()
+            .is_some_and(|key| key.len() < 32)
+        {
+            return Err(ApiAuthConfigError::InvalidEnvironment(
+                "WORKFLOW_ACTION_ATTESTATION_KEY",
+            ));
+        }
         let mut callers = Vec::new();
         if let Some(token) = optional_env("CENTAUR_APIRS_ADMIN_API_KEY") {
             callers.push(static_caller(
@@ -152,6 +162,7 @@ impl ApiAuthConfig {
         Ok(Self {
             static_callers: Arc::new(callers),
             jwt_secret: jwt_secret.into(),
+            action_attestation_key: action_attestation_key.map(Into::into),
             jwt_audience: jwt_audience.into(),
             jwt_issuer: jwt_issuer.into(),
         })
@@ -161,6 +172,7 @@ impl ApiAuthConfig {
         Self {
             static_callers: Arc::new(Vec::new()),
             jwt_secret: Arc::from(jwt_secret.into()),
+            action_attestation_key: None,
             jwt_audience: Arc::from(DEFAULT_API_JWT_AUDIENCE),
             jwt_issuer: Arc::from(DEFAULT_API_JWT_ISSUER),
         }
@@ -187,6 +199,7 @@ impl ApiAuthConfig {
         Self {
             static_callers: Arc::new(callers),
             jwt_secret: Arc::from(jwt_secret.into()),
+            action_attestation_key: None,
             jwt_audience: Arc::from(DEFAULT_API_JWT_AUDIENCE),
             jwt_issuer: Arc::from(DEFAULT_API_JWT_ISSUER),
         }
@@ -196,8 +209,30 @@ impl ApiAuthConfig {
         &self,
         request: centaur_workflows::slack_buttons::Invocation,
     ) -> Result<centaur_workflows::CreateWorkflowRunRequest, ApiError> {
-        centaur_workflows::slack_buttons::verify(request, self.jwt_secret.as_bytes())
-            .map_err(|error| ApiError::Forbidden(error.into()))
+        let clicked_message = request.message.clone();
+        let mut request =
+            centaur_workflows::slack_buttons::verify(request, self.jwt_secret.as_bytes())
+                .map_err(|error| ApiError::Forbidden(error.into()))?;
+        // Discard user input even when attestation is disabled.
+        let opt_in = if let Some(input) = request.input.as_object_mut() {
+            input.remove("action_attestation");
+            input.remove("_attest_action") == Some(serde_json::json!(true))
+        } else {
+            false
+        };
+        if opt_in
+            && let Some(key) = &self.action_attestation_key
+            && let Some(proof) = centaur_workflows::action_attestation::sign(
+                &request.input,
+                &request.workflow_name,
+                clicked_message.as_ref(),
+                key.as_bytes(),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+        {
+            request.input["action_attestation"] = serde_json::json!(proof);
+        }
+        Ok(request)
     }
 
     pub(crate) fn authenticate(
@@ -277,6 +312,8 @@ impl ApiAuthConfig {
 pub enum ApiAuthConfigError {
     #[error("{0} is required for api-rs authentication")]
     MissingEnvironment(&'static str),
+    #[error("{0} must contain at least 32 bytes")]
+    InvalidEnvironment(&'static str),
     #[error("api-rs authentication keys for {first} and {second} must be distinct")]
     DuplicateToken { first: String, second: String },
 }
@@ -408,6 +445,56 @@ mod tests {
     use crate::routes::thread_key_matches_platform;
 
     #[test]
+    fn only_verified_button_path_replaces_caller_attestation() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let group = "00000000-0000-0000-0000-000000000001";
+        let invocation = |opt_in: bool| {
+            let mut message = json!({"channel": "D1", "text": "Exact preview", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "Exact preview"}},
+                {"type": "actions", "elements": [{
+                "type": "button", "text": {"type": "plain_text", "text": "Accept and send"},
+                "action_id": format!("centaur.workflow.action:{group}:accept"),
+                "value": json!({"workflow_name": "resolve_action_approval", "input": {
+                    "action_id": group, "_attest_action": opt_in, "action_attestation": "FORGED", "click": {"user_id": "FORGED"}
+                }}).to_string()
+            }]}]});
+            centaur_workflows::slack_buttons::sign_message(&mut message, b"jwt-secret").unwrap();
+            centaur_workflows::slack_buttons::Invocation {
+                button: message["blocks"][1]["elements"][0]["value"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                click: json!({"id": group, "action": "accept", "user_id": "U1", "team_id": "T1",
+                    "channel_id": "D1", "message_ts": "1.0", "action_ts": "2.0"}),
+                idempotency_key: "click-key".into(),
+                message: Some(message),
+            }
+        };
+        let mut auth = ApiAuthConfig::testing("jwt-secret");
+        let disabled = auth.verify_workflow_button(invocation(true)).unwrap();
+        assert!(disabled.input.get("action_attestation").is_none());
+        auth.action_attestation_key = Some(Arc::from("01234567890123456789012345678901"));
+        let ordinary = auth.verify_workflow_button(invocation(false)).unwrap();
+        assert!(ordinary.input.get("action_attestation").is_none());
+        assert!(ordinary.input.get("_attest_action").is_none());
+        let verified = auth.verify_workflow_button(invocation(true)).unwrap();
+        let proof = verified.input["action_attestation"].as_str().unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(proof.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["user_id"], "U1");
+        assert_eq!(claims["action_id"], group);
+        assert_eq!(claims["message_ts"], "1.0");
+        assert_eq!(
+            claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+            900
+        );
+    }
+
+    #[test]
     fn authenticates_console_service_jwt() {
         let auth = ApiAuthConfig::testing("jwt-secret");
         let token = encode(
@@ -445,6 +532,7 @@ mod tests {
                 None,
             )]),
             jwt_secret: Arc::from("jwt-secret"),
+            action_attestation_key: None,
             jwt_audience: Arc::from(DEFAULT_API_JWT_AUDIENCE),
             jwt_issuer: Arc::from(DEFAULT_API_JWT_ISSUER),
         };

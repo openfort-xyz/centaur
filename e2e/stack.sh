@@ -39,6 +39,7 @@ SLACK_BOT_TOKEN=xoxb-centaur-e2e
 SLACK_SIGNING_SECRET=centaur-e2e-signing-secret
 # Admin bearer for api-rs operator routes the tests call.
 API_ADMIN_KEY=centaur-e2e-api-admin-key
+ACTION_ATTESTATION_KEY=centaur-e2e-action-attestation-key
 OPENAI_TEST_KEY=sk-e2e-openai-test-key
 ANTHROPIC_TEST_KEY=sk-ant-e2e-anthropic-test-key
 # Subscription access tokens as the console's broker would mint them, and the
@@ -123,7 +124,7 @@ up() {
     contrib/scripts/bootstrap-k8s-secrets.sh --namespace "$NAMESPACE"
   # iron-proxy's env secret source resolves the provider keys from here.
   kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p \
-    "{\"stringData\":{\"OPENAI_API_KEY\":\"$OPENAI_TEST_KEY\",\"ANTHROPIC_API_KEY\":\"$ANTHROPIC_TEST_KEY\",\"OPENAI_CODEX_ACCOUNT_ID\":\"$CHATGPT_ACCOUNT_ID\",\"CENTAUR_APIRS_ADMIN_API_KEY\":\"$API_ADMIN_KEY\"}}" > /dev/null
+    "{\"stringData\":{\"OPENAI_API_KEY\":\"$OPENAI_TEST_KEY\",\"ANTHROPIC_API_KEY\":\"$ANTHROPIC_TEST_KEY\",\"OPENAI_CODEX_ACCOUNT_ID\":\"$CHATGPT_ACCOUNT_ID\",\"CENTAUR_APIRS_ADMIN_API_KEY\":\"$API_ADMIN_KEY\",\"WORKFLOW_ACTION_ATTESTATION_KEY\":\"$ACTION_ATTESTATION_KEY\"}}" > /dev/null
   # iron-proxy pods mount the release CA at this path; trusting it lets them
   # verify the model server, whose certificate the same CA signs below.
   kubectl -n "$NAMESPACE" create secret generic centaur-e2e-iron-proxy-env \
