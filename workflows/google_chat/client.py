@@ -58,7 +58,11 @@ class GoogleChatReadonlyClient:
 
     def _transport(self) -> Any:
         if self._http is None:
-            self._http = build_http(timeout=CHAT_HTTP_TIMEOUT_SECONDS)
+            # The shared upstream helper takes no timeout argument, so the
+            # bound is set here; httplib2 applies `timeout` to every connection.
+            http = build_http()
+            http.timeout = CHAT_HTTP_TIMEOUT_SECONDS
+            self._http = http
         return self._http
 
     def _get(self, url: str) -> dict[str, Any]:

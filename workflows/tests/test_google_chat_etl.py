@@ -276,6 +276,21 @@ class _FakeTransport:
         return types.SimpleNamespace(status=200), b"{}"
 
 
+def test_client_transport_uses_shared_helper_with_bounded_timeout(monkeypatch):
+    """The real transport must build: a helper signature drift raised TypeError
+    for every app-auth Chat request (2026-10-06) while stubbed tests passed."""
+    import httplib2
+
+    from workflows.google_chat.client import CHAT_HTTP_TIMEOUT_SECONDS, GoogleChatReadonlyClient
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    transport = GoogleChatReadonlyClient(None)._transport()
+
+    assert isinstance(transport, httplib2.Http)
+    assert transport.timeout == CHAT_HTTP_TIMEOUT_SECONDS
+    assert transport.proxy_info.proxy_host == "proxy.invalid"
+
+
 def test_client_builds_space_scoped_urls():
     from workflows.google_chat.client import GoogleChatReadonlyClient
 
