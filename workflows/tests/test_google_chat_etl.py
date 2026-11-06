@@ -441,6 +441,75 @@ def test_readonly_reactions_use_fixed_broker_identity():
     ]
 
 
+class FlakyBroker:
+    def __init__(self, *errors):
+        self.errors = list(errors)
+        self.calls = 0
+
+    async def google_chat_dwd_read(self, subject, operation, **kwargs):
+        self.calls += 1
+        if self.errors:
+            raise RuntimeError(self.errors.pop(0))
+        return {"emojiReactions": []}
+
+
+def _record_sleeps(monkeypatch):
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return sleeps
+
+
+def test_broker_reads_retry_transient_failures(monkeypatch):
+    sleeps = _record_sleeps(monkeypatch)
+    ctx = FlakyBroker(
+        "Google Chat DWD broker request failed",
+        "Google Chat DWD broker request failed with status 502 Bad Gateway",
+    )
+
+    result = asyncio.run(
+        chat_client.GoogleChatReadonlyClient(ctx).list_reactions("spaces/S1/messages/M1")
+    )
+
+    assert result == {"emojiReactions": []}
+    assert ctx.calls == 3
+    assert len(sleeps) == 2
+
+
+def test_broker_rejections_are_not_retried(monkeypatch):
+    _record_sleeps(monkeypatch)
+    ctx = FlakyBroker("Google Chat DWD broker request failed with status 403 Forbidden")
+
+    try:
+        asyncio.run(chat_client.GoogleChatReadonlyClient(ctx).list_reactions("spaces/S1/messages/M1"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a 403 from the broker must fail the read")
+    assert ctx.calls == 1
+
+
+def test_exhausted_broker_retries_report_the_broker_reason(monkeypatch):
+    _record_sleeps(monkeypatch)
+    ctx = FlakyBroker(*["Google Chat DWD broker request failed"] * 3)
+    client = chat_client.GoogleChatDelegatedClient(ctx, "alice@example.com")
+
+    try:
+        asyncio.run(client.list_messages("spaces/S1"))
+    except RuntimeError as error:
+        failure = error
+    else:
+        raise AssertionError("the read must fail once retries run out")
+
+    assert ctx.calls == 3
+    assert chat_sync._safe_error(failure) == (
+        "Google Chat API request failed (Google Chat DWD broker request failed)"
+    )
+
+
 def test_incremental_filter_matches_the_broker_contract():
     timestamp = dt.datetime(2026, 8, 1, 0, 0, 0, 123456, tzinfo=dt.UTC)
     assert f'createTime > "{chat_sync._rfc3339(timestamp)}"' == (
