@@ -92,10 +92,10 @@ describe('finalizeRender surface selection', () => {
       }
       await consumeRenderStream(stubClient(capture), interrupted(), target(), state)
       // Both live delivery and recovery persist this answer before finalization.
-      expect(state.answer).toBe(answer || 'Execution interrupted')
+      expect(state.answer).toBe(answer || 'Execution interrupted.')
       expect(state.terminal).toBe(true)
       await finalizeRender(stubClient(capture), target(), state)
-      expect(capture.body?.text).toBe(answer || 'Execution interrupted')
+      expect(capture.body?.text).toBe(answer || 'Execution interrupted.')
       expect(capture.body?.cardsV2).toEqual([])
     }
   })
