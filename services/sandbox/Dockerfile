@@ -67,8 +67,6 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
-# gcloud's bundled pip only installs components, which the apt package
-# disables; it vendors msgpack/setuptools with HIGH CVEs, so it is removed.
 ARG NODE_VERSION=24.22.1
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -89,7 +87,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && node --version | grep -Fx "v${NODE_VERSION}" \
     && gcloud --version >/dev/null \
     && bq version >/dev/null \
-    && rm -rf /usr/lib/google-cloud-sdk/platform/bundledpythonunix/lib/python3.14/site-packages/pip \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Non-root agent user ─────────────────────────────────────────────────────
@@ -176,17 +173,12 @@ ENV PI_TELEMETRY=0 \
 # this venv's interpreter; the `hermes` shim serves cron ticks + CLI use.
 # Hermes intentionally rejects wheel builds because its runtime assets depend
 # on the source-checkout layout, so install the pinned checkout editable.
-# The pinned ref holds Pillow/PyJWT/certifi/urllib3 versions with HIGH and
-# CRITICAL CVEs; upgrade them to the versions Hermes main pins. Drop that
-# step once HERMES_AGENT_REF carries them for this Python.
 RUN git init /opt/hermes-agent \
     && git -C /opt/hermes-agent remote add origin https://github.com/NousResearch/hermes-agent.git \
     && git -C /opt/hermes-agent fetch --depth 1 origin "${HERMES_AGENT_REF}" \
     && git -C /opt/hermes-agent checkout --detach FETCH_HEAD \
     && python3 -m venv /opt/hermes \
     && /opt/hermes/bin/pip install --no-cache-dir --editable /opt/hermes-agent \
-    && /opt/hermes/bin/pip install --no-cache-dir \
-      "Pillow==13.0.0" "PyJWT[crypto]==2.15.1" "certifi==2026.10.19" "urllib3==2.8.0" \
     && rm -rf /opt/hermes-agent/.git \
     && ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes \
     && hermes version
