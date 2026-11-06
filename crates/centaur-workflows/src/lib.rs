@@ -75,7 +75,6 @@ const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
 const WORKFLOW_ALLOWED_NAMES_ENV: &str = "WORKFLOW_ALLOWED_NAMES";
-const SESSION_SANDBOX_HARNESS_ENV: &str = "SESSION_SANDBOX_HARNESS";
 const MAX_LIST_RUNS_LIMIT: i64 = 1_000;
 /// How many consecutive reconcile passes a workflow must be missing from
 /// discovery before its active tasks are cancelled. 0 disables reaping.
@@ -232,21 +231,6 @@ fn parse_workflow_allowed_names(raw: &str) -> BTreeSet<String> {
             (!name.is_empty()).then(|| name.to_owned())
         })
         .collect()
-}
-
-/// Harness for workflow agent turns that do not pin one themselves (a workflow
-/// pins its own via `AGENT_DEFAULTS["harness"]`). Follows the control plane's
-/// `SESSION_SANDBOX_HARNESS` so workflows run on the same harness as every
-/// other session instead of a separate hardcoded one.
-fn default_workflow_harness() -> HarnessType {
-    parse_default_workflow_harness(env::var(SESSION_SANDBOX_HARNESS_ENV).ok().as_deref())
-}
-
-fn parse_default_workflow_harness(raw: Option<&str>) -> HarnessType {
-    raw.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| HarnessType::from_str(value).ok())
-        .unwrap_or(HarnessType::ClaudeCode)
 }
 
 #[derive(Clone)]
@@ -921,9 +905,7 @@ impl WorkflowRuntime {
                 WorkflowTaskInput {
                     workflow_name: workflow_name.to_owned(),
                     input: request.input,
-                    harness_type: request
-                        .harness_type
-                        .unwrap_or_else(default_workflow_harness),
+                    harness_type: request.harness_type.unwrap_or(HarnessType::Codex),
                     slack_button_feedback: feedback,
                 },
                 SpawnOptions {
@@ -2547,7 +2529,7 @@ async fn run_schedule_tick(
             WorkflowTaskInput {
                 workflow_name: schedule.workflow_name.clone(),
                 input: schedule.input.clone(),
-                harness_type: default_workflow_harness(),
+                harness_type: HarnessType::Codex,
                 slack_button_feedback: None,
             },
             SpawnOptions {
@@ -5289,25 +5271,6 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-
-    #[test]
-    fn default_workflow_harness_follows_session_sandbox_harness() {
-        assert_eq!(
-            parse_default_workflow_harness(Some("codex")),
-            HarnessType::Codex
-        );
-        assert_eq!(
-            parse_default_workflow_harness(Some(" claudecode ")),
-            HarnessType::ClaudeCode
-        );
-        for raw in [None, Some(""), Some("  "), Some("not-a-harness")] {
-            assert_eq!(
-                parse_default_workflow_harness(raw),
-                HarnessType::ClaudeCode,
-                "workflows must fall back to Claude Code, not Codex; raw={raw:?}"
-            );
-        }
-    }
 
     async fn assert_structured_host_error_is_bounded(message_type: &str) {
         let stderr_task = tokio::spawn(async {
