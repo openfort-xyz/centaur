@@ -44,7 +44,7 @@ ENV LIBCLANG_PATH=/usr/lib/llvm-22/lib
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip3 install --break-system-packages --no-compile --ignore-installed "packaging>=24.2.0" \
     && pip3 install --break-system-packages --no-compile \
-    python-docx==1.2.0 lxml==6.1.3 docx-revisions==0.1.4 \
+    python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
     faster-whisper \
@@ -97,8 +97,8 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
 ARG CLAUDE_CODE_VERSION=2.1.310
-ARG CODEX_VERSION=0.165.0
-ARG PI_CODING_AGENT_VERSION=1.4.0
+ARG CODEX_VERSION=0.160.1
+ARG PI_CODING_AGENT_VERSION=1.0.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG NUSHELL_VERSION=0.112.2
@@ -219,7 +219,7 @@ ARG FOUNDRY_VERSION=v1.7.0
 ARG AMP_CLI_VERSION=0.0.1792995770-gba80ba
 ARG MANIM_VERSION=0.20.1
 ARG BUN_VERSION=bun-v1.4.4
-ARG OMP_VERSION=18.13.2
+ARG OMP_VERSION=18.8.6
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

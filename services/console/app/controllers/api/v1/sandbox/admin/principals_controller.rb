@@ -178,7 +178,7 @@ module Api
                     "#{invalid.keys.join(', ')} must be true or false (sandbox_repo_cache: none, public, or all)"
             end
 
-            data.permit("sandbox_repo_cache", *SANDBOX_ACCESS_FLAGS).to_h
+            attributes
           end
         end
       end
