@@ -415,6 +415,22 @@ describe('stop reaches api-rs while the response stream is open', () => {
     mock.finish('exec-1', 'done')
   }, 20_000)
 
+  test('a finishing turn leaves the thread to a newer execution that already took it over', async () => {
+    const { app, state } = bot()
+    await app.request('/api/chat/events', dmEvent('M1', 'first'))
+    await waitFor(() => mock.streams.size === 1)
+    // A newer turn started and recorded itself while exec-1's final was in flight.
+    const key = threadStateKey(DM_THREAD)
+    const current = (await state.get<GoogleChatThreadState>(key)) ?? {}
+    await state.set(key, { ...current, activeExecution: true, activeExecutionId: 'exec-new' })
+    mock.finish('exec-1', 'first answer')
+    await waitFor(() => [...mock.messages.values()].some(m => m.text === 'first answer'))
+    await waitFor(() => renderMetrics().includes('googlechatbot_runs_total{outcome="completed"} 1'))
+    const after = await state.get<GoogleChatThreadState>(key)
+    expect(after?.activeExecution).toBe(true)
+    expect(after?.activeExecutionId).toBe('exec-new')
+  }, 20_000)
+
   test('the ack reaction is added by the delegated actor and removed on final and on stop', async () => {
     const env = {
       GOOGLECHATBOT_REACTION_ACTOR_USER: 'actor@example.com',

@@ -1333,7 +1333,7 @@ async function recoverFinalRender(
     outcome,
     answer: renderState.answer
   })
-  await finishThreadRun(client, stateAdapter, work.event.thread_key, {
+  await finishThreadRun(client, stateAdapter, work.event.thread_key, work.executionId, {
     lastEventId: work.lastEventId
   })
 }
@@ -1492,7 +1492,7 @@ async function driveSession(
     if (!delivered) throw error
     work.stage = 'final'
     await persistWork(durableState, work)
-    await finishThreadRun(client, durableState, threadKey)
+    await finishThreadRun(client, durableState, threadKey, work.executionId)
   }
 }
 
@@ -1917,7 +1917,7 @@ async function renderTurn(
     outcome: deliveryOutcome,
     answer: state.answer
   })
-  await finishThreadRun(client, durableState, threadKey, { lastEventId })
+  await finishThreadRun(client, durableState, threadKey, execution.execution_id, { lastEventId })
   incr('googlechatbot_runs_total', { outcome: state.error ? 'failed' : 'completed' })
   // Reuse slackbotv2's delivery_status vocabulary so cross-bot dashboards
   // aggregate both: the final answer is written once and visible.
@@ -2443,23 +2443,35 @@ async function holdSteeringAck(client: ChatEdgeClient, ackMessageName: string): 
 }
 
 /** Marks the thread idle and removes the steering notices the run collected.
- * A crash between hold and finish strands a notice — the same ceiling
- * slackbotv2 accepts for its process-local reactions. */
+ * Runs under the handoff lock, so a message folding into this run records its
+ * notice either before the read below (and is removed here) or after the run
+ * is idle (and starts its own). A thread a newer execution already owns is
+ * left untouched: its flag and notices belong to that run. A crash between
+ * hold and finish strands a notice — the same ceiling slackbotv2 accepts for
+ * its process-local reactions. */
 async function finishThreadRun(
   client: ChatEdgeClient,
   durableState: StateAdapter,
   threadKey: string,
+  executionId: string | undefined,
   update: Partial<GoogleChatThreadState> = {}
 ): Promise<void> {
-  const held =
-    (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey)))
-      ?.steeringAckMessageNames ?? []
-  await updateThreadState(durableState, threadKey, {
-    ...update,
-    activeExecution: false,
-    activeExecutionId: null,
-    activeRequesterEmail: null,
-    steeringAckMessageNames: []
+  const held = await withThreadHandoff(durableState, threadKey, async lost => {
+    const current =
+      (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
+    if (current.activeExecutionId && current.activeExecutionId !== executionId) {
+      logInfo('googlechatbot_finish_skipped_newer_turn', { thread_key: threadKey })
+      return []
+    }
+    lost.throwIfAborted()
+    await updateThreadState(durableState, threadKey, {
+      ...update,
+      activeExecution: false,
+      activeExecutionId: null,
+      activeRequesterEmail: null,
+      steeringAckMessageNames: []
+    })
+    return current.steeringAckMessageNames ?? []
   })
   for (const name of held) await removeAck(client, name)
 }
