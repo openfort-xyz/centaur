@@ -482,9 +482,10 @@ def test_broker_reads_retry_transient_failures(monkeypatch):
 def test_broker_rejections_are_not_retried(monkeypatch):
     _record_sleeps(monkeypatch)
     ctx = FlakyBroker("Google Chat DWD broker request failed with status 403 Forbidden")
+    client = chat_client.GoogleChatReadonlyClient(ctx)
 
     try:
-        asyncio.run(chat_client.GoogleChatReadonlyClient(ctx).list_reactions("spaces/S1/messages/M1"))
+        asyncio.run(client.list_reactions("spaces/S1/messages/M1"))
     except RuntimeError:
         pass
     else:

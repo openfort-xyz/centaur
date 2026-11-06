@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
+import re
 import time
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -18,6 +20,12 @@ CHAT_API_BASE = "https://chat.googleapis.com/v1"
 CHAT_HTTP_TIMEOUT_SECONDS = 60.0
 MAX_GET_ATTEMPTS = 3
 MAX_RETRY_DELAY_SECONDS = 30.0
+# api-rs reports a broker timeout, connection error or 429/5xx with these
+# texts (crates/centaur-workflows google_chat_dwd_read_with_config).
+_TRANSIENT_BROKER_ERROR = re.compile(
+    r"Google Chat DWD broker (?:request failed(?: with status (?:429|5\d\d)\b.*)?"
+    r"|response failed)"
+)
 
 # App-authentication is minted by iron-proxy's gcp_auth transform, exactly like
 # the Drive/Calendar ETLs. Opt-in private-DM sync uses WorkflowContext's
@@ -42,6 +50,28 @@ class GoogleChatApiError(RuntimeError):
     def __init__(self, message: str, status: int) -> None:
         super().__init__(message)
         self.status = status
+
+
+class GoogleChatBrokerError(RuntimeError):
+    """A Chat read through the api-rs DWD broker that failed.
+
+    The message is api-rs's fixed reason text (no subject, URL or token), so
+    the caller may show it to operators.
+    """
+
+
+async def _broker_read(ctx: Any, subject: str, operation: str, **kwargs: Any) -> dict[str, Any]:
+    for attempt in range(MAX_GET_ATTEMPTS):
+        try:
+            result = await ctx.google_chat_dwd_read(subject, operation, **kwargs)
+        except RuntimeError as error:
+            reason = str(error)
+            if not _TRANSIENT_BROKER_ERROR.fullmatch(reason) or attempt == MAX_GET_ATTEMPTS - 1:
+                raise GoogleChatBrokerError(reason) from error
+            await asyncio.sleep(_retry_delay_seconds(None, attempt))
+            continue
+        return result if isinstance(result, dict) else {}
+    raise RuntimeError("unreachable")
 
 
 class GoogleChatReadonlyClient:
@@ -130,14 +160,14 @@ class GoogleChatReadonlyClient:
         page_size: int = 100,
         page_token: str | None = None,
     ) -> dict[str, Any]:
-        result = await self._ctx.google_chat_dwd_read(
+        return await _broker_read(
+            self._ctx,
             "",
             "list_reactions",
             resource_name=message_name,
             page_size=page_size,
             page_token=page_token,
         )
-        return result if isinstance(result, dict) else {}
 
 
 class GoogleChatDelegatedClient:
@@ -157,7 +187,8 @@ class GoogleChatDelegatedClient:
         filter: str | None = None,
         show_deleted: bool = False,
     ) -> dict[str, Any]:
-        result = await self._ctx.google_chat_dwd_read(
+        return await _broker_read(
+            self._ctx,
             self._subject,
             operation,
             resource_name=resource_name,
@@ -166,7 +197,6 @@ class GoogleChatDelegatedClient:
             filter=filter,
             **({"show_deleted": True} if show_deleted else {}),
         )
-        return result if isinstance(result, dict) else {}
 
     async def list_spaces(
         self, *, page_size: int = 100, page_token: str | None = None

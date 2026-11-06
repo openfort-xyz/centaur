@@ -220,10 +220,17 @@ def _safe_error(error: Exception) -> str:
         return "Google Chat API rate limited"
     if kind == "permission_error":
         return "Google Chat API permission denied"
+    from workflows.google_chat.client import GoogleChatBrokerError
+
     status = _error_status(error)
     # Without this the generic bucket is undiagnosable: every 4xx, 5xx and
     # timeout collapses into one string with nothing left to tell them apart.
-    detail = f"HTTP {status}" if status is not None else type(error).__name__
+    if status is not None:
+        detail = f"HTTP {status}"
+    elif isinstance(error, GoogleChatBrokerError):
+        detail = str(error)
+    else:
+        detail = type(error).__name__
     return f"Google Chat API request failed ({detail})"
 
 
