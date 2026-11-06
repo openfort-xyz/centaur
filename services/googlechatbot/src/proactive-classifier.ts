@@ -2,7 +2,7 @@ import { isJsonObject } from './message-overrides-strategy'
 import { stripTrailingSlashes } from './url'
 
 // Backends share the instructions and transcript so that swapping the model
-// changes only the transport. Tune both with evals/proactive-response.
+// changes only the transport. Tune both with evals/googlechat-proactive-response.
 
 const MAX_MESSAGE_CHARS = 2_000
 // Minimum probability that the bot should reply.
