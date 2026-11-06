@@ -220,10 +220,17 @@ def _safe_error(error: Exception) -> str:
         return "Google Chat API rate limited"
     if kind == "permission_error":
         return "Google Chat API permission denied"
+    from workflows.google_chat.client import GoogleChatBrokerError
+
     status = _error_status(error)
     # Without this the generic bucket is undiagnosable: every 4xx, 5xx and
     # timeout collapses into one string with nothing left to tell them apart.
-    detail = f"HTTP {status}" if status is not None else type(error).__name__
+    if status is not None:
+        detail = f"HTTP {status}"
+    elif isinstance(error, GoogleChatBrokerError):
+        detail = str(error)
+    else:
+        detail = type(error).__name__
     return f"Google Chat API request failed ({detail})"
 
 
@@ -801,15 +808,20 @@ async def _replace_reactions(
     owner_email: str,
     space_id: str,
     message_id: str,
-    message_name: str,
+    message: dict[str, Any],
     run_id: str,
 ) -> int:
     reaction_ids: list[str] = []
     page_token: str | None = None
-    while True:
+    # messages.list carries emojiReactionSummaries only when a message has
+    # reactions, so skip the per-message RPC and let the DELETE below clear
+    # rows whose reactions were all removed.
+    while message.get("emojiReactionSummaries"):
         page = await _call_client(
             client.list_reactions,
-            message_name, page_size=DEFAULT_PAGE_SIZE, page_token=page_token
+            str(message.get("name") or ""),
+            page_size=DEFAULT_PAGE_SIZE,
+            page_token=page_token,
         )
         for reaction in page.get("emojiReactions") or page.get("reactions") or []:
             if not isinstance(reaction, dict):
@@ -975,7 +987,7 @@ async def _sync_space(
                     owner_email=owner_email,
                     space_id=space_id,
                     message_id=message_id,
-                    message_name=str(message.get("name") or ""),
+                    message=message,
                     run_id=run_id,
                 )
                 counts["files_processed"] = counts.get("files_processed", 0) + attachment_count

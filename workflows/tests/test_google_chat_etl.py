@@ -441,6 +441,76 @@ def test_readonly_reactions_use_fixed_broker_identity():
     ]
 
 
+class FlakyBroker:
+    def __init__(self, *errors):
+        self.errors = list(errors)
+        self.calls = 0
+
+    async def google_chat_dwd_read(self, subject, operation, **kwargs):
+        self.calls += 1
+        if self.errors:
+            raise RuntimeError(self.errors.pop(0))
+        return {"emojiReactions": []}
+
+
+def _record_sleeps(monkeypatch):
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return sleeps
+
+
+def test_broker_reads_retry_transient_failures(monkeypatch):
+    sleeps = _record_sleeps(monkeypatch)
+    ctx = FlakyBroker(
+        "Google Chat DWD broker request failed",
+        "Google Chat DWD broker request failed with status 502 Bad Gateway",
+    )
+
+    result = asyncio.run(
+        chat_client.GoogleChatReadonlyClient(ctx).list_reactions("spaces/S1/messages/M1")
+    )
+
+    assert result == {"emojiReactions": []}
+    assert ctx.calls == 3
+    assert len(sleeps) == 2
+
+
+def test_broker_rejections_are_not_retried(monkeypatch):
+    _record_sleeps(monkeypatch)
+    ctx = FlakyBroker("Google Chat DWD broker request failed with status 403 Forbidden")
+    client = chat_client.GoogleChatReadonlyClient(ctx)
+
+    try:
+        asyncio.run(client.list_reactions("spaces/S1/messages/M1"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a 403 from the broker must fail the read")
+    assert ctx.calls == 1
+
+
+def test_exhausted_broker_retries_report_the_broker_reason(monkeypatch):
+    _record_sleeps(monkeypatch)
+    ctx = FlakyBroker(*["Google Chat DWD broker request failed"] * 3)
+    client = chat_client.GoogleChatDelegatedClient(ctx, "alice@example.com")
+
+    try:
+        asyncio.run(client.list_messages("spaces/S1"))
+    except RuntimeError as error:
+        failure = error
+    else:
+        raise AssertionError("the read must fail once retries run out")
+
+    assert ctx.calls == 3
+    assert chat_sync._safe_error(failure) == (
+        "Google Chat API request failed (Google Chat DWD broker request failed)"
+    )
+
+
 def test_incremental_filter_matches_the_broker_contract():
     timestamp = dt.datetime(2026, 8, 1, 0, 0, 0, 123456, tzinfo=dt.UTC)
     assert f'createTime > "{chat_sync._rfc3339(timestamp)}"' == (
@@ -790,6 +860,9 @@ def test_dm_membership_failure_does_not_block_owner_scoped_sync():
     assert asyncio.run(chat_sync._member_directory(BrokenMembers([]), "spaces/DM")) == {}
 
 
+REACTION_SUMMARY = [{"emoji": {"unicode": "✅"}, "reactionCount": 1}]
+
+
 def test_malformed_reactions_are_skipped_without_page_index_ids():
     class Reactions(FakeChatClient):
         def list_reactions(self, message_name, *, page_size, page_token=None):
@@ -812,13 +885,99 @@ def test_malformed_reactions_are_skipped_without_page_index_ids():
             owner_email="",
             space_id="S1",
             message_id="M1",
-            message_name="spaces/S1/messages/M1",
+            message={
+                "name": "spaces/S1/messages/M1",
+                "emojiReactionSummaries": REACTION_SUMMARY,
+            },
             run_id="run_1",
         )
     )
     assert count == 1
     inserts = [args for sql, args in pool.executed if "INSERT INTO google_chat_sync_reactions" in sql]
     assert [args[3] for args in inserts] == ["R1"]
+
+
+def _chat_message(message_id, **fields):
+    return {
+        "name": f"spaces/S1/messages/{message_id}",
+        "text": f"message {message_id}",
+        "sender": {"name": "users/1", "type": "HUMAN"},
+        "createTime": "2026-06-01T10:00:00Z",
+        **fields,
+    }
+
+
+def _sync_one_page(client):
+    pool = FakeSyncPool()
+    counts = {"messages_seen": 0, "messages_upserted": 0}
+    asyncio.run(
+        chat_sync._sync_space(
+            pool,
+            client=client,
+            space={"name": "spaces/S1", "type": "SPACE"},
+            run_id="run_1",
+            page_size=100,
+            overlap_seconds=60,
+            max_pages=0,
+            explicit_since=None,
+            counts=counts,
+        )
+    )
+    reaction_deletes = {
+        args[2]: args[3]
+        for sql, args in pool.executed
+        if sql.startswith("DELETE FROM google_chat_sync_reactions")
+    }
+    return counts, reaction_deletes
+
+
+def test_reactions_are_listed_only_for_messages_with_reaction_summaries():
+    class RecordingReactions(FakeChatClient):
+        def __init__(self, pages):
+            super().__init__(pages)
+            self.reaction_reads = []
+
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            self.reaction_reads.append(message_name)
+            return {
+                "emojiReactions": [
+                    {
+                        "name": f"{message_name}/reactions/R1",
+                        "user": {"name": "users/2"},
+                        "emoji": {"unicode": "✅"},
+                    }
+                ]
+            }
+
+    client = RecordingReactions(
+        [
+            {
+                "messages": [
+                    _chat_message("plain"),
+                    _chat_message("reacted", emojiReactionSummaries=REACTION_SUMMARY),
+                ]
+            }
+        ]
+    )
+    counts, reaction_deletes = _sync_one_page(client)
+
+    assert client.reaction_reads == ["spaces/S1/messages/reacted"]
+    assert counts["reactions_processed"] == 1
+    assert reaction_deletes["reacted"] == ["R1"]
+
+
+def test_message_without_reaction_summaries_clears_stale_reactions_without_rpc():
+    class NoReactionReads(FakeChatClient):
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            raise AssertionError(f"unexpected reactions read for {message_name}")
+
+    counts, reaction_deletes = _sync_one_page(
+        NoReactionReads([{"messages": [_chat_message("unreacted")]}])
+    )
+
+    assert counts["messages_upserted"] == 1
+    assert counts["reactions_processed"] == 0
+    assert reaction_deletes == {"unreacted": []}
 
 
 def test_changed_chat_threads_exclude_owner_scoped_dms():
@@ -981,6 +1140,7 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
                         "text": "see the runbook",
                         "sender": {"name": "users/1", "type": "HUMAN"},
                         "createTime": "2026-08-14T10:00:00Z",
+                        "emojiReactionSummaries": REACTION_SUMMARY,
                         "attachment": [
                             {
                                 "name": "spaces/DM1/messages/M1/attachments/A1",
