@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Drive a local googlechatbot (real src/server.ts + disposable Postgres) whose
+# Google and api-rs traffic is faked in-process by scripts/verify-harness.ts.
+# Run `gchat-verify help` for usage.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
+SERVICE_DIR="$REPO_ROOT/services/googlechatbot"
+ROOT="${GCHAT_VERIFY_ROOT:-/tmp/verify-googlechatbot}"
+
+die() {
+  echo "gchat-verify: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+gchat-verify up                       start Postgres + bot + fakes; prints the run id
+gchat-verify doctor                   read-only health/ownership check of the current run
+gchat-verify event '<json>'           sign a Chat event and POST it to the bot webhook
+gchat-verify listed '<json>'          add a message to spaces.messages.list (proactive poller)
+gchat-verify decision true|false      what the fake proactive classifier answers
+gchat-verify status <exec> <text>     emit a status event on an open execution stream
+gchat-verify finish <exec> <text>     complete an execution with a final answer
+gchat-verify state [jq args]          what the bot wrote to fake Chat / api-rs (args go to jq)
+gchat-verify metrics [regex]          the bot's own /metrics lines matching regex
+gchat-verify wait '<jq-expr>' [secs]  poll state until the jq expression is true
+gchat-verify wait-metric <regex> [secs]  poll /metrics until a line matches
+gchat-verify snapshot <label>         save state, metrics, and log into the evidence dir
+gchat-verify down                     stop what `up` started; evidence is kept
+Run selection: GCHAT_VERIFY_RUN=<id> (default: the last `up`). Root: GCHAT_VERIFY_ROOT.
+EOF
+}
+
+run_id() {
+  if [[ -n "${GCHAT_VERIFY_RUN:-}" ]]; then
+    echo "$GCHAT_VERIFY_RUN"
+  elif [[ -f "$ROOT/current" ]]; then
+    cat "$ROOT/current"
+  else
+    die "no current run; start one with: gchat-verify up"
+  fi
+}
+
+load_run() {
+  RUN="$(run_id)"
+  RUN_DIR="$ROOT/runs/$RUN"
+  EVIDENCE_DIR="$ROOT/evidence/$RUN"
+  [[ -f "$RUN_DIR/run.env" ]] || die "run $RUN has no $RUN_DIR/run.env (already down?)"
+  # shellcheck source=/dev/null
+  source "$RUN_DIR/run.env"
+}
+
+free_port() {
+  bun -e 'const s = Bun.serve({ port: 0, fetch: () => new Response() }); console.log(s.port); s.stop(true)'
+}
+
+# HEAD plus a hash of the bot's source as it is on disk, so an edit made after
+# `up` (bun runs source, nothing is rebuilt) shows up in doctor.
+source_revision() {
+  local content
+  content="$(cd "$REPO_ROOT" && git ls-files -co --exclude-standard -z -- services/googlechatbot packages |
+    { xargs -0 cat 2>/dev/null || true; } | shasum | cut -c1-8)"
+  echo "$(git -C "$REPO_ROOT" rev-parse --short HEAD)+$content"
+}
+
+preflight() {
+  local tool
+  for tool in bun initdb pg_ctl jq curl openssl lsof git; do
+    command -v "$tool" >/dev/null || die "missing $tool on PATH"
+  done
+  [[ -d "$SERVICE_DIR/node_modules/@chat-adapter/state-pg" ]] ||
+    die "deps missing; run 'pnpm install --frozen-lockfile' from $REPO_ROOT (not bun install)"
+}
+
+start_postgres() {
+  initdb -D "$RUN_DIR/pg" -A trust -U gchat --no-locale -E UTF8 >"$RUN_DIR/initdb.log" 2>&1 ||
+    die "initdb failed; see $RUN_DIR/initdb.log"
+  pg_ctl -D "$RUN_DIR/pg" -l "$RUN_DIR/postgres.log" -w \
+    -o "-p $PG_PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=" start >/dev/null ||
+    die "postgres failed to start; see $RUN_DIR/postgres.log"
+}
+
+start_bot() {
+  local sa_json
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RUN_DIR/sa.pem" 2>/dev/null
+  sa_json="$(jq -cn --rawfile key "$RUN_DIR/sa.pem" \
+    '{client_email: "verify-bot@verify.invalid", private_key: $key}')"
+  (
+    cd "$SERVICE_DIR"
+    env -i PATH="$PATH" HOME="$HOME" \
+      PORT="$BOT_PORT" VERIFY_CONTROL_PORT="$CONTROL_PORT" COMMIT_SHA="$REVISION" \
+      GOOGLECHATBOT_DATABASE_URL="postgres://gchat@127.0.0.1:$PG_PORT/postgres" \
+      GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS=true GOOGLECHATBOT_INGRESS_MODE=workspace_addon \
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE=https://googlechatbot.verify.invalid/api/chat/events \
+      GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL=addon@verify.iam.gserviceaccount.com \
+      GOOGLECHATBOT_DIRECTORY_LOOKUP_USER=directory-reader@example.test \
+      GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID=verify-client.apps.googleusercontent.com \
+      GOOGLE_SERVICE_ACCOUNT_JSON="$sa_json" \
+      CENTAUR_API_URL=http://api-rs.verify.invalid GOOGLECHATBOT_API_KEY=verify-fake-api-key \
+      GOOGLECHATBOT_PROACTIVITY_ENABLED=true GOOGLECHATBOT_PROACTIVITY_SPACES=spaces/PROACTIVE \
+      GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY=verify-fake-openai-key \
+      GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS=1000 GOOGLECHATBOT_SHUTDOWN_DRAIN_MS=2000 \
+      nohup bun --preload ./scripts/verify-harness.ts src/server.ts >"$RUN_DIR/bot.log" 2>&1 &
+    echo $! >"$RUN_DIR/bot.pid"
+  )
+  BOT_PID="$(cat "$RUN_DIR/bot.pid")"
+  echo "BOT_PID=$BOT_PID" >>"$RUN_DIR/run.env"
+}
+
+wait_ready() {
+  local deadline=$((SECONDS + 60))
+  until curl -fsS "http://127.0.0.1:$BOT_PORT/health/ready" >/dev/null 2>&1 &&
+    curl -fsS "http://127.0.0.1:$CONTROL_PORT/health" >/dev/null 2>&1; do
+    kill -0 "$BOT_PID" 2>/dev/null || die "bot exited during startup; see $RUN_DIR/bot.log"
+    ((SECONDS < deadline)) || die "bot not ready after 60s; see $RUN_DIR/bot.log"
+    sleep 0.5
+  done
+}
+
+cmd_up() {
+  preflight
+  RUN="$(date +%Y%m%d-%H%M%S)-$$"
+  RUN_DIR="$ROOT/runs/$RUN"
+  EVIDENCE_DIR="$ROOT/evidence/$RUN"
+  mkdir -p "$RUN_DIR" "$EVIDENCE_DIR"
+  PG_PORT="$(free_port)"
+  BOT_PORT="$(free_port)"
+  CONTROL_PORT="$(free_port)"
+  REVISION="$(source_revision)"
+  printf 'PG_PORT=%s\nBOT_PORT=%s\nCONTROL_PORT=%s\nREVISION=%s\n' \
+    "$PG_PORT" "$BOT_PORT" "$CONTROL_PORT" "$REVISION" >"$RUN_DIR/run.env"
+  echo "$RUN" >"$ROOT/current"
+  start_postgres
+  start_bot
+  wait_ready
+  echo "run=$RUN bot=http://127.0.0.1:$BOT_PORT control=http://127.0.0.1:$CONTROL_PORT"
+  echo "evidence=$EVIDENCE_DIR"
+}
+
+expect() {
+  if [[ "$2" == "$3" ]]; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1 (got '$2', want '$3')"
+    DOCTOR_FAILED=1
+  fi
+}
+
+cmd_doctor() {
+  load_run
+  DOCTOR_FAILED=0
+  local bot="http://127.0.0.1:$BOT_PORT" control="http://127.0.0.1:$CONTROL_PORT"
+  echo "run=$RUN dir=$RUN_DIR"
+  expect "bot pid $BOT_PID alive and running our harness" \
+    "$(ps -p "$BOT_PID" -o command= 2>/dev/null | grep -c verify-harness.ts || true)" 1
+  expect "bot port $BOT_PORT owned by our pid" \
+    "$(lsof -nP -iTCP:"$BOT_PORT" -sTCP:LISTEN -t 2>/dev/null || true)" "$BOT_PID"
+  expect "control port $CONTROL_PORT served by the same process" \
+    "$(curl -fsS "$control/health" 2>/dev/null | jq -r .pid || true)" "$BOT_PID"
+  expect "postgres on $PG_PORT running from this run's data dir" \
+    "$(pg_ctl -D "$RUN_DIR/pg" status >/dev/null 2>&1 && echo running || echo stopped)" running
+  expect "/health/ready ok with database connected" \
+    "$(curl -sS "$bot/health/ready" 2>/dev/null | jq -c '{ok, database_connected}' || true)" \
+    '{"ok":true,"database_connected":true}'
+  expect "running source matches the checkout (restart after edits)" \
+    "$(curl -fsS "$bot/health/live" 2>/dev/null | jq -r .commit || true)" "$(source_revision)"
+  expect "no unfaked outbound fetch in bot.log" \
+    "$(grep -c 'unexpected fetch in test' "$RUN_DIR/bot.log" || true)" 0
+  ((DOCTOR_FAILED == 0)) || die "doctor found problems; restart with: gchat-verify down && gchat-verify up"
+}
+
+control_post() {
+  local path="$1" body="$2" response
+  response="$(curl -sS -X POST -H 'content-type: application/json' --data "$body" \
+    "http://127.0.0.1:$CONTROL_PORT$path")"
+  jq -cn --arg at "$(date -u +%FT%TZ)" --arg path "$path" --argjson request "$body" \
+    --argjson response "$response" '{at: $at, path: $path, request: $request, response: $response}' \
+    >>"$EVIDENCE_DIR/actions.jsonl"
+  echo "$response" | jq .
+  echo "$response" | jq -e 'has("error") | not' >/dev/null
+}
+
+state_matches() {
+  curl -fsS "http://127.0.0.1:$CONTROL_PORT/state" | jq -e "$1"
+}
+
+metrics_match() {
+  curl -fsS "http://127.0.0.1:$BOT_PORT/metrics" | grep -E "$1"
+}
+
+wait_until() {
+  local what="$1" timeout="$2"
+  shift 2
+  local deadline=$((SECONDS + timeout))
+  until "$@" >/dev/null; do
+    ((SECONDS < deadline)) || die "timed out after ${timeout}s waiting for: $what"
+    sleep 0.25
+  done
+  echo "ok $what"
+}
+
+cmd_snapshot() {
+  local label="$1"
+  curl -fsS "http://127.0.0.1:$CONTROL_PORT/state" | jq . >"$EVIDENCE_DIR/$label.state.json"
+  curl -fsS "http://127.0.0.1:$BOT_PORT/metrics" >"$EVIDENCE_DIR/$label.metrics.txt"
+  cp "$RUN_DIR/bot.log" "$EVIDENCE_DIR/$label.bot.log"
+  echo "saved $EVIDENCE_DIR/$label.{state.json,metrics.txt,bot.log}"
+}
+
+stop_bot() {
+  BOT_PID="${BOT_PID:-}"
+  [[ -n "$BOT_PID" ]] || {
+    echo "no bot pid recorded"
+    return
+  }
+  if ! ps -p "$BOT_PID" -o command= 2>/dev/null | grep -q verify-harness.ts; then
+    echo "bot pid $BOT_PID is not running (or is not ours); not signalling it"
+    return
+  fi
+  kill -TERM "$BOT_PID"
+  local deadline=$((SECONDS + 15))
+  while kill -0 "$BOT_PID" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.25; done
+  if kill -0 "$BOT_PID" 2>/dev/null; then kill -KILL "$BOT_PID"; fi
+  echo "stopped bot pid $BOT_PID"
+}
+
+cmd_down() {
+  load_run
+  stop_bot
+  if pg_ctl -D "$RUN_DIR/pg" status >/dev/null 2>&1; then
+    pg_ctl -D "$RUN_DIR/pg" -m fast -w stop >/dev/null
+    echo "stopped postgres on $PG_PORT"
+  fi
+  mkdir -p "$EVIDENCE_DIR"
+  cp "$RUN_DIR/bot.log" "$EVIDENCE_DIR/final.bot.log"
+  cp "$RUN_DIR/postgres.log" "$EVIDENCE_DIR/final.postgres.log"
+  trash "$RUN_DIR"
+  if [[ -f "$ROOT/current" && "$(cat "$ROOT/current")" == "$RUN" ]]; then trash "$ROOT/current"; fi
+  echo "evidence kept at $EVIDENCE_DIR"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+  case "$command" in
+    up) cmd_up ;;
+    doctor) cmd_doctor ;;
+    event) load_run && control_post /event "${1:?event json}" ;;
+    listed) load_run && control_post /listed "${1:?message json}" ;;
+    decision) load_run && control_post /decision "{\"respond\": ${1:?true|false}}" ;;
+    status | finish)
+      load_run
+      control_post "/$command" "$(jq -cn --arg e "${1:?execution id}" --arg t "${2:?text}" \
+        '{execution: $e, text: $t}')"
+      ;;
+    state) load_run && curl -fsS "http://127.0.0.1:$CONTROL_PORT/state" | jq "${@:-.}" ;;
+    metrics) load_run && curl -fsS "http://127.0.0.1:$BOT_PORT/metrics" | grep -E "${1:-.}" ;;
+    wait) load_run && wait_until "${1:?jq expression}" "${2:-15}" state_matches "$1" ;;
+    wait-metric) load_run && wait_until "${1:?regex}" "${2:-15}" metrics_match "$1" ;;
+    snapshot) load_run && cmd_snapshot "${1:?label}" ;;
+    down) cmd_down ;;
+    help | -h | --help) usage ;;
+    *) usage >&2 && exit 2 ;;
+  esac
+}
+
+main "$@"
