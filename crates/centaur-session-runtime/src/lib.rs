@@ -9254,7 +9254,7 @@ mod tests {
         let thread_key = ThreadKey::parse("chat:spaces:AAAA:spaces:AAAA:threads:BBBB").unwrap();
         let trace = SessionTraceContext::new(None, None);
 
-        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let line = input_line_with_session_context(&thread_key, &trace, None, r#"{"type":"user"}"#);
         let value: Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(value["session_context"]["platform"], "google_chat");
