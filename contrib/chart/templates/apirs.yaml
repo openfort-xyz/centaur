@@ -292,6 +292,8 @@ spec:
             - name: CENTAUR_SESSION_PRINCIPAL_ADMISSION
               value: {{ .Values.apiRs.sessionPrincipalAdmission | quote }}
 {{- end }}
+            - name: CENTAUR_API_CLIENTS_ENABLED
+              value: {{ .Values.apiClients.enabled | quote }}
 {{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_V2_ENABLED") }}
             - name: CENTAUR_MCP_V2_ENABLED
               value: {{ .Values.apiRs.mcpV2Enabled | quote }}
@@ -357,6 +359,10 @@ spec:
               value: {{ .Values.apiRs.sandboxReadyTimeoutSecs | quote }}
             - name: SESSION_SANDBOX_WARM_POOL_SIZE
               value: {{ .Values.apiRs.sandboxWarmPoolSize | quote }}
+{{- with .Values.apiRs.sandboxWarmPools }}
+            - name: SESSION_SANDBOX_WARM_POOLS
+              value: {{ toJson . | quote }}
+{{- end }}
             - name: SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxWarmPoolReplenishIntervalSecs | quote }}
             - name: SESSION_SANDBOX_RUNNING_LIMIT
@@ -392,6 +398,12 @@ spec:
               value: {{ .Values.apiRs.activitySummary.maxOutputTokens | quote }}
             - name: SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT
               value: {{ .Values.apiRs.activitySummary.reasoningEffort | default "" | quote }}
+            - name: SESSION_PROGRESS_UPDATE_ENABLED
+              value: {{ .Values.apiRs.activitySummary.progressUpdates.enabled | quote }}
+            - name: SESSION_PROGRESS_UPDATE_AFTER_SECS
+              value: {{ .Values.apiRs.activitySummary.progressUpdates.afterSecs | quote }}
+            - name: SESSION_PROGRESS_UPDATE_INTERVAL_SECS
+              value: {{ .Values.apiRs.activitySummary.progressUpdates.intervalSecs | quote }}
 {{- end }}
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
@@ -430,6 +442,14 @@ spec:
             - name: SESSION_SANDBOX_POD_ANNOTATIONS
               value: {{ toJson .Values.sandbox.podAnnotations | quote }}
 {{- end }}
+{{- if and (kindIs "bool" .Values.sandbox.hostUsers) (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_HOST_USERS")) }}
+            - name: SESSION_SANDBOX_HOST_USERS
+              value: {{ .Values.sandbox.hostUsers | quote }}
+{{- end }}
+{{- if and .Values.sandbox.containerSecurityContext (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_CONTAINER_SECURITY_CONTEXT")) }}
+            - name: SESSION_SANDBOX_CONTAINER_SECURITY_CONTEXT
+              value: {{ toJson .Values.sandbox.containerSecurityContext | quote }}
+{{- end }}
 {{- if and .Values.sandbox.tolerations (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_TOLERATIONS")) }}
             - name: SESSION_SANDBOX_TOLERATIONS
               value: {{ toJson .Values.sandbox.tolerations | quote }}
@@ -463,11 +483,35 @@ spec:
               value: {{ .Values.ironProxy.image.pullPolicy | quote }}
             - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
               value: {{ join "," .Values.ironProxy.upstreamDenyCidrs | quote }}
-{{- if and (not .Values.postgres.enabled) .Values.externalDatabase.cidrs }}
             # Per-sandbox iron-proxies forward the tool-server sidecar's pool to
-            # the core database; allow them to reach the external database.
+            # the core database; allow them to reach it and no other in-cluster
+            # Postgres.
+{{- if .Values.postgres.enabled }}
+{{- $databasePodLabels := list }}
+{{- range $key, $value := fromYaml (include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres")) }}
+{{- $databasePodLabels = append $databasePodLabels (printf "%s=%s" $key $value) }}
+{{- end }}
+            - name: KUBERNETES_IRON_PROXY_DATABASE_POD_LABEL_SELECTOR
+              value: {{ join "," $databasePodLabels | quote }}
+            - name: KUBERNETES_IRON_PROXY_DATABASE_PORT
+              value: "5432"
+{{- else if or .Values.externalDatabase.cidrs .Values.externalDatabase.podSelector }}
+{{- with .Values.externalDatabase.cidrs }}
             - name: KUBERNETES_IRON_PROXY_DATABASE_CIDRS
-              value: {{ join "," .Values.externalDatabase.cidrs | quote }}
+              value: {{ join "," . | quote }}
+{{- end }}
+{{- with .Values.externalDatabase.podSelector }}
+{{- $databasePodLabels := list }}
+{{- range $key, $value := . }}
+{{- $databasePodLabels = append $databasePodLabels (printf "%s=%s" $key $value) }}
+{{- end }}
+            - name: KUBERNETES_IRON_PROXY_DATABASE_POD_LABEL_SELECTOR
+              value: {{ join "," $databasePodLabels | quote }}
+{{- with $.Values.externalDatabase.namespace }}
+            - name: KUBERNETES_IRON_PROXY_DATABASE_NAMESPACE
+              value: {{ . | quote }}
+{{- end }}
+{{- end }}
             - name: KUBERNETES_IRON_PROXY_DATABASE_PORT
               value: {{ .Values.externalDatabase.port | quote }}
 {{- end }}
@@ -558,6 +602,9 @@ spec:
 {{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS" "value" (.Values.sandbox.telemetry.captureTranscripts | toString)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TELEMETRY_CAPTURE_TOOL_TRACES") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TELEMETRY_CAPTURE_TOOL_TRACES" "value" (.Values.sandbox.telemetry.captureToolTraces | toString)) }}
 {{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}
@@ -708,10 +755,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ $apiRsName }}
-{{- with $apiRsMetricsAnnotations }}
-  annotations:
-{{ toYaml . | nindent 4 }}
-{{- end }}
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
 spec:

@@ -150,6 +150,28 @@ preceding gate to pass on the same evidence identifier.
 
 ## Upstream sync windows
 
+### 2026-11-06 — 92 upstream commits, `9c6aabde..e83dfb39`
+
+Conflicts: the Console admin paragraph in `docs/API.md` and the `centaur-console
+admin` help text keep upstream's new wording (GCP ID token secrets, role secret
+grants) plus the Google Chat DM text. The iron-proxy Dockerfile rebuilds v0.56.0
+from source, because that release still pins vulnerable go-jose, x/net, and gRPC.
+SQLx: upstream adds no numbered migration, so the fork stays at `0064`.
+
+| Upstream change | Google Chat disposition |
+| --- | --- |
+| Interrupted text when a stopped turn ends before cancellation (#2105), unphased progress suppression (#2097) | **Shared.** The fork's extra interrupted-text line in `codex-app-server.ts` is dropped for upstream's; the Chat renderer test expects `Execution interrupted.`. |
+| Scheduled tasks skip delivery on `NO_UPDATE` (#2155, #2163) | **Shared.** The skip check runs before the Chat/Slack branch in `console_workflow.py`, so Chat destinations skip too. |
+| Sandbox admins create GCP ID token secrets and grant secrets to roles (#2092) | **Shared.** The new endpoints use `SandboxAdminAuthentication`, so a verified Google Chat admin DM gets them too. |
+| Slack principals only from Slack thread keys (#2113) | **Already equivalent.** `derive_principal` handles `chat:spaces:` keys before the Slack parser runs, so Chat principals do not change. |
+| Session API clients (#2162), sandbox release endpoint (#2172), per-harness warm pools (#2158), tool trace capture (#2160), token-broker always on (#2029, #2128), agent-sandbox v1.0.9 (#2157) | **Shared.** No Chat code change. |
+| Proactivity prompts and ordered rules (#2099, #2102), split-message debounce (#2104), debate-between-people classifier line (#2116) | **Follow-up.** Chat keeps the #2081 classifier and its exact-space poller. |
+| Progress updates for long-running tasks (#2091) | **Follow-up.** Off by default (`apiRs.activitySummary.progressUpdates.enabled`). The Chat renderer ignores `session.progress_update`. |
+| Render index append retried on Postgres deadlock (#2040) | **Follow-up.** `acceptWork` makes the same `appendToList` call. Postgres recovery does not read that list, so a failed append could be logged instead of failing the accept. |
+| Plain-text `@centaur` is not a mention (#2121) | **Already equivalent.** Chat takes mentions only from `USER_MENTION` annotations, slash commands, and 1:1 DMs. |
+| Slack unfurls (#2152), `&amp;` decoding (#2055), agent-view status (#2101), Slack proxy user email (#2156), Slack button channel IDs (#2118), `SLACK_SEARCH_TOKEN` removal (#2110), Slack file downloads to disk (#2165) | **Platform-specific.** |
+| CI and toolchain pins (#2062, #2078, #2080, #2151), new `evals.yml` and `chart-version.yml` | **Fork infrastructure.** The googlechatbot job uses slackbotv2's Node 24.22.2 and pnpm 10.34.9. Its Dockerfile pnpm, `hono`, and `@types/bun` follow slackbotv2. The two new workflows need Depot runners and are left as upstream has them. |
+
 ### 2026-10-29 — focused functional ports, upstream `8f404382..5e94d92e`
 
 A selective port on top of the 2026-10-26 sync, not an upstream merge.

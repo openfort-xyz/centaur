@@ -20,9 +20,13 @@ const LAMINAR_METADATA_PREFIX: &str = "lmnr.association.properties.metadata.";
 const MAX_SPAN_IO_BYTES: usize = 60 * 1024;
 const MAX_TOOL_COMMAND_BYTES: usize = 8 * 1024;
 const TRUNCATION_SUFFIX: &str = "…[truncated]";
-/// Transcript capture is opt-in: LLM prompt/response text and shell commands
-/// are only exported when this env var is set to a truthy value.
+/// Transcript capture is opt-in: LLM prompt/response text is only exported
+/// when this env var is set to a truthy value.
 const TRANSCRIPT_CAPTURE_ENV: &str = "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS";
+/// Tool trace capture is opt-in: bounded shell commands and workspace-relative
+/// working directories are only exported on tool spans when this env var is
+/// set to a truthy value. It is independent of transcript capture.
+const TOOL_TRACE_CAPTURE_ENV: &str = "CENTAUR_TELEMETRY_CAPTURE_TOOL_TRACES";
 
 static TELEMETRY: OnceLock<Option<TelemetryRuntime>> = OnceLock::new();
 
@@ -108,6 +112,7 @@ pub(crate) struct TurnTelemetry {
     tools: HashMap<String, ActiveTool>,
     centaur_tool_names: BTreeSet<String>,
     capture_transcripts: bool,
+    capture_tool_commands: bool,
     observed_status: Option<TurnStatus>,
     finished: bool,
 }
@@ -151,7 +156,8 @@ impl TurnTelemetry {
             model_provider.into(),
             turn_id.into(),
             input,
-            transcript_capture_enabled(),
+            env_flag_enabled(TRANSCRIPT_CAPTURE_ENV),
+            env_flag_enabled(TOOL_TRACE_CAPTURE_ENV),
         )
     }
 
@@ -166,6 +172,7 @@ impl TurnTelemetry {
         turn_id: String,
         input: Option<String>,
         capture_transcripts: bool,
+        capture_tool_commands: bool,
     ) -> Self {
         Self {
             tracer,
@@ -186,6 +193,7 @@ impl TurnTelemetry {
             tools: HashMap::new(),
             centaur_tool_names: load_centaur_tool_names(),
             capture_transcripts,
+            capture_tool_commands,
             observed_status: None,
             finished: false,
         }
@@ -273,7 +281,7 @@ impl TurnTelemetry {
                     && let Some(id) = string_at_path(item, &["id"])
                     && let Some(labels) = tool_labels_from_item(item, &self.centaur_tool_names)
                 {
-                    let command = tool_command_details(item, self.capture_transcripts);
+                    let command = tool_command_details(item, self.capture_tool_commands);
                     self.start_tool(id, labels, command);
                 }
             }
@@ -378,7 +386,7 @@ impl TurnTelemetry {
         let Some(labels) = tool_labels_from_item(item, &self.centaur_tool_names) else {
             return;
         };
-        let command = tool_command_details(item, self.capture_transcripts);
+        let command = tool_command_details(item, self.capture_tool_commands);
         self.start_tool(id.clone(), labels, command);
         if let Some(mut tool) = self.tools.remove(&id) {
             finish_tool_span(&mut tool.span, status);
@@ -539,11 +547,8 @@ fn traces_export_disabled() -> bool {
     )
 }
 
-fn transcript_capture_enabled() -> bool {
-    env::var(TRANSCRIPT_CAPTURE_ENV)
-        .ok()
-        .as_deref()
-        .is_some_and(truthy_env_value)
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name).ok().as_deref().is_some_and(truthy_env_value)
 }
 
 fn truthy_env_value(value: &str) -> bool {
@@ -826,7 +831,7 @@ fn centaur_catalog_tool_labels(
     })
 }
 
-fn tool_command_details(item: &Value, capture_transcripts: bool) -> Option<ToolCommandDetails> {
+fn tool_command_details(item: &Value, capture_commands: bool) -> Option<ToolCommandDetails> {
     if !matches!(
         item.get("type").and_then(Value::as_str),
         Some("commandExecution" | "command_execution")
@@ -839,8 +844,8 @@ fn tool_command_details(item: &Value, capture_transcripts: bool) -> Option<ToolC
     let executable = executable_name(words.first()?).to_owned();
     Some(ToolCommandDetails {
         executable,
-        command: capture_transcripts.then(|| bounded_tool_command(&command)),
-        cwd: if capture_transcripts {
+        command: capture_commands.then(|| bounded_tool_command(&command)),
+        cwd: if capture_commands {
             workspace_relative_cwd(item)
         } else {
             None
@@ -1134,6 +1139,15 @@ fn normalize_model_name(model: &str) -> String {
 }
 
 fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
+    if model.contains("fable-5-1") || model.contains("mythos-5-1") {
+        return Some(TokenPricing {
+            input_per_mtok: 10.0,
+            cache_creation_per_mtok: 12.5,
+            cache_read_per_mtok: 0.25,
+            output_per_mtok: 50.0,
+            source: "centaur_estimate:anthropic:fable-mythos-5-1:5m-cache-write",
+        });
+    }
     if model.contains("fable-5") || model.contains("mythos-5") {
         return Some(TokenPricing {
             input_per_mtok: 10.0,
@@ -1184,6 +1198,15 @@ fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
             source: "centaur_estimate:anthropic:opus-4-deprecated:5m-cache-write",
         });
     }
+    if model.contains("sonnet-5-5") {
+        return Some(TokenPricing {
+            input_per_mtok: 2.0,
+            cache_creation_per_mtok: 2.5,
+            cache_read_per_mtok: 0.1,
+            output_per_mtok: 10.0,
+            source: "centaur_estimate:anthropic:sonnet-5-5:5m-cache-write",
+        });
+    }
     if model.contains("sonnet-5") {
         return Some(TokenPricing {
             input_per_mtok: 2.0,
@@ -1202,6 +1225,16 @@ fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
             source: "centaur_estimate:anthropic:sonnet-4:5m-cache-write",
         });
     }
+    // Short-context estimate (<=100K prompt tokens); longer prompts cost 5x.
+    if model.contains("haiku-5-5") {
+        return Some(TokenPricing {
+            input_per_mtok: 0.1,
+            cache_creation_per_mtok: 0.125,
+            cache_read_per_mtok: 0.01,
+            output_per_mtok: 0.5,
+            source: "centaur_estimate:anthropic:haiku-5-5:5m-cache-write",
+        });
+    }
     if model.contains("haiku-4-5") {
         return Some(TokenPricing {
             input_per_mtok: 1.0,
@@ -1216,9 +1249,20 @@ fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
 
 fn openai_pricing(model: &str) -> Option<TokenPricing> {
     // Standard rates for <=272K input tokens, verified against the model pages:
+    // https://developers.openai.com/api/docs/models/gpt-6-astra
     // https://developers.openai.com/api/docs/models/gpt-6.1-sol
     // https://developers.openai.com/api/docs/models/gpt-6-sol
     // https://developers.openai.com/api/docs/models/gpt-6-luna
+    // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    if model.contains("gpt-6-1-terra") {
+        return Some(TokenPricing {
+            input_per_mtok: 1.0,
+            cache_creation_per_mtok: 1.25,
+            cache_read_per_mtok: 0.05,
+            output_per_mtok: 5.0,
+            source: "centaur_estimate:openai:gpt-6.1-terra:standard-short-context",
+        });
+    }
     if model.contains("gpt-6-1-sol") {
         return Some(TokenPricing {
             input_per_mtok: 2.0,
@@ -1251,16 +1295,17 @@ fn openai_pricing(model: &str) -> Option<TokenPricing> {
             input_per_mtok: 10.0,
             cache_creation_per_mtok: 12.5,
             cache_read_per_mtok: 1.0,
-            output_per_mtok: 60.0,
+            output_per_mtok: 50.0,
             source: "centaur_estimate:openai:gpt-6-astra:standard-short-context",
         });
     }
+    // https://developers.openai.com/api/docs/models/gpt-5.6-sol
     if model.contains("gpt-5-6-sol") {
         return Some(TokenPricing {
-            input_per_mtok: 5.0,
-            cache_creation_per_mtok: 6.25,
-            cache_read_per_mtok: 0.5,
-            output_per_mtok: 30.0,
+            input_per_mtok: 4.0,
+            cache_creation_per_mtok: 5.0,
+            cache_read_per_mtok: 0.4,
+            output_per_mtok: 20.0,
             source: "centaur_estimate:openai:gpt-5.6-sol:standard-short-context",
         });
     }
@@ -1282,6 +1327,17 @@ fn openai_pricing(model: &str) -> Option<TokenPricing> {
             source: "centaur_estimate:openai:gpt-5.6-luna:standard-short-context",
         });
     }
+    // https://developers.openai.com/api/docs/models/gpt-5.5-pro
+    // Pro has no cached-input discount; use the input rate for cache tokens.
+    if model.contains("gpt-5-5-pro") {
+        return Some(TokenPricing {
+            input_per_mtok: 30.0,
+            cache_creation_per_mtok: 30.0,
+            cache_read_per_mtok: 30.0,
+            output_per_mtok: 180.0,
+            source: "centaur_estimate:openai:gpt-5.5-pro:standard-short-context",
+        });
+    }
     if model.contains("gpt-5-5") {
         return Some(TokenPricing {
             input_per_mtok: 5.0,
@@ -1289,6 +1345,37 @@ fn openai_pricing(model: &str) -> Option<TokenPricing> {
             cache_read_per_mtok: 0.5,
             output_per_mtok: 30.0,
             source: "centaur_estimate:openai:gpt-5.5",
+        });
+    }
+    // https://developers.openai.com/api/docs/models/gpt-5.4-pro
+    // Pro has no cached-input discount; use the input rate for cache tokens.
+    if model.contains("gpt-5-4-pro") {
+        return Some(TokenPricing {
+            input_per_mtok: 30.0,
+            cache_creation_per_mtok: 30.0,
+            cache_read_per_mtok: 30.0,
+            output_per_mtok: 180.0,
+            source: "centaur_estimate:openai:gpt-5.4-pro:standard-short-context",
+        });
+    }
+    // https://developers.openai.com/api/docs/models/gpt-5.4-mini
+    if model.contains("gpt-5-4-mini") {
+        return Some(TokenPricing {
+            input_per_mtok: 0.75,
+            cache_creation_per_mtok: 0.75,
+            cache_read_per_mtok: 0.075,
+            output_per_mtok: 4.5,
+            source: "centaur_estimate:openai:gpt-5.4-mini:standard-short-context",
+        });
+    }
+    // https://developers.openai.com/api/docs/models/gpt-5.4-nano
+    if model.contains("gpt-5-4-nano") {
+        return Some(TokenPricing {
+            input_per_mtok: 0.2,
+            cache_creation_per_mtok: 0.2,
+            cache_read_per_mtok: 0.02,
+            output_per_mtok: 1.25,
+            source: "centaur_estimate:openai:gpt-5.4-nano:standard-short-context",
         });
     }
     if model.contains("gpt-5-4") {
@@ -1364,12 +1451,13 @@ mod tests {
     }
 
     fn test_turn(tracer: SdkTracer) -> TurnTelemetry {
-        test_turn_with_transcript_capture(tracer, false)
+        test_turn_with_capture(tracer, false, false)
     }
 
-    fn test_turn_with_transcript_capture(
+    fn test_turn_with_capture(
         tracer: SdkTracer,
         capture_transcripts: bool,
+        capture_tool_commands: bool,
     ) -> TurnTelemetry {
         let trace = trace_context();
         TurnTelemetry::with_tracer(
@@ -1382,6 +1470,7 @@ mod tests {
             "turn-1".to_owned(),
             Some("hello".to_owned()),
             capture_transcripts,
+            capture_tool_commands,
         )
     }
 
@@ -1395,9 +1484,9 @@ mod tests {
     fn test_turn_with_centaur_tools_and_capture(
         tracer: SdkTracer,
         names: impl IntoIterator<Item = &'static str>,
-        capture_transcripts: bool,
+        capture_tool_commands: bool,
     ) -> TurnTelemetry {
-        let mut turn = test_turn_with_transcript_capture(tracer, capture_transcripts);
+        let mut turn = test_turn_with_capture(tracer, false, capture_tool_commands);
         turn.centaur_tool_names = names.into_iter().map(str::to_owned).collect();
         turn
     }
@@ -1551,7 +1640,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_capture_exports_bounded_command_and_relative_cwd() {
+    fn tool_trace_capture_exports_bounded_command_and_relative_cwd_without_transcripts() {
         let (exporter, provider, tracer) = test_telemetry();
         let mut turn = test_turn_with_centaur_tools_and_capture(tracer, ["websearch"], true);
         let cwd = env::current_dir().expect("current dir").join("src");
@@ -1688,6 +1777,7 @@ mod tests {
             "turn-1".to_owned(),
             None,
             false,
+            true,
         );
         turn.set_model("gpt-5.4");
         turn.observe_wire_value(&json!({
@@ -1764,7 +1854,7 @@ mod tests {
     #[test]
     fn transcript_capture_exports_prompt_and_response_when_enabled() {
         let (exporter, provider, tracer) = test_telemetry();
-        let mut turn = test_turn_with_transcript_capture(tracer, true);
+        let mut turn = test_turn_with_capture(tracer, true, true);
         turn.observe_wire_value(&json!({
             "method": "item/completed",
             "params": {"item": {
@@ -1891,14 +1981,19 @@ mod tests {
             ..Default::default()
         };
 
-        for model in [
-            "gpt-6-astra",
-            "gpt-6.1-sol",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
+        for (model, input, cache_write, cache_read, output) in [
+            ("gpt-6-astra", 10.0, 12.5, 1.0, 50.0),
+            ("gpt-6.1-sol", 2.0, 2.5, 0.1, 10.0),
+            ("gpt-6.1-terra", 1.0, 1.25, 0.05, 5.0),
+            ("gpt-6-sol", 2.0, 2.5, 0.2, 10.0),
+            ("gpt-6-luna", 0.1, 0.125, 0.01, 0.5),
+            ("gpt-5.6-sol", 4.0, 5.0, 0.4, 20.0),
+            ("gpt-5.6-terra", 2.0, 2.5, 0.2, 12.0),
+            ("gpt-5.6-luna", 0.2, 0.25, 0.02, 1.2),
+            ("gpt-5.5-pro", 30.0, 30.0, 30.0, 180.0),
+            ("gpt-5.4-pro", 30.0, 30.0, 30.0, 180.0),
+            ("gpt-5.4-mini", 0.75, 0.75, 0.075, 4.5),
+            ("gpt-5.4-nano", 0.2, 0.2, 0.02, 1.25),
         ] {
             let cost =
                 estimate_usage_cost(HarnessKind::Codex, "openai", model, &usage).expect("cost");
@@ -1906,11 +2001,24 @@ mod tests {
                 cost.source,
                 format!("centaur_estimate:openai:{model}:standard-short-context")
             );
+            assert!((cost.input_cost - input).abs() < 1e-9, "{model}");
+            assert!((cost.output_cost - output * 0.1).abs() < 1e-9, "{model}");
+            // Exercise normalized spellings and cached-token rates, too.
+            for name in [
+                model.to_owned(),
+                model.replace('.', "_"),
+                model.replace('.', "-"),
+            ] {
+                let pricing =
+                    pricing_for_usage(HarnessKind::Codex, "openai", &name).expect("pricing");
+                assert_eq!(pricing.cache_creation_per_mtok, cache_write, "{name}");
+                assert_eq!(pricing.cache_read_per_mtok, cache_read, "{name}");
+            }
         }
     }
 
     #[test]
-    fn opus_5_5_cost_is_not_billed_as_opus_5() {
+    fn current_claude_models_are_priced_on_their_own_tiers() {
         let usage = NormalizedTokenUsage {
             input_tokens: Some(1_000_000),
             cache_creation_input_tokens: Some(100_000),
@@ -1931,6 +2039,30 @@ mod tests {
                 4.225,
                 2.5,
                 "centaur_estimate:anthropic:opus-4.5-plus:5m-cache-write",
+            ),
+            (
+                "claude-fable-5-1",
+                8.3,
+                5.0,
+                "centaur_estimate:anthropic:fable-mythos-5-1:5m-cache-write",
+            ),
+            (
+                "claude-sonnet-5-5",
+                1.67,
+                1.0,
+                "centaur_estimate:anthropic:sonnet-5-5:5m-cache-write",
+            ),
+            (
+                "claude-haiku-5-5",
+                0.0845,
+                0.05,
+                "centaur_estimate:anthropic:haiku-5-5:5m-cache-write",
+            ),
+            (
+                "claude-haiku-4-5",
+                0.845,
+                0.5,
+                "centaur_estimate:anthropic:haiku-4.5:5m-cache-write",
             ),
         ] {
             let cost = estimate_usage_cost(HarnessKind::ClaudeCode, "anthropic", model, &usage)

@@ -7,6 +7,8 @@
     "eval": "PROMPTFOO_DISABLE_TELEMETRY=1 PROMPTFOO_DISABLE_UPDATE=1 PROMPTFOO_DISABLE_SHARING=1 promptfoo eval",
     "eval:message-overrides": "pnpm run eval -c message-overrides/promptfooconfig.yaml",
     "eval:proactive-response": "pnpm run eval -c proactive-response/promptfooconfig.yaml",
+    "eval:googlechat-message-overrides": "pnpm run eval -c googlechat-message-overrides/promptfooconfig.yaml",
+    "eval:googlechat-proactive-response": "pnpm run eval -c googlechat-proactive-response/promptfooconfig.yaml",
     "view": "PROMPTFOO_DISABLE_TELEMETRY=1 PROMPTFOO_DISABLE_UPDATE=1 PROMPTFOO_DISABLE_SHARING=1 promptfoo view"
   },
   "devDependencies": {

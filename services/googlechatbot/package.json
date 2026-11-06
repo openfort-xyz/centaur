@@ -15,13 +15,13 @@
     "@centaur/rendering": "workspace:*",
     "@chat-adapter/state-pg": "4.40.0",
     "chat": "4.40.0",
-    "hono": "^4.13.13",
+    "hono": "^4.13.14",
     "pg": "^8.23.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@chat-adapter/state-memory": "4.40.0",
-    "@types/bun": "^1.4.3",
+    "@types/bun": "^1.4.4",
     "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
     "@typescript/native-preview": "^7.0.0-dev.20260707.2",
