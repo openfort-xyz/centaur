@@ -821,6 +821,92 @@ def test_malformed_reactions_are_skipped_without_page_index_ids():
     assert [args[3] for args in inserts] == ["R1"]
 
 
+REACTION_SUMMARY = [{"emoji": {"unicode": "✅"}, "reactionCount": 1}]
+
+
+def _chat_message(message_id, **fields):
+    return {
+        "name": f"spaces/S1/messages/{message_id}",
+        "text": f"message {message_id}",
+        "sender": {"name": "users/1", "type": "HUMAN"},
+        "createTime": "2026-06-01T10:00:00Z",
+        **fields,
+    }
+
+
+def _sync_one_page(client):
+    pool = FakeSyncPool()
+    counts = {"messages_seen": 0, "messages_upserted": 0}
+    asyncio.run(
+        chat_sync._sync_space(
+            pool,
+            client=client,
+            space={"name": "spaces/S1", "type": "SPACE"},
+            run_id="run_1",
+            page_size=100,
+            overlap_seconds=60,
+            max_pages=0,
+            explicit_since=None,
+            counts=counts,
+        )
+    )
+    reaction_deletes = {
+        args[2]: args[3]
+        for sql, args in pool.executed
+        if sql.startswith("DELETE FROM google_chat_sync_reactions")
+    }
+    return counts, reaction_deletes
+
+
+def test_reactions_are_listed_only_for_messages_with_reaction_summaries():
+    class RecordingReactions(FakeChatClient):
+        def __init__(self, pages):
+            super().__init__(pages)
+            self.reaction_reads = []
+
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            self.reaction_reads.append(message_name)
+            return {
+                "emojiReactions": [
+                    {
+                        "name": f"{message_name}/reactions/R1",
+                        "user": {"name": "users/2"},
+                        "emoji": {"unicode": "✅"},
+                    }
+                ]
+            }
+
+    client = RecordingReactions(
+        [
+            {
+                "messages": [
+                    _chat_message("plain"),
+                    _chat_message("reacted", emojiReactionSummaries=REACTION_SUMMARY),
+                ]
+            }
+        ]
+    )
+    counts, reaction_deletes = _sync_one_page(client)
+
+    assert client.reaction_reads == ["spaces/S1/messages/reacted"]
+    assert counts["reactions_processed"] == 1
+    assert reaction_deletes["reacted"] == ["R1"]
+
+
+def test_message_without_reaction_summaries_clears_stale_reactions_without_rpc():
+    class NoReactionReads(FakeChatClient):
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            raise AssertionError(f"unexpected reactions read for {message_name}")
+
+    counts, reaction_deletes = _sync_one_page(
+        NoReactionReads([{"messages": [_chat_message("unreacted")]}])
+    )
+
+    assert counts["messages_upserted"] == 1
+    assert counts["reactions_processed"] == 0
+    assert reaction_deletes == {"unreacted": []}
+
+
 def test_changed_chat_threads_exclude_owner_scoped_dms():
     class Pool:
         def __init__(self):
