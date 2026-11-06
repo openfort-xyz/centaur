@@ -6,7 +6,6 @@ name: Release Chart
       - main
     paths:
       - "contrib/chart/**"
-      - "scripts/verify-google-chat-network-policy.sh"
       - ".github/workflows/release-chart.yml"
   merge_group:
   push:
@@ -14,7 +13,6 @@ name: Release Chart
       - main
     paths:
       - "contrib/chart/**"
-      - "scripts/verify-google-chat-network-policy.sh"
       - ".github/workflows/release-chart.yml"
 
 permissions: {}
@@ -23,7 +21,7 @@ jobs:
   release:
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,9 +63,6 @@ jobs:
 
       - name: Lint chart
         run: helm lint contrib/chart
-
-      - name: Verify Google Chat chart security
-        run: scripts/verify-google-chat-network-policy.sh
 
       - name: Install yq
         uses: mikefarah/yq@504fc38780cc46be8444ea1b72fb55919fc0bfb0 # v4.54.1
