@@ -790,6 +790,9 @@ def test_dm_membership_failure_does_not_block_owner_scoped_sync():
     assert asyncio.run(chat_sync._member_directory(BrokenMembers([]), "spaces/DM")) == {}
 
 
+REACTION_SUMMARY = [{"emoji": {"unicode": "✅"}, "reactionCount": 1}]
+
+
 def test_malformed_reactions_are_skipped_without_page_index_ids():
     class Reactions(FakeChatClient):
         def list_reactions(self, message_name, *, page_size, page_token=None):
@@ -812,16 +815,16 @@ def test_malformed_reactions_are_skipped_without_page_index_ids():
             owner_email="",
             space_id="S1",
             message_id="M1",
-            message_name="spaces/S1/messages/M1",
+            message={
+                "name": "spaces/S1/messages/M1",
+                "emojiReactionSummaries": REACTION_SUMMARY,
+            },
             run_id="run_1",
         )
     )
     assert count == 1
     inserts = [args for sql, args in pool.executed if "INSERT INTO google_chat_sync_reactions" in sql]
     assert [args[3] for args in inserts] == ["R1"]
-
-
-REACTION_SUMMARY = [{"emoji": {"unicode": "✅"}, "reactionCount": 1}]
 
 
 def _chat_message(message_id, **fields):
@@ -1067,6 +1070,7 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
                         "text": "see the runbook",
                         "sender": {"name": "users/1", "type": "HUMAN"},
                         "createTime": "2026-08-14T10:00:00Z",
+                        "emojiReactionSummaries": REACTION_SUMMARY,
                         "attachment": [
                             {
                                 "name": "spaces/DM1/messages/M1/attachments/A1",
