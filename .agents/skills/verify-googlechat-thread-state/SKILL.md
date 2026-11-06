@@ -10,7 +10,7 @@ a turn or steer the running one, a mentioned `stop`, and a Stop-card press, all 
 each other and the api-rs execution. TLC checks every interleaving of those steps within
 the bounds below. A pass covers the model and its bounds, not the whole bot.
 
-Sync commit: `7eb5c1bc51fd206f6f29ceebb18830ded5e8bf87`
+Sync commit: `5459adb6f54b69ca4e3bc3c121077520f626f1ca`
 
 ## What it checks
 

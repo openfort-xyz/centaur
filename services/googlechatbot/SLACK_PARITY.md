@@ -136,8 +136,8 @@ indefinite retries and record abandonment in metrics.
 | Card | At most 100 widgets; no empty sections |
 
 These are per-operation limits, not an overall memory or queue-capacity bound. The
-work-index and lease-ownership defects recorded in the
-[source review](../../docs/fork-upstream-review.md) are closed by the authoritative
+work-index and lease-ownership defects found in the 2026-09-07 fork review are
+closed by the authoritative
 pending-work query and the token-checked leases (see the README's recovery
 section and `state.test.ts`).
 
@@ -159,8 +159,8 @@ A selective port on top of the 2026-10-26 sync, not an upstream merge.
 | Native Stop including the startup race (#1973) | **Ported.** Stop card on the acknowledgement plus the mentioned stop command; stop intent persisted before any lock; card bound to its acknowledgement and checked under the thread handoff lock; status edits keep the card, the final removes it. The cards-only PATCH carries placeholder text under `updateMask=cardsV2` because Google rejects an otherwise empty body (verified live). |
 | Proactive replies (#2081) | **Ported with a Google event source.** Upstream's classifier and eligibility rules; unmentioned messages are collected by a bounded exact-space poller over `spaces.messages.list` using `createTime > <cursor minus one nanosecond>` (`>=` is rejected by the API, verified live) with durable cursor and seen names. |
 | Eyes acknowledgement (#2083) | **Ported as a delegated reaction.** Requires `GOOGLECHATBOT_REACTION_ACTOR_USER` with `chat.messages.reactions`; authored by that user. Off by default. |
-| Decisions-API override classifier and evals (#2082, #2087) | **Ported.** Same instructions and questions with Google naming; `maxOutputTokens` removed; default model `gpt-6-luna`; `evals/` workspace runs both classifiers against the shipped Google code. |
-| Model aliases and GPT-6.1 Terra (#2068) | **Ported.** `--fable`/`--sonnet`/`--haiku` expand to Fable 5.1, Sonnet 5.5, Haiku 5.5; `gpt-6.1-terra` is selectable with ultra effort. The deployment's default execution model is unchanged. The shared harness-server, sandbox image, and Pi docs parts of #2068 are ported separately. |
+| Decisions-API override classifier and evals (#2082, #2087) | **Ported.** Same instructions and questions with Google naming; `maxOutputTokens` removed; default model `gpt-6-luna`; `evals/googlechat-message-overrides` and `evals/googlechat-proactive-response` run both classifiers against the shipped Google code (`cd evals && pnpm run eval -c <dir>/promptfooconfig.yaml`). |
+| Model aliases and GPT-6.1 Terra (#2068) | **Ported.** `--fable`/`--sonnet`/`--haiku` expand to Fable 5.1, Sonnet 5.5, Haiku 5.5; `gpt-6.1-terra` is selectable with ultra effort. The deployment's default execution model is unchanged. The shared harness-server, sandbox image, and Pi docs parts of #2068 come from upstream. |
 | Deploy drain (#1999) | **Ported.** Bounded SIGTERM drain, readiness fails at once, chart grace period and `Recreate` for the lease-scheme rollout. |
 
 ### 2026-10-21 — 87 upstream commits, `d63acb7b..4bf5d61d`

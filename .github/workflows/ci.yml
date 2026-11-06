@@ -153,7 +153,6 @@ jobs:
             '^\.github/workflows/ci\.yml$'
           set_output rust_api \
             '^Cargo\.(toml|lock)$' \
-            '^crates/harness-server/' \
             '^crates/absurd-sdk/' \
             '^crates/active-record-encryption/' \
             '^crates/centaur-' \
@@ -198,6 +197,8 @@ jobs:
             '^docs/google-chat-parity-verification\.md$' \
             '^plan/feature-google-chat-slack-parity-1\.md$' \
             '^scripts/(verify-google-chat-parity-ledger\.sh|test_google_chat_parity_ledger\.py)$' \
+            '^contrib/chart/' \
+            '^scripts/verify-google-chat-network-policy\.sh$' \
             '^package\.json$' \
             '^pnpm-lock\.yaml$' \
             '^pnpm-workspace\.yaml$' \
@@ -712,6 +713,18 @@ jobs:
         run: |
           scripts/verify-google-chat-parity-ledger.sh
           python3 scripts/test_google_chat_parity_ledger.py
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.1.1
+
+      - name: Verify Google Chat chart security
+        run: |
+          helm repo add onepassword https://1password.github.io/connect-helm-charts
+          helm dependency build contrib/chart
+          helm lint contrib/chart
+          scripts/verify-google-chat-network-policy.sh
 
       - name: Start Test Postgres
         run: .github/scripts/start-test-postgres.sh centaur-googlechatbot-test-postgres 5432 postgres

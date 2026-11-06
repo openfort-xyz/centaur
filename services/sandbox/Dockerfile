@@ -44,7 +44,7 @@ ENV LIBCLANG_PATH=/usr/lib/llvm-22/lib
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip3 install --break-system-packages --no-compile --ignore-installed "packaging>=24.2.0" \
     && pip3 install --break-system-packages --no-compile \
-    python-docx==1.2.0 lxml==6.1.3 docx-revisions==0.1.4 \
+    python-docx==1.2.0 lxml==6.0.2 docx-revisions==0.1.4 \
     matplotlib==3.10.8 numpy==2.4.4 pandas==3.0.2 \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.27.2 mammoth==1.12.0 \
     faster-whisper \
@@ -67,8 +67,6 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
-# gcloud's bundled pip only installs components, which the apt package
-# disables; it vendors msgpack/setuptools with HIGH CVEs, so it is removed.
 ARG NODE_VERSION=24.22.1
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -89,7 +87,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && node --version | grep -Fx "v${NODE_VERSION}" \
     && gcloud --version >/dev/null \
     && bq version >/dev/null \
-    && rm -rf /usr/lib/google-cloud-sdk/platform/bundledpythonunix/lib/python3.14/site-packages/pip \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Non-root agent user ─────────────────────────────────────────────────────
@@ -97,8 +94,8 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
 ARG CLAUDE_CODE_VERSION=2.1.310
-ARG CODEX_VERSION=0.165.0
-ARG PI_CODING_AGENT_VERSION=1.4.0
+ARG CODEX_VERSION=0.160.1
+ARG PI_CODING_AGENT_VERSION=1.0.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG NUSHELL_VERSION=0.112.2
@@ -176,17 +173,12 @@ ENV PI_TELEMETRY=0 \
 # this venv's interpreter; the `hermes` shim serves cron ticks + CLI use.
 # Hermes intentionally rejects wheel builds because its runtime assets depend
 # on the source-checkout layout, so install the pinned checkout editable.
-# The pinned ref holds Pillow/PyJWT/certifi/urllib3 versions with HIGH and
-# CRITICAL CVEs; upgrade them to the versions Hermes main pins. Drop that
-# step once HERMES_AGENT_REF carries them for this Python.
 RUN git init /opt/hermes-agent \
     && git -C /opt/hermes-agent remote add origin https://github.com/NousResearch/hermes-agent.git \
     && git -C /opt/hermes-agent fetch --depth 1 origin "${HERMES_AGENT_REF}" \
     && git -C /opt/hermes-agent checkout --detach FETCH_HEAD \
     && python3 -m venv /opt/hermes \
     && /opt/hermes/bin/pip install --no-cache-dir --editable /opt/hermes-agent \
-    && /opt/hermes/bin/pip install --no-cache-dir \
-      "Pillow==13.0.0" "PyJWT[crypto]==2.15.1" "certifi==2026.10.19" "urllib3==2.8.0" \
     && rm -rf /opt/hermes-agent/.git \
     && ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes \
     && hermes version
@@ -219,7 +211,7 @@ ARG FOUNDRY_VERSION=v1.7.0
 ARG AMP_CLI_VERSION=0.0.1792995770-gba80ba
 ARG MANIM_VERSION=0.20.1
 ARG BUN_VERSION=bun-v1.4.4
-ARG OMP_VERSION=18.13.2
+ARG OMP_VERSION=18.8.6
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

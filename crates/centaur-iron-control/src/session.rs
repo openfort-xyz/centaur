@@ -1,7 +1,7 @@
 //! Per-session principal registration.
 //!
-//! Roles are registered once at startup. See [`crate::register_role`].
-//! When a session starts, [`SessionRegistrar`] upserts its principal.
+//! Roles are registered once at startup (see [`crate::register_role`]); a
+//! When a session starts, [`SessionRegistrar`] upserts the session's principal.
 //! Iron-control owns default role assignment for brand-new principals, while
 //! existing principals keep their current assignments so operator revocations
 //! in console or ``centaur-perms`` remain sticky. The principal is derived from
