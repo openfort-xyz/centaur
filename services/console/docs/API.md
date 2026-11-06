@@ -1109,7 +1109,7 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 
 ### Sandbox Admin Permission Management
 
-An active admin Console user's DM sandbox may create workflow principals, create and edit static and Postgres DSN secrets whose sources reference an external store, inspect a principal's effective grants, and manage its roles, direct secret grants, and sandbox capabilities with its sandbox entitlement JWT. From a Slack DM it may additionally create Slack channel and Slack user principals, manage Slack channel permissions, and edit the Slack Connect allowlist; those Slack-scoped operations return `403` from a Google Chat DM. From a Google Chat DM it may additionally manage Google Chat space permissions and email-targeted DM permissions; those return `403` from a Slack DM.
+An active admin Console user's DM sandbox may create workflow principals, create and edit static, Postgres DSN, and GCP ID token secrets whose sources reference an external store, grant secrets to roles, inspect a principal's effective grants, and manage its roles, direct secret grants, and sandbox capabilities with its sandbox entitlement JWT. From a Slack DM it may additionally create Slack channel and Slack user principals, manage Slack channel permissions, and edit the Slack Connect allowlist; those Slack-scoped operations return `403` from a Google Chat DM. From a Google Chat DM it may additionally manage Google Chat space permissions and email-targeted DM permissions; those return `403` from a Slack DM.
 
 The sandbox principal must be one of:
 
@@ -1124,15 +1124,16 @@ Other sandboxes, including channel, shared Google Chat space, Slack Connect, bar
 | `GET` | `/api/v1/sandbox/admin/principals/:id` | Fetch one by OID. |
 | `POST` | `/api/v1/sandbox/admin/principals` | Create a Slack channel (`data: { kind: "slack_channel", slack_channel_id }`), Slack user (`data: { kind: "slack_dm", slack_user_id }`), or workflow (`data: { kind: "workflow", workflow_name }`) principal. The foreign ID, kind, and Slack fields match what api-rs derives: `slack-channel-<channel>`, `slack-user-<team>-<user>` in the admin's workspace, or `workflow-<slugged workflow_name>` for `WORKFLOW_PRINCIPAL = True`. A new channel principal gets full Slack access to its own channel. Other kinds and DM channel IDs return `400`; invalid IDs and existing principals return `422`. |
 | `GET` | `/api/v1/sandbox/admin/principals/lookup/:foreign_id` | Fetch one by foreign ID. |
-| `GET`/`POST` | `/api/v1/sandbox/admin/static_secrets[/:id]`, `/api/v1/sandbox/admin/pg_dsn_secrets[/:id]` | Fetch a secret by OID or create one, as in the static and Postgres DSN secret APIs. Inline `control_plane` and OAuth `token_broker` sources return `403`. |
-| `PATCH`/`PUT` | `/api/v1/sandbox/admin/static_secrets/:id`, `/api/v1/sandbox/admin/pg_dsn_secrets/:id` | Update an existing secret by OID. Omitted fields, including the source, keep their current values. Same source restrictions; secrets with a `token_broker` source return `403`. |
+| `GET`/`POST` | `/api/v1/sandbox/admin/static_secrets[/:id]`, `/api/v1/sandbox/admin/pg_dsn_secrets[/:id]`, `/api/v1/sandbox/admin/gcp_id_token_secrets[/:id]` | Fetch a secret by OID or create one, as in the static, Postgres DSN, and GCP ID token secret APIs. Inline `control_plane` and OAuth `token_broker` sources return `403`. |
+| `PATCH`/`PUT` | `/api/v1/sandbox/admin/static_secrets/:id`, `/api/v1/sandbox/admin/pg_dsn_secrets/:id`, `/api/v1/sandbox/admin/gcp_id_token_secrets/:id` | Update an existing secret by OID. Omitted fields, including the source, keep their current values. Same source restrictions; secrets with a `token_broker` source return `403`. |
 | `GET`/`POST` | `/api/v1/sandbox/admin/principals/:principal_id/roles` | List or assign roles (`data: { role_id }`). |
 | `DELETE` | `/api/v1/sandbox/admin/principals/:principal_id/roles/:id` | Unassign a role. |
 | `GET` | `/api/v1/sandbox/admin/roles`, `/roles/:id`, `/roles/lookup/:foreign_id` | List or fetch roles. |
+| `GET` | `/api/v1/sandbox/admin/roles/:role_id/grants` | List a role's grants. |
 | `GET` | `/api/v1/sandbox/admin/principals/:principal_id/grants` | List a principal's direct grants. |
 | `GET` | `/api/v1/sandbox/admin/principals/:id/effective_grants` | List secrets the principal holds directly or through roles, paginated with `page` and `limit`. Each row has `id`, `grant_key`, `foreign_id`, `name`, `direct`, and `roles` (`id`, `foreign_id`, `name`) that grant it. |
-| `POST` | `/api/v1/sandbox/admin/grants` | Grant a secret to a principal (`data: { principal_id, <grant_key>: <secret oid> }`). Role grants return `403`. |
-| `DELETE` | `/api/v1/sandbox/admin/grants/:id` | Revoke a direct principal grant. Role grants return `404`. |
+| `POST` | `/api/v1/sandbox/admin/grants` | Grant a secret to a principal (`data: { principal_id, <grant_key>: <secret oid> }`) or a role (`data: { role_id, <grant_key>: <secret oid> }`). A role grant reaches every holder of the role. |
+| `DELETE` | `/api/v1/sandbox/admin/grants/:id` | Revoke a principal or role grant. |
 | `GET` | `/api/v1/sandbox/admin/secrets` | List grantable secrets of every kind with `id`, `grant_key`, `foreign_id`, `name`, `description`, and `labels`. `q` filters by name or foreign ID. |
 | `POST` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions` | Upsert one Slack channel permission (`data: { channel_id, upload_enabled, download_enabled, history_enabled }`). New permissions default omitted flags to `true`. |
 | `DELETE` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions/:channel_id` | Remove the principal's own permission for a channel. |
