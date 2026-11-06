@@ -237,8 +237,8 @@ the scopes above to one convenience account.
 - The first 10 attachments on an accepted message are hydrated. A file may be
   at most 100 MiB, and all decoded attachments in one turn share the
   `googlechatbot.attachmentAggregateMaxBytes` ceiling (100 MiB by default).
-- Files up to 25 MiB are inlined. Larger accepted files use bounded,
-  SHA-256-checked `attachment.chunk` staging before execution.
+- Files up to 25 MiB are inlined. Larger accepted files use bounded
+  `attachment.chunk` staging before execution.
 - Agent uploads and proxy downloads have a 100 MiB server ceiling. The CLI
   download default is 10 MiB and refuses to overwrite an existing file.
 - A complete serialized Google `Message` is capped at 32,000 UTF-8 bytes.

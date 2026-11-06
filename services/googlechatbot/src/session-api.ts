@@ -1,6 +1,5 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import { isHarnessEnabled } from './harness-routing'
-import { createHash } from 'node:crypto'
 import type { AppConfig } from './config'
 import { centaurApiKey } from './config'
 import { logWarn } from './logging'
@@ -725,8 +724,6 @@ function stagedAttachmentInputLines(part: NormalizedPart, attachmentId: string):
   if (part.type === 'text' || !part.source?.data) return []
   const lines: string[] = []
   const chunkSize = STAGED_ATTACHMENT_CHUNK_CHARS - (STAGED_ATTACHMENT_CHUNK_CHARS % 4)
-  const chunkCount = Math.ceil(part.source.data.length / chunkSize)
-  const sha256 = createHash('sha256').update(Buffer.from(part.source.data, 'base64')).digest('hex')
   for (let offset = 0, index = 0; offset < part.source.data.length; offset += chunkSize, index++) {
     lines.push(JSON.stringify({
       type: 'attachment.chunk',
@@ -735,9 +732,6 @@ function stagedAttachmentInputLines(part: NormalizedPart, attachmentId: string):
       mimeType: part.mime_type,
       attachmentType: part.type,
       chunkIndex: index,
-      chunkCount,
-      byteSize: part.size,
-      sha256,
       final: offset + chunkSize >= part.source.data.length,
       dataBase64: part.source.data.slice(offset, offset + chunkSize)
     }))

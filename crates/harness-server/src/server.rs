@@ -18,7 +18,6 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::amp::AmpHarness;
@@ -303,101 +302,6 @@ struct StagedAttachment {
     path: PathBuf,
     mime_type: Option<String>,
     attachment_type: Option<String>,
-    integrity: AttachmentIntegrity,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct AttachmentIntegrityMetadata {
-    chunk_count: u64,
-    byte_size: u64,
-    sha256: String,
-    verified: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AttachmentIntegrity {
-    metadata: AttachmentIntegrityMetadata,
-    next_chunk_index: u64,
-    received_bytes: u64,
-    hasher: Sha256,
-}
-
-impl AttachmentIntegrityMetadata {
-    pub(crate) fn parse(
-        chunk_count: Option<u64>,
-        byte_size: Option<u64>,
-        sha256: Option<&str>,
-    ) -> Option<Self> {
-        match (chunk_count, byte_size, sha256) {
-            (None, None, None) => Some(Self {
-                chunk_count: 0,
-                byte_size: 100 * 1024 * 1024,
-                sha256: String::new(),
-                verified: false,
-            }),
-            (Some(chunk_count), Some(byte_size), Some(sha256))
-                if chunk_count > 0
-                    && byte_size <= 100 * 1024 * 1024
-                    && sha256.len() == 64
-                    && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
-            {
-                Some(Self {
-                    chunk_count,
-                    byte_size,
-                    sha256: sha256.to_ascii_lowercase(),
-                    verified: true,
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-impl AttachmentIntegrity {
-    pub(crate) fn new(metadata: AttachmentIntegrityMetadata) -> Self {
-        Self {
-            metadata,
-            next_chunk_index: 0,
-            received_bytes: 0,
-            hasher: Sha256::new(),
-        }
-    }
-
-    pub(crate) fn accepts(
-        &self,
-        metadata: &AttachmentIntegrityMetadata,
-        chunk_index: u64,
-        final_chunk: bool,
-    ) -> bool {
-        self.next_chunk_index == chunk_index
-            && self.metadata.verified == metadata.verified
-            && (!metadata.verified
-                || (self.metadata == *metadata
-                    && final_chunk == (chunk_index + 1 == metadata.chunk_count)))
-    }
-
-    pub(crate) fn append(&mut self, bytes: &[u8]) -> bool {
-        if self.received_bytes + bytes.len() as u64 > self.metadata.byte_size {
-            return false;
-        }
-        self.received_bytes += bytes.len() as u64;
-        self.hasher.update(bytes);
-        self.next_chunk_index += 1;
-        true
-    }
-
-    pub(crate) fn verified(&self) -> bool {
-        !self.metadata.verified
-            || (self.received_bytes == self.metadata.byte_size
-                && self
-                    .hasher
-                    .clone()
-                    .finalize()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-                    == self.metadata.sha256)
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,14 +336,6 @@ struct BlocksLine {
     mime_type: Option<String>,
     #[serde(rename = "attachmentType", default)]
     attachment_type: Option<String>,
-    #[serde(rename = "chunkIndex", default)]
-    chunk_index: Option<u64>,
-    #[serde(rename = "chunkCount", default)]
-    chunk_count: Option<u64>,
-    #[serde(rename = "byteSize", default)]
-    byte_size: Option<u64>,
-    #[serde(default)]
-    sha256: Option<String>,
     #[serde(rename = "final", default)]
     final_chunk: bool,
     #[serde(rename = "dataBase64", default)]
@@ -690,9 +586,10 @@ fn attachment_block_to_user_input(
                 ),
             ));
         }
-        return Err(HarnessServerError::InvalidBlocksInput {
-            message: format!("attachment was not staged successfully: {name}"),
-        });
+        return Ok(vec![UserInput::Text {
+            text: format!("[Attachment was not staged successfully: {name}]"),
+            text_elements: Vec::new(),
+        }]);
     }
 
     if let Some(data_base64) = non_empty(block.data_base64.as_deref()) {
@@ -728,32 +625,8 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
     })?;
     let name = non_empty(parsed.name.as_deref()).unwrap_or("attachment");
     let mime_type = non_empty(parsed.mime_type.as_deref());
-    let chunk_index = parsed
-        .chunk_index
-        .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
-            message: format!("attachment chunk missing chunkIndex for {attachment_id}"),
-        })?;
-    let integrity_metadata = AttachmentIntegrityMetadata::parse(
-        parsed.chunk_count,
-        parsed.byte_size,
-        parsed.sha256.as_deref(),
-    )
-    .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
-        message: format!("invalid attachment integrity metadata for {attachment_id}"),
-    })?;
-
-    if state.staged.contains_key(attachment_id) {
-        return Err(HarnessServerError::InvalidBlocksInput {
-            message: format!("duplicate finalized attachment chunk for {attachment_id}"),
-        });
-    }
 
     if !state.uploads.contains_key(attachment_id) {
-        if chunk_index != 0 {
-            return Err(HarnessServerError::InvalidBlocksInput {
-                message: format!("attachment chunk sequence for {attachment_id} must start at 0"),
-            });
-        }
         let path = unique_upload_path(name, mime_type)?;
         state.uploads.insert(
             attachment_id.to_string(),
@@ -762,51 +635,17 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
                 mime_type: mime_type.map(ToOwned::to_owned),
                 attachment_type: non_empty(parsed.attachment_type.as_deref())
                     .map(ToOwned::to_owned),
-                integrity: AttachmentIntegrity::new(integrity_metadata.clone()),
             },
         );
     }
 
-    let upload = state.uploads.get(attachment_id).expect("upload exists");
-    if !upload
-        .integrity
-        .accepts(&integrity_metadata, chunk_index, parsed.final_chunk)
-    {
-        discard_upload(state, attachment_id);
-        return Err(HarnessServerError::InvalidBlocksInput {
-            message: format!("invalid attachment chunk sequence for {attachment_id}"),
-        });
-    }
-
-    let data_base64 = non_empty(parsed.data_base64.as_deref()).ok_or_else(|| {
-        discard_upload(state, attachment_id);
-        HarnessServerError::InvalidBlocksInput {
-            message: format!("attachment chunk missing dataBase64 for {attachment_id}"),
-        }
-    })?;
-    let bytes = match BASE64_STANDARD.decode(data_base64) {
-        Ok(bytes) => bytes,
-        Err(source) => {
-            discard_upload(state, attachment_id);
-            return Err(HarnessServerError::InvalidBlocksInput {
+    if let Some(data_base64) = non_empty(parsed.data_base64.as_deref()) {
+        let bytes = BASE64_STANDARD.decode(data_base64).map_err(|source| {
+            HarnessServerError::InvalidBlocksInput {
                 message: format!("invalid attachment chunk for {attachment_id}: {source}"),
-            });
-        }
-    };
-    if !state
-        .uploads
-        .get_mut(attachment_id)
-        .expect("upload exists")
-        .integrity
-        .append(&bytes)
-    {
-        discard_upload(state, attachment_id);
-        return Err(HarnessServerError::InvalidBlocksInput {
-            message: format!("attachment chunks exceed declared byteSize for {attachment_id}"),
-        });
-    }
-    {
-        let upload = state.uploads.get_mut(attachment_id).expect("upload exists");
+            }
+        })?;
+        let upload = state.uploads.get(attachment_id).expect("upload exists");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -814,24 +653,13 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
         file.write_all(&bytes)?;
     }
 
-    if parsed.final_chunk {
-        let upload = state.uploads.remove(attachment_id).expect("upload exists");
-        if !upload.integrity.verified() {
-            let _ = std::fs::remove_file(&upload.path);
-            return Err(HarnessServerError::InvalidBlocksInput {
-                message: format!("attachment size or hash mismatch for {attachment_id}"),
-            });
-        }
+    if parsed.final_chunk
+        && let Some(upload) = state.uploads.remove(attachment_id)
+    {
         state.staged.insert(attachment_id.to_string(), upload);
     }
 
     Ok(())
-}
-
-fn discard_upload(state: &mut BlocksState, attachment_id: &str) {
-    if let Some(upload) = state.uploads.remove(attachment_id) {
-        let _ = std::fs::remove_file(upload.path);
-    }
 }
 
 fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Vec<UserInput> {
@@ -1901,7 +1729,7 @@ mod tests {
     fn parses_attachment_chunk_without_starting_turn() {
         let _upload_dir = temp_upload_dir();
         let mut state = BlocksState::default();
-        let line = r#"{"type":"attachment.chunk","attachmentId":"att-1","name":"large-upload.mp4","mimeType":"video/mp4","attachmentType":"video","chunkIndex":0,"chunkCount":1,"byteSize":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","final":true,"dataBase64":"aGVsbG8="}"#;
+        let line = r#"{"type":"attachment.chunk","attachmentId":"att-1","name":"large-upload.mp4","mimeType":"video/mp4","attachmentType":"video","chunkIndex":0,"final":true,"dataBase64":"aGVsbG8="}"#;
 
         assert!(matches!(
             parse_blocks_line_with_state(line, &mut state).expect("parses"),
@@ -1917,25 +1745,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_chunk_metadata_from_existing_chat_producers() {
-        let _upload_dir = temp_upload_dir();
-        let mut state = BlocksState::default();
-        let line = r#"{"type":"attachment.chunk","attachmentId":"legacy","name":"a.txt","mimeType":"text/plain","chunkIndex":0,"final":true,"dataBase64":"aGVsbG8="}"#;
-        assert!(matches!(
-            parse_blocks_line_with_state(line, &mut state).expect("legacy chunk parses"),
-            BlocksCommand::AttachmentChunk
-        ));
-        assert_eq!(
-            std::fs::read(&state.staged.get("legacy").expect("staged").path).unwrap(),
-            b"hello"
-        );
-    }
-
-    #[test]
     fn staged_attachment_block_becomes_local_file_text_input() {
         let _upload_dir = temp_upload_dir();
         let mut state = BlocksState::default();
-        let chunk = r#"{"type":"attachment.chunk","attachmentId":"att-1","name":"clip.mp4","mimeType":"video/mp4","attachmentType":"video","chunkIndex":0,"chunkCount":1,"byteSize":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","final":true,"dataBase64":"aGVsbG8="}"#;
+        let chunk = r#"{"type":"attachment.chunk","attachmentId":"att-1","name":"clip.mp4","mimeType":"video/mp4","attachmentType":"video","chunkIndex":0,"final":true,"dataBase64":"aGVsbG8="}"#;
         parse_blocks_line_with_state(chunk, &mut state).expect("chunk parses");
 
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"analyze this"},{"type":"attachment","attachment_type":"video","stagedAttachmentId":"att-1","name":"clip.mp4","mimeType":"video/mp4","size":5}]}}"#;
@@ -1958,26 +1771,6 @@ mod tests {
         };
         assert!(text.starts_with("[Attached file saved to "));
         assert!(text.ends_with("clip.mp4]"));
-    }
-
-    #[test]
-    fn rejects_missing_duplicate_and_hash_mismatched_chunks_before_user_turn() {
-        let _upload_dir = temp_upload_dir();
-        let mut state = BlocksState::default();
-        let second_without_first = r#"{"type":"attachment.chunk","attachmentId":"missing","chunkIndex":1,"chunkCount":2,"byteSize":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","final":true,"dataBase64":"bG8="}"#;
-        assert!(parse_blocks_line_with_state(second_without_first, &mut state).is_err());
-
-        let first = r#"{"type":"attachment.chunk","attachmentId":"partial","name":"a.txt","mimeType":"text/plain","chunkIndex":0,"chunkCount":2,"byteSize":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","final":false,"dataBase64":"aGU="}"#;
-        parse_blocks_line_with_state(first, &mut state).expect("first chunk");
-        assert!(parse_blocks_line_with_state(first, &mut state).is_err());
-
-        let user = r#"{"type":"user","message":{"content":[{"type":"attachment","stagedAttachmentId":"partial","name":"a.txt"}]}}"#;
-        assert!(parse_blocks_line_with_state(user, &mut state).is_err());
-
-        let wrong_hash = r#"{"type":"attachment.chunk","attachmentId":"bad-hash","name":"a.txt","mimeType":"text/plain","chunkIndex":0,"chunkCount":1,"byteSize":5,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","final":true,"dataBase64":"aGVsbG8="}"#;
-        assert!(parse_blocks_line_with_state(wrong_hash, &mut state).is_err());
-        let bad_user = r#"{"type":"user","message":{"content":[{"type":"attachment","stagedAttachmentId":"bad-hash","name":"a.txt"}]}}"#;
-        assert!(parse_blocks_line_with_state(bad_user, &mut state).is_err());
     }
 
     #[test]

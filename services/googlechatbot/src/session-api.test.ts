@@ -1,5 +1,4 @@
 import { test, expect, describe, afterEach, beforeEach } from 'bun:test'
-import { createHash } from 'node:crypto'
 import {
   DEFAULT_SESSION_IDLE_TIMEOUT_MS,
   DEFAULT_SESSION_MAX_DURATION_MS,
@@ -878,21 +877,19 @@ describe('attachment.chunk staging', () => {
     expect(lines.slice(0, -1).every(line => line.type === 'attachment.chunk')).toBe(true)
   })
 
-  test('accepts exactly 100 MiB and reconstructs chunk bytes and hash', () => {
+  test('accepts exactly 100 MiB and reconstructs chunk bytes', () => {
     const lines = parseLines(MAX_ATTACHMENT_BYTES)
     const chunks = lines.slice(0, -1)
     const dataBase64 = chunks.map(chunk => String(chunk.dataBase64)).join('')
     const reconstructed = Buffer.from(dataBase64, 'base64')
     expect(reconstructed.byteLength).toBe(MAX_ATTACHMENT_BYTES)
     expect(reconstructed.every(byte => byte === 0x5a)).toBe(true)
-    expect(new Set(chunks.map(chunk => chunk.sha256))).toEqual(
-      new Set([createHash('sha256').update(reconstructed).digest('hex')])
-    )
     expect(chunks.map(chunk => chunk.chunkIndex)).toEqual(
       Array.from({ length: chunks.length }, (_, index) => index)
     )
-    expect(chunks.every(chunk => chunk.chunkCount === chunks.length)).toBe(true)
-    expect(chunks.at(-1)?.final).toBe(true)
+    expect(chunks.map(chunk => chunk.final)).toEqual(
+      chunks.map((_, index) => index === chunks.length - 1)
+    )
   }, 30_000)
 
   test('rejects 100 MiB plus one byte before any execution request', async () => {
