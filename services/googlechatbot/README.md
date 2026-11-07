@@ -97,8 +97,9 @@ domain-wide-delegation grant for `chat.messages.reactions`, the bot reacts to
 the message that starts a turn as that user and removes the reaction when the
 turn ends, whatever the outcome. The reaction is visibly authored by that
 user, not the Chat app. Without an actor, or on any failure, the thinking
-message remains the only acknowledgement; a 403 disables further attempts for
-the process.
+message remains the only acknowledgement. A 403 stops further attempts in
+that space for the process, for example a DM the actor is not a member of;
+other spaces keep their reactions.
 
 The initial `--persona <id>` selection is pinned by api-rs for the session;
 later persona flags do not replace it. An unavailable requested persona produces

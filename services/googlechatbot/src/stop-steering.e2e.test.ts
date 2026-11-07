@@ -35,18 +35,18 @@ async function drainRuntimes(): Promise<void> {
 
 type Message = Record<string, unknown>
 
-function dmEvent(id: string, text: string, eventTime = new Date().toISOString()) {
+function dmEvent(id: string, text: string, eventTime = new Date().toISOString(), space = 'spaces/DM') {
   return {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       type: 'MESSAGE',
       eventTime,
-      space: { name: 'spaces/DM', spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true },
+      space: { name: space, spaceType: 'DIRECT_MESSAGE', singleUserBotDm: true },
       message: {
-        name: `spaces/DM/messages/${id}`,
+        name: `${space}/messages/${id}`,
         text,
-        thread: { name: 'spaces/DM/threads/T1' },
+        thread: { name: `${space}/threads/T1` },
         threadReply: true,
         sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' }
       },
@@ -468,7 +468,7 @@ describe('stop reaches api-rs while the response stream is open', () => {
     await waitFor(() => mock.reactions.size === 0)
   }, 20_000)
 
-  test('reaction failures never block the turn and a 403 disables further attempts', async () => {
+  test('reaction failures never block the turn and a 403 stops attempts only in that space', async () => {
     const env = {
       GOOGLECHATBOT_REACTION_ACTOR_USER: 'actor@example.com',
       GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
@@ -478,21 +478,31 @@ describe('stop reaches api-rs while the response stream is open', () => {
     const { app, runtime } = bot(env)
     ;(runtime.client as unknown as { exchangeJwtForToken: () => Promise<unknown> })
       .exchangeJwtForToken = async () => ({ token: 'app-token', expiry: Date.now() + 3_600_000 })
-    let attempts = 0
-    runtime.client.createReaction = async () => {
-      attempts += 1
+    const attempts: string[] = []
+    const createReaction = runtime.client.createReaction.bind(runtime.client)
+    runtime.client.createReaction = async (messageName, unicode) => {
+      attempts.push(messageName)
+      if (!messageName.startsWith('spaces/OTHER/')) return createReaction(messageName, unicode)
       const { ChatApiError } = await import('./chat/client')
       throw new ChatApiError('POST', 'reactions', 403, 'PERMISSION_DENIED')
     }
-    await app.request('/api/chat/events', dmEvent('M1', 'first'))
+    const now = () => new Date().toISOString()
+    await app.request('/api/chat/events', dmEvent('M1', 'first', now(), 'spaces/OTHER'))
     await waitFor(() => mock.streams.size === 1)
     mock.finish('exec-1', 'one')
-    await waitFor(() => ackOf(mock)[1].text === 'one')
-    await app.request('/api/chat/events', dmEvent('M2', 'second'))
+    await waitFor(() => ackOf(mock, 'spaces/OTHER')[1].text === 'one')
+    await app.request('/api/chat/events', dmEvent('M2', 'second', now(), 'spaces/OTHER'))
     await waitFor(() => mock.executions.length === 2)
     mock.finish('exec-2', 'two')
-    expect(attempts).toBe(1)
+    await waitFor(() => [...mock.messages.values()].some(m => m.text === 'two'))
+    await app.request('/api/chat/events', dmEvent('M3', 'third'))
+    await waitFor(() => mock.reactions.size === 1)
+    expect([...mock.reactions.values()][0]?.messageName).toBe('spaces/DM/messages/M3')
+    expect(attempts).toEqual(['spaces/OTHER/messages/M1', 'spaces/DM/messages/M3'])
     expect(renderMetrics()).toContain('googlechatbot_reactions_total{operation="create",outcome="failed"} 1')
+    expect(renderMetrics()).toContain('googlechatbot_reactions_total{operation="create",outcome="ok"} 1')
+    await waitFor(() => mock.executions.length === 3)
+    mock.finish('exec-3', 'three')
   }, 20_000)
 
   test('without a delegated actor no reaction call is made', async () => {
