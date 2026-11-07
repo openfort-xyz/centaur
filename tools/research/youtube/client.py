@@ -23,7 +23,17 @@ class YouTubeClient:
 
     def __init__(self, api_key: str | None = None, timeout: float = 30.0):
         self._api_key = api_key
-        self.base_url = "https://www.googleapis.com/youtube/v3"
+        # Deliberately the youtube.googleapis.com alias, NOT the equivalent
+        # www.googleapis.com/youtube/v3. Any tool declaring www.googleapis.com
+        # for an oauth_token secret (gsuite does, for Gmail/Drive/Calendar)
+        # makes iron-proxy attach that Bearer to every request to the host —
+        # including this one. Google then honours the Bearer, ignores ?key=,
+        # and rejects on scopes, so even a valid API key returns 403
+        # ACCESS_TOKEN_SCOPE_INSUFFICIENT. The alias host carries no such
+        # claim, so the API-key path works. Verified 2026-07-27: an identical
+        # request with a deliberately invalid key returns the scope error on
+        # www.googleapis.com but a clean "API key not valid" on this host.
+        self.base_url = "https://youtube.googleapis.com/youtube/v3"
         self.timeout = timeout
         self._client: httpx.Client | None = None
 
