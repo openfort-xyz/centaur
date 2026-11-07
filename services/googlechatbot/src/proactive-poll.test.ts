@@ -13,7 +13,7 @@ import {
   pollSpace,
   type PollCursor
 } from './proactive-poll'
-import { threadStateKey, type GoogleChatWorkObligation } from './state'
+import { threadStateKey, type GoogleChatThreadState, type GoogleChatWorkObligation } from './state'
 
 const SPACE = 'spaces/ROOM'
 const THREAD = 'spaces/ROOM/threads/T1'
@@ -245,5 +245,94 @@ describe('proactive poller', () => {
     await pollSpace(deps, SPACE, 1000)
     expect(enqueued).toHaveLength(0)
     expect(renderMetrics()).toContain('rejected_stale_event_timestamp')
+  })
+})
+
+describe('threads the app posted in', () => {
+  beforeEach(() => resetMetrics())
+
+  const appPost = (id: string, createTime: string) =>
+    listed(id, createTime, { sender: { name: BOT, type: 'BOT' }, threadReply: false })
+  const thread = (state: StateAdapter) => state.get<GoogleChatThreadState>(threadStateKey(THREAD_KEY))
+
+  test('an untagged reply in a thread the app started is accepted', async () => {
+    const { state, deps, enqueued } = harness({
+      pages: [[appPost('DIGEST', at(1000)), listed('Q', at(2000))]]
+    })
+    await state.connect()
+    await pollSpace(deps, SPACE, 1000)
+    const collected = renderMetrics()
+      .split('\n')
+      .filter(line => line.startsWith('googlechatbot_proactive_collected_total'))
+    expect(collected).toEqual([
+      'googlechatbot_proactive_collected_total{outcome="bot"} 1',
+      'googlechatbot_proactive_collected_total{outcome="accepted"} 1'
+    ])
+    expect(names(enqueued)).toEqual(['Q'])
+    expect(await thread(state)).toEqual({ proactiveEligible: true, proactiveEligibleAt: BASE_MS + 1000 })
+  })
+
+  test('another bot, or the app when its own user is unknown, does not open the thread', async () => {
+    const other = harness({
+      pages: [[
+        listed('ALERT', at(1000), { sender: { name: 'users/OTHERBOT', type: 'BOT' }, threadReply: false }),
+        listed('Q', at(2000))
+      ]]
+    })
+    await other.state.connect()
+    await pollSpace(other.deps, SPACE, 1000)
+    expect(other.enqueued).toHaveLength(0)
+    expect(await thread(other.state)).toBeNull()
+
+    const unknown = harness({ pages: [[appPost('DIGEST', at(1000)), listed('Q', at(2000))]] })
+    unknown.client.getBotUserName = async () => { throw new Error('membership lookup failed') }
+    await unknown.state.connect()
+    await pollSpace(unknown.deps, SPACE, 1000)
+    expect(unknown.enqueued).toHaveLength(0)
+    expect(await thread(unknown.state)).toBeNull()
+
+    const metrics = renderMetrics()
+    expect(metrics).toContain('googlechatbot_proactive_collected_total{outcome="bot"} 2')
+    expect(metrics).toContain('googlechatbot_proactive_collected_total{outcome="not_eligible"} 2')
+  })
+
+  test('a stopped thread stays closed to app posts from before or after the stop', async () => {
+    const stoppedAt = BASE_MS + 1500
+    const { state, deps, enqueued } = harness({
+      pages: [[appPost('DIGEST', at(1000)), appPost('STOPPED', at(1600)), listed('Q', at(2000))]]
+    })
+    await state.connect()
+    await state.set(threadStateKey(THREAD_KEY), { stopRequestedAt: stoppedAt, proactiveEligible: false })
+    await pollSpace(deps, SPACE, 1000)
+    expect(enqueued).toHaveLength(0)
+    expect(renderMetrics()).toContain('googlechatbot_proactive_collected_total{outcome="not_eligible"} 1')
+    expect(await thread(state)).toEqual({ stopRequestedAt: stoppedAt, proactiveEligible: false })
+  })
+
+  test('joining a thread never overwrites a running turn and waits for its thread-state lock', async () => {
+    const running: GoogleChatThreadState = {
+      activeExecution: true,
+      activeExecutionId: 'exec-1',
+      activeRequesterEmail: null,
+      executedMessageIds: ['M0'],
+      lastExecutedAt: BASE_MS + 500
+    }
+    const { state, deps } = harness({ pages: [[appPost('REPLY', at(1000))]] })
+    await state.connect()
+    await state.set(threadStateKey(THREAD_KEY), running)
+
+    const turnLock = await state.acquireLock(threadStateKey(THREAD_KEY), 30_000)
+    await pollSpace(deps, SPACE, 1000)
+    expect(await thread(state)).toEqual(running)
+    expect(await state.get<PollCursor>(cursorKey(SPACE))).toEqual({ createTime: at(0), names: [] })
+    expect(renderMetrics()).toContain('googlechatbot_proactive_poll_total{outcome="halted"} 1')
+
+    await state.releaseLock(turnLock!)
+    await pollSpace(deps, SPACE, 1000)
+    expect(await thread(state)).toEqual({
+      ...running,
+      proactiveEligible: true,
+      proactiveEligibleAt: BASE_MS + 1000
+    })
   })
 })
