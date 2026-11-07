@@ -75,15 +75,16 @@ running" notice, as before.
 ## Contextual replies
 
 With `GOOGLECHATBOT_PROACTIVITY_ENABLED=true`, a mention in one of the exact
-`GOOGLECHATBOT_PROACTIVITY_SPACES` opts its thread in until a stop. Google
+`GOOGLECHATBOT_PROACTIVITY_SPACES`, or the app's own post there (a scheduled
+digest, a workflow post, a reply), opts its thread in until a stop. Google
 pushes no unmentioned messages to a Chat app, so the bot polls
 `spaces.messages.list` for the listed spaces (every
 `GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS`, one poller per space across
 replicas, durable cursor, dedupe shared with the webhook, bot and mention
-messages skipped). Each collected message passes the same identity, domain,
-and timestamp checks as a webhook delivery. An unmentioned message in an
-eligible thread is classified with the OpenAI Decisions API using recent
-thread history; a decline, a classifier error or timeout, an ineligible
+messages skipped; the app's own posts only opt their thread in). Each
+collected message passes the same identity, domain, and timestamp checks as a
+webhook delivery. An unmentioned message in an eligible thread is classified
+with the OpenAI Decisions API using recent thread history; a decline, a classifier error or timeout, an ineligible
 thread, or a message seen while a run is active stays silent. An unmentioned
 message never steers an active execution and never starts one if a newer turn
 began after it was sent. A stop ends participation until the next mention.

@@ -65,12 +65,45 @@ export type GoogleChatThreadState = {
   /** Google event time (ms) of the latest stop request. A turn whose message
    * predates it does not start; one already executing is interrupted. */
   stopRequestedAt?: number
-  /** Set by a mention in an allowed space and cleared by a stop: unmentioned
-   * replies in this thread may get a proactive response. */
+  /** Set by a mention of the app or a post by the app in an allowed space
+   * (see proactiveOptIn) and cleared by a stop: unmentioned replies in this
+   * thread may get a proactive response. */
   proactiveEligible?: boolean
-  /** Google event time (ms) of the mention that last opted the thread in, so
-   * a stop sent before that mention cannot undo it. */
+  /** Google event time (ms) of the mention or post that last opted the thread
+   * in, so a stop sent before it cannot undo it. */
   proactiveEligibleAt?: number
+}
+
+/** What brings the app into a thread: a person mentioning it, or the app's
+ * own post there (a scheduled digest, a workflow post, a reply). */
+export type ThreadJoin = {
+  by: 'mention' | 'app_post'
+  spaceName: string
+  spaceType: string | undefined
+  /** Google create or event time of the mention or post, in ms. */
+  sentAt: number
+}
+
+/** The thread-state patch that opts a thread into unmentioned replies, or `{}`.
+ * Only in a space listed for contextual replies (`proactiveSpaces` is
+ * undefined when the feature is off), never in a DM. A stop ends
+ * participation until the next mention: a mention sent after the stop opts
+ * back in, but an app post never does, because the app's own answer to the
+ * stop is itself a post sent after it. The opt-in time never moves backwards,
+ * so a late-processed older post cannot expose a newer opt-in to an older
+ * stop. */
+export function proactiveOptIn(
+  current: GoogleChatThreadState,
+  join: ThreadJoin,
+  proactiveSpaces: readonly string[] | undefined
+): Partial<GoogleChatThreadState> {
+  if (join.spaceType === 'DIRECT_MESSAGE' || !proactiveSpaces?.includes(join.spaceName)) return {}
+  const stoppedAt = current.stopRequestedAt
+  if (stoppedAt !== undefined && (join.by === 'app_post' || join.sentAt <= stoppedAt)) return {}
+  return {
+    proactiveEligible: true,
+    proactiveEligibleAt: Math.max(join.sentAt, current.proactiveEligibleAt ?? 0)
+  }
 }
 
 export type CanonicalFinal = {
@@ -322,11 +355,14 @@ export async function clearStopControl(state: StateAdapter, ackMessageName: stri
 /**
  * Merge thread state under a lock. ID lists and transcript entries append,
  * dedupe, and retain their newest bounded tail. Empty steering ack lists clear.
+ * Pass a function to decide the update from the state read under the lock.
  */
 export async function updateThreadState(
   state: StateAdapter,
   threadKey: string,
-  update: Partial<GoogleChatThreadState>,
+  change:
+    | Partial<GoogleChatThreadState>
+    | ((current: GoogleChatThreadState) => Partial<GoogleChatThreadState>),
   transcriptLimit: number = DEFAULT_THREAD_HISTORY_LIMIT
 ): Promise<GoogleChatThreadState> {
   const key = threadStateKey(threadKey)
@@ -334,6 +370,7 @@ export async function updateThreadState(
   if (!lock) throw new Error(`Google Chat thread state is busy: ${threadKey}`)
   try {
     const current = (await state.get<GoogleChatThreadState>(key)) ?? {}
+    const update = typeof change === 'function' ? change(current) : change
     const next = { ...current, ...update }
     // A stop cutoff only ever moves forward: a late-delivered older stop must
     // not lower the cutoff a newer stop already set.

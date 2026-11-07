@@ -39,6 +39,7 @@ import {
   listPendingWorkIds,
   persistStopControl,
   persistWork,
+  proactiveOptIn,
   requestWorkStop,
   stopControlKey,
   threadStateKey,
@@ -1537,12 +1538,13 @@ async function handoffTurn(
   // opt-in is decided against the freshest state at the point it is written.
   const sentAt = eventTimeMs(event, work)
   const eligibilityFor = (current: GoogleChatThreadState): Partial<GoogleChatThreadState> =>
-    runtime.proactivity
-    && event.is_mention
-    && event.space_type !== 'DIRECT_MESSAGE'
-    && proactiveSpaceAllowed(runtime.proactivity, event.space_name)
-    && sentAt > (current.stopRequestedAt ?? 0)
-      ? { proactiveEligible: true, proactiveEligibleAt: sentAt }
+    event.is_mention
+      ? proactiveOptIn(current, {
+          by: 'mention',
+          spaceName: event.space_name,
+          spaceType: event.space_type,
+          sentAt
+        }, runtime.proactivity?.spaces)
       : {}
   const eligibility = eligibilityFor(threadState)
   // Inline directives (--model, -rsn, --bedrock, --claude, ...) are stripped from

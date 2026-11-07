@@ -309,6 +309,14 @@ describe('threads the app posted in', () => {
     expect(await thread(state)).toEqual({ stopRequestedAt: stoppedAt, proactiveEligible: false })
   })
 
+  test('an older app post listed late keeps a newer mention as the opt-in time', async () => {
+    const { state, deps } = harness({ pages: [[appPost('DIGEST', at(1000))]] })
+    await state.connect()
+    await state.set(threadStateKey(THREAD_KEY), { proactiveEligible: true, proactiveEligibleAt: BASE_MS + 5000 })
+    await pollSpace(deps, SPACE, 1000)
+    expect(await thread(state)).toEqual({ proactiveEligible: true, proactiveEligibleAt: BASE_MS + 5000 })
+  })
+
   test('joining a thread never overwrites a running turn and waits for its thread-state lock', async () => {
     const running: GoogleChatThreadState = {
       activeExecution: true,

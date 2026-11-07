@@ -213,13 +213,14 @@ the scopes above to one convenience account.
   appended to that run (steering); anyone else in a shared space is told the
   turn is still running.
 - `googlechatbot.proactivity` enables contextual replies in exact spaces only.
-  A mention opts its thread in until a stop. Because Google does not push
-  unmentioned messages to a Chat app, the bot polls `spaces.messages.list` for
-  the listed spaces under the admin-approved `chat.app.messages.readonly`
-  scope, then classifies each unmentioned message with the OpenAI Decisions
-  API before answering. Declines, classifier errors and timeouts, threads
-  without a prior mention, and messages seen while a run is active stay
-  silent. Enabling it requires the space list and `OPENAI_API_KEY` (or
+  A mention, or the app's own post in a thread, opts that thread in until a
+  stop. After a stop, only a new mention opts it back in. Because Google does
+  not push unmentioned messages to a Chat app, the bot polls
+  `spaces.messages.list` for the listed spaces under the admin-approved
+  `chat.app.messages.readonly` scope, then classifies each unmentioned message
+  with the OpenAI Decisions API before answering. Declines, classifier errors
+  and timeouts, threads the app was never mentioned or posted in, and messages
+  seen while a run is active stay silent. Enabling it requires the space list and `OPENAI_API_KEY` (or
   `GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY`).
 
 ## Conversation and file behavior
