@@ -141,9 +141,10 @@ type BotRuntime = {
   messageOverrides: MessageOverridesStrategy
   spaceDefaults: SpaceDefaults
   proactivity?: ProactivityRuntime
-  /** Flipped when Google rejects the delegated reaction actor, so one
-   * misconfigured scope costs one failed call per process, not one per turn. */
-  reactionsDisabled: boolean
+  /** Spaces where Google rejected the delegated reaction actor (typically a
+   * DM it is not a member of), so each costs one failed call per process and
+   * other spaces keep their reactions. */
+  reactionsDeniedSpaces: Set<string>
   /** Background work started by webhooks, polling, and recovery; drained on
    * shutdown so a reply in flight is not abandoned mid-render. */
   background: Set<Promise<unknown>>
@@ -227,7 +228,7 @@ export function createGooglechatbot(
     messageOverrides: messageOverridesStrategyFromConfig(config),
     spaceDefaults: spaceDefaultsFromConfig(config),
     ...(proactivity ? { proactivity } : {}),
-    reactionsDisabled: false,
+    reactionsDeniedSpaces: new Set(),
     background: new Set(),
     inFlightWork: new Map(),
     shuttingDown: false
@@ -1204,8 +1205,9 @@ async function addAckReaction(
   event: NormalizedChatEvent
 ): Promise<void> {
   const emoji = config.GOOGLECHATBOT_ACK_REACTION.trim()
-  if (!emoji || runtime.reactionsDisabled || !client.canWriteReactions()) return
-  if (!/^spaces\/[^/]+\/messages\/[^/]+$/.test(event.message_id)) return
+  if (!emoji || !client.canWriteReactions()) return
+  const space = /^(spaces\/[^/]+)\/messages\/[^/]+$/.exec(event.message_id)?.[1]
+  if (!space || runtime.reactionsDeniedSpaces.has(space)) return
   try {
     const reaction = await client.createReaction(event.message_id, emoji)
     if (!reaction.name) return
@@ -1214,9 +1216,8 @@ async function addAckReaction(
     incr('googlechatbot_reactions_total', { operation: 'create', outcome: 'ok' })
   } catch (error) {
     if (error instanceof ChatApiError && error.status === 403) {
-      // The actor lacks chat.messages.reactions (or is not in the space).
-      // One failed call per process is enough to learn that.
-      runtime.reactionsDisabled = true
+      // The actor lacks chat.messages.reactions or is not in this space.
+      runtime.reactionsDeniedSpaces.add(space)
       logWarn('googlechatbot_ack_reaction_auto_disabled', { status: error.status })
     } else {
       logWarn('googlechatbot_ack_reaction_create_failed', error, { work_id: work.workId })

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -595,3 +596,64 @@ def test_handler_still_routes_slack_shaped_destinations_to_slack():
     assert context.google_chat_calls == []
     assert context.dm_setup_calls == []
     assert len(context.slack_calls) == 1
+
+
+def turn_completed(status: str, message: str | None = None) -> str:
+    turn: dict = {"status": status}
+    if message is not None:
+        turn["error"] = {"message": message}
+    return json.dumps({"method": "turn/completed", "params": {"turn": turn}})
+
+
+GCHAT_PARAMS = {
+    "prompt": "Summarize the top stories",
+    "principal": "console-user-author",
+    "channel": "spaces/AAAAexample",
+    "author_email": "author@example.com",
+    "scheduled_task_id": "tsk_123",
+}
+
+
+def test_handler_fails_a_google_chat_run_whose_turn_failed_instead_of_posting_the_error():
+    error = "API Error: 530 {\"error\":\"origin unreachable\"}"
+    context = FakeContext(
+        result_text=error,
+        output_lines=["not json", turn_completed("completed"), turn_completed("failed", error)],
+    )
+
+    with pytest.raises(console_workflow.AgentTurnFailedError, match="exec-123 failed: API Error: 530"):
+        asyncio.run(console_workflow.handler(GCHAT_PARAMS, context))
+
+    assert context.google_chat_calls == []
+    assert context.dm_setup_calls == []
+
+
+def test_handler_posts_to_google_chat_when_only_an_earlier_turn_failed():
+    context = FakeContext(output_lines=[turn_completed("failed", "transient"), turn_completed("completed")])
+
+    asyncio.run(console_workflow.handler(GCHAT_PARAMS, context))
+
+    assert [text.split("\n")[0] for _, text, _ in context.google_chat_calls] == ["Daily summary"]
+
+
+def test_handler_posts_to_google_chat_when_the_result_has_no_output_lines():
+    context = FakeContext()
+    context.output_lines = None
+
+    asyncio.run(console_workflow.handler(GCHAT_PARAMS, context))
+
+    assert len(context.google_chat_calls) == 1
+
+
+def test_handler_keeps_slack_delivery_unchanged_when_the_turn_failed():
+    context = FakeContext(result_text="API Error: 530", output_lines=[turn_completed("failed", "530")])
+
+    asyncio.run(
+        console_workflow.handler(
+            {**GCHAT_PARAMS, "channel": "C0123456789", "slack_user_id": "U0123456789"},
+            context,
+        )
+    )
+
+    assert context.google_chat_calls == []
+    assert [channel for channel, _, _ in context.slack_calls] == ["C0123456789"]
