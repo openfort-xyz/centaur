@@ -621,6 +621,45 @@ def test_sync_space_pages_skips_empty_and_advances_watermark():
     assert client.calls[0]["order_by"] == "createTime ASC"
 
 
+def test_sync_space_emits_only_positive_counter_increments(monkeypatch):
+    increments = []
+
+    def record(name, count, **_labels):
+        increments.append((name, count))
+
+    monkeypatch.setattr(chat_metrics, "increment_metric", record)
+    # Sibling test modules may replace workflows.etl_metrics in sys.modules,
+    # so patch the module the sync imported from.
+    monkeypatch.setitem(chat_sync.record_etl_items_seen.__globals__, "increment_metric", record)
+    message = {
+        "name": "spaces/S1/messages/m1",
+        "text": "no files, no reactions",
+        "thread": {"name": "spaces/S1/threads/T1"},
+        "sender": {"name": "users/1", "type": "HUMAN"},
+        "createTime": "2026-06-01T10:00:00Z",
+    }
+    client = FakeChatClient([{"messages": [], "nextPageToken": "1"}, {"messages": [message]}])
+    counts = {"spaces_seen": 1, "spaces_synced": 0, "messages_seen": 0, "messages_upserted": 0}
+
+    asyncio.run(
+        chat_sync._sync_space(
+            FakeSyncPool(),
+            client=client,
+            space={"name": "spaces/S1", "displayName": "Eng", "type": "SPACE"},
+            run_id="run_1",
+            page_size=100,
+            overlap_seconds=60,
+            max_pages=0,
+            explicit_since=None,
+            counts=counts,
+        )
+    )
+
+    assert counts["messages_upserted"] == 1
+    assert ("google_chat_etl_items_processed_total", 1) in increments
+    assert [entry for entry in increments if entry[1] <= 0] == []
+
+
 def test_scheduled_sync_rescans_old_messages_so_edits_converge():
     class CheckpointPool(FakeSyncPool):
         async def fetchrow(self, query, *args):

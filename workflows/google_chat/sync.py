@@ -950,7 +950,8 @@ async def _sync_space(
             raise
         messages = [m for m in page.get("messages", []) if isinstance(m, dict)]
         counts["messages_seen"] += len(messages)
-        record_etl_items_seen("google_chat", "message", "message", len(messages))
+        if messages:
+            record_etl_items_seen("google_chat", "message", "message", len(messages))
         record_items("message", len(messages))
         for message in messages:
             message_id = _resource_id(str(message.get("name") or ""))

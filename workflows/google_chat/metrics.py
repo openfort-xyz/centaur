@@ -13,8 +13,14 @@ def _bounded(value: str, allowed: set[str], fallback: str) -> str:
     return value if value in allowed else fallback
 
 
+def _increment(metric: str, count: int, **labels: str) -> None:
+    # api-rs rejects counter increments <= 0 and logs a warning for each one.
+    if count > 0:
+        increment_metric(metric, count, **labels)
+
+
 def record_run(status: str, count: int = 1) -> None:
-    increment_metric(
+    _increment(
         "google_chat_etl_runs_total",
         count,
         status=_bounded(status, _STATUSES, "failed"),
@@ -31,14 +37,14 @@ def observe_run_duration(status: str, duration_s: float) -> None:
 
 
 def record_api_outcome(operation: str, outcome: str, count: int = 1) -> None:
-    increment_metric(
+    _increment(
         "google_chat_etl_api_requests_total",
         count,
         operation=_bounded(operation, _OPERATIONS, "list_messages"),
         outcome=_bounded(outcome, _OUTCOMES, "error"),
     )
     if outcome == "rate_limited":
-        increment_metric(
+        _increment(
             "google_chat_etl_rate_limits_total",
             count,
             operation=_bounded(operation, _OPERATIONS, "list_messages"),
@@ -46,15 +52,15 @@ def record_api_outcome(operation: str, outcome: str, count: int = 1) -> None:
 
 
 def record_items(item_type: str, count: int) -> None:
-    increment_metric(
+    _increment(
         "google_chat_etl_items_processed_total",
-        max(int(count), 0),
+        int(count),
         item_type=item_type if item_type in {"message", "file", "reaction"} else "message",
     )
 
 
 def record_space_failure(reason: str, count: int = 1) -> None:
-    increment_metric(
+    _increment(
         "google_chat_etl_space_failures_total",
         count,
         reason=_bounded(reason, _FAILURE_REASONS, "api_error"),
@@ -81,9 +87,9 @@ def set_last_failure_time(timestamp_s: float) -> None:
 
 
 def record_retention(mode: str, item_type: str, count: int) -> None:
-    increment_metric(
+    _increment(
         "google_chat_retention_items_total",
-        max(int(count), 0),
+        int(count),
         mode=mode if mode in {"dry_run", "count", "delete"} else "count",
         item_type=item_type
         if item_type
