@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -42,6 +43,36 @@ Use *bold* with single asterisks, _italics_ with underscores, ~strikethrough~, `
 Never use **double asterisks**, [link](url) Markdown links, Markdown headings, or tables.
 Use bold text instead of headings and lists instead of tables.
 Return only the message that should be posted to Google Chat."""
+
+
+class AgentTurnFailedError(RuntimeError):
+    """The harness failed the turn but the execution still completed.
+
+    The error text (an upstream API error, a usage limit) arrives as the final
+    answer, so posting it would ship the error as the task's report.
+    """
+
+    def __init__(self, execution_id: str, message: str) -> None:
+        self.execution_id = execution_id
+        super().__init__(f"agent execution {execution_id} failed: {message}")
+
+
+def _turn_failure(lines: list[Any]) -> str | None:
+    """Return the harness error of the last turn if it failed, else None."""
+    turn: Any = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(event, dict) and event.get("method") == "turn/completed":
+            params = event.get("params")
+            turn = params.get("turn") if isinstance(params, dict) else None
+    if not isinstance(turn, dict) or turn.get("status") != "failed":
+        return None
+    error = turn.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    return str(message or "turn failed without an error message")
 
 
 def _required_string(params: Any, key: str) -> str:
@@ -249,8 +280,13 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
                 "scheduled_task_name": str(params.get("scheduled_task_name") or ""),
             },
         )
+        execution_id = str(result.get("execution_id") or "")
+        output_lines = result.get("output_lines")
+        if google_chat and isinstance(output_lines, list):
+            if failure := _turn_failure(output_lines):
+                raise AgentTurnFailedError(execution_id, failure)
         return {
-            "execution_id": str(result.get("execution_id") or ""),
+            "execution_id": execution_id,
             "result_text": str(result.get("result_text") or "").strip()[
                 :SLACK_MESSAGE_MAX_LENGTH
             ],
