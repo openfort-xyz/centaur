@@ -12,7 +12,9 @@ import { resolveSenderEmail } from './sender-lookup'
 import {
   acceptWork,
   acquireLease,
+  proactiveOptIn,
   threadStateKey,
+  updateThreadState,
   type GoogleChatThreadState,
   type GoogleChatWorkObligation
 } from './state'
@@ -203,10 +205,25 @@ async function considerMessage(
   }
   const sender = message.sender
   if (!message.name || !sender?.name || !message.createTime) return record('malformed')
-  if (sender.type === 'BOT' || (botUserName && sender.name === botUserName)) return record('bot')
+  if (botUserName && sender.name === botUserName) {
+    // The app's own post (a scheduled digest, a workflow post, a reply) makes
+    // it a participant in that thread, exactly as a mention does.
+    const threadKey = buildThreadKey(spaceName, message.thread?.name ?? message.name)
+    const sentAt = Date.parse(message.createTime)
+    const join = { by: 'app_post', spaceName, spaceType, sentAt } as const
+    try {
+      await updateThreadState(state, threadKey, current => proactiveOptIn(current, join, deps.spaces))
+    } catch (error) {
+      logWarn('googlechatbot_proactive_join_failed', error, { space_name: spaceName })
+      incr('googlechatbot_proactive_collected_total', { outcome: 'join_failed' })
+      return 'failed'
+    }
+    return record('bot')
+  }
+  if (sender.type === 'BOT') return record('bot')
   if (mentionsApp(message, botUserName) || message.slashCommand) return record('mention')
   if (!(message.text ?? message.argumentText ?? '').trim()) return record('empty')
-  // Cheap durable pre-checks: a thread the bot was never mentioned in gets no
+  // Cheap durable pre-checks: a thread the bot never joined gets no
   // dedupe write and no obligation at all, and a message seen while a run is
   // active is that run's context, never a later unsolicited turn.
   const threadKey = buildThreadKey(spaceName, message.thread?.name ?? message.name)

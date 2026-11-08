@@ -4,6 +4,7 @@ import { createGooglechatbot, type Googlechatbot, type ProactivityRuntime } from
 import { loadConfig } from './config'
 import { renderMetrics, resetMetrics } from './metrics'
 import type { ProactiveClassifierInput } from './proactive-classifier'
+import { cursorKey } from './proactive-poll'
 import { acceptWork, persistStopControl, threadStateKey, workKey, type GoogleChatThreadState, type GoogleChatWorkObligation } from './state'
 import { installSessionMock, threadKeyFor, waitFor, type SessionMock } from './test-session-mock'
 
@@ -134,6 +135,30 @@ describe('contextual replies in an opted-in space', () => {
     expect([...mock.messages.values()].some(m => String(m.text).includes('thinking'))).toBe(true)
     expect(renderMetrics()).toContain('googlechatbot_proactive_decisions_total{outcome="respond"} 1')
     mock.finish('exec-2', 'Retried.')
+  }, 20_000)
+
+  test('the app posting in a thread lets the poller answer an untagged follow-up', async () => {
+    const { runtime, inputs } = proactivity(() => ({ respond: true, probability: 0.9 }))
+    const state = createMemoryState()
+    const googlechatbot = tracked(createGooglechatbot(
+      loadConfig({ ...ENV, GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS: '20' }), { state, proactivity: runtime }
+    ))
+    // The app's own Chat user comes from its membership, read with service
+    // account credentials this fixture does not have.
+    googlechatbot.client.getBotUserName = async () => BOT
+    await googlechatbot.stateConnected
+    await waitFor(async () => Boolean(await state.get(cursorKey('spaces/ROOM'))))
+    await new Promise(resolve => setTimeout(resolve, 5))
+    const thread1 = { name: 'spaces/ROOM/threads/T1' }
+    mock.listed.push(
+      { name: 'spaces/ROOM/messages/DIGEST', text: 'Weekly digest', sender: { name: BOT, type: 'BOT' }, createTime: new Date().toISOString(), thread: thread1, threadReply: false },
+      { name: 'spaces/ROOM/messages/Q1', text: 'why did the sweep fail?', sender: { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' }, createTime: new Date().toISOString(), thread: thread1, threadReply: true }
+    )
+    await waitFor(() => mock.executions.length === 1)
+    expect(mock.executions[0]!.idempotencyKey).toBe('spaces/ROOM/messages/Q1')
+    expect(inputs.map(input => input.message.text)).toEqual(['why did the sweep fail?'])
+    expect((await thread(state))?.proactiveEligible).toBe(true)
+    mock.finish('exec-1', 'The sweep hit a timeout.')
   }, 20_000)
 
   test('classifier errors and timeouts stay silent', async () => {

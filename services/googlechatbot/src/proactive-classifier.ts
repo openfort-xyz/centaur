@@ -41,8 +41,8 @@ export type ProactiveClassifier = (
 export function proactiveDecisionInstructions(botName: string): string {
   return [
     `You decide whether ${botName}, an AI assistant in a Google Chat thread, should reply to the newest message.`,
-    `${botName} was mentioned earlier in this thread, possibly before the messages shown. The newest message does not mention ${botName}.`,
-    `Once mentioned, ${botName} is a participant in the thread: anyone in it can keep working with ${botName} without mentioning it again.`,
+    `${botName} was mentioned or posted earlier in this thread, possibly before the messages shown. The newest message does not mention ${botName}.`,
+    `Once mentioned or once it has posted, ${botName} is a participant in the thread: anyone in it can keep working with ${botName} without mentioning it again.`,
     `Reply when the newest message asks for something ${botName} can do or answer: a question, request, or instruction with no other named addressee, a follow-up on ${botName}'s work, or a challenge or correction to ${botName}'s output.`,
     `Do not reply when the message is addressed to a person, as in "Bob, can you..." or an @-mention (merely naming someone is not addressing them), needs a person (a review, an approval, or what people decided, are doing, or are responsible for), or is conversation between people: acknowledgements, thanks, opinions, jokes, reactions, status updates, or remarks about ${botName}.`,
     `A message that @-mentions a person is for that person unless it clearly asks ${botName} to act and only copies the person in, such as "do X, cc @name".`,
