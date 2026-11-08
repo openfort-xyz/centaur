@@ -465,14 +465,10 @@ function toHistoryMessage(
   botUserName: string | undefined
 ): ChatHistoryMessage {
   const senderName = message.sender?.name
-  // Two-pronged role detection: prefer the explicit sender.type from the API,
-  // fall back to comparing against the bot's resource name. sender.type='BOT'
-  // is the reliable signal — botUserName matching is brittle because the bot's
-  // sender.name is a numeric "users/12345...", not "users/<email>".
-  const role: 'user' | 'assistant' =
-    message.sender?.type === 'BOT' || (botUserName && senderName === botUserName)
-      ? 'assistant'
-      : 'user'
+  // Other Chat apps (alert bots) post here too, so only this app's own user is
+  // the assistant. Without that user, any app sender is the best guess.
+  const isOwnPost = botUserName ? senderName === botUserName : message.sender?.type === 'BOT'
+  const role: 'user' | 'assistant' = isOwnPost ? 'assistant' : 'user'
 
   // Prefer argumentText (mention pre-stripped by Google) for cleaner agent
   // prompts; fall back to text. Pass the bare bot id (sans "users/" prefix) so
@@ -485,7 +481,7 @@ function toHistoryMessage(
 
   const metadata: Record<string, unknown> = {}
   if (message.createTime) metadata.create_time = message.createTime
-  if (message.sender?.displayName) metadata.sender_display_name = message.sender.displayName
+  if (message.sender?.displayName) metadata.user_name = message.sender.displayName
 
   return {
     message_id: message.name ?? '',

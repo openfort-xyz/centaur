@@ -1191,12 +1191,18 @@ async function sharedThreadHistory(
   work: GoogleChatWorkObligation,
   event: NormalizedChatEvent
 ): Promise<NonNullable<NormalizedChatEvent['history_messages']>> {
+  // An unmentioned turn has no mention to read the app's user from, and only a
+  // thread reply has earlier messages to label.
+  const mentioned = work.envelope ? mentionedChatAppUserName(work.envelope) : undefined
+  const botUserName = mentioned ?? (event.chat.thread_reply === true
+    ? await client.getBotUserName(event.space_name).catch(() => undefined)
+    : undefined)
   return collectThreadHistory(client, {
     spaceName: event.space_name,
     threadName: event.chat.thread_name,
     currentMessageName: event.message_id,
     threadReply: event.chat.thread_reply,
-    botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
+    botUserName,
     historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
   }).catch(error => {
     logWarn('googlechatbot_thread_history_failed', error)
