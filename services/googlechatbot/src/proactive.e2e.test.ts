@@ -595,7 +595,7 @@ describe('operator rules answer unmentioned messages', () => {
     await googlechatbot.stateConnected
     await waitFor(async () => Boolean(await state.get(cursorKey('spaces/ROOM'))))
     await new Promise(resolve => setTimeout(resolve, 5))
-    return { state }
+    return { state, client: googlechatbot.client }
   }
 
   function topLevel(id: string, sender: { name: string; displayName: string; type: 'HUMAN' | 'BOT' }, extra: Record<string, unknown> = {}) {
@@ -679,6 +679,18 @@ describe('operator rules answer unmentioned messages', () => {
     expect(mock.executions).toHaveLength(0)
     // The app's own post still joins its thread, as before rules existed.
     expect((await state.get<GoogleChatThreadState>(threadStateKey(threadOf('OWN'))))?.proactiveEligible).toBe(true)
+  }, 20_000)
+
+  test("with the app's own user unknown, no app post starts a rule turn", async () => {
+    const { runtime, inputs } = proactivity(alertRuleClassifier)
+    const { client } = await pollingBot({ ...runtime, rules: ALERT_RULES })
+    client.getBotUserName = async () => { throw new Error('membership lookup failed') }
+    // This may be the app's own post; it cannot tell another app from itself.
+    mock.listed.push(topLevel('OWN', { name: BOT, displayName: 'Centaur', type: 'BOT' }, { text: 'FIRING: weekly digest' }))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="bot"} 1'))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(inputs).toHaveLength(0)
+    expect(mock.executions).toHaveLength(0)
   }, 20_000)
 
   test('with no rules for the space, top-level messages stay not eligible', async () => {
