@@ -129,6 +129,8 @@ export type GoogleChatEnvelope = {
     attachedGifs?: Array<{ uri?: string }>
     quotedMessageMetadata?: Record<string, unknown>
     cardsV2?: Array<Record<string, unknown>>
+    /** Legacy cards, still posted by some alerting webhooks. */
+    cards?: Array<Record<string, unknown>>
   }
   user?: {
     name?: string
@@ -205,6 +207,8 @@ export type ChatListMessage = {
   attachedGifs?: Array<{ uri?: string }>
   quotedMessageMetadata?: Record<string, unknown>
   cardsV2?: Array<Record<string, unknown>>
+  /** Legacy cards, still posted by some alerting webhooks. */
+  cards?: Array<Record<string, unknown>>
   thread?: { name?: string }
   slashCommand?: { commandId?: string }
   annotations?: NonNullable<GoogleChatEnvelope['message']>['annotations']

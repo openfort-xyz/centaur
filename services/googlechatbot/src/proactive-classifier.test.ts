@@ -75,6 +75,39 @@ describe('OpenAI proactive classifier', () => {
     await expect(malformed(input, new AbortController().signal)).rejects.toThrow('probability')
   })
 
+  test('asks one question per operator rule and answers with the first rule met', async () => {
+    const requests: Array<{ body: Record<string, unknown>; url: string }> = []
+    let probabilities = [0.3, 0.7, 0.9]
+    const classifier = classifierReturning(
+      () => Response.json({
+        answers: probabilities.map((probability, index) => ({ name: `rule_${index + 1}`, probability, type: 'predicate' }))
+      }),
+      requests
+    )
+    const rules = [
+      { name: 'deploys', when: 'A failed deploy.' },
+      { name: 'alerts', when: 'A firing alert.' },
+      { name: 'anything', when: 'Any message.' }
+    ]
+    const alert = { botName: 'Centaur', history: [], message: { author: 'Alert Bot', fromBot: false, text: 'High error rate' }, rules }
+    await expect(classifier(alert, new AbortController().signal)).resolves.toEqual({
+      probability: 0.7,
+      respond: true,
+      rule: 'alerts'
+    })
+    expect(requests[0]!.body).toMatchObject({
+      questions: [{ name: 'rule_1' }, { name: 'rule_2' }, { name: 'rule_3' }]
+    })
+    const messages = requests[0]!.body.input as Array<{ content: string }>
+    expect(messages[0]!.content).toContain('Rule 2 (alerts):\nA firing alert.')
+
+    probabilities = [0.1, 0.4, 0.2]
+    await expect(classifier(alert, new AbortController().signal)).resolves.toEqual({
+      probability: 0.4,
+      respond: false
+    })
+  })
+
   test('a decision slower than the deadline is rejected rather than applied late', async () => {
     const slow = createOpenAiProactiveClassifier({
       apiKey: 'k',

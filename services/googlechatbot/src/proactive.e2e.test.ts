@@ -3,9 +3,9 @@ import { createMemoryState } from '@chat-adapter/state-memory'
 import { createGooglechatbot, type Googlechatbot, type ProactivityRuntime } from './index'
 import { loadConfig } from './config'
 import { renderMetrics, resetMetrics } from './metrics'
-import type { ProactiveClassifierInput } from './proactive-classifier'
+import type { ProactiveClassifierInput, ProactiveDecision } from './proactive-classifier'
 import { cursorKey } from './proactive-poll'
-import { acceptWork, persistStopControl, threadStateKey, workKey, type GoogleChatThreadState, type GoogleChatWorkObligation } from './state'
+import { acceptWork, persistStopControl, threadStateKey, updateThreadState, workKey, type GoogleChatThreadState, type GoogleChatWorkObligation } from './state'
 import { installSessionMock, threadKeyFor, waitFor, type SessionMock } from './test-session-mock'
 
 const ENV = {
@@ -50,7 +50,7 @@ function roomMessage(id: string, text: string, opts: { mention?: boolean; user?:
   }
 }
 
-type Decision = { respond: boolean; probability?: number } | Error | 'hang'
+type Decision = ProactiveDecision | Error | 'hang'
 
 function proactivity(decide: (input: ProactiveClassifierInput) => Decision, spaces = ['spaces/ROOM']): {
   runtime: ProactivityRuntime
@@ -71,7 +71,7 @@ function proactivity(decide: (input: ProactiveClassifierInput) => Decision, spac
           })
         }
         if (decision instanceof Error) throw decision
-        return decision as { respond: boolean; probability?: number }
+        return decision as ProactiveDecision
       }
     }
   }
@@ -559,4 +559,204 @@ describe('contextual replies in an opted-in space', () => {
     }).GOOGLECHATBOT_PROACTIVITY_SPACES).toEqual(['spaces/AAAA', 'spaces/BBBB'])
     expect(loadConfig(ENV).GOOGLECHATBOT_PROACTIVITY_ENABLED).toBe(false)
   })
+})
+
+describe('operator rules answer unmentioned messages', () => {
+  let mock: SessionMock
+  beforeEach(() => {
+    resetMetrics()
+    mock = installSessionMock()
+  })
+  afterEach(async () => {
+    await drainRuntimes()
+    mock.restore()
+  })
+
+  const ALERT_RULES = { default: [{ name: 'alert', when: 'A firing alert.', context: 'Investigate, then reply in the thread.' }] }
+  const RULE_CONTEXT = 'You were not mentioned. This message matched the operators\' proactive reply rule "alert". '
+    + 'Their instructions for responding:\nInvestigate, then reply in the thread.'
+  const ALICE = { name: 'users/U1', displayName: 'Alice', type: 'HUMAN' as const }
+  const ALERT_BOT = { name: 'users/ALERTBOT', displayName: 'Alert Bot', type: 'BOT' as const }
+
+  /** Meets the alert rule when the text says FIRING; otherwise declines. */
+  const alertRuleClassifier = (input: ProactiveClassifierInput): Decision => {
+    if (!input.rules) return { respond: false, probability: 0.1 }
+    return input.message.text.includes('FIRING')
+      ? { respond: true, probability: 0.9, rule: 'alert' }
+      : { respond: false, probability: 0.1 }
+  }
+
+  async function pollingBot(runtime: ProactivityRuntime, env: Record<string, string> = {}) {
+    const state = createMemoryState()
+    const googlechatbot = tracked(createGooglechatbot(
+      loadConfig({ ...ENV, GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS: '20', ...env }), { state, proactivity: runtime }
+    ))
+    googlechatbot.client.getBotUserName = async () => BOT
+    await googlechatbot.stateConnected
+    await waitFor(async () => Boolean(await state.get(cursorKey('spaces/ROOM'))))
+    await new Promise(resolve => setTimeout(resolve, 5))
+    return { state, client: googlechatbot.client }
+  }
+
+  function topLevel(id: string, sender: { name: string; displayName: string; type: 'HUMAN' | 'BOT' }, extra: Record<string, unknown> = {}) {
+    return {
+      name: `spaces/ROOM/messages/${id}`,
+      sender,
+      createTime: new Date().toISOString(),
+      thread: { name: `spaces/ROOM/threads/${id}` },
+      threadReply: false,
+      ...extra
+    }
+  }
+
+  function executeBody(idempotencyKey: string) {
+    const call = mock.calls.find(c => c.method === 'POST' && c.url.endsWith('/execute')
+      && (c.body as { idempotency_key?: string }).idempotency_key === idempotencyKey)
+    const body = call?.body as { input_lines: string[]; metadata: Record<string, unknown> }
+    const line = JSON.parse(body.input_lines.at(-1)!) as { message: { content: Array<{ text?: string }> } }
+    return { metadata: body.metadata, texts: line.message.content.map(part => part.text ?? '') }
+  }
+
+  const threadOf = (id: string) => threadKeyFor('ROOM', id)
+
+  test('a top-level message that meets a rule is answered in its thread, with the rule context once', async () => {
+    const { runtime, inputs } = proactivity(alertRuleClassifier)
+    const { state } = await pollingBot({ ...runtime, rules: ALERT_RULES })
+
+    mock.listed.push(topLevel('A1', ALICE, { text: 'FIRING: checkout latency high' }))
+    await waitFor(() => mock.executions.length === 1)
+    expect(mock.executions[0]!.idempotencyKey).toBe('spaces/ROOM/messages/A1')
+    expect(inputs[0]!.rules).toEqual(ALERT_RULES.default)
+    expect(executeBody('spaces/ROOM/messages/A1').texts).toContain(RULE_CONTEXT)
+    const ack = [...mock.messages.values()].find(m => String(m.text).includes('thinking'))
+    expect(ack?.thread).toEqual({ name: 'spaces/ROOM/threads/A1' })
+    mock.finish('exec-1', 'Checkout latency is back to normal.')
+    await waitFor(async () => (await state.get<GoogleChatThreadState>(threadStateKey(threadOf('A1'))))?.activeExecution === false)
+    expect((await state.get<GoogleChatThreadState>(threadStateKey(threadOf('A1'))))?.proactiveRulesSent).toEqual(['alert'])
+
+    // The same rule matching again in that thread starts a turn without repeating its context.
+    mock.listed.push({ ...topLevel('A2', ALICE, { text: 'FIRING again' }), thread: { name: 'spaces/ROOM/threads/A1' }, threadReply: true })
+    await waitFor(() => mock.executions.length === 2)
+    expect(executeBody('spaces/ROOM/messages/A2').texts).not.toContain(RULE_CONTEXT)
+    mock.finish('exec-2', 'Still normal.')
+
+    // A message no rule meets stays silent.
+    mock.listed.push(topLevel('C1', ALICE, { text: 'lunch anyone?' }))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_decisions_total{outcome="decline"} 1'))
+    expect(mock.executions).toHaveLength(2)
+  }, 20_000)
+
+  test("another app's card-only alert meets a rule and runs with no person's identity", async () => {
+    const { runtime } = proactivity(alertRuleClassifier)
+    // People without a verified email fail this allowlist; another app has none to check.
+    await pollingBot({ ...runtime, rules: ALERT_RULES }, { GOOGLECHATBOT_ALLOWED_DOMAIN: 'example.test' })
+
+    mock.listed.push(topLevel('H1', ALICE, { text: 'FIRING: from a person without a verified email' }))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="rejected_domain_not_allowlisted"} 1'))
+    mock.listed.push(topLevel('B1', ALERT_BOT, {
+      cards: [{ header: { title: 'FIRING: disk almost full' }, sections: [{ widgets: [{ textParagraph: { text: 'node-1 at 97%' } }] }] }]
+    }))
+    await waitFor(() => mock.executions.length === 1)
+    expect(mock.executions[0]!.idempotencyKey).toBe('spaces/ROOM/messages/B1')
+    const { metadata, texts } = executeBody('spaces/ROOM/messages/B1')
+    expect(metadata.googlechat_request_verified).toBe(false)
+    expect(metadata).not.toHaveProperty('googlechat_requester_email')
+    expect(texts).toContain(RULE_CONTEXT)
+    expect(texts.some(text => text.includes('FIRING: disk almost full'))).toBe(true)
+    mock.finish('exec-1', 'Rotated the logs on node-1.')
+  }, 20_000)
+
+  test("the app's own post never starts a rule turn", async () => {
+    const { runtime, inputs } = proactivity(() => ({ respond: true, probability: 0.99, rule: 'anything' }))
+    const { state } = await pollingBot({
+      ...runtime,
+      rules: { spaces: { ROOM: [{ name: 'anything', when: 'Any message.' }] } }
+    })
+    mock.listed.push(topLevel('OWN', { name: BOT, displayName: 'Centaur', type: 'BOT' }, { text: 'FIRING: weekly digest' }))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="bot"} 1'))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(inputs).toHaveLength(0)
+    expect(mock.executions).toHaveLength(0)
+    // The app's own post still joins its thread, as before rules existed.
+    expect((await state.get<GoogleChatThreadState>(threadStateKey(threadOf('OWN'))))?.proactiveEligible).toBe(true)
+  }, 20_000)
+
+  test("in an alert thread, only the app's own reply reads as the assistant", async () => {
+    const { runtime, inputs } = proactivity(() => ({ respond: true, probability: 0.9, rule: 'alert' }))
+    const { state } = await pollingBot({ ...runtime, rules: ALERT_RULES })
+    mock.listed.push(topLevel('B1', ALERT_BOT, { text: 'FIRING: disk almost full' }))
+    await waitFor(() => mock.executions.length === 1)
+    mock.finish('exec-1', 'Rotated the logs on node-1.')
+    await waitFor(async () => (await state.get<GoogleChatThreadState>(threadStateKey(threadOf('B1'))))?.activeExecution === false)
+
+    const inThread = { thread: { name: 'spaces/ROOM/threads/B1' }, threadReply: true }
+    mock.listed.push(
+      { ...topLevel('R1', { name: BOT, displayName: 'Centaur', type: 'BOT' }, { text: 'Rotated the logs on node-1.' }), ...inThread },
+      { ...topLevel('Q1', ALICE, { text: 'is it fixed?' }), ...inThread }
+    )
+    await waitFor(() => mock.executions.length === 2)
+    const context = executeBody('spaces/ROOM/messages/Q1').texts
+      .find(text => text.startsWith('# Google Chat Thread Context')) ?? ''
+    expect(context).toMatch(/\d\. Alert Bot:\s+FIRING: disk almost full/)
+    expect(context).toMatch(/\d\. assistant \(you\):\s+Rotated the logs on node-1\./)
+    expect(context.split('assistant (you)')).toHaveLength(2)
+    const question = inputs.find(input => input.message.text === 'is it fixed?')
+    const authors = question?.history.map(message => [message.author, message.fromBot])
+    expect(authors).toHaveLength(2)
+    expect(authors).toEqual(expect.arrayContaining([['Alert Bot', false], ['Centaur', true]]))
+    mock.finish('exec-2', 'Yes.')
+  }, 20_000)
+
+  test("with the app's own user unknown, no app post starts a rule turn", async () => {
+    const { runtime, inputs } = proactivity(alertRuleClassifier)
+    const { client } = await pollingBot({ ...runtime, rules: ALERT_RULES })
+    client.getBotUserName = async () => { throw new Error('membership lookup failed') }
+    // This may be the app's own post; it cannot tell another app from itself.
+    mock.listed.push(topLevel('OWN', { name: BOT, displayName: 'Centaur', type: 'BOT' }, { text: 'FIRING: weekly digest' }))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="bot"} 1'))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(inputs).toHaveLength(0)
+    expect(mock.executions).toHaveLength(0)
+  }, 20_000)
+
+  test('with no rules for the space, top-level messages stay not eligible', async () => {
+    const { runtime, inputs } = proactivity(() => ({ respond: true, probability: 0.99, rule: 'alert' }))
+    // Default rules exist, but this space's empty list turns them off.
+    await pollingBot({ ...runtime, rules: { ...ALERT_RULES, spaces: { ROOM: [] } } })
+    mock.listed.push(
+      topLevel('H1', ALICE, { text: 'FIRING: checkout latency high' }),
+      topLevel('B1', ALERT_BOT, { text: 'FIRING: disk almost full' })
+    )
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="not_eligible"} 1'))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="bot"} 1'))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(inputs).toHaveLength(0)
+    expect(mock.executions).toHaveLength(0)
+  }, 20_000)
+
+  test('a stopped thread ignores rule matches, including a stop that lands during the decision', async () => {
+    let releaseDecision: (() => void) | undefined
+    const { runtime, inputs } = proactivity(alertRuleClassifier)
+    const gated: ProactivityRuntime = {
+      ...runtime,
+      rules: ALERT_RULES,
+      timeoutMs: 10_000,
+      classifier: async (input, signal) => {
+        if (input.message.text.includes('gated')) await new Promise<void>(resolve => { releaseDecision = resolve })
+        return runtime.classifier(input, signal)
+      }
+    }
+    const { state } = await pollingBot(gated)
+    await state.set(threadStateKey(threadOf('S1')), { proactiveEligible: false } satisfies GoogleChatThreadState)
+    mock.listed.push(topLevel('S1', ALERT_BOT, { text: 'FIRING: after a stop' }))
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_collected_total{outcome="not_eligible"} 1'))
+
+    mock.listed.push(topLevel('S2', ALERT_BOT, { text: 'FIRING: gated' }))
+    await waitFor(() => Boolean(releaseDecision))
+    await updateThreadState(state, threadOf('S2'), { proactiveEligible: false, stopRequestedAt: Date.now() })
+    releaseDecision!()
+    await waitFor(() => renderMetrics().includes('googlechatbot_proactive_decisions_total{outcome="skip_not_eligible"} 1'))
+    expect(inputs.map(input => input.message.text)).toEqual(['FIRING: gated'])
+    expect(mock.executions).toHaveLength(0)
+  }, 20_000)
 })

@@ -6,7 +6,8 @@ missing="$(mktemp)"
 project="$(mktemp)"
 webhook="$(mktemp)"
 addon="$(mktemp)"
-trap 'rm -f "$rendered" "$missing" "$project" "$webhook" "$addon"' EXIT
+rules="$(mktemp)"
+trap 'rm -f "$rendered" "$missing" "$project" "$webhook" "$addon" "$rules"' EXIT
 
 if helm template parity contrib/chart \
   --set googlechatbot.enabled=true >"$missing" 2>&1; then
@@ -131,3 +132,49 @@ ruby -ryaml -e '
   abort "removed Console UI link still configured" if env.any? { |entry| entry["name"] == "CENTAUR_CONSOLE_PUBLIC_URL" }
   puts "verified Google Chat managed database egress and removed Console link"
 ' "$rendered"
+
+# Operator proactivity rules render as one ConfigMap file per space, mounted
+# where the bot reads them; a list that repeats a rule name fails the render.
+cat >"$rules" <<'YAML'
+googlechatbot:
+  enabled: true
+  requireSignedRequests: false
+  proactivity:
+    enabled: true
+    spaces: [spaces/AAAAalerts]
+    defaultRules:
+      - name: question
+        when: A direct question about a service we own.
+    spaceRules:
+      AAAAalerts:
+        - name: alert
+          when: A monitoring alert that is firing.
+          context: Check the dashboards first.
+      AAAAsocial: []
+YAML
+helm template parity contrib/chart -f "$rules" >"$rendered"
+ruby -ryaml -rjson -e '
+  docs = YAML.load_stream(File.read(ARGV.fetch(0))).compact
+  config_map = docs.find { |doc| doc["kind"] == "ConfigMap" && doc.dig("metadata", "name").end_with?("googlechatbot-proactivity-rules") } \
+    or abort "googlechatbot proactivity rules ConfigMap not rendered"
+  data = config_map.fetch("data")
+  abort "default rules not rendered" unless JSON.parse(data.fetch("default.json")) == [{ "name" => "question", "when" => "A direct question about a service we own." }]
+  abort "space rules not rendered" unless JSON.parse(data.fetch("AAAAalerts.json")).first["context"] == "Check the dashboards first."
+  abort "empty space list not rendered" unless JSON.parse(data.fetch("AAAAsocial.json")) == []
+  deployment = docs.find { |doc| doc["kind"] == "Deployment" &&
+    doc.dig("spec", "template", "metadata", "labels", "app.kubernetes.io/component") == "googlechatbot" }
+  pod = deployment.dig("spec", "template", "spec")
+  env = pod.dig("containers", 0, "env").to_h { |entry| [entry.fetch("name"), entry["value"]] }
+  dir = env["GOOGLECHATBOT_PROACTIVITY_RULES_DIR"] or abort "rules directory not configured"
+  mount = pod.dig("containers", 0, "volumeMounts").find { |entry| entry["mountPath"] == dir } or abort "rules directory not mounted"
+  volume = pod.fetch("volumes").find { |entry| entry["name"] == mount["name"] }
+  abort "rules volume does not use the ConfigMap" unless volume.dig("configMap", "name") == config_map.dig("metadata", "name")
+  puts "verified Google Chat proactivity rules ConfigMap and mount"
+' "$rendered"
+if helm template parity contrib/chart -f "$rules" \
+  --set 'googlechatbot.proactivity.spaceRules.AAAAalerts[1].name=alert' \
+  --set 'googlechatbot.proactivity.spaceRules.AAAAalerts[1].when=Again.' >"$missing" 2>&1; then
+  echo "googlechatbot rendered rules that repeat a name" >&2
+  exit 1
+fi
+grep -Fq 'googlechatbot.proactivity: AAAAalerts rules repeat the name "alert"' "$missing"

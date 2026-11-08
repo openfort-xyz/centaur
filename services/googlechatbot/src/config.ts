@@ -184,6 +184,9 @@ const EnvSchema = z.object({
   GOOGLECHATBOT_PROACTIVITY_SPACES: z.string().default('').transform(parseSpaceList),
   GOOGLECHATBOT_PROACTIVITY_TIMEOUT_MS: z.coerce.number().int().positive().default(2_000),
   GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5_000),
+  // Directory of operator rule files (see proactivity-rules.ts); unset means
+  // no rules, so only threads the app joined get unmentioned replies.
+  GOOGLECHATBOT_PROACTIVITY_RULES_DIR: z.string().optional(),
 
   // Optional reaction on the message that starts a turn, removed when the
   // answer is posted. Google's reactions.create/delete reject app auth, so the

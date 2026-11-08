@@ -604,7 +604,7 @@ describe('collectThreadHistory', () => {
       {
         name: 'spaces/AAAA/messages/T1.M2',
         argumentText: 'sure, what do you want to know?',
-        sender: { name: 'users/bot-numeric-id', displayName: 'Bot', type: 'BOT' },
+        sender: { name: BOT_USER, displayName: 'Bot', type: 'BOT' },
         createTime: '2026-01-01T00:00:02Z'
       },
       {
@@ -696,6 +696,20 @@ describe('collectThreadHistory', () => {
     // We should have stopped paginating once we hit the cap — second page started
     // mid-iteration but the loop breaks at 50.
     expect(captured.length).toBeLessThanOrEqual(2)
+  })
+
+  test("another app's post is a named participant; without the app's user, any app is the assistant", async () => {
+    const thread = (): ChatListMessage[] => [
+      { name: 'spaces/AAAA/messages/T1.M2', text: 'Rotated the logs.', sender: { name: BOT_USER, type: 'BOT' } },
+      { name: 'spaces/AAAA/messages/T1.M1', text: 'FIRING: disk full', sender: { name: 'users/ALERTBOT', displayName: 'Grafana', type: 'BOT' } }
+    ]
+    const known = await collectThreadHistory(fetcher([{ messages: thread() }]), baseOpts)
+    expect(known.map(message => [message.role, message.metadata?.user_name])).toEqual([
+      ['user', 'Grafana'],
+      ['assistant', undefined]
+    ])
+    const unknown = await collectThreadHistory(fetcher([{ messages: thread() }]), { ...baseOpts, botUserName: undefined })
+    expect(unknown.map(message => message.role)).toEqual(['assistant', 'assistant'])
   })
 
   test('infers role=assistant via botUserName fallback when sender.type is missing', async () => {

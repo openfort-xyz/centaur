@@ -72,6 +72,9 @@ export type GoogleChatThreadState = {
   /** Google event time (ms) of the mention or post that last opted the thread
    * in, so a stop sent before it cannot undo it. */
   proactiveEligibleAt?: number
+  /** Names of the operator rules whose context a turn in this thread already
+   * carried; a rule's context rides only on the first turn it starts. */
+  proactiveRulesSent?: string[]
 }
 
 /** What brings the app into a thread: a person mentioning it, or the app's
@@ -121,6 +124,11 @@ export type GoogleChatWorkObligation = {
   /** An unmentioned message the proactive classifier may answer. It starts an
    * execution or does nothing; it never steers an active one. */
   proactive?: boolean
+  /** The operator rule that matched this proactive message, by name. */
+  proactiveRule?: string
+  /** Another Chat app (such as an alert bot) posted this message. Only
+   * operator rules may answer it, and its turn carries no person's identity. */
+  appSender?: boolean
   canonicalFinal?: CanonicalFinal
   dedupeKey: string
   /** Parsed authenticated envelope, retained until background normalization. */

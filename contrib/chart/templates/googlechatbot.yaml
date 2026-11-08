@@ -14,11 +14,42 @@
 {{- end }}
 {{- end }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $proactivity := .Values.googlechatbot.proactivity -}}
+{{- $proactivityRules := and $proactivity.enabled (or $proactivity.defaultRules $proactivity.spaceRules) -}}
 {{- $googleChatBotMetricsAnnotations := dict -}}
 {{- if .Values.googlechatbot.metrics.scrapeAnnotations -}}
 {{- $googleChatBotMetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.googlechatbot.metrics.path "prometheus.io/port" "3002" -}}
 {{- $googleChatBotMetricsAnnotations = mergeOverwrite $googleChatBotMetricsAnnotations (.Values.googlechatbot.metrics.annotations | default dict) -}}
 {{- end -}}
+{{- if $proactivityRules }}
+{{- /* The bot runs with no rules at all if any list repeats a name, so fail here. */ -}}
+{{- $ruleLists := dict "default" ($proactivity.defaultRules | default list) -}}
+{{- range $space, $rules := $proactivity.spaceRules }}{{- $_ := set $ruleLists $space ($rules | default list) -}}{{- end }}
+{{- range $key, $rules := $ruleLists }}
+{{- $names := dict -}}
+{{- range $rules }}
+{{- if hasKey $names (trim .name) }}{{- fail (printf "googlechatbot.proactivity: %s rules repeat the name %q" $key (trim .name)) }}{{- end }}
+{{- $_ := set $names (trim .name) true -}}
+{{- end }}
+{{- end }}
+# Proactivity rules as JSON files the bot reads at boot from
+# GOOGLECHATBOT_PROACTIVITY_RULES_DIR: default.json for every listed space and
+# <SPACE_ID>.json per space (an empty list turns rule matching off there).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}-proactivity-rules
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+data:
+{{- if $proactivity.defaultRules }}
+  default.json: {{ $proactivity.defaultRules | toJson | quote }}
+{{- end }}
+{{- range $space, $rules := $proactivity.spaceRules }}
+  {{ printf "%s.json" $space }}: {{ $rules | default list | toJson | quote }}
+{{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,6 +67,9 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- if $proactivityRules }}
+        checksum/proactivity-rules: {{ dict "default" $proactivity.defaultRules "spaces" $proactivity.spaceRules | toJson | sha256sum }}
+{{- end }}
 {{- with $googleChatBotMetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
 {{- end }}
@@ -182,6 +216,10 @@ spec:
               value: {{ .Values.googlechatbot.proactivity.timeoutMs | quote }}
             - name: GOOGLECHATBOT_PROACTIVITY_POLL_INTERVAL_MS
               value: {{ .Values.googlechatbot.proactivity.pollIntervalMs | quote }}
+{{- if $proactivityRules }}
+            - name: GOOGLECHATBOT_PROACTIVITY_RULES_DIR
+              value: /etc/googlechatbot/proactivity-rules
+{{- end }}
 {{- end }}
 {{- if .Values.googlechatbot.reactionActorUser }}
             - name: GOOGLECHATBOT_REACTION_ACTOR_USER
@@ -246,6 +284,16 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.googlechatbot.resources | nindent 12 }}
+{{- if $proactivityRules }}
+          volumeMounts:
+            - name: proactivity-rules
+              mountPath: /etc/googlechatbot/proactivity-rules
+              readOnly: true
+      volumes:
+        - name: proactivity-rules
+          configMap:
+            name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}-proactivity-rules
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

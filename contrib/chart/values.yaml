@@ -1103,15 +1103,22 @@ googlechatbot:
     model: gpt-6-luna
     openaiBaseUrl: https://api.openai.com/v1
     timeoutMs: 1500
-  # Contextual replies. A mention makes its thread eligible until a stop
-  # command; later unmentioned messages in that thread are classified and
-  # answered without a mention when the classifier says the bot should
-  # respond. Unlike Slack, Google pushes no unmentioned messages to the app, so
-  # the bot polls spaces.messages.list for exactly the listed spaces under its
+  # Proactive replies without a mention. Once mentioned in a thread, or once
+  # the app has posted there, the bot replies to later unmentioned messages
+  # there that its built-in rules accept. Operator rules remove the need for a
+  # mention: the bot replies to any unmentioned message in a listed space that
+  # meets a rule's `when`, in the thread of that message. Another Chat app's
+  # post (such as an alert bot's) may meet operator rules but never the
+  # built-in ones, and its turn runs with no person's identity. Rules are
+  # checked in order and the first match wins; its optional `context` tells
+  # the agent how to respond, once per rule per thread. A stop command
+  # silences proactive replies in its thread until the next mention. Unlike
+  # Slack, Google pushes no unmentioned messages to the app, so the bot polls
+  # spaces.messages.list for exactly the listed spaces under its
   # admin-approved chat.app.messages.readonly scope. `spaces` is required when
-  # enabled; there is no "every space" mode. The openai classifier reads
-  # OPENAI_API_KEY from the shared secret, or
-  # GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY via extraEnv.
+  # enabled; there is no "every space" mode, and rules apply only in listed
+  # spaces. The openai classifier reads OPENAI_API_KEY from the shared secret,
+  # or GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY via extraEnv.
   proactivity:
     enabled: false
     classifier: openai
@@ -1120,6 +1127,23 @@ googlechatbot:
     spaces: []
     timeoutMs: 2000
     pollIntervalMs: 5000
+    # Rules are mounted from a ConfigMap, so `when` and `context` can be long
+    # and span lines. Rules for every listed space; empty means no rule
+    # matching by default.
+    defaultRules: []
+    # Rules keyed by Google Chat space id (without `spaces/`). Each list
+    # replaces defaultRules in its space; an empty list turns rule matching off
+    # there. A list holds at most 20 rules with unique names. Example:
+    #   spaceRules:
+    #     AAAAalerts:
+    #       - name: alert
+    #         when: |
+    #           A monitoring alert that is firing for a service we own.
+    #         context: |
+    #           Check the service's dashboards and recent deploys first, then
+    #           reply in a few lines with the likely cause and a next step.
+    #     AAAAsocial: []
+    spaceRules: {}
   # Optional reaction on the message that starts a turn, removed after the
   # answer is posted. Google's reactions.create/delete reject app auth, so the
   # reaction is authored by this Workspace user through domain-wide delegation

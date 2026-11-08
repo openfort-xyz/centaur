@@ -212,16 +212,32 @@ the scopes above to one convenience account.
 - A mentioned follow-up from the person who started the running turn is
   appended to that run (steering); anyone else in a shared space is told the
   turn is still running.
-- `googlechatbot.proactivity` enables contextual replies in exact spaces only.
-  A mention, or the app's own post in a thread, opts that thread in until a
-  stop. After a stop, only a new mention opts it back in. Because Google does
-  not push unmentioned messages to a Chat app, the bot polls
+- `googlechatbot.proactivity` enables replies without a mention in exact
+  spaces only. A mention, or the app's own post in a thread, opts that thread
+  in until a stop. After a stop, only a new mention opts it back in. Because
+  Google does not push unmentioned messages to a Chat app, the bot polls
   `spaces.messages.list` for the listed spaces under the admin-approved
   `chat.app.messages.readonly` scope, then classifies each unmentioned message
   with the OpenAI Decisions API before answering. Declines, classifier errors
-  and timeouts, threads the app was never mentioned or posted in, and messages
-  seen while a run is active stay silent. Enabling it requires the space list and `OPENAI_API_KEY` (or
-  `GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY`).
+  and timeouts, threads no proactivity applies to, and messages seen while a
+  run is active stay silent. Enabling it requires the space list and
+  `OPENAI_API_KEY` (or `GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY`).
+- Operator rules remove the need for a mention. `defaultRules` applies in
+  every listed space, and `spaceRules.<SPACE_ID>` (the id without `spaces/`)
+  replaces it in that space; an empty list turns rule matching off there. Each
+  list holds at most 20 rules, each with a unique `name`, `when` criteria, and
+  optional `context`. The bot replies to any unmentioned message in a listed
+  space that the classifier judges to meet a rule, in that message's thread;
+  once the bot has posted there, the thread counts as joined. Rules are checked
+  in order and the first match wins. When that match starts a turn, the agent
+  is told which rule matched along with its `context`, once per rule per
+  thread. A stop silences rule matches in its thread until the next mention.
+  Another Chat app's post, such as a monitoring alert, can start a reply only
+  by meeting a rule. Its turn runs with the space's
+  identity only, so no person's desktop or credentials attach, and the domain
+  allowlist, which applies to people, does not reject it. The app's own posts
+  never match. The bot reads the rules at startup from a mounted ConfigMap; if
+  a file is invalid it logs a warning and starts with no rule matching.
 
 ## Conversation and file behavior
 

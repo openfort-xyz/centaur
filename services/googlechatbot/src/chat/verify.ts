@@ -136,6 +136,10 @@ export function verifyChatRequest(opts: {
   envelope: GoogleChatEnvelope
   userEmail?: string
   userId?: string
+  /** The sender is another Chat app, listed under the app's own credentials.
+   * It has no email and its turn claims no person's identity, so the
+   * people's domain policy does not apply to it. */
+  appSender?: boolean
   nowSeconds?: number
 }): ChatEnvelopeCheck {
   if (opts.userId) {
@@ -151,7 +155,7 @@ export function verifyChatRequest(opts: {
     }
   }
   const allowedDomains = opts.config.GOOGLECHATBOT_ALLOWED_DOMAIN
-  if (allowedDomains.length > 0) {
+  if (allowedDomains.length > 0 && !opts.appSender) {
     // Chat Event User resources have no email. Only a verified Add-on
     // userIdToken or the directory lookup can satisfy an email-domain policy.
     const emailParts = (opts.userEmail ?? '').trim().split('@')

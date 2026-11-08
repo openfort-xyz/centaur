@@ -63,9 +63,19 @@ import {
   createOpenAiProactiveClassifier,
   decideWithTimeout,
   type ProactiveClassifier,
+  type ProactiveDecision,
   type ProactiveThreadMessage
 } from './proactive-classifier'
 import { startProactivePoller } from './proactive-poll'
+import {
+  loadProactivityRules,
+  proactiveLayers,
+  proactiveRuleContext,
+  resolveProactivityRules,
+  type ProactiveLayer,
+  type ProactivityRule,
+  type ProactivityRules
+} from './proactivity-rules'
 import { resolveSpaceDefault, spaceDefaultsFromConfig, type SpaceDefaults } from './space-defaults'
 import {
   buildResponseContextWidget,
@@ -130,9 +140,11 @@ type IdentityContext = {
   confirmSpace: (spaceName: string) => Promise<SpaceDmConfirmation>
 }
 
-/** Contextual replies: the classifier and the exact spaces it applies to. */
+/** Contextual replies: the classifier, the exact spaces it applies to, and
+ * the operator rules that answer unmentioned messages in those spaces. */
 export type ProactivityRuntime = {
   classifier: ProactiveClassifier
+  rules?: ProactivityRules
   spaces: readonly string[]
   timeoutMs: number
 }
@@ -742,6 +754,7 @@ export function createGooglechatbot(
         config,
         deduper,
         spaces: runtime.proactivity.spaces,
+        ...(runtime.proactivity.rules ? { rules: runtime.proactivity.rules } : {}),
         state,
         enqueue: work => {
           addGauge('googlechatbot_pending_render_obligations', 1)
@@ -775,14 +788,29 @@ function proactivityFromConfig(config: AppConfig): ProactivityRuntime | undefine
   if (!config.GOOGLECHATBOT_PROACTIVITY_ENABLED) return undefined
   // loadConfig already required the key and the space list.
   const apiKey = config.GOOGLECHATBOT_PROACTIVITY_OPENAI_API_KEY || config.OPENAI_API_KEY || ''
+  const rules = proactivityRulesFromConfig(config)
   return {
     classifier: createOpenAiProactiveClassifier({
       apiKey,
       baseUrl: config.GOOGLECHATBOT_PROACTIVITY_OPENAI_BASE_URL,
       model: config.GOOGLECHATBOT_PROACTIVITY_MODEL
     }),
+    ...(rules ? { rules } : {}),
     spaces: config.GOOGLECHATBOT_PROACTIVITY_SPACES,
     timeoutMs: config.GOOGLECHATBOT_PROACTIVITY_TIMEOUT_MS
+  }
+}
+
+function proactivityRulesFromConfig(config: AppConfig): ProactivityRules | undefined {
+  const dir = config.GOOGLECHATBOT_PROACTIVITY_RULES_DIR
+  if (!dir) return undefined
+  try {
+    return loadProactivityRules(dir)
+  } catch (error) {
+    // Run without any rules rather than a partial set: a missing empty
+    // space file would otherwise let the default rules apply there.
+    logWarn('googlechatbot_proactivity_rules_unreadable', error, { dir })
+    return undefined
   }
 }
 
@@ -1034,7 +1062,8 @@ export async function processWorkObligation(
     }
     if (!work.event && work.envelope) {
       work.event = await normalizeChatEnvelope(work.envelope, undefined, client, {
-        acceptFollowUpAttachments: config.GOOGLECHATBOT_FOLLOW_UP_THREADS
+        acceptFollowUpAttachments: config.GOOGLECHATBOT_FOLLOW_UP_THREADS,
+        ...(work.appSender ? { acceptAppSender: true } : {})
       }) ?? undefined
       if (work.event && work.identityUserEmail) work.event.user_email = work.identityUserEmail
       await persistWork(state, work)
@@ -1054,20 +1083,23 @@ export async function processWorkObligation(
       await finishWork(client, state, work)
       return
     }
-    const followUp = config.GOOGLECHATBOT_FOLLOW_UP_THREADS && isThreadReply(event)
+    // Another app's post runs only through an operator rule, never as a follow-up.
+    const followUp = !work.appSender && config.GOOGLECHATBOT_FOLLOW_UP_THREADS && isThreadReply(event)
     if (!event.is_mention && !followUp && !work.proactive) {
       // A decision is made once; a recovered obligation keeps its answer.
-      if (!(await shouldReplyProactively(config, client, runtime, state, work, event))) {
+      const accepted = await shouldReplyProactively(config, client, runtime, state, work, event)
+      if (!accepted) {
         await finishWork(client, state, work)
         return
       }
       work.proactive = true
+      if (accepted.rule) work.proactiveRule = accepted.rule.name
       await persistWork(state, work)
-    } else if (work.proactive && !work.ackMessageName && !(await proactivePermitted(
-      runtime, (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key))) ?? {}, event
-    ))) {
+    } else if (work.proactive && !work.ackMessageName && !proactivePermitted(
+      runtime, (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key))) ?? {}, event, work
+    )) {
       // A stored positive decision is not authorization: the current
-      // policy (feature, exact space, thread opt-in, generation) decides.
+      // policy (feature, exact space, opt-in or rules, generation) decides.
       incr('googlechatbot_proactive_decisions_total', { outcome: 'skip_policy' })
       await finishWork(client, state, work)
       return
@@ -1159,12 +1191,18 @@ async function sharedThreadHistory(
   work: GoogleChatWorkObligation,
   event: NormalizedChatEvent
 ): Promise<NonNullable<NormalizedChatEvent['history_messages']>> {
+  // An unmentioned turn has no mention to read the app's user from, and only a
+  // thread reply has earlier messages to label.
+  const mentioned = work.envelope ? mentionedChatAppUserName(work.envelope) : undefined
+  const botUserName = mentioned ?? (event.chat.thread_reply === true
+    ? await client.getBotUserName(event.space_name).catch(() => undefined)
+    : undefined)
   return collectThreadHistory(client, {
     spaceName: event.space_name,
     threadName: event.chat.thread_name,
     currentMessageName: event.message_id,
     threadReply: event.chat.thread_reply,
-    botUserName: work.envelope ? mentionedChatAppUserName(work.envelope) : undefined,
+    botUserName,
     historyLimit: config.GOOGLECHATBOT_THREAD_HISTORY_LIMIT
   }).catch(error => {
     logWarn('googlechatbot_thread_history_failed', error)
@@ -1524,11 +1562,11 @@ async function handoffTurn(
     incr('googlechatbot_dedupe_total', { outcome: 'thread_duplicate' })
     return noRun()
   }
-  if (work.proactive && !proactivePermitted(runtime, threadState, event)) {
+  if (work.proactive && !proactivePermitted(runtime, threadState, event, work)) {
     // A stored positive decision is not authorization: the feature, the
-    // exact space list, the thread's opt-in (a stop clears it), and the
-    // generation (a run started since) are all re-checked here, under the
-    // lock, before any execution. Context for the next turn, never its own.
+    // exact space list, the thread's opt-in or rules (a stop silences both),
+    // and the generation (a run started since) are all re-checked here, under
+    // the lock, before any execution. Context for the next turn, never its own.
     await skipProactiveTurn(client, ackMessageName, threadKey, execute.id)
     return noRun()
   }
@@ -1624,7 +1662,7 @@ async function handoffTurn(
   // after this one keeps its opt-in) and raises the cutoff to its own time.
   handoffLost.throwIfAborted()
   const latest = (await durableState.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
-  if (work.proactive && !proactivePermitted(runtime, latest, event)) {
+  if (work.proactive && !proactivePermitted(runtime, latest, event, work)) {
     // A stop or a newer turn may have landed while the session call was held.
     await skipProactiveTurn(client, ackMessageName, threadKey, execute.id)
     return noRun()
@@ -1718,6 +1756,13 @@ async function handoffTurn(
         overrides.reasoning ?? spaceDefault?.reasoning
       )
     : resolvedReasoning
+  // A rule's context rides only on the first turn it starts in this thread;
+  // later turns have it in the session's context.
+  const rule = work.proactiveRule && !(latest.proactiveRulesSent ?? []).includes(work.proactiveRule)
+    ? resolveProactivityRules(runtime.proactivity?.rules, event.space_name)
+      ?.find(item => item.name === work.proactiveRule)
+    : undefined
+  if (rule) execute.proactiveContext = proactiveRuleContext(rule)
   let execution
   try {
     handoffLost.throwIfAborted()
@@ -1784,6 +1829,9 @@ async function handoffTurn(
     forwardedMessageIds: appended.map(message => message.id),
     lastExecutedAt: sentAt,
     ...eligibilityFor(latest),
+    ...(rule
+      ? { proactiveRulesSent: [...new Set([...(latest.proactiveRulesSent ?? []), rule.name])] }
+      : {}),
     ...dmTranscriptUpdate(event, execute),
     ...(overrides.harnessType ? { harnessType: overrides.harnessType } : {}),
     ...(overrides.model
@@ -1945,23 +1993,36 @@ function stopRequestedFor(
   return (state.stopRequestedAt ?? 0) >= eventTimeMs(event, work)
 }
 
-/** An unmentioned message may start a run only while nothing newer has: a
- * later execution already saw it as thread context. */
 /** Whether an unmentioned message may start a run right now, whatever any
- * earlier classifier decision said: feature on, exact space, thread opted in
- * (a stop clears it), and nothing newer has run. */
+ * earlier classifier decision said: feature on, exact space, a proactive
+ * layer still applies (a stop silences both), and nothing newer has run. */
 function proactivePermitted(
   runtime: BotRuntime,
   state: GoogleChatThreadState,
-  event: NormalizedChatEvent
+  event: NormalizedChatEvent,
+  work: GoogleChatWorkObligation
 ): boolean {
-  return Boolean(runtime.proactivity)
-    && event.space_type !== 'DIRECT_MESSAGE'
-    && proactiveSpaceAllowed(runtime.proactivity!, event.space_name)
-    && state.proactiveEligible === true
+  return applicableProactiveLayers(runtime, state, event, work).length > 0
     && proactiveStillCurrent(state, event)
 }
 
+/** The proactive layers that may answer this unmentioned message: none in a
+ * DM or a space not listed for proactivity. */
+function applicableProactiveLayers(
+  runtime: BotRuntime,
+  state: GoogleChatThreadState,
+  event: NormalizedChatEvent,
+  work: GoogleChatWorkObligation
+): ProactiveLayer[] {
+  const proactivity = runtime.proactivity
+  if (!proactivity || event.space_type === 'DIRECT_MESSAGE') return []
+  if (!proactiveSpaceAllowed(proactivity, event.space_name)) return []
+  const rules = resolveProactivityRules(proactivity.rules, event.space_name)
+  return proactiveLayers(rules, state, work.appSender ? 'app' : 'person')
+}
+
+/** An unmentioned message may start a run only while nothing newer has: a
+ * later execution already saw it as thread context. */
 function proactiveStillCurrent(state: GoogleChatThreadState, event: NormalizedChatEvent): boolean {
   if (state.activeExecution === true) return false
   const sentAt = event.chat.event_time ? Date.parse(event.chat.event_time) : Number.NaN
@@ -2246,13 +2307,19 @@ function proactiveSpaceAllowed(proactivity: ProactivityRuntime, spaceName: strin
   return proactivity.spaces.includes(spaceName)
 }
 
+/** A positive proactive decision: the operator rule that matched, if any. */
+type ProactiveAcceptance = { rule?: ProactivityRule }
+
 /**
- * Whether an unmentioned message in an eligible thread should get a reply.
- * Silent on every other outcome: the wrong space, a thread without a prior
- * mention, an active run, an empty message, a decline, or a classifier error
- * or timeout. The thread is re-checked after the decision because a stop or
- * a new run may have landed while the classifier ran; the handoff lock makes
- * the final check before any execution.
+ * Whether an unmentioned message should get a reply, and under which operator
+ * rule. Each applicable layer asks the classifier its own question (a joined
+ * thread's follow-up, the space's rules); any acceptance replies, and a
+ * matching rule shapes the reply even when the joined-thread layer accepted
+ * too. Silent on every other outcome: the wrong space, no applicable layer, an
+ * active run, an empty message, a decline, or a classifier error or timeout.
+ * The thread is re-checked after the decision because a stop or a new run may
+ * have landed while the classifier ran; the handoff lock makes the final
+ * check before any execution.
  */
 async function shouldReplyProactively(
   config: AppConfig,
@@ -2261,9 +2328,9 @@ async function shouldReplyProactively(
   state: StateAdapter,
   work: GoogleChatWorkObligation,
   event: NormalizedChatEvent
-): Promise<boolean> {
+): Promise<ProactiveAcceptance | undefined> {
   const proactivity = runtime.proactivity
-  if (!proactivity) return false
+  if (!proactivity) return undefined
   const startedAt = Date.now()
   const record = (outcome: string, fields: Record<string, unknown> = {}) => {
     incr('googlechatbot_proactive_decisions_total', { outcome })
@@ -2274,27 +2341,30 @@ async function shouldReplyProactively(
       ...fields
     })
   }
-  const skipReason = async () => {
+  const check = async (): Promise<{ skip: string } | { layers: ProactiveLayer[] }> => {
     if (event.space_type === 'DIRECT_MESSAGE' || !proactiveSpaceAllowed(proactivity, event.space_name)) {
-      return 'space'
+      return { skip: 'space' }
     }
     const threadState = (await state.get<GoogleChatThreadState>(threadStateKey(event.thread_key))) ?? {}
-    if (threadState.proactiveEligible !== true) return 'not_eligible'
-    if (!proactiveStillCurrent(threadState, event)) return 'active_execution'
-    if (!normalizedEventText(event).trim()) return 'empty'
+    const layers = applicableProactiveLayers(runtime, threadState, event, work)
+    if (layers.length === 0) return { skip: 'not_eligible' }
+    if (!proactiveStillCurrent(threadState, event)) return { skip: 'active_execution' }
+    if (!normalizedEventText(event).trim()) return { skip: 'empty' }
+    return { layers }
+  }
+  const early = await check()
+  if ('skip' in early) {
+    record(`skip_${early.skip}`)
     return undefined
   }
-  const early = await skipReason()
-  if (early) {
-    record(`skip_${early}`)
-    return false
-  }
-  let decision
+  const { layers } = early
+  const rules = resolveProactivityRules(proactivity.rules, event.space_name)
+  let decisions: Array<PromiseSettledResult<ProactiveDecision>>
   try {
     const history = (await sharedThreadHistory(config, client, work, event))
       .slice(-PROACTIVE_HISTORY_MESSAGES)
       .map(message => proactiveThreadMessage(message))
-    decision = await decideWithTimeout(proactivity.classifier, {
+    const input = {
       botName: BOT_DISPLAY_NAME,
       history,
       message: {
@@ -2302,22 +2372,63 @@ async function shouldReplyProactively(
         fromBot: false,
         text: normalizedEventText(event)
       }
-    }, proactivity.timeoutMs)
+    }
+    decisions = await Promise.allSettled(layers.map(layer => decideWithTimeout(
+      proactivity.classifier,
+      layer === 'rules' && rules ? { ...input, rules } : input,
+      proactivity.timeoutMs
+    )))
   } catch (error) {
     record('error', { error: error instanceof Error ? error.message : String(error) })
-    return false
+    return undefined
   }
-  if (!decision.respond) {
-    record('decline', { probability: decision.probability })
-    return false
+  const { error, fields, layer, rule } = combineProactiveDecisions(layers, decisions, rules)
+  if (!layer) {
+    record(error === undefined ? 'decline' : 'error', { ...fields, ...(error === undefined ? {} : { error }) })
+    return undefined
   }
-  const late = await skipReason()
-  if (late) {
-    record(`skip_${late}`, { probability: decision.probability })
-    return false
+  const late = await check()
+  if ('skip' in late) {
+    record(`skip_${late.skip}`, fields)
+    return undefined
   }
-  record('respond', { probability: decision.probability })
-  return true
+  record('respond', fields)
+  return rule ? { rule } : {}
+}
+
+/** What the layers' answers add up to: the layer that accepted and the rule
+ * that matched, or, when none accepted, the error of one that failed. */
+function combineProactiveDecisions(
+  layers: ProactiveLayer[],
+  decisions: Array<PromiseSettledResult<ProactiveDecision>>,
+  rules: ProactivityRule[] | undefined
+): { error?: string; fields: Record<string, unknown>; layer?: ProactiveLayer; rule?: ProactivityRule } {
+  const fields: Record<string, unknown> = {}
+  layers.forEach((layer, index) => {
+    const result = decisions[index]!
+    if (result.status === 'fulfilled' && result.value.probability !== undefined) {
+      fields[`${layer}_probability`] = result.value.probability
+    }
+  })
+  const layer = layers.find((_, index) => {
+    const result = decisions[index]!
+    return result.status === 'fulfilled' && result.value.respond
+  })
+  if (!layer) {
+    const failure = decisions.find(result => result.status === 'rejected')
+    if (!failure) return { fields }
+    const reason: unknown = failure.reason
+    return { error: reason instanceof Error ? reason.message : String(reason), fields }
+  }
+  fields.layer = layer
+  // A matching rule shapes the reply even when the joined-thread layer
+  // also accepted the message.
+  const rulesDecision = decisions[layers.indexOf('rules')]
+  const rule = rulesDecision?.status === 'fulfilled' && rulesDecision.value.respond
+    ? rules?.find(item => item.name === rulesDecision.value.rule)
+    : undefined
+  if (rule) fields.rule = rule.name
+  return { fields, layer, ...(rule ? { rule } : {}) }
 }
 
 function proactiveThreadMessage(
