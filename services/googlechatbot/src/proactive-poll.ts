@@ -227,8 +227,9 @@ async function considerMessage(
   }
   const appSender = sender.type === 'BOT'
   const rules = resolveProactivityRules(deps.rules, spaceName)
-  // Another app's post can only meet operator rules.
-  if (appSender && !rules) return record('bot')
+  // Another app's post can only meet operator rules. With the app's own user
+  // unknown, an app post might be its own, so none is considered.
+  if (appSender && (!rules || !botUserName)) return record('bot')
   if (!appSender && (mentionsApp(message, botUserName) || message.slashCommand)) return record('mention')
   // Alert bots often post cards with no text; normalization reads the cards.
   const text = appSender
