@@ -681,6 +681,32 @@ describe('operator rules answer unmentioned messages', () => {
     expect((await state.get<GoogleChatThreadState>(threadStateKey(threadOf('OWN'))))?.proactiveEligible).toBe(true)
   }, 20_000)
 
+  test("in an alert thread, only the app's own reply reads as the assistant", async () => {
+    const { runtime, inputs } = proactivity(() => ({ respond: true, probability: 0.9, rule: 'alert' }))
+    const { state } = await pollingBot({ ...runtime, rules: ALERT_RULES })
+    mock.listed.push(topLevel('B1', ALERT_BOT, { text: 'FIRING: disk almost full' }))
+    await waitFor(() => mock.executions.length === 1)
+    mock.finish('exec-1', 'Rotated the logs on node-1.')
+    await waitFor(async () => (await state.get<GoogleChatThreadState>(threadStateKey(threadOf('B1'))))?.activeExecution === false)
+
+    const inThread = { thread: { name: 'spaces/ROOM/threads/B1' }, threadReply: true }
+    mock.listed.push(
+      { ...topLevel('R1', { name: BOT, displayName: 'Centaur', type: 'BOT' }, { text: 'Rotated the logs on node-1.' }), ...inThread },
+      { ...topLevel('Q1', ALICE, { text: 'is it fixed?' }), ...inThread }
+    )
+    await waitFor(() => mock.executions.length === 2)
+    const context = executeBody('spaces/ROOM/messages/Q1').texts
+      .find(text => text.startsWith('# Google Chat Thread Context')) ?? ''
+    expect(context).toMatch(/\d\. Alert Bot:\s+FIRING: disk almost full/)
+    expect(context).toMatch(/\d\. assistant \(you\):\s+Rotated the logs on node-1\./)
+    expect(context.split('assistant (you)')).toHaveLength(2)
+    const question = inputs.find(input => input.message.text === 'is it fixed?')
+    const authors = question?.history.map(message => [message.author, message.fromBot])
+    expect(authors).toHaveLength(2)
+    expect(authors).toEqual(expect.arrayContaining([['Alert Bot', false], ['Centaur', true]]))
+    mock.finish('exec-2', 'Yes.')
+  }, 20_000)
+
   test("with the app's own user unknown, no app post starts a rule turn", async () => {
     const { runtime, inputs } = proactivity(alertRuleClassifier)
     const { client } = await pollingBot({ ...runtime, rules: ALERT_RULES })
