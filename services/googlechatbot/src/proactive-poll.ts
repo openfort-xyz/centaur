@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { StateAdapter } from 'chat'
 import type { AppConfig } from './config'
+import { cardFallbackText } from './chat/card-text'
 import type { ChatEdgeClient } from './chat/client'
 import { chatDedupKey, type EventDeduper } from './chat/dedup'
 import { buildThreadKey } from './chat/normalize'
@@ -8,6 +9,7 @@ import type { ChatListMessage, GoogleChatEnvelope } from './chat/types'
 import { verifyChatRequest } from './chat/verify'
 import { logError, logInfo, logWarn } from './logging'
 import { incr } from './metrics'
+import { proactiveLayers, resolveProactivityRules, type ProactivityRules } from './proactivity-rules'
 import { resolveSenderEmail } from './sender-lookup'
 import {
   acceptWork,
@@ -28,9 +30,11 @@ import {
  *
  * Each message passes the same gates as a webhook delivery: a durable dedupe
  * key shared with the webhook (so an event delivered both ways is processed
- * once), bot and self suppression, the domain allowlist and timestamp checks,
- * and the directory-backed sender identity. Mentions are left to the webhook
+ * once), self suppression, the domain allowlist and timestamp checks, and the
+ * directory-backed sender identity. Mentions are left to the webhook
  * entirely so the signed delivery stays the source of a mentioned turn.
+ * Another Chat app's post (an alert bot) is collected only where operator
+ * rules apply, and carries no person's identity.
  */
 
 const PAGE_SIZE = 100
@@ -41,6 +45,7 @@ export type ProactivePollerDeps = {
   config: AppConfig
   deduper: EventDeduper
   spaces: readonly string[]
+  rules?: ProactivityRules
   state: StateAdapter
   enqueue: (work: GoogleChatWorkObligation) => void
   /** Test seams. */
@@ -220,15 +225,24 @@ async function considerMessage(
     }
     return record('bot')
   }
-  if (sender.type === 'BOT') return record('bot')
-  if (mentionsApp(message, botUserName) || message.slashCommand) return record('mention')
-  if (!(message.text ?? message.argumentText ?? '').trim()) return record('empty')
-  // Cheap durable pre-checks: a thread the bot never joined gets no
+  const appSender = sender.type === 'BOT'
+  const rules = resolveProactivityRules(deps.rules, spaceName)
+  // Another app's post can only meet operator rules.
+  if (appSender && !rules) return record('bot')
+  if (!appSender && (mentionsApp(message, botUserName) || message.slashCommand)) return record('mention')
+  // Alert bots often post cards with no text; normalization reads the cards.
+  const text = appSender
+    ? message.text || message.formattedText || cardFallbackText(message)
+    : message.text ?? message.argumentText ?? ''
+  if (!text.trim()) return record('empty')
+  // Cheap durable pre-checks: a thread no proactivity applies to gets no
   // dedupe write and no obligation at all, and a message seen while a run is
   // active is that run's context, never a later unsolicited turn.
   const threadKey = buildThreadKey(spaceName, message.thread?.name ?? message.name)
-  const threadState = await state.get<GoogleChatThreadState>(threadStateKey(threadKey))
-  if (threadState?.proactiveEligible !== true) return record('not_eligible')
+  const threadState = (await state.get<GoogleChatThreadState>(threadStateKey(threadKey))) ?? {}
+  if (proactiveLayers(rules, threadState, appSender ? 'app' : 'person').length === 0) {
+    return record('not_eligible')
+  }
   if (threadState.activeExecution === true) return record('active_execution')
 
   const envelope: GoogleChatEnvelope = {
@@ -244,7 +258,10 @@ async function considerMessage(
       ...(typeof message.threadReply === 'boolean' ? { threadReply: message.threadReply } : {}),
       sender,
       ...(message.annotations ? { annotations: message.annotations } : {}),
-      ...(message.attachment ? { attachment: message.attachment } : {})
+      ...(message.attachment ? { attachment: message.attachment } : {}),
+      ...(message.cardsV2 ? { cardsV2: message.cardsV2 } : {}),
+      ...(message.cards ? { cards: message.cards } : {}),
+      ...(message.fallbackText ? { fallbackText: message.fallbackText } : {})
     },
     user: sender
   }
@@ -256,7 +273,7 @@ async function considerMessage(
     ingressMode: config.GOOGLECHATBOT_INGRESS_MODE,
     envelope
   })
-  const verification = verifyChatRequest({ config, envelope, userEmail })
+  const verification = verifyChatRequest({ config, envelope, userEmail, ...(appSender ? { appSender } : {}) })
   if (!verification.ok) {
     logInfo('googlechatbot_proactive_collected_rejected', { reason: verification.reason, space_name: spaceName })
     return record(`rejected_${verification.reason}`)
@@ -271,7 +288,10 @@ async function considerMessage(
       envelope,
       eventType: 'MESSAGE',
       failures: 0,
-      identityVerified: true,
+      // An app's post names no person, so its turn claims no identity: no
+      // one's desktop or credentials attach to it.
+      identityVerified: !appSender,
+      ...(appSender ? { appSender } : {}),
       ...(userEmail ? { identityUserEmail: userEmail } : {}),
       lastEventId: 0,
       stage: 'accepted',

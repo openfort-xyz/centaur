@@ -37,6 +37,9 @@ export type GoogleChatTurnMessage = {
   /** Upload destination for the session-context block (executing turn only). */
   spaceName?: string
   threadName?: string
+  /** Why an unmentioned turn runs and how the operators want it answered
+   * (executing turn only). */
+  proactiveContext?: string
 }
 
 type CreateSessionRequest = {
@@ -872,6 +875,7 @@ function codexInputContent(
   if (requesterContext) content.push({ type: 'text', text: requesterContext })
   const threadContext = threadHistoryContext(message, history)
   if (threadContext) content.push({ type: 'text', text: threadContext })
+  if (message.proactiveContext?.trim()) content.push({ type: 'text', text: message.proactiveContext })
   if (message.text.trim()) content.push({ type: 'text', text: message.text })
   for (const part of message.parts) {
     if (part.type === 'text') continue

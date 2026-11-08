@@ -79,7 +79,7 @@ export async function normalizeChatEnvelope(
   envelope: GoogleChatEnvelope,
   botUserName?: string,
   client?: ChatAttachmentDownloader,
-  opts: { acceptFollowUpAttachments?: boolean } = {}
+  opts: { acceptFollowUpAttachments?: boolean; acceptAppSender?: boolean } = {}
 ): Promise<NormalizedChatEvent | null> {
   if (!envelope.type) return null
   if (!envelope.space?.name) return null
@@ -112,9 +112,11 @@ export async function normalizeChatEnvelope(
   const senderName = message.sender.name
   if (!senderName) return null
 
-  // Never let bot-authored messages start an agent loop. The canonical resource
-  // catches older payloads that omit sender.type.
-  if (message.sender.type === 'BOT' || (botUserName && senderName === botUserName)) return null
+  // Never let bot-authored messages start an agent loop, except another app's
+  // post an operator rule may answer. The canonical resource catches older
+  // payloads that omit sender.type.
+  if (botUserName && senderName === botUserName) return null
+  if (message.sender.type === 'BOT' && !opts.acceptAppSender) return null
 
   // A slash command (`/centaur …`) is addressed to the app: Google strips the
   // command token and puts the rest in argumentText, which is the cleanest
