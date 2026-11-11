@@ -115,8 +115,10 @@ class ScheduledTask < ApplicationRecord
     parsed_cron&.next_time(after)&.to_t
   end
 
+  # A task delivered to the author's Slack DM runs as that DM's principal, so it
+  # keeps the DM's grants, such as reading the conversation it was created in.
   def execution_principal
-    ConsoleUserPrincipalProvisioner.call(author)
+    slack_dm_principal || ConsoleUserPrincipalProvisioner.call(author)
   end
 
   def delivery_platform
@@ -149,6 +151,12 @@ class ScheduledTask < ApplicationRecord
   end
 
   private
+
+  def slack_dm_principal
+    return unless delivery_platform == :slack
+
+    Principal.find_by(kind: "slack_dm", console_user: author, slack_user_id: delivery_channel)
+  end
 
   def google_chat_api_input
     unless GoogleChatDeliveryPolicy.new(author).allowed?(delivery_channel)
