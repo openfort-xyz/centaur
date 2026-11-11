@@ -114,6 +114,22 @@ class ScheduledTaskTest < ActiveSupport::TestCase
     )
   end
 
+  test "runs a task delivered to the author's Slack DM as that DM's principal" do
+    dm_principal = create_slack_dm_principal(users(:acme_admin))
+    create_slack_dm_principal(users(:globex_admin), foreign_id: "slack-user-other")
+    task = ScheduledTask.create!(valid_attributes(delivery_channel: "U0123456789"))
+
+    assert_equal dm_principal, task.execution_principal
+    assert_equal dm_principal.foreign_id, task.api_input.fetch(:principal)
+  end
+
+  test "runs a Slack channel task as the author's Console principal even with a DM principal" do
+    create_slack_dm_principal(users(:acme_admin))
+    task = ScheduledTask.create!(valid_attributes)
+
+    assert_equal "console_user", task.execution_principal.kind
+  end
+
   test "allows a granted Google Chat space and rejects an ungranted one" do
     grant_google_chat_space("spaces/AAQA42QLdws")
     granted = ScheduledTask.new(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
@@ -167,6 +183,18 @@ class ScheduledTaskTest < ActiveSupport::TestCase
   end
 
   private
+
+  def create_slack_dm_principal(user, foreign_id: "slack-user-t0123456789-u0123456789")
+    Principal.create!(
+      foreign_id: foreign_id,
+      created_by: user,
+      kind: "slack_dm",
+      console_user: user,
+      slack_user_id: "U0123456789",
+      slack_team_id: "T0123456789",
+      slack_channel_id: "D0123456789"
+    )
+  end
 
   def grant_google_chat_space(space_name, user: users(:acme_admin))
     principal = ConsoleUserPrincipalProvisioner.call(user)
