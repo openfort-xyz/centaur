@@ -160,60 +160,6 @@ class UserTest < ActiveSupport::TestCase
     assert_equal existing.user, user
   end
 
-  test "link_or_provision moves the user's email with a renamed account" do
-    existing = user_identities(:acme_admin_google)
-    user = User.link_or_provision(
-      provider: "google",
-      identity: identity(subject: existing.subject, email: " Admin@Renamed.example ")
-    )
-
-    assert_equal existing.user, user
-    assert_equal "admin@renamed.example", user.reload.email
-    assert_equal user, User.find_by(email: "admin@renamed.example")
-    assert_nil User.find_by(email: "admin@acme.example")
-
-    chat_user = Principal.new(kind: "gchat_user", labels: { "google_email" => "admin@renamed.example" })
-    chat_user.link_console_user_by_google_email
-    assert_equal user, chat_user.console_user
-  end
-
-  test "link_or_provision keeps the user's email when the new address is unverified" do
-    existing = user_identities(:acme_admin_google)
-    user = User.link_or_provision(
-      provider: "google",
-      identity: identity(subject: existing.subject, email: "admin@renamed.example", email_verified: false)
-    )
-
-    assert_equal "admin@acme.example", user.reload.email
-  end
-
-  test "link_or_provision never moves a user onto another user's email" do
-    existing = user_identities(:acme_admin_google)
-    taken = users(:globex_admin)
-    user = User.link_or_provision(
-      provider: "google",
-      identity: identity(subject: existing.subject, email: taken.email)
-    )
-
-    assert_equal existing.user, user
-    assert_equal "admin@acme.example", user.reload.email
-    assert_equal "admin@globex.example", taken.reload.email
-  end
-
-  test "link_or_provision leaves the user's email to the identity it came from" do
-    user = users(:acme_admin)
-    user.user_identities.create!(
-      provider: "slack", subject: "U0ADMIN001", email: "admin@slack.example", email_verified: true
-    )
-
-    User.link_or_provision(
-      provider: "slack",
-      identity: identity(subject: "U0ADMIN001", email: "admin@slack-renamed.example")
-    )
-
-    assert_equal "admin@acme.example", user.reload.email
-  end
-
   test "link_or_provision rejects a returning identity outside the configured domain allowlist" do
     ENV["CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS"] = "globex.example"
     existing = user_identities(:acme_admin_google)

@@ -13,7 +13,7 @@ class ConsoleUserPrincipalProvisioner
 
   def call
     Principal.transaction do
-      principal = existing_principal || Principal.find_or_initialize_by(foreign_id: foreign_id)
+      principal = Principal.find_or_initialize_by(foreign_id: foreign_id)
       newly_created = principal.new_record?
       principal.created_by ||= user
       principal.name = user.name.presence || user.email
@@ -34,13 +34,6 @@ class ConsoleUserPrincipalProvisioner
   private
 
   attr_reader :user
-
-  # The foreign_id is derived from the email only when the principal is first
-  # created. A user whose email later changes keeps the principal they have,
-  # with its grants and roles, instead of getting an empty one.
-  def existing_principal
-    Principal.where(kind: "console_user", console_user: user).order(:id).first
-  end
 
   def foreign_id
     normalized = user.email.to_s.downcase.strip

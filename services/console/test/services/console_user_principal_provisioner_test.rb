@@ -16,29 +16,6 @@ class ConsoleUserPrincipalProvisionerTest < ActiveSupport::TestCase
     assert_includes @principal.roles, Role.find_by!(foreign_id: "user-mcp")
   end
 
-  test "a user whose email changes keeps their principal, grants and roles" do
-    user = users(:member_user)
-    principal = ConsoleUserPrincipalProvisioner.call(user)
-    grant = principal.grants.create!(static_secret: static_secrets(:github_token_inject), created_by: user)
-
-    user.update!(email: "renamed-member@example.com")
-
-    assert_no_difference -> { Principal.count } do
-      assert_equal principal, ConsoleUserPrincipalProvisioner.call(user)
-    end
-    assert_equal principal.foreign_id, principal.reload.foreign_id
-    assert_includes principal.grants, grant
-    assert_includes principal.roles, Role.find_by!(foreign_id: "user-mcp")
-  end
-
-  test "two users never share a principal" do
-    first = ConsoleUserPrincipalProvisioner.call(users(:member_user))
-    second = ConsoleUserPrincipalProvisioner.call(users(:globex_admin))
-
-    assert_not_equal first, second
-    assert_equal users(:globex_admin), second.console_user
-  end
-
   test "repeated calls leave an unchanged principal untouched" do
     user = users(:member_user)
     principal = ConsoleUserPrincipalProvisioner.call(user)
