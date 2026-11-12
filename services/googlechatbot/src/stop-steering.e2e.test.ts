@@ -681,6 +681,73 @@ describe('mentioned follow-ups while the response stream is open', () => {
   }, 20_000)
 })
 
+describe('requester identity on execute', () => {
+  let mock: SessionMock
+  beforeEach(() => {
+    resetMetrics()
+    mock = installSessionMock()
+  })
+  afterEach(async () => {
+    await drainRuntimes()
+    mock.restore()
+  })
+
+  test('a verified turn names its sender to api-rs by Google account id as well as email', async () => {
+    const pair = await generateRsaKeyPair()
+    const kid = 'requester-test'
+    const jwk = { ...await crypto.subtle.exportKey('jwk', pair.publicKey), kid }
+    const inner = globalThis.fetch
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/service_accounts/v1/jwk/') || url.includes('/oauth2/v3/certs')) {
+        return Response.json({ keys: [jwk] }, { headers: { 'cache-control': 'max-age=3600' } })
+      }
+      return inner(input as string, init)
+    }) as typeof fetch
+    const audience = 'https://chat.example.test/api/chat/events'
+    const clientId = 'fixture-client.apps.googleusercontent.com'
+    const signer = 'addon@example.iam.gserviceaccount.com'
+    const now = Math.floor(Date.now() / 1000)
+    const signed = (claims: Record<string, unknown>) => signJwt({ privateKey: pair.privateKey, kid, claims: {
+      iss: 'https://accounts.google.com', email_verified: true, iat: now, exp: now + 300, ...claims
+    } })
+    const runtime = tracked(createGooglechatbot(loadConfig({
+      CHAT_EVENTS_PATH: '/api/chat/events',
+      GOOGLECHATBOT_RECOVERY_SWEEP_INTERVAL_MS: '3600000',
+      GOOGLECHATBOT_INGRESS_MODE: 'workspace_addon',
+      GOOGLECHATBOT_WEBHOOK_AUDIENCE: audience,
+      GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL: signer,
+      GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID: clientId
+    }), { state: createMemoryState() }))
+
+    const response = await runtime.app.request('/api/chat/events', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${await signed({ aud: audience, email: signer })}`
+      },
+      body: JSON.stringify({
+        ...mentionEvent('M1', 'who am I', 'users/1042'),
+        authorizationEventObject: {
+          userIdToken: await signed({ aud: clientId, sub: '1042', email: 'ada@new.example' })
+        }
+      })
+    })
+    expect(response.status).toBe(200)
+    await waitFor(() => mock.streams.has('exec-1'))
+
+    const execute = mock.calls.find(c => c.method === 'POST' && c.url.endsWith('/execute'))
+    const metadata = (execute?.body as { metadata: Record<string, unknown> }).metadata
+    expect(metadata.googlechat_request_verified).toBe(true)
+    expect(metadata.googlechat_requester_email).toBe('ada@new.example')
+    expect(metadata.googlechat_requester_subject).toBe('1042')
+
+    mock.finish('exec-1', 'done')
+    await waitFor(() => [...mock.messages.values()].some(m => m.text === 'done'))
+    globalThis.fetch = inner
+  }, 20_000)
+})
+
 describe('Workspace Add-on Stop card callback', () => {
   let mock: SessionMock
   beforeEach(() => {

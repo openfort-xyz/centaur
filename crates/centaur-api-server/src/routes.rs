@@ -1185,6 +1185,7 @@ mod session_authorization_tests {
             CallerClass::Admin,
             CallerClass::Console,
             CallerClass::Principal,
+            CallerClass::ApiClient,
         ] {
             assert_eq!(
                 sanitize_execute_metadata(caller_class, Some(metadata.clone())),
