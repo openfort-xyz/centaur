@@ -11,7 +11,8 @@ use centaur_console_db::{
     ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
     api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
     find_gchat_user_principal_by_google_subject, find_principal, find_principal_by_foreign_id,
-    find_user_id_by_email, models::Config,
+    find_user_id_by_email, find_user_id_for_google_account, models::Config,
+    principal_is_linked_to_another_google_account,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -472,6 +473,134 @@ async fn finds_a_google_chat_user_by_google_account_not_by_email() {
     assert_eq!(found(subject("admin")).await, Some(fixture.name("linked")));
 
     assert_eq!(found(subject("nobody")).await, None);
+}
+
+/// A Console user, optionally signing in with a Google account; returns its id.
+async fn console_user(fixture: &Fixture, email: &str, google: Option<(&str, &str, bool)>) -> i64 {
+    let user: i64 = sqlx::query_scalar(
+        "INSERT INTO users (email, admin, status, created_at, updated_at) \
+         VALUES ($1, false, 'active', now(), now()) RETURNING id",
+    )
+    .bind(email)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    if let Some((subject, identity_email, verified)) = google {
+        sqlx::query(
+            "INSERT INTO user_identities (user_id, provider, subject, email, email_verified, created_at, updated_at) \
+             VALUES ($1, 'google', $2, $3, $4, now(), now())",
+        )
+        .bind(user)
+        .bind(subject)
+        .bind(identity_email)
+        .bind(verified)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    }
+    user
+}
+
+#[tokio::test]
+async fn an_unlabelled_principal_linked_to_another_google_account_is_not_claimable() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let subject = |label: &str| format!("{label}-{}", fixture.unique);
+    let ada = console_user(
+        &fixture,
+        &format!("ada-{}@old.example", fixture.unique),
+        Some((&subject("ada"), "ada@old.example", true)),
+    )
+    .await;
+    let password_only = console_user(
+        &fixture,
+        &format!("pw-{}@old.example", fixture.unique),
+        None,
+    )
+    .await;
+    let linked_to_ada = gchat_user(&fixture, "ada", json!({}), Some(ada)).await;
+    let linked_without_google = gchat_user(&fixture, "pw", json!({}), Some(password_only)).await;
+    let unlinked = gchat_user(&fixture, "unlinked", json!({}), None).await;
+    let conflict = async |foreign_id: &str, subject: String| {
+        principal_is_linked_to_another_google_account(&fixture.pool, foreign_id, &subject)
+            .await
+            .unwrap()
+    };
+
+    assert!(conflict(&linked_to_ada, subject("grace")).await);
+    assert!(!conflict(&linked_to_ada, subject("ada")).await);
+    assert!(!conflict(&linked_without_google, subject("grace")).await);
+    assert!(!conflict(&unlinked, subject("grace")).await);
+    assert!(!conflict(&fixture.name("missing"), subject("grace")).await);
+}
+
+#[tokio::test]
+async fn links_a_google_chat_principal_to_the_user_of_the_account_before_the_email() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let subject = |label: &str| format!("{label}-{}", fixture.unique);
+    let address = |label: &str| format!("{label}-{}@example.com", fixture.unique);
+    // Ada was renamed: her stored email is the old address, and her Google
+    // sign-in has since reported the new one.
+    let ada = console_user(
+        &fixture,
+        &address("ada-old"),
+        Some((&subject("ada"), &address("ada-new"), true)),
+    )
+    .await;
+    let password_only = console_user(&fixture, &address("pw"), None).await;
+    console_user(
+        &fixture,
+        &address("unverified-owner"),
+        Some((&subject("unverified"), &address("claimed"), false)),
+    )
+    .await;
+    let found = async |subject: Option<String>, email: String| {
+        find_user_id_for_google_account(&fixture.pool, subject.as_deref(), &email)
+            .await
+            .unwrap()
+    };
+
+    // The account id finds her whatever address Chat reports.
+    assert_eq!(
+        found(Some(subject("ada")), address("ada-new")).await,
+        Some(ada)
+    );
+    assert_eq!(
+        found(Some(subject("ada")), address("elsewhere")).await,
+        Some(ada)
+    );
+    // Without an account id, either of her addresses finds her.
+    assert_eq!(found(None, address("ada-old")).await, Some(ada));
+    assert_eq!(found(None, address("ada-new")).await, Some(ada));
+    // Another account reporting one of her addresses is not her.
+    assert_eq!(
+        found(Some(subject("grace")), address("ada-old")).await,
+        None
+    );
+    assert_eq!(
+        found(Some(subject("grace")), address("ada-new")).await,
+        None
+    );
+    // A user with no Google sign-in is still found by email.
+    assert_eq!(
+        found(Some(subject("grace")), address("pw")).await,
+        Some(password_only)
+    );
+    // An unverified sign-in email names nobody.
+    assert_eq!(found(None, address("claimed")).await, None);
+    assert_eq!(found(None, address("nobody")).await, None);
+
+    // An address two users are known by names neither.
+    console_user(
+        &fixture,
+        &address("ada-new"),
+        Some((&subject("twin"), &address("twin"), true)),
+    )
+    .await;
+    assert_eq!(found(None, address("ada-new")).await, None);
 }
 
 #[tokio::test]

@@ -18,5 +18,6 @@ pub use oid::{decode_oid, oid};
 pub use principals::{
     Principal, SlackChannelPermission, effective_config, find_direct_slack_channel_permission,
     find_gchat_user_principal_by_google_subject, find_principal, find_principal_by_foreign_id,
-    find_user_id_by_email,
+    find_user_id_by_email, find_user_id_for_google_account,
+    principal_is_linked_to_another_google_account,
 };

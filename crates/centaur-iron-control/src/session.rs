@@ -206,8 +206,10 @@ impl SessionRegistrar {
     /// already has. The derived `foreign_id` is keyed on the email, so without
     /// this a changed primary email would mint a second principal holding none
     /// of the person's grants or roles. An account seen for the first time
-    /// keeps the email-derived `foreign_id`, unless another account already
-    /// holds that one (an address reassigned to a new person): then it gets a
+    /// keeps the email-derived `foreign_id`, unless that principal belongs to
+    /// another account (an address reassigned to a new person): it is labelled
+    /// with another `google_subject`, or it has no label and its linked Console
+    /// user signs in with another Google account. Then the sender gets a
     /// `foreign_id` keyed on its own account id, so two people never share a
     /// principal.
     async fn keep_gchat_user_principal(&self, input: &mut PrincipalInput) -> Result<()> {
@@ -226,12 +228,28 @@ impl SessionRegistrar {
             Err(error) if error.is_not_found() => return Ok(()),
             Err(error) => return Err(error),
         };
-        if holder
+        let held_by_another_account = match holder
             .labels
             .get(GOOGLE_SUBJECT_LABEL)
-            .is_some_and(|held| !held.is_empty() && *held != subject)
+            .filter(|held| !held.is_empty())
         {
-            input.foreign_id = format!("{GCHAT_USER_FOREIGN_ID_PREFIX}{subject}");
+            Some(held) => *held != subject,
+            None => {
+                self.client
+                    .linked_to_another_google_account(&input.foreign_id, &subject)
+                    .await?
+            }
+        };
+        if held_by_another_account {
+            let own = format!("{GCHAT_USER_FOREIGN_ID_PREFIX}{subject}");
+            tracing::warn!(
+                holder_principal = %holder.id,
+                holder_foreign_id = %input.foreign_id,
+                sender_foreign_id = %own,
+                "google chat requester's email-derived principal belongs to another Google \
+                 account; the sender gets its own principal with none of the holder's grants"
+            );
+            input.foreign_id = own;
         }
         Ok(())
     }

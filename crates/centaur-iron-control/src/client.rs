@@ -192,6 +192,22 @@ impl IronControlClient {
             .find(|foreign_id| foreign_id.starts_with(GCHAT_USER_FOREIGN_ID_PREFIX)))
     }
 
+    /// Whether the principal `foreign_id` is linked to a Console user who
+    /// signs in with a Google account other than `subject`. Without a Console
+    /// database connection the link cannot be read and this is `false`.
+    pub(crate) async fn linked_to_another_google_account(
+        &self,
+        foreign_id: &str,
+        subject: &str,
+    ) -> Result<bool> {
+        match &self.console_db {
+            Some(pool) => {
+                database::linked_to_another_google_account(pool, foreign_id, subject).await
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Assign a role (by OID) to a principal (by OID).
     pub async fn assign_role(&self, principal_id: &str, role_id: &str) -> Result<()> {
         let path = format!(
