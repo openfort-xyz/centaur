@@ -92,7 +92,8 @@ directory lookup) the bot sends on `/execute` as `googlechat_requester_email` wi
 `googlechat_requester_subject`. api-rs looks for the `gchat_user` principal that account
 already has (its `google_subject` label, else the Google sign-in of its linked Console user)
 before deriving one from the email, so a person keeps their principal and its `foreign_id`
-when their primary email changes. The Console hoists that principal's hand-granted
+when their primary email changes. The Console links that principal to its Console user by the
+same id before the email; a Console user's stored email does not change on a rename. The Console hoists that principal's hand-granted
 non-broker static secrets into the turn's proxy config, which is how a
 per-person desktop token follows its owner into a group; Slack, GitHub and
 console requesters keep upstream's always-available-wrapper-only hoist. The

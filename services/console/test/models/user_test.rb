@@ -203,6 +203,95 @@ class UserTest < ActiveSupport::TestCase
     end
   end
 
+  # --- a renamed Google account ------------------------------------------------
+
+  # Google reports acme_admin's account under a new address on the next
+  # sign-in: same subject, the old address kept as an alias.
+  def google_reports_new_address(email = "admin@renamed.example")
+    existing = user_identities(:acme_admin_google)
+    User.link_or_provision(provider: existing.provider,
+                           identity: identity(subject: existing.subject, email: email))
+  end
+
+  test "a returning identity with a new address never changes the stored email" do
+    user = users(:acme_admin)
+    slack = user.user_identities.create!(provider: "slack", subject: "U0ADMIN001",
+                                         email: user.email, email_verified: true)
+
+    assert_no_difference -> { User.count } do
+      assert_equal user, google_reports_new_address
+      assert_equal user, User.link_or_provision(
+        provider: "slack", identity: identity(subject: slack.subject, email: "anything@elsewhere.example")
+      )
+    end
+
+    assert_equal "admin@acme.example", user.reload.email
+    assert_equal "admin@renamed.example", user_identities(:acme_admin_google).reload.email
+    assert_equal %w[admin@renamed.example admin@acme.example], user.google_addresses
+  end
+
+  test "for_google_account finds a renamed user by account id before any sign-in" do
+    user = users(:acme_admin)
+    subject = user_identities(:acme_admin_google).subject
+
+    assert_equal user, User.for_google_account(subject: subject, email: "admin@renamed.example")
+    assert_nil User.for_google_account(subject: nil, email: "admin@renamed.example")
+
+    google_reports_new_address
+    assert_equal user, User.for_google_account(subject: nil, email: "admin@renamed.example")
+    assert_equal user, User.for_google_account(subject: nil, email: " Admin@Acme.Example ")
+  end
+
+  test "for_google_account never gives another Google account a user by one of their addresses" do
+    google_reports_new_address
+
+    %w[admin@acme.example admin@renamed.example].each do |address|
+      assert_nil User.for_google_account(subject: "another-account", email: address), address
+    end
+    # A user with no Google sign-in has only the email to be found by.
+    assert_equal users(:member_user),
+                 User.for_google_account(subject: "another-account", email: users(:member_user).email)
+  end
+
+  test "for_google_account ignores unverified sign-in emails and addresses two users share" do
+    users(:member_user).user_identities.create!(provider: "google", subject: "member-sub",
+                                                email: "claimed@acme.example", email_verified: false)
+    assert_nil User.for_google_account(subject: nil, email: "claimed@acme.example")
+    assert_nil User.for_google_account(subject: nil, email: "")
+
+    users(:member_user).user_identities.create!(provider: "google", subject: "member-sub-2",
+                                                email: users(:globex_admin).email, email_verified: true)
+    assert_nil User.for_google_account(subject: nil, email: users(:globex_admin).email)
+  end
+
+  test "a first sign-in through another provider joins a renamed user under either address" do
+    user = google_reports_new_address
+
+    assert_no_difference -> { User.count } do
+      assert_equal user, User.link_or_provision(
+        provider: "slack", identity: identity(subject: "U0ADMIN001", email: "admin@acme.example")
+      )
+      assert_equal user, User.link_or_provision(
+        provider: "okta", identity: identity(subject: "okta-admin", email: "admin@renamed.example")
+      )
+    end
+  end
+
+  test "a second Google account reporting a user's address never joins that user" do
+    user = google_reports_new_address
+
+    %w[admin@acme.example admin@renamed.example].each do |address|
+      assert_no_difference -> { user.user_identities.count } do
+        joined = begin
+          User.link_or_provision(provider: "google", identity: identity(subject: "another-account", email: address))
+        rescue ActiveRecord::RecordInvalid
+          nil
+        end
+        assert_not_equal user, joined, address
+      end
+    end
+  end
+
   test "link_or_provision makes a bootstrap-allowlisted email active and admin" do
     ENV["CENTAUR_CONSOLE_BOOTSTRAP_ADMINS"] = "boss@example.com"
     user = User.link_or_provision(provider: "google", identity: identity(subject: "boss-sub", email: "boss@example.com"))

@@ -469,6 +469,36 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
+  test "a renamed admin keeps Google Chat DM admin authority; another account on their address has none" do
+    admin = users(:acme_admin)
+    subject = user_identities(:acme_admin_google).subject
+    requester_as = lambda do |account, email|
+      gchat_principal("gchat_user", email, "requester-#{account}").tap do |requester|
+        requester.update!(labels: requester.labels.merge("google_subject" => account))
+      end
+    end
+    change_roles = lambda do |proxy|
+      with_token(proxy) do |headers|
+        post "/api/v1/sandbox/admin/principals/#{@channel.oid}/roles",
+             params: { data: { role_id: @role.oid } }, headers: headers, as: :json
+      end
+    end
+
+    # Chat reports the new address; the admin's stored email is still the old one.
+    renamed = gchat_proxy_for(admin, kind: "gchat_dm", email: "admin@renamed.example",
+                                     requester: requester_as.call(subject, "admin@renamed.example"))
+    reassigned = gchat_proxy_for(admin, kind: "gchat_dm", email: admin.email,
+                                        requester: requester_as.call("another-account", admin.email))
+
+    change_roles.call(reassigned)
+    assert_response :forbidden
+    assert_not_includes @channel.reload.roles, @role
+
+    change_roles.call(renamed)
+    assert_response :created
+    assert_includes @channel.reload.roles, @role
+  end
+
   test "only a verified Google Chat DM linked to an active admin with a matching requester can change roles" do
     admin = users(:acme_admin)
     other_admin = users(:globex_admin)

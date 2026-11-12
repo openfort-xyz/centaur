@@ -64,9 +64,12 @@ module SandboxAdminAuthentication
     team_id.present? && SlackBotChannel.exists?(team_id: team_id)
   end
 
-  # The DM space's verified email must be the linked admin's email and the
-  # email of the turn's verified requester, so a stale link, an operator-set
-  # console_user_id, or an unverified turn never grants admin authority.
+  # The DM space's verified email must be the email of the turn's verified
+  # requester, and that requester's Google account must be the linked admin's,
+  # so a stale link, an operator-set console_user_id, or an unverified turn
+  # never grants admin authority. The admin is matched by Google account id
+  # before the email: their stored email is the old address after a Workspace
+  # rename.
   def verified_google_dm?(principal)
     email = principal.google_chat_reader_subject
     return false if email.nil?
@@ -74,8 +77,12 @@ module SandboxAdminAuthentication
     requester = current_proxy.requester_principal
     return false unless requester&.kind == Principal::GCHAT_USER_KIND
 
-    requester_email = requester.labels.to_h[Principal::GOOGLE_EMAIL_LABEL].to_s.strip.downcase
-    email == requester_email && email == principal.console_user&.email
+    labels = requester.labels.to_h
+    return false unless email == labels[Principal::GOOGLE_EMAIL_LABEL].to_s.strip.downcase
+
+    user = principal.console_user
+    user.present? &&
+      User.for_google_account(subject: labels[Principal::GOOGLE_SUBJECT_LABEL], email: email) == user
   end
 
   def slack_admin_dm?
