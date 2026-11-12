@@ -125,6 +125,22 @@ pub struct AppendMessagesResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EditMessageRequest {
+    pub parts: Vec<Value>,
+    #[serde(default)]
+    pub metadata: serde_json::Map<String, Value>,
+    /// True also tells an active execution about the edit. It never starts one.
+    #[serde(default)]
+    pub forward_to_active_execution: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EditMessageResponse {
+    pub ok: bool,
+    pub message_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExecuteSessionRequest {
     pub idempotency_key: Option<String>,
     pub metadata: Option<Value>,

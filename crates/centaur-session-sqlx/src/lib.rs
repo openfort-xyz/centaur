@@ -355,6 +355,36 @@ impl PgSessionStore {
         Ok(message_ids)
     }
 
+    /// Replace the parts of a stored user message after the user edited it on
+    /// the chat platform. Metadata keys in `metadata` overwrite stored ones.
+    pub async fn edit_user_message(
+        &self,
+        thread_key: &ThreadKey,
+        client_message_id: &str,
+        parts: &[Value],
+        metadata: &serde_json::Map<String, Value>,
+    ) -> Result<String, SessionStoreError> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            update session_messages
+            set parts = $3, metadata = metadata || $4
+            where thread_key = $1 and client_message_id = $2 and role = $5
+            returning message_id
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(client_message_id)
+        .bind(Value::Array(parts.to_vec()))
+        .bind(Value::Object(metadata.clone()))
+        .bind(MessageRole::User.as_ref())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| SessionStoreError::MessageNotFound {
+            thread_key: thread_key.to_string(),
+            client_message_id: client_message_id.to_owned(),
+        })
+    }
+
     pub async fn title_generation_candidate(
         &self,
         thread_key: &ThreadKey,
@@ -2032,6 +2062,11 @@ pub struct SessionEventNotification {
 pub enum SessionStoreError {
     #[error("session not found for thread_key {thread_key}")]
     NotFound { thread_key: String },
+    #[error("user message {client_message_id} not found in session {thread_key}")]
+    MessageNotFound {
+        thread_key: String,
+        client_message_id: String,
+    },
     #[error(
         "session {thread_key} already exists with harness_type {existing}, requested {requested}"
     )]

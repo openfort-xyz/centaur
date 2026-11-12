@@ -42,6 +42,7 @@ import { slackUserIdForMessage } from './slack-user'
 import {
   collectInitialContext,
   dispatchSlackBlockAction,
+  editSessionMessage,
   fetchWithTimeout,
   forwardToSessionApi,
   harnessRestartPreamble,
@@ -599,6 +600,33 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       state,
       steeringReactions,
       trigger: 'subscribed_message'
+    })
+  })
+
+  // Slack edits keep the stored transcript in step with the thread. An edit
+  // never starts an execution; it steers an active one only where the
+  // original message could have (a DM or a mention).
+  chat.onMessageUpdated(async (_thread, message) => {
+    if (!(await isAllowedSlackMessage(message, options, logger))) return
+    const raw = isJsonObject(message.raw) ? message.raw : {}
+    const channel = stringValue(raw.channel)
+    const threadTs = stringValue(raw.thread_ts) ?? stringValue(raw.ts)
+    if (!channel || !threadTs) return
+    const threadId = slack.encodeThreadId({ channel, threadTs })
+    const forward = raw.channel_type === 'im'
+      || message.isMention === true
+      || slackRichTextMentionsUser(raw, options.botUserId)
+    const stored = await editSessionMessage(
+      options,
+      threadId,
+      await serializeMessage(message, options),
+      forward
+    )
+    traceLog(options, 'slackbotv2_message_edit_handled', undefined, {
+      forward_to_active_execution: forward,
+      message_id: message.id,
+      stored,
+      thread_id: threadId
     })
   })
 

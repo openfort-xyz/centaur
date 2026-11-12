@@ -289,6 +289,62 @@ describe('slackbotv2', () => {
     })
   })
 
+  it.each([
+    ['user DM edit', 'im', 'D000000001', USER_ID, true],
+    ['unmentioned channel edit', 'channel', CHANNEL_ID, USER_ID, false],
+    ['bot self edit', 'im', 'D000000001', BOT_USER_ID, null]
+  ] as const)('stores a Slack message edit without executing (%s)', async (
+    _,
+    channelType,
+    channel,
+    user,
+    expectedForward
+  ) => {
+    const edits: Array<{ body: Record<string, unknown>; method: string; url: string }> = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (/\/messages\/[^/]+$/.test(String(input))) {
+          edits.push({
+            body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+            method: String(init?.method),
+            url: String(input)
+          })
+          return Response.json({ ok: true, message_id: 'msg-edited' })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const ts = '1700000000.000300'
+    const message = { type: 'message', user, ts, team: TEAM_ID }
+
+    const delivery = await deliverEvent({
+      type: 'message',
+      subtype: 'message_changed',
+      channel,
+      channel_type: channelType,
+      hidden: true,
+      ts: '1700000100.000100',
+      message: { ...message, text: 'expenses el 2024', edited: { user, ts: '1700000100.000100' } },
+      previous_message: { ...message, text: 'expenses' }
+    })
+
+    expect(delivery.response.status).toBe(200)
+    await delivery.finished()
+    expect(codexApi.executes).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(0)
+    if (expectedForward === null) {
+      expect(edits).toHaveLength(0)
+      return
+    }
+    expect(edits).toHaveLength(1)
+    expect(edits[0]).toMatchObject({
+      method: 'PATCH',
+      url: `${codexApi.url}/api/session/${encodeURIComponent(`slack:${channel}:${ts}`)}/messages/${ts}`,
+      body: { forward_to_active_execution: expectedForward }
+    })
+    expect(JSON.stringify(edits[0]?.body.parts)).toContain('expenses el 2024')
+  })
+
   it('logs a failed native stop without failing the webhook', async () => {
     const logs: CapturedLog[] = []
     const sharedState = createMemoryState()

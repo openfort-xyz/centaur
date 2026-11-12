@@ -1385,6 +1385,41 @@ async function appendSessionMessages(
   await ensureApiOk(response, 'append session messages')
 }
 
+/**
+ * Replace the stored copy of a user message the user edited in Slack. Returns
+ * false when the session never stored that message.
+ */
+export async function editSessionMessage(
+  options: SlackbotV2Options,
+  threadId: string,
+  message: SlackbotV2ApiMessage,
+  forwardToActiveExecution: boolean
+): Promise<boolean> {
+  const { parts, metadata } = await toSessionMessage(options, message, true)
+  const url = new URL(
+    `messages/${encodeURIComponent(message.id)}`,
+    ensureTrailingSlash(apiSessionUrl(options.apiUrl, threadId))
+  )
+  const response = await fetchWithTimeout(
+    options.fetch ?? fetch,
+    url.toString(),
+    {
+      method: 'PATCH',
+      headers: apiHeaders(options),
+      body: JSON.stringify({
+        parts,
+        metadata,
+        forward_to_active_execution: forwardToActiveExecution
+      })
+    },
+    sessionApiTimeoutMs(options),
+    'edit session message'
+  )
+  if (response.status === 404) return false
+  await ensureApiOk(response, 'edit session message')
+  return true
+}
+
 async function executeSession(
   options: SlackbotV2Options,
   threadId: string,

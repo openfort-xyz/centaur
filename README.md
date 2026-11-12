@@ -56,6 +56,7 @@ You can also drive Centaur directly through the API:
 ```text
 POST /api/session/{thread_key}          # create or reuse a session
 POST /api/session/{thread_key}/messages # store the user turn
+PATCH /api/session/{thread_key}/messages/{client_message_id} # record a user's edit
 POST /api/session/{thread_key}/execute  # start the agent
 GET  /api/session/{thread_key}/events   # stream or replay output
 ```

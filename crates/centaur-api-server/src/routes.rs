@@ -17,7 +17,7 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, patch, post},
 };
 use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::{ChatDestination, ThreadKey};
@@ -58,11 +58,12 @@ use crate::{
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
-        DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, GithubThreadContext, GoogleChatThreadContext,
-        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        DiscordThreadContext, EditMessageRequest, EditMessageResponse, EmitWorkflowEventRequest,
+        EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse, GithubThreadContext,
+        GoogleChatThreadContext, InterruptSessionExecutionRequest,
+        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
+        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
+        stream_error_sse,
     },
 };
 
@@ -238,6 +239,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}/messages",
             post(append_messages).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/session/{thread_key}/messages/{client_message_id}",
+            patch(edit_message).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/session/{thread_key}/execute",
@@ -856,6 +861,28 @@ async fn append_messages(
     Ok(Json(AppendMessagesResponse {
         ok: true,
         message_ids,
+    }))
+}
+
+async fn edit_message(
+    State(state): State<AppState>,
+    Path((raw_thread_key, client_message_id)): Path<(String, String)>,
+    Json(request): Json<EditMessageRequest>,
+) -> Result<Json<EditMessageResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let message_id = state
+        .runtime()?
+        .edit_user_message(
+            &thread_key,
+            &client_message_id,
+            &request.parts,
+            &request.metadata,
+            request.forward_to_active_execution,
+        )
+        .await?;
+    Ok(Json(EditMessageResponse {
+        ok: true,
+        message_id,
     }))
 }
 

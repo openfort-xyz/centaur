@@ -1961,6 +1961,50 @@ impl SessionRuntime {
         Ok(message_ids)
     }
 
+    /// Record a platform edit of a stored user message. Forwarding steers an
+    /// active execution with the edited text; it never starts an execution.
+    pub async fn edit_user_message(
+        &self,
+        thread_key: &ThreadKey,
+        client_message_id: &str,
+        parts: &[Value],
+        metadata: &serde_json::Map<String, Value>,
+        forward_to_active_execution: bool,
+    ) -> Result<String, SessionRuntimeError> {
+        let message_id = self
+            .store
+            .edit_user_message(thread_key, client_message_id, parts, metadata)
+            .await?;
+        info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_message_edited",
+            thread_key = %thread_key,
+            message_id = %message_id,
+            forward_to_active_execution,
+            "session message edited"
+        );
+        if forward_to_active_execution {
+            let mut steer_parts = vec![json!({
+                "type": "text",
+                "text": "The user edited an earlier message. It now reads:",
+            })];
+            steer_parts.extend_from_slice(parts);
+            let steer = SessionMessageInput {
+                client_message_id: None,
+                role: MessageRole::User,
+                parts: steer_parts,
+                metadata: Value::Object(metadata.clone()),
+            };
+            self.forward_messages_to_active_execution(
+                thread_key,
+                &[steer],
+                std::slice::from_ref(&message_id),
+            )
+            .await;
+        }
+        Ok(message_id)
+    }
+
     fn spawn_session_title_generation(&self, thread_key: &ThreadKey) {
         let Some(generator) = self.session_title_generator.clone() else {
             return;
@@ -9749,6 +9793,91 @@ mod adoption_tests {
         let input: Value = serde_json::from_slice(&buffer[..length]).unwrap();
         assert!(input.to_string().contains("a real follow-up"));
         assert!(!input.to_string().contains("already executed"));
+        store.complete_execution(&execution_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_user_message_updates_transcript_and_steers_active_execution() {
+        use tokio::io::AsyncReadExt;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!("test:edit-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-edit"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, mut stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-edit")
+            .await
+            .unwrap();
+        let ids = runtime
+            .append_messages_with_forwarding(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("1700000000.000100".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "expenses"})],
+                    metadata: json!({"platform": "slack", "slack_display_text_chars": 8}),
+                }],
+                false,
+            )
+            .await
+            .unwrap();
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("slack_display_text_chars".to_owned(), json!(16));
+        let edited_parts = vec![json!({"type": "text", "text": "expenses el 2024"})];
+
+        let message_id = runtime
+            .edit_user_message(
+                &thread_key,
+                "1700000000.000100",
+                &edited_parts,
+                &metadata,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(message_id, ids[0]);
+        let (parts, stored_metadata): (Value, Value) =
+            sqlx::query_as("select parts, metadata from session_messages where message_id = $1")
+                .bind(&message_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(parts, json!(edited_parts));
+        assert_eq!(
+            stored_metadata,
+            json!({"platform": "slack", "slack_display_text_chars": 16})
+        );
+        let mut buffer = [0u8; 4096];
+        let length = tokio::time::timeout(Duration::from_secs(2), stdin.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let input = String::from_utf8_lossy(&buffer[..length]);
+        assert!(input.contains("edited an earlier message"), "{input}");
+        assert!(input.contains("expenses el 2024"), "{input}");
+
+        let missing = runtime
+            .edit_user_message(
+                &thread_key,
+                "1700000000.999999",
+                &edited_parts,
+                &metadata,
+                true,
+            )
+            .await;
+        assert!(matches!(
+            missing,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::MessageNotFound { .. }
+            ))
+        ));
         store.complete_execution(&execution_id).await.unwrap();
     }
 
