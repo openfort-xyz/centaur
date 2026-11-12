@@ -11,10 +11,12 @@ use centaur_console_db::{
     ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
     api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
     find_gchat_user_principal_by_google_subject, find_principal, find_principal_by_foreign_id,
-    find_user_id_by_email, find_user_id_for_google_account, models::Config,
+    find_user_id_by_email, find_user_id_for_google_account, models::Config, oid,
     principal_is_linked_to_another_google_account,
 };
+use centaur_iron_control::{IronControlClient, SessionRegistrar, slugify};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 const PRIMARY_KEY: &str = "dev_ar_encryption_primary_key_0000000000000000";
@@ -404,7 +406,16 @@ async fn reads_principals_users_and_direct_slack_permissions() {
 /// A `gchat_user` principal with the given labels, optionally linked to a
 /// Console user; returns its `foreign_id`.
 async fn gchat_user(fixture: &Fixture, label: &str, labels: Value, user: Option<i64>) -> String {
-    let foreign_id = fixture.name(label);
+    gchat_user_as(fixture, fixture.name(label), labels, user).await
+}
+
+/// [`gchat_user`] under an exact `foreign_id`.
+async fn gchat_user_as(
+    fixture: &Fixture,
+    foreign_id: String,
+    labels: Value,
+    user: Option<i64>,
+) -> String {
     sqlx::query(
         "INSERT INTO principals (foreign_id, name, kind, labels, console_user_id, created_by_id, created_at, updated_at) \
          VALUES ($1, 'Example', 'gchat_user', $2, $3, $4, now(), now())",
@@ -533,6 +544,160 @@ async fn an_unlabelled_principal_linked_to_another_google_account_is_not_claimab
     assert!(!conflict(&linked_without_google, subject("grace")).await);
     assert!(!conflict(&unlinked, subject("grace")).await);
     assert!(!conflict(&fixture.name("missing"), subject("grace")).await);
+}
+
+/// Secrets [`Fixture::grant_secret_values`] makes visible in a principal's
+/// effective config.
+const GRANTED_SECRETS: usize = 3;
+
+/// A Google account id no other test uses.
+fn google_account() -> String {
+    rand::random::<u64>().to_string()
+}
+
+/// The `foreign_id` api-rs derives for a Chat sender it sees for the first
+/// time under `email`.
+fn chat_sender_foreign_id(email: &str) -> String {
+    let digest = hex::encode(Sha256::digest(email.as_bytes()));
+    format!("gchat-user-{}-{}", slugify(email), &digest[..12])
+}
+
+/// Grants the principal `foreign_id` secrets and returns its OID.
+async fn grant_secrets(fixture: &Fixture, foreign_id: &str) -> String {
+    let principal = find_principal_by_foreign_id(&fixture.pool, foreign_id)
+        .await
+        .unwrap()
+        .expect("principal exists");
+    fixture.grant_secret_values(principal.id).await;
+    oid("prn", principal.id)
+}
+
+/// The OID of the principal api-rs resolves a verified Chat sender to, with
+/// the number of secrets that principal is granted. The registrar reads
+/// Console's database as it does in production; its admin API is unreachable,
+/// so resolving must not write.
+async fn chat_sender(
+    fixture: &Fixture,
+    email: &str,
+    subject: Option<&str>,
+) -> Option<(String, usize)> {
+    let client = IronControlClient::new("http://127.0.0.1:9", "unused")
+        .with_console_db(fixture.pool.clone());
+    let metadata = json!({
+        "googlechat_request_verified": true,
+        "googlechat_requester_email": email,
+        "googlechat_requester_subject": subject,
+    });
+    let principal = SessionRegistrar::new(client.clone())
+        .resolve_requester(
+            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
+            Some(&metadata),
+            false,
+        )
+        .await
+        .unwrap()?;
+    let config = client.effective_config(&principal.id).await.unwrap();
+    Some((principal.id, config.secrets.len()))
+}
+
+#[tokio::test]
+async fn a_renamed_chat_sender_keeps_the_unlabelled_principal_of_its_console_user() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let address = |label: &str| format!("{label}-{}@example.com", fixture.unique);
+    let subject = google_account();
+    let ada = console_user(
+        &fixture,
+        &address("ada-old"),
+        Some((&subject, &address("ada-old"), true)),
+    )
+    .await;
+    let foreign_id = gchat_user_as(
+        &fixture,
+        chat_sender_foreign_id(&address("ada-old")),
+        json!({ "google_email": address("ada-old") }),
+        Some(ada),
+    )
+    .await;
+    let principal = grant_secrets(&fixture, &foreign_id).await;
+
+    assert_eq!(
+        chat_sender(&fixture, &address("ada-new"), Some(&subject)).await,
+        Some((principal, GRANTED_SECRETS))
+    );
+}
+
+#[tokio::test]
+async fn another_google_account_reusing_an_address_never_resolves_to_its_linked_principal() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let address = format!("ada-{}@example.com", fixture.unique);
+    let (ada_subject, grace_subject) = (google_account(), google_account());
+    let ada = console_user(&fixture, &address, Some((&ada_subject, &address, true))).await;
+    let foreign_id = gchat_user_as(
+        &fixture,
+        chat_sender_foreign_id(&address),
+        json!({ "google_email": address }),
+        Some(ada),
+    )
+    .await;
+    let ada_principal = grant_secrets(&fixture, &foreign_id).await;
+    // The address alone names Ada's principal, so it is the one at stake.
+    assert_eq!(
+        chat_sender(&fixture, &address, None).await,
+        Some((ada_principal.clone(), GRANTED_SECRETS))
+    );
+
+    assert_eq!(
+        chat_sender(&fixture, &address, Some(&grace_subject)).await,
+        None
+    );
+
+    // Once the sender has the principal keyed on its own account id, it
+    // resolves to that one, which holds none of Ada's grants.
+    let own = gchat_user_as(
+        &fixture,
+        format!("gchat-user-{grace_subject}"),
+        json!({}),
+        None,
+    )
+    .await;
+    let own = find_principal_by_foreign_id(&fixture.pool, &own)
+        .await
+        .unwrap()
+        .expect("principal exists");
+    assert_eq!(
+        chat_sender(&fixture, &address, Some(&grace_subject)).await,
+        Some((oid("prn", own.id), 0))
+    );
+    assert_eq!(
+        chat_sender(&fixture, &address, Some(&ada_subject)).await,
+        Some((ada_principal, GRANTED_SECRETS))
+    );
+}
+
+#[tokio::test]
+async fn a_renamed_chat_sender_keeps_the_principal_labelled_with_its_account() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let address = |label: &str| format!("{label}-{}@example.com", fixture.unique);
+    let subject = google_account();
+    let foreign_id = gchat_user_as(
+        &fixture,
+        chat_sender_foreign_id(&address("ada-old")),
+        json!({ "google_email": address("ada-old"), "google_subject": subject }),
+        None,
+    )
+    .await;
+    let principal = grant_secrets(&fixture, &foreign_id).await;
+
+    assert_eq!(
+        chat_sender(&fixture, &address("ada-new"), Some(&subject)).await,
+        Some((principal, GRANTED_SECRETS))
+    );
 }
 
 #[tokio::test]
