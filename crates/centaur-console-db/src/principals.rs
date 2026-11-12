@@ -67,6 +67,33 @@ pub async fn find_user_id_by_email(pool: &PgPool, email: &str) -> Result<Option<
         .await?)
 }
 
+/// The Google Chat user principal that Google account `subject` already has:
+/// the one labelled with that `google_subject`, else an unlabelled one linked
+/// to the Console user who signs in with that account. The account id
+/// outlives a primary-email change, which the email a `gchat_user` principal's
+/// `foreign_id` is derived from does not. A principal labelled with another
+/// account is never returned; the oldest match wins.
+pub async fn find_gchat_user_principal_by_google_subject(
+    pool: &PgPool,
+    subject: &str,
+) -> Result<Option<Principal>> {
+    let row = sqlx::query(&format!(
+        "SELECT {PRINCIPAL_COLUMNS} FROM principals \
+         WHERE kind = 'gchat_user' AND foreign_id IS NOT NULL \
+           AND (labels ->> 'google_subject' = $1 \
+                OR (COALESCE(labels ->> 'google_subject', '') = '' \
+                    AND console_user_id IN ( \
+                        SELECT user_id FROM user_identities \
+                        WHERE provider = 'google' AND subject = $1))) \
+         ORDER BY COALESCE(labels ->> 'google_subject', '') = '', id \
+         LIMIT 1"
+    ))
+    .bind(subject)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(principal).transpose()
+}
+
 pub async fn find_direct_slack_channel_permission(
     pool: &PgPool,
     principal_id: i64,

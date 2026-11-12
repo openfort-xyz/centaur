@@ -538,7 +538,7 @@ describe('executeSession', () => {
   // names: `user_email` on message metadata is display-only and never gated.
   const captureExecuteMetadata = async (
     config: Parameters<typeof executeSession>[0],
-    requester?: { verified: boolean; userEmail?: string }
+    requester?: { verified: boolean; userEmail?: string; userId?: string }
   ): Promise<Record<string, unknown>> => {
     let captured: string | undefined
     globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
@@ -578,6 +578,28 @@ describe('executeSession', () => {
       const metadata = await captureExecuteMetadata(config, requester)
       expect(metadata.googlechat_request_verified).toBe(requester.verified)
       expect('googlechat_requester_email' in metadata).toBe(false)
+    }
+  })
+
+  test('names the requester by Google account id only alongside a released email', async () => {
+    const allowlisted = loadConfig({ GOOGLECHATBOT_ALLOWED_DOMAIN: 'openfort.xyz' })
+    const named = await captureExecuteMetadata(allowlisted, {
+      verified: true,
+      userEmail: 'ada@openfort.xyz',
+      userId: 'users/1042'
+    })
+    expect(named.googlechat_requester_subject).toBe('1042')
+
+    for (const requester of [
+      { verified: false, userEmail: 'ada@openfort.xyz', userId: 'users/1042' },
+      { verified: true, userEmail: 'ada@elsewhere.example', userId: 'users/1042' },
+      { verified: true, userId: 'users/1042' },
+      { verified: true, userEmail: 'ada@openfort.xyz', userId: 'users/app' },
+      { verified: true, userEmail: 'ada@openfort.xyz', userId: 'system' },
+      { verified: true, userEmail: 'ada@openfort.xyz' }
+    ]) {
+      const metadata = await captureExecuteMetadata(allowlisted, requester)
+      expect('googlechat_requester_subject' in metadata).toBe(false)
     }
   })
 

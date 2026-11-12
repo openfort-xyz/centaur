@@ -52,6 +52,16 @@ pub(crate) async fn unchanged_principal(
     principal_record(row).map(Some)
 }
 
+/// The `foreign_id` of the Google Chat user principal that Google account
+/// `subject` already has.
+pub(crate) async fn gchat_user_foreign_id(pool: &PgPool, subject: &str) -> Result<Option<String>> {
+    Ok(
+        centaur_console_db::find_gchat_user_principal_by_google_subject(pool, subject)
+            .await?
+            .and_then(|principal| principal.foreign_id),
+    )
+}
+
 /// The email supplied by this upsert, using the same identity rules as Console.
 fn console_user_email(
     row: &centaur_console_db::Principal,

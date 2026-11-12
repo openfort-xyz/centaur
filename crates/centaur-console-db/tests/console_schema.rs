@@ -10,7 +10,8 @@ use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
     ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
     api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
-    find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
+    find_gchat_user_principal_by_google_subject, find_principal, find_principal_by_foreign_id,
+    find_user_id_by_email, models::Config,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -397,6 +398,80 @@ async fn reads_principals_users_and_direct_slack_permissions() {
             .unwrap(),
         None
     );
+}
+
+/// A `gchat_user` principal with the given labels, optionally linked to a
+/// Console user; returns its `foreign_id`.
+async fn gchat_user(fixture: &Fixture, label: &str, labels: Value, user: Option<i64>) -> String {
+    let foreign_id = fixture.name(label);
+    sqlx::query(
+        "INSERT INTO principals (foreign_id, name, kind, labels, console_user_id, created_by_id, created_at, updated_at) \
+         VALUES ($1, 'Example', 'gchat_user', $2, $3, $4, now(), now())",
+    )
+    .bind(&foreign_id)
+    .bind(labels)
+    .bind(user)
+    .bind(fixture.admin)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    foreign_id
+}
+
+#[tokio::test]
+async fn finds_a_google_chat_user_by_google_account_not_by_email() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let subject = |label: &str| format!("{label}-{}", fixture.unique);
+    let found = async |subject: String| {
+        find_gchat_user_principal_by_google_subject(&fixture.pool, &subject)
+            .await
+            .unwrap()
+            .and_then(|principal| principal.foreign_id)
+    };
+
+    // Labelled with the account: found whatever email it was created under.
+    let labelled = gchat_user(
+        &fixture,
+        "labelled",
+        json!({ "google_email": "ada@old.example", "google_subject": subject("ada") }),
+        None,
+    )
+    .await;
+    assert_eq!(found(subject("ada")).await, Some(labelled));
+
+    // Unlabelled, but linked to the Console user who signs in with the account.
+    sqlx::query(
+        "INSERT INTO user_identities (user_id, provider, subject, email, email_verified, created_at, updated_at) \
+         VALUES ($1, 'google', $2, 'admin@old.example', true, now(), now())",
+    )
+    .bind(fixture.admin)
+    .bind(subject("admin"))
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let linked = gchat_user(
+        &fixture,
+        "linked",
+        json!({ "google_email": "admin@old.example" }),
+        Some(fixture.admin),
+    )
+    .await;
+    assert_eq!(found(subject("admin")).await, Some(linked));
+
+    // A principal labelled with another account is not that user's, even when
+    // an operator linked it to them.
+    gchat_user(
+        &fixture,
+        "other",
+        json!({ "google_subject": subject("grace") }),
+        Some(fixture.admin),
+    )
+    .await;
+    assert_eq!(found(subject("admin")).await, Some(fixture.name("linked")));
+
+    assert_eq!(found(subject("nobody")).await, None);
 }
 
 #[tokio::test]

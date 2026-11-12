@@ -931,6 +931,7 @@ fn sanitize_execute_metadata(
         if caller_class != CallerClass::Ingress {
             fields.remove("googlechat_request_verified");
             fields.remove("googlechat_requester_email");
+            fields.remove("googlechat_requester_subject");
         }
     }
     metadata
@@ -1172,7 +1173,8 @@ mod session_authorization_tests {
         let metadata = json!({
             "source": "googlechatbot",
             "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@example.com"
+            "googlechat_requester_email": "ada@example.com",
+            "googlechat_requester_subject": "1042"
         });
 
         assert_eq!(

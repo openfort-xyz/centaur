@@ -356,16 +356,23 @@ function identityMetadata(identity: ResolvedSessionIdentity | undefined): JsonOb
  * verified person, and it only carries what an operator granted to that
  * person by name, so the roster is the allowlist. A configured domain policy
  * still applies.
+ *
+ * `googlechat_requester_subject` is the sender's Google account id, the
+ * number in `users/<id>`. It never changes, so api-rs finds the person's
+ * principal by it before the email, which a Workspace rename replaces. It
+ * ships only alongside the email, never as an identity of its own.
  */
 function requesterMetadata(
   config: AppConfig,
-  requester: { verified: boolean; userEmail?: string } | undefined
+  requester: { verified: boolean; userEmail?: string; userId?: string } | undefined
 ): JsonObject {
   if (!requester) return {}
   const email = requesterEmail(config, requester)
+  const subject = email ? /^users\/(\d+)$/.exec(requester.userId ?? '')?.[1] : undefined
   return {
     googlechat_request_verified: requester.verified,
-    ...(email ? { googlechat_requester_email: email } : {})
+    ...(email ? { googlechat_requester_email: email } : {}),
+    ...(subject ? { googlechat_requester_subject: subject } : {})
   }
 }
 
@@ -432,8 +439,9 @@ export async function executeSession(
      * applied here. Unlike
      * session identity, no DM confirmation is required: the requester
      * principal is per person, so a group turn binds the asker's own grants
-     * without the space inheriting them. */
-    requester?: { verified: boolean; userEmail?: string }
+     * without the space inheriting them. `userId` is the `users/<id>` of the
+     * sender that email was resolved for. */
+    requester?: { verified: boolean; userEmail?: string; userId?: string }
   } = {}
 ): Promise<ExecuteSessionResponse> {
   const body: ExecuteSessionRequest = {

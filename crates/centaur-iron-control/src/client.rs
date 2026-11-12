@@ -21,6 +21,7 @@ use crate::models::{
     PrincipalInput, Proxy, ProxyInput, Role, SecretRecord, SlackChannelPermissionInput,
     StaticSecretInput,
 };
+use crate::principal::{GCHAT_USER_FOREIGN_ID_PREFIX, GOOGLE_SUBJECT_LABEL};
 
 const API_PREFIX: &str = "/api/v1";
 
@@ -173,6 +174,22 @@ impl IronControlClient {
         let path = resource_path("principals", "prn_", principal, "");
         let resp = self.send(Method::GET, &path, None::<&Value>).await?;
         decode_data(resp, Method::GET, &path).await
+    }
+
+    /// The `foreign_id` of the Google Chat user principal that Google account
+    /// `subject` already has, when it has one. Without a Console database
+    /// connection only the principal's `google_subject` label is matched.
+    pub(crate) async fn gchat_user_foreign_id(&self, subject: &str) -> Result<Option<String>> {
+        if let Some(pool) = &self.console_db {
+            return database::gchat_user_foreign_id(pool, subject).await;
+        }
+        let labelled = self
+            .list_principals(&[(GOOGLE_SUBJECT_LABEL.to_owned(), subject.to_owned())])
+            .await?;
+        Ok(labelled
+            .into_iter()
+            .filter_map(|principal| principal.foreign_id)
+            .find(|foreign_id| foreign_id.starts_with(GCHAT_USER_FOREIGN_ID_PREFIX)))
     }
 
     /// Assign a role (by OID) to a principal (by OID).
