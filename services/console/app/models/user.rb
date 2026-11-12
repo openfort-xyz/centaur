@@ -46,7 +46,8 @@ class User < ApplicationRecord
 
   # Resolves the console user behind a verified SSO identity, creating or linking
   # as needed, and (re)caches the identity's email/name. A returning login matches
-  # by the stable (provider, subject). A new identity links to an existing user
+  # by the stable (provider, subject), and the user's email follows that
+  # identity's when the IdP renamed the account. A new identity links to an existing user
   # only when the IdP-verified email matches -- an unverified email must never
   # adopt an account -- otherwise a new active user is created (admin when the
   # verified email is on the bootstrap allowlist). +identity+ is the provider
@@ -57,9 +58,11 @@ class User < ApplicationRecord
     transaction do
       user =
         if (existing = UserIdentity.find_by(provider: provider, subject: identity[:subject]))
+          tracked_email = existing.email
           existing.update!(identity_attributes(provider:, identity:))
           existing.user.tap do |u|
             u.update!(name: identity[:name]) if identity[:name].present? && u.name.blank?
+            follow_renamed_identity(u, tracked_email:, identity:)
           end
         else
           (linkable_user(identity) || create!(provisioned_attributes(identity))).tap do |u|
@@ -80,6 +83,24 @@ class User < ApplicationRecord
     find_by(email: identity[:email].strip.downcase)
   end
   private_class_method :linkable_user
+
+  # The IdP gave the same account (same subject) a new verified address. The
+  # user's email is what Chat principals link by and what a Chat DM is
+  # addressed to, so it moves with the account. Only the identity whose
+  # address the user carried moves it, so a second provider with another
+  # address never does, and an address another user holds is left alone.
+  def self.follow_renamed_identity(user, tracked_email:, identity:)
+    email = identity[:email].to_s.strip.downcase
+    return unless identity[:email_verified] && email.present?
+    return if user.email == email || user.email != tracked_email
+
+    if where.not(id: user.id).exists?(email: email)
+      Rails.logger.warn("user_email_not_followed user=#{user.oid} reason=email_taken")
+      return
+    end
+    user.update!(email: email)
+  end
+  private_class_method :follow_renamed_identity
 
   def self.identity_attributes(provider:, identity:)
     attributes = { email: identity[:email], email_verified: identity[:email_verified] }
