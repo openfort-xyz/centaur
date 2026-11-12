@@ -151,16 +151,20 @@ class ScheduledTask < ApplicationRecord
   private
 
   def google_chat_api_input
-    unless GoogleChatDeliveryPolicy.new(author).allowed?(delivery_channel)
+    policy = GoogleChatDeliveryPolicy.new(author)
+    unless policy.allowed?(delivery_channel)
       raise DeliveryDestinationUnavailable,
             "Google Chat delivery destination is no longer available to the author"
     end
 
+    # A DM is only ever to the author, so it goes to the address Google knows
+    # them by now, whichever of their addresses the task was saved under.
+    author_address = policy.direct_message_identity
     {
       prompt: prompt,
       principal: execution_principal.foreign_id,
-      channel: delivery_channel,
-      author_email: author.email.to_s.strip.downcase,
+      channel: delivery_platform == :gchat_dm ? author_address : delivery_channel,
+      author_email: author_address,
       scheduled_task_id: oid,
       scheduled_task_name: name
     }
