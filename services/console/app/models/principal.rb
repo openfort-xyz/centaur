@@ -37,6 +37,7 @@ class Principal < ApplicationRecord
   # Stamped by api-rs only from a signature-verified Google Chat identity: on a
   # 1:1 DM space principal, and on the per-user requester principal.
   GOOGLE_EMAIL_LABEL = "google_email".freeze
+  GOOGLE_SUBJECT_LABEL = "google_subject".freeze
   GCHAT_USER_KIND = "gchat_user".freeze
   GOOGLE_CHAT_HUMAN_KINDS = %w[gchat_dm gchat_user].freeze
   TOOL_LABEL = "centaur-tool".freeze
@@ -203,14 +204,17 @@ class Principal < ApplicationRecord
   # confirmed 1:1 DM space principal and on the per-user requester principal.
   # Unverified events never carry one, so the label is as trusted as
   # slack_email. Called from the same API upsert boundary for the same reason:
-  # an omitted label must not activate a stale stored value.
+  # an omitted label must not activate a stale stored value. api-rs also
+  # stamps the sender's Google account id as `google_subject` on the per-user
+  # principal; the user is found by it before the email, which a Workspace
+  # rename changes while the user's stored email stays as it was.
   def link_console_user_by_google_email
     return unless GOOGLE_CHAT_HUMAN_KINDS.include?(kind)
 
     email = labels.to_h[GOOGLE_EMAIL_LABEL].to_s.strip.downcase
     return if email.blank?
 
-    self.console_user = User.find_by(email: email)
+    self.console_user = User.for_google_account(subject: labels.to_h[GOOGLE_SUBJECT_LABEL], email: email)
   end
 
   def labels_with_sandbox_capabilities

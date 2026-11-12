@@ -43,6 +43,10 @@ pub(crate) const GCHAT_SPACE_KIND: &str = "gchat_space";
 /// that identifies a human rather than a room; see
 /// [`derive_gchat_requester_principal`].
 pub(crate) const GCHAT_USER_KIND: &str = "gchat_user";
+/// Label carrying a Google account id (the OIDC `sub`), which a Google Chat
+/// user principal is found by before its email is consulted.
+pub(crate) const GOOGLE_SUBJECT_LABEL: &str = "google_subject";
+pub(crate) const GCHAT_USER_FOREIGN_ID_PREFIX: &str = "gchat-user-";
 /// The Google Chat ``SpaceType`` for a 1:1 conversation. Google documents it as
 /// "1:1 messages between two humans or a human and a Chat app", so a space our
 /// bot sees with this type has exactly one human in it. ``GROUP_CHAT`` (3 or
@@ -387,9 +391,15 @@ pub fn derive_github_requester_principal(
 /// `console-user-<email>-<digest>` principal for the same person. Returns
 /// `None` for non-Chat thread keys and for anything that is not
 /// `local@domain`.
+///
+/// The email is only the key of a person seen for the first time. `subject`,
+/// the sender's numeric Google account id, is labeled `google_subject` so the
+/// registrar can find this principal again after the account's primary email
+/// changes. A subject that is not numeric is dropped.
 pub fn derive_gchat_requester_principal(
     thread_key: &str,
     email: &str,
+    subject: Option<&str>,
     display_name: Option<&str>,
 ) -> Option<PrincipalRef> {
     parse_gchat_space(thread_key)?;
@@ -400,8 +410,18 @@ pub fn derive_gchat_requester_principal(
     }
     let mut labels = BTreeMap::new();
     labels.insert("google_email".to_owned(), email.to_owned());
+    if let Some(subject) = subject
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty() && subject.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        labels.insert(GOOGLE_SUBJECT_LABEL.to_owned(), subject.to_owned());
+    }
     Some(PrincipalRef {
-        foreign_id: format!("gchat-user-{}-{}", slugify(email), email_digest(email)),
+        foreign_id: format!(
+            "{GCHAT_USER_FOREIGN_ID_PREFIX}{}-{}",
+            slugify(email),
+            email_digest(email)
+        ),
         name: display_name
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -960,9 +980,13 @@ mod tests {
             "chat:spaces:AAAA:spaces:AAAA:messages:M9",
             "chat:spaces:lw57hyAAAAE:spaces:lw57hyAAAAE:threads:UgtiPHEVtMk",
         ] {
-            let principal =
-                derive_gchat_requester_principal(thread_key, " Ada@Example.com ", Some("Ada"))
-                    .unwrap();
+            let principal = derive_gchat_requester_principal(
+                thread_key,
+                " Ada@Example.com ",
+                None,
+                Some("Ada"),
+            )
+            .unwrap();
             // The same person resolves to one principal from any space, DM or
             // group, so a grant on it follows them everywhere.
             assert_eq!(
@@ -981,6 +1005,7 @@ mod tests {
         let fallback = derive_gchat_requester_principal(
             "chat:spaces:AAAA:spaces:AAAA:threads:T1",
             "ada@example.com",
+            None,
             Some("  "),
         )
         .unwrap();
@@ -990,34 +1015,64 @@ mod tests {
     #[test]
     fn gchat_requester_ids_do_not_collide_on_slug_alike_emails() {
         let chat = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
-        let dotted = derive_gchat_requester_principal(chat, "a.b@example.com", None).unwrap();
-        let dashed = derive_gchat_requester_principal(chat, "a-b@example.com", None).unwrap();
+        let dotted = derive_gchat_requester_principal(chat, "a.b@example.com", None, None).unwrap();
+        let dashed = derive_gchat_requester_principal(chat, "a-b@example.com", None, None).unwrap();
         assert!(dotted.foreign_id.starts_with("gchat-user-a-b-example-com-"));
         assert!(dashed.foreign_id.starts_with("gchat-user-a-b-example-com-"));
         assert_ne!(dotted.foreign_id, dashed.foreign_id);
         // Case and whitespace are not identity.
-        let upper = derive_gchat_requester_principal(chat, " A.B@Example.COM ", None).unwrap();
+        let upper =
+            derive_gchat_requester_principal(chat, " A.B@Example.COM ", None, None).unwrap();
         assert_eq!(upper.foreign_id, dotted.foreign_id);
+    }
+
+    #[test]
+    fn gchat_requester_carries_the_google_account_id_across_an_email_change() {
+        let chat = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
+        let before =
+            derive_gchat_requester_principal(chat, "ada@old.example", Some(" 1042 "), None)
+                .unwrap();
+        let after =
+            derive_gchat_requester_principal(chat, "ada@new.example", Some("1042"), None).unwrap();
+        // The email-keyed id moves with the address, so the label is the only
+        // thing the two turns of one account have in common.
+        assert_ne!(before.foreign_id, after.foreign_id);
+        assert_eq!(
+            before.labels.get("google_subject").map(String::as_str),
+            Some("1042")
+        );
+        assert_eq!(
+            before.labels.get("google_subject"),
+            after.labels.get("google_subject")
+        );
+
+        for subject in [None, Some(""), Some("  "), Some("users/1042"), Some("ada")] {
+            let principal =
+                derive_gchat_requester_principal(chat, "ada@old.example", subject, None).unwrap();
+            assert_eq!(principal.foreign_id, before.foreign_id, "{subject:?}");
+            assert_eq!(principal.labels.get("google_subject"), None, "{subject:?}");
+        }
     }
 
     #[test]
     fn gchat_requester_rejects_non_chat_threads_and_malformed_emails() {
         let chat = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
         assert_eq!(
-            derive_gchat_requester_principal("slack:T123:C456:ts", "ada@example.com", None),
+            derive_gchat_requester_principal("slack:T123:C456:ts", "ada@example.com", None, None),
             None
         );
         assert_eq!(
             derive_gchat_requester_principal(
                 "chat:C123:1780000000.000000",
                 "ada@example.com",
+                None,
                 None
             ),
             None
         );
         for email in ["", "  ", "ada", "@example.com", "ada@", "a@b@c"] {
             assert_eq!(
-                derive_gchat_requester_principal(chat, email, None),
+                derive_gchat_requester_principal(chat, email, None, None),
                 None,
                 "{email:?}"
             );

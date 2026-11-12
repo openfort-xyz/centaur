@@ -67,6 +67,102 @@ pub async fn find_user_id_by_email(pool: &PgPool, email: &str) -> Result<Option<
         .await?)
 }
 
+/// The Google Chat user principal that Google account `subject` already has:
+/// the one labelled with that `google_subject`, else an unlabelled one linked
+/// to the Console user who signs in with that account. The account id
+/// outlives a primary-email change, which the email a `gchat_user` principal's
+/// `foreign_id` is derived from does not. A principal labelled with another
+/// account is never returned; the oldest match wins.
+pub async fn find_gchat_user_principal_by_google_subject(
+    pool: &PgPool,
+    subject: &str,
+) -> Result<Option<Principal>> {
+    let row = sqlx::query(&format!(
+        "SELECT {PRINCIPAL_COLUMNS} FROM principals \
+         WHERE kind = 'gchat_user' AND foreign_id IS NOT NULL \
+           AND (labels ->> 'google_subject' = $1 \
+                OR (COALESCE(labels ->> 'google_subject', '') = '' \
+                    AND console_user_id IN ( \
+                        SELECT user_id FROM user_identities \
+                        WHERE provider = 'google' AND subject = $1))) \
+         ORDER BY COALESCE(labels ->> 'google_subject', '') = '', id \
+         LIMIT 1"
+    ))
+    .bind(subject)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(principal).transpose()
+}
+
+/// Whether the principal `foreign_id` is linked to a Console user who signs
+/// in with a Google account other than `subject`. Such a principal belongs to
+/// that user, so a different account must not adopt it by arriving first under
+/// the same email.
+pub async fn principal_is_linked_to_another_google_account(
+    pool: &PgPool,
+    foreign_id: &str,
+    subject: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM principals \
+             JOIN user_identities ON user_identities.user_id = principals.console_user_id \
+             WHERE principals.foreign_id = $1 AND user_identities.provider = 'google' \
+               AND user_identities.subject <> $2)",
+    )
+    .bind(foreign_id)
+    .bind(subject)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The Console user a Google Chat principal's verified labels name, by the
+/// rules of Console's `User.for_google_account`: the user who signs in with
+/// Google account `subject`; else the one user known by `email` (their stored
+/// email or a verified Google sign-in email), unless a subject was given and
+/// that user signs in with a different Google account.
+pub async fn find_user_id_for_google_account(
+    pool: &PgPool,
+    subject: Option<&str>,
+    email: &str,
+) -> Result<Option<i64>> {
+    if let Some(subject) = subject {
+        let by_subject: Option<i64> = sqlx::query_scalar(
+            "SELECT user_id FROM user_identities WHERE provider = 'google' AND subject = $1",
+        )
+        .bind(subject)
+        .fetch_optional(pool)
+        .await?;
+        if by_subject.is_some() {
+            return Ok(by_subject);
+        }
+    }
+    let known: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE email = $1 \
+         UNION \
+         SELECT user_id FROM user_identities \
+         WHERE provider = 'google' AND email_verified AND email = $1",
+    )
+    .bind(email)
+    .fetch_all(pool)
+    .await?;
+    let [user] = known[..] else {
+        return Ok(None);
+    };
+    if subject.is_some() {
+        let has_google_account: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM user_identities WHERE provider = 'google' AND user_id = $1)",
+        )
+        .bind(user)
+        .fetch_one(pool)
+        .await?;
+        if has_google_account {
+            return Ok(None);
+        }
+    }
+    Ok(Some(user))
+}
+
 pub async fn find_direct_slack_channel_permission(
     pool: &PgPool,
     principal_id: i64,

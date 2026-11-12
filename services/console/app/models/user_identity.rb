@@ -9,8 +9,10 @@ class UserIdentity < ApplicationRecord
 
   PROVIDERS = %w[google slack okta].freeze
   SLACK_PROVIDER = "slack".freeze
+  GOOGLE_PROVIDER = "google".freeze
 
   scope :slack, -> { where(provider: SLACK_PROVIDER) }
+  scope :google, -> { where(provider: GOOGLE_PROVIDER) }
 
   # A Slack identity that arrives (or gains its team) after the user already
   # consented to OAuth credentials is the one ordering the Principal/

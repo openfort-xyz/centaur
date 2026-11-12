@@ -44,9 +44,47 @@ class User < ApplicationRecord
     mcp_oauth_refresh_tokens.usable.update_all(revoked_at: now, updated_at: now)
   end
 
+  # The console user a Google-verified account belongs to. +subject+ is the
+  # Google account id, which a Workspace rename never changes, so it is tried
+  # first; the stored email is not updated on a rename and may be the old
+  # address. Without an identity for the subject, the one user known by the
+  # verified +email+ is used, unless a subject was given and that user signs in
+  # with a different Google account: the address has then moved to someone
+  # else.
+  def self.for_google_account(subject:, email:)
+    subject = subject.to_s.strip
+    if subject.present?
+      identity = UserIdentity.google.find_by(subject: subject)
+      return identity.user if identity
+    end
+    user = known_by_google_address(email)
+    return nil if subject.present? && user&.user_identities&.google&.exists?
+
+    user
+  end
+
+  # The one user known by an address: it is their stored email or the verified
+  # email of their Google sign-in. An address two users are known by names
+  # neither.
+  def self.known_by_google_address(email)
+    email = email.to_s.strip.downcase
+    return nil if email.blank?
+
+    ids = where(email: email).ids | UserIdentity.google.where(email_verified: true, email: email).pluck(:user_id)
+    find(ids.first) if ids.one?
+  end
+
+  # The addresses that reach this person in Google: the stored email and the
+  # verified emails of their Google sign-ins, most recently changed first.
+  def google_addresses
+    verified = user_identities.google.where(email_verified: true).order(updated_at: :desc).pluck(:email)
+    (verified + [ email ]).compact.uniq
+  end
+
   # Resolves the console user behind a verified SSO identity, creating or linking
   # as needed, and (re)caches the identity's email/name. A returning login matches
-  # by the stable (provider, subject). A new identity links to an existing user
+  # by the stable (provider, subject); the user's stored email never follows the
+  # identity. A new identity links to an existing user
   # only when the IdP-verified email matches -- an unverified email must never
   # adopt an account -- otherwise a new active user is created (admin when the
   # verified email is on the bootstrap allowlist). +identity+ is the provider
@@ -62,7 +100,7 @@ class User < ApplicationRecord
             u.update!(name: identity[:name]) if identity[:name].present? && u.name.blank?
           end
         else
-          (linkable_user(identity) || create!(provisioned_attributes(identity))).tap do |u|
+          (linkable_user(provider, identity) || create!(provisioned_attributes(identity))).tap do |u|
             u.user_identities.create!(
               identity_attributes(provider:, identity:).merge(provider:, subject: identity[:subject])
             )
@@ -75,9 +113,19 @@ class User < ApplicationRecord
 
   # An existing user this identity may attach to: only when the IdP marked the
   # email verified (an unverified email must not adopt an existing account).
-  def self.linkable_user(identity)
+  # The user is found by any address Google has verified for them, so a first
+  # sign-in through another provider joins a renamed user under either address.
+  # A Google account is its subject: a second Google account reporting a
+  # user's address is a different account, and never joins that user.
+  def self.linkable_user(provider, identity)
     return nil unless identity[:email_verified] && identity[:email].present?
-    find_by(email: identity[:email].strip.downcase)
+
+    user = known_by_google_address(identity[:email])
+    if provider == UserIdentity::GOOGLE_PROVIDER && user&.user_identities&.google&.exists?
+      Rails.logger.warn("console_login_not_linked user=#{user.oid} reason=other_google_account")
+      return nil
+    end
+    user
   end
   private_class_method :linkable_user
 

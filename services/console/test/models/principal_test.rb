@@ -596,6 +596,43 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal static_secrets(:acme_prod_api_key).id, ids.last
   end
 
+  def gchat_link(kind, email:, subject: nil)
+    labels = { "google_email" => email }
+    labels["google_subject"] = subject if subject
+    Principal.new(kind: kind, labels: labels, console_user: users(:globex_admin))
+             .tap(&:link_console_user_by_google_email).console_user
+  end
+
+  test "a Google Chat user stays linked to its Console user when its address changes" do
+    user = users(:acme_admin)
+    subject = user_identities(:acme_admin_google).subject
+
+    assert_equal user, gchat_link("gchat_user", email: "admin@renamed.example", subject: subject)
+    assert_equal "admin@acme.example", user.reload.email
+  end
+
+  test "another Google account reporting a user's address is not linked to that user" do
+    assert_nil gchat_link("gchat_user", email: "admin@acme.example", subject: "another-account")
+  end
+
+  test "a Google Chat DM links by the address the user's Google sign-in last reported" do
+    user = users(:acme_admin)
+    assert_equal user, gchat_link("gchat_dm", email: "admin@acme.example")
+    assert_nil gchat_link("gchat_dm", email: "admin@renamed.example")
+
+    user_identities(:acme_admin_google).update!(email: "admin@renamed.example")
+    assert_equal user, gchat_link("gchat_dm", email: "admin@renamed.example")
+    assert_equal user, gchat_link("gchat_dm", email: "admin@acme.example")
+  end
+
+  test "a Slack DM stays linked by the stored email after a Google rename" do
+    user_identities(:acme_admin_google).update!(email: "admin@renamed.example")
+    dm = Principal.new(kind: "slack_dm", slack_email: "admin@acme.example")
+    dm.link_console_user_by_slack_email
+
+    assert_equal users(:acme_admin), dm.console_user
+  end
+
   def jwt_payload(token)
     _header, payload, _signature = token.split(".")
     JSON.parse(Base64.urlsafe_decode64(payload))

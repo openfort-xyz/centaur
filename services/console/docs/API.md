@@ -1114,7 +1114,7 @@ An active admin Console user's DM sandbox may create workflow principals, create
 The sandbox principal must be one of:
 
 - a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog;
-- a `gchat_dm` principal whose verified `google_email` label (stamped by api-rs only on signature-verified 1:1 DMs) is the linked admin's email, and whose proxy's current requester is the `gchat_user` principal with that same email.
+- a `gchat_dm` principal whose verified `google_email` label (stamped by api-rs only on signature-verified 1:1 DMs) is the email of its proxy's current requester, a `gchat_user` principal whose Google account is the linked admin's: matched by its `google_subject` label against the admin's Google sign-in, else by that email being the admin's stored email or the verified email of their Google sign-in.
 
 Other sandboxes, including channel, shared Google Chat space, Slack Connect, bare `gchat_user`, unverified or requester-less Google Chat DM, and Console-user sessions, receive `403`. Request and response shapes match the corresponding admin endpoints.
 

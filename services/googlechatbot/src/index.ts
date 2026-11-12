@@ -1779,6 +1779,7 @@ async function handoffTurn(
       // desktop, their credentials) in any space, DM or group.
       requester: {
         verified: identity.verified,
+        userId: event.user_id,
         ...(event.user_email ? { userEmail: event.user_email } : {})
       },
       ...(session.harnessType ? { harnessType: session.harnessType } : {})

@@ -15,10 +15,10 @@ use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
 use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
-    GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND, PrincipalRef,
-    derive_gchat_requester_principal, derive_github_requester_principal,
-    derive_principal_with_slack_team, derive_slack_requester_principal, is_direct_message,
-    parse_gchat_space, slack_conversation_id,
+    GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND, GCHAT_USER_FOREIGN_ID_PREFIX,
+    GCHAT_USER_KIND, GOOGLE_SUBJECT_LABEL, PrincipalRef, derive_gchat_requester_principal,
+    derive_github_requester_principal, derive_principal_with_slack_team,
+    derive_slack_requester_principal, is_direct_message, parse_gchat_space, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -185,6 +185,7 @@ impl SessionRegistrar {
                     &mut input,
                     metadata.get("slack_user_email").and_then(Value::as_str),
                 );
+                self.keep_gchat_user_principal(&mut input).await?;
                 let existing = self.merge_existing_labels(&mut input).await?;
                 match principal_write(existing, create_if_missing) {
                     PrincipalWrite::UseExisting(principal) => Ok(Some(principal)),
@@ -199,6 +200,58 @@ impl SessionRegistrar {
 
     pub async fn get_principal(&self, principal: &str) -> Result<Principal> {
         self.client.get_principal(principal).await
+    }
+
+    /// Point a Google Chat requester at the principal its Google account
+    /// already has. The derived `foreign_id` is keyed on the email, so without
+    /// this a changed primary email would mint a second principal holding none
+    /// of the person's grants or roles. An account seen for the first time
+    /// keeps the email-derived `foreign_id`, unless that principal belongs to
+    /// another account (an address reassigned to a new person): it is labelled
+    /// with another `google_subject`, or it has no label and its linked Console
+    /// user signs in with another Google account. Then the sender gets a
+    /// `foreign_id` keyed on its own account id, so two people never share a
+    /// principal.
+    async fn keep_gchat_user_principal(&self, input: &mut PrincipalInput) -> Result<()> {
+        if input.kind.as_deref() != Some(GCHAT_USER_KIND) {
+            return Ok(());
+        }
+        let Some(subject) = input.labels.get(GOOGLE_SUBJECT_LABEL).cloned() else {
+            return Ok(());
+        };
+        if let Some(foreign_id) = self.client.gchat_user_foreign_id(&subject).await? {
+            input.foreign_id = foreign_id;
+            return Ok(());
+        }
+        let holder = match self.client.get_principal(&input.foreign_id).await {
+            Ok(holder) => holder,
+            Err(error) if error.is_not_found() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let held_by_another_account = match holder
+            .labels
+            .get(GOOGLE_SUBJECT_LABEL)
+            .filter(|held| !held.is_empty())
+        {
+            Some(held) => *held != subject,
+            None => {
+                self.client
+                    .linked_to_another_google_account(&input.foreign_id, &subject)
+                    .await?
+            }
+        };
+        if held_by_another_account {
+            let own = format!("{GCHAT_USER_FOREIGN_ID_PREFIX}{subject}");
+            tracing::warn!(
+                holder_principal = %holder.id,
+                holder_foreign_id = %input.foreign_id,
+                sender_foreign_id = %own,
+                "google chat requester's email-derived principal belongs to another Google \
+                 account; the sender gets its own principal with none of the holder's grants"
+            );
+            input.foreign_id = own;
+        }
+        Ok(())
     }
 
     /// Fold an existing principal's labels under the freshly derived ones so
@@ -313,7 +366,9 @@ fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
 }
 
 /// The Google Chat requester, from the email googlechatbot verified on the
-/// Add-on `userIdToken` and released only after its domain allowlist. It
+/// Add-on `userIdToken` and released only after its domain allowlist, and the
+/// Google account id of the same sender, which the bot sends only with that
+/// email. It
 /// travels under its own key so the display-only `user_email` on message
 /// metadata, which is not gated, can never be mistaken for it, and the bot's
 /// `googlechat_request_verified` flag is required as well so a turn that
@@ -332,6 +387,9 @@ fn gchat_requester(thread_key: &str, metadata: &Value) -> Option<PrincipalRef> {
     derive_gchat_requester_principal(
         thread_key,
         email,
+        metadata
+            .get("googlechat_requester_subject")
+            .and_then(Value::as_str),
         metadata.get("user_name").and_then(Value::as_str),
     )
 }
@@ -1234,6 +1292,146 @@ mod tests {
             assert_eq!(upsert["data"]["labels"]["google_email"], "ada@example.com");
             server.abort();
         }
+    }
+
+    /// A Console holding one Google Chat user: Ada, Google account 1042, whose
+    /// principal was created while her address was `ada@old.example`.
+    fn console_with_ada(method: &str, path: &str) -> (&'static str, String) {
+        const ADA: &str = "gchat-user-ada-old-example-";
+        let ada_labels = json!({
+            "google_email": "ada@old.example",
+            "google_subject": "1042",
+            "team": "infra"
+        });
+        let foreign_id = path.rsplit('/').next().unwrap_or_default();
+        match method {
+            "GET" if path.starts_with("/api/v1/principals?") => {
+                let data = if path.contains("=1042&") {
+                    json!([{
+                        "id": "prn_ada",
+                        "foreign_id": format!("{ADA}0123456789ab"),
+                        "name": "Google Chat User @Ada",
+                        "labels": ada_labels
+                    }])
+                } else {
+                    json!([])
+                };
+                ("200 OK", json!({ "data": data }).to_string())
+            }
+            "GET" if foreign_id.starts_with(ADA) => principal("prn_ada", foreign_id, ada_labels),
+            "PUT" if foreign_id.starts_with(ADA) => principal("prn_ada", foreign_id, json!({})),
+            "PUT" => principal("prn_new", foreign_id, json!({})),
+            _ => not_found(),
+        }
+    }
+
+    /// Registers the Chat requester in `metadata` against [`console_with_ada`]
+    /// and returns the resolved principal id with the upsert it sent.
+    async fn register_gchat_requester(metadata: Value) -> (String, StubRequest) {
+        let (base_url, requests, server) = spawn_iron_control_stub(console_with_ada).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+        let principal = registrar
+            .register_requester("chat:spaces:GROUP:spaces:GROUP:threads:T1", Some(&metadata))
+            .await
+            .unwrap()
+            .expect("a verified Chat requester resolves to a principal");
+        server.abort();
+        let upsert = requests
+            .lock()
+            .unwrap()
+            .drain(..)
+            .find(|request| request.method == "PUT")
+            .expect("the requester principal is upserted");
+        (principal.id, upsert)
+    }
+
+    #[tokio::test]
+    async fn a_chat_requester_keeps_its_principal_when_its_email_changes() {
+        let (id, upsert) = register_gchat_requester(json!({
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@new.example",
+            "googlechat_requester_subject": "1042"
+        }))
+        .await;
+
+        assert_eq!(id, "prn_ada");
+        assert_eq!(
+            upsert.path,
+            "/api/v1/principals/gchat-user-ada-old-example-0123456789ab"
+        );
+        let labels = &upsert.body.expect("upsert body")["data"]["labels"];
+        assert_eq!(labels["google_email"], "ada@new.example");
+        assert_eq!(labels["google_subject"], "1042");
+        assert_eq!(labels["team"], "infra");
+    }
+
+    #[tokio::test]
+    async fn a_chat_requester_without_an_account_id_still_resolves_by_email() {
+        let old_address = derive_gchat_requester_principal(
+            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
+            "ada@old.example",
+            None,
+            None,
+        )
+        .unwrap();
+        let (id, upsert) = register_gchat_requester(json!({
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@old.example"
+        }))
+        .await;
+
+        assert_eq!(id, "prn_ada");
+        assert_eq!(
+            upsert.path,
+            format!("/api/v1/principals/{}", old_address.foreign_id)
+        );
+        assert_eq!(
+            upsert.body.expect("upsert body")["data"]["labels"]["google_subject"],
+            "1042"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_google_account_gets_its_own_email_keyed_principal() {
+        let derived = derive_gchat_requester_principal(
+            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
+            "grace@new.example",
+            None,
+            None,
+        )
+        .unwrap();
+        let (id, upsert) = register_gchat_requester(json!({
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "grace@new.example",
+            "googlechat_requester_subject": "2077"
+        }))
+        .await;
+
+        assert_eq!(id, "prn_new");
+        assert_eq!(
+            upsert.path,
+            format!("/api/v1/principals/{}", derived.foreign_id)
+        );
+        assert_eq!(
+            upsert.body.expect("upsert body")["data"]["labels"]["google_subject"],
+            "2077"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_google_account_never_takes_over_a_principal_by_reusing_its_email() {
+        let (id, upsert) = register_gchat_requester(json!({
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@old.example",
+            "googlechat_requester_subject": "2077"
+        }))
+        .await;
+
+        assert_eq!(id, "prn_new");
+        assert_eq!(upsert.path, "/api/v1/principals/gchat-user-2077");
+        let labels = &upsert.body.expect("upsert body")["data"]["labels"];
+        assert_eq!(labels["google_subject"], "2077");
+        assert_eq!(labels.get("team"), None);
     }
 
     #[tokio::test]

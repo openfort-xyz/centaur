@@ -587,6 +587,7 @@ name = "centaur-console-db"
 version = "0.1.0"
 dependencies = [
  "active-record-encryption",
+ "centaur-iron-control",
  "hex",
  "rand 0.10.3",
  "serde",
@@ -613,6 +614,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "urlencoding",
 ]
 

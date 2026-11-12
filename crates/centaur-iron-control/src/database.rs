@@ -9,7 +9,7 @@ use sqlx::PgPool;
 
 use crate::error::{IronControlError, Result};
 use crate::models::{EffectiveConfig, Principal, PrincipalInput, SlackChannelPermissionInput};
-use crate::principal::{GCHAT_DM_KIND, GCHAT_USER_KIND};
+use crate::principal::{GCHAT_DM_KIND, GCHAT_USER_KIND, GOOGLE_SUBJECT_LABEL};
 
 const PRINCIPAL_OID_PREFIX: &str = "prn";
 /// Console stores the principal's repo-cache access as this label too.
@@ -43,6 +43,14 @@ pub(crate) async fn unchanged_principal(
         return Ok(None);
     };
     let linked_user = match console_user_email(&row, input) {
+        Some(email) if is_google_chat_human(&row, input) => Some(
+            centaur_console_db::find_user_id_for_google_account(
+                pool,
+                google_subject(input),
+                &email,
+            )
+            .await?,
+        ),
         Some(email) => Some(centaur_console_db::find_user_id_by_email(pool, &email).await?),
         None => None,
     };
@@ -50,6 +58,48 @@ pub(crate) async fn unchanged_principal(
         return Ok(None);
     }
     principal_record(row).map(Some)
+}
+
+/// The `foreign_id` of the Google Chat user principal that Google account
+/// `subject` already has.
+pub(crate) async fn gchat_user_foreign_id(pool: &PgPool, subject: &str) -> Result<Option<String>> {
+    Ok(
+        centaur_console_db::find_gchat_user_principal_by_google_subject(pool, subject)
+            .await?
+            .and_then(|principal| principal.foreign_id),
+    )
+}
+
+/// Whether the principal `foreign_id` is linked to a Console user who signs
+/// in with a Google account other than `subject`.
+pub(crate) async fn linked_to_another_google_account(
+    pool: &PgPool,
+    foreign_id: &str,
+    subject: &str,
+) -> Result<bool> {
+    Ok(
+        centaur_console_db::principal_is_linked_to_another_google_account(
+            pool, foreign_id, subject,
+        )
+        .await?,
+    )
+}
+
+fn is_google_chat_human(row: &centaur_console_db::Principal, input: &PrincipalInput) -> bool {
+    matches!(
+        input.kind.as_deref().unwrap_or(&row.kind),
+        GCHAT_DM_KIND | GCHAT_USER_KIND
+    )
+}
+
+/// The Google account id this upsert labels the principal with, which Console
+/// links a Google Chat principal by before the email.
+fn google_subject(input: &PrincipalInput) -> Option<&str> {
+    input
+        .labels
+        .get(GOOGLE_SUBJECT_LABEL)
+        .map(|subject| subject.trim())
+        .filter(|subject| !subject.is_empty())
 }
 
 /// The email supplied by this upsert, using the same identity rules as Console.

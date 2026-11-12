@@ -157,6 +157,26 @@ class ScheduledTaskTest < ActiveSupport::TestCase
     assert_not_includes dm_task.api_input.keys, :slack_user_id
   end
 
+  test "a Google Chat DM task keeps running and follows the author to a new address" do
+    task = ScheduledTask.create!(valid_attributes(delivery_channel: "admin@acme.example"))
+    user_identities(:acme_admin_google).update!(email: "admin@renamed.example")
+    task.reload
+
+    assert task.valid?, task.errors.full_messages.to_sentence
+    assert_equal "admin@renamed.example", task.api_input.fetch(:channel)
+    assert_equal "admin@renamed.example", task.api_input.fetch(:author_email)
+    assert_equal "admin@acme.example", task.delivery_channel
+    moved = ScheduledTask.new(valid_attributes(name: "Moved", delivery_channel: "admin@renamed.example"))
+    assert moved.valid?, moved.errors.full_messages.to_sentence
+  end
+
+  test "an unverified Google sign-in email is not a DM destination" do
+    user_identities(:acme_admin_google).update!(email: "admin@renamed.example", email_verified: false)
+
+    assert_not ScheduledTask.new(valid_attributes(delivery_channel: "admin@renamed.example")).valid?
+    assert_equal "admin@acme.example", GoogleChatDeliveryPolicy.new(users(:acme_admin)).direct_message_identity
+  end
+
   test "raises when a Google Chat space grant is revoked after the task was saved" do
     principal = grant_google_chat_space("spaces/AAQA42QLdws")
     task = ScheduledTask.create!(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
