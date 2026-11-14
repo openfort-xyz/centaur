@@ -9,6 +9,7 @@ mod error;
 pub mod models;
 mod oid;
 mod principals;
+mod ssh_keys;
 
 pub use api_clients::{ApiClient, ApiClientPrincipal, api_client_principals, find_api_client};
 pub use config::{REDACTED, SecretValues, Subject, build_config};
@@ -21,3 +22,4 @@ pub use principals::{
     find_user_id_by_email, find_user_id_for_google_account,
     principal_is_linked_to_another_google_account,
 };
+pub use ssh_keys::{SshKey, ssh_keys};
