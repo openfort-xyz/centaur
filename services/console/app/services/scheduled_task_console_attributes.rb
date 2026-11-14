@@ -4,6 +4,8 @@
 #                    (custom uses custom_days ["1".."6","0"] + custom_time "HH:MM";
 #                    "cron" uses cron_expression verbatim)
 #   delivery_mode    dm (the author's Slack DM) | channel (delivery_channel)
+#                    | gchat_dm (the author's Google Chat DM)
+#                    | gchat_space (delivery_channel as spaces/<id>)
 #
 # Only fields present in the input are changed, so a partial update keeps the
 # stored schedule and destination. The model validates the result, including
@@ -42,6 +44,8 @@ class ScheduledTaskConsoleAttributes
     case input[:delivery_mode].presence || "channel"
     when "dm" then task.author && SlackDeliveryPolicy.new(task.author).direct_message_user_id
     when "channel" then input[:delivery_channel]
+    when "gchat_dm" then task.author && GoogleChatDeliveryPolicy.new(task.author).direct_message_identity
+    when "gchat_space" then GoogleChatSpacePermission.normalize_resource_name(input[:delivery_channel])
     end
   end
 end

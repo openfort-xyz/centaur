@@ -9,6 +9,7 @@ import { displayLabel } from "@/lib/format";
 
 import { useRole } from "../api";
 import { RoleGrantsSection } from "../sections/RoleGrantsSection";
+import { RoleGoogleChatPermissionsSection } from "../sections/RoleGoogleChatPermissionsSection";
 import { RoleSlackPermissionsSection } from "../sections/RoleSlackPermissionsSection";
 
 export default function RoleDetailPage() {
@@ -54,6 +55,7 @@ function RoleDetail() {
       </div>
 
       <RoleSlackPermissionsSection role={role} />
+      <RoleGoogleChatPermissionsSection role={role} />
       <RoleGrantsSection role={role} />
     </>
   );

@@ -1941,8 +1941,8 @@ the additions listed here. The additions exist only under `/api/v1/console`.
 | `GET`/`POST`/`PUT`/`PATCH`/`DELETE` `/api/v1/console/{static,pg_dsn,gcp_auth,gcp_id_token}_secrets[/:id]` (show, create, update, destroy) | [Static](#static-secrets), [PG DSN](#pg-dsn-secrets), [GCP auth](#gcp-auth-secrets), [GCP ID token](#gcp-id-token-secrets) secrets | [Secret write semantics](#console-secret-writes) |
 | `/api/v1/console/broker_credentials[/:id]` (index, show, create, update, destroy) | [Broker credentials](#broker-credentials) | [Broker credential fields](#console-broker-credentials) |
 | `/api/v1/console/oauth_apps[/:id]` (index, show, create, update, destroy), plus `credentials`, `provider_details`, `presets/:provider` | [OAuth apps](#oauth-apps) | [OAuth app fields and actions](#console-oauth-apps) |
-| `/api/v1/console/principals[/:id]` (index, show, create, update, destroy), `…/roles`, `…/grants`, `…/effective_grants`, `…/slack_channel_permissions` | [Principals](#principals), [role assignments](#role-assignments) | [Principal views and actions](#console-principals) |
-| `/api/v1/console/roles[/:id]` (index, show, create, update, destroy), `…/grants`, `…/slack_channel_permissions` | [Roles](#roles) | [Role filters and actions](#console-roles) |
+| `/api/v1/console/principals[/:id]` (index, show, create, update, destroy), `…/roles`, `…/grants`, `…/effective_grants`, `…/slack_channel_permissions`, `…/google_chat_space_permissions`, `…/google_chat_dm_permissions` | [Principals](#principals), [role assignments](#role-assignments) | [Principal views and actions](#console-principals) |
+| `/api/v1/console/roles[/:id]` (index, show, create, update, destroy), `…/grants`, `…/slack_channel_permissions`, `…/google_chat_space_permissions`, `…/google_chat_dm_permissions` | [Roles](#roles) | [Role filters and actions](#console-roles) |
 | `GET`/`POST`/`DELETE` `/api/v1/console/grants[/:id]`, `GET /api/v1/console/{principals,roles}/:id/grants` | [Grants](#grants) | Every grant payload adds `grantable` (below) |
 
 Grant payloads in the console API add a summary of the secret, never its
@@ -2068,10 +2068,15 @@ Console-only actions:
 | `GET` | `/api/v1/console/principals/:principal_id/grants` | [Direct grants](#list-by-grantee), with `grantable`. |
 | `PUT` | `/api/v1/console/principals/:id/slack_channel_permissions` | Replace the direct Slack channel permissions with `data.slack_channel_permissions`. DM rows (`D…`) are API-managed: stored DM rows are kept and submitted DM rows ignored. An unchanged submission writes nothing. Returns the stored rows. |
 | `DELETE` | `/api/v1/console/principals/:id/slack_channel_permissions/:channel_id` | Delete one direct Slack channel permission. `204`; `404` if absent. |
+| `PUT` | `/api/v1/console/principals/:id/google_chat_space_permissions` | Google Chat DM only. Replace the direct Google Chat space permissions with `data.google_chat_space_permissions` (rows of `space_name` plus the eight `*_enabled` flags). Rows are keyed by `space_name`. An unchanged submission writes nothing. Returns the stored rows. `422` if a row has no permission enabled or an invalid space name. |
+| `DELETE` | `/api/v1/console/principals/:id/google_chat_space_permissions/spaces/:space_id` | Google Chat DM only. Delete the direct permission for `spaces/:space_id`. `204`; `404` if absent. |
+| `PUT` | `/api/v1/console/principals/:id/google_chat_dm_permissions` | Google Chat DM only. Replace the direct Google Chat DM permissions with `data.google_chat_dm_permissions` (rows of `target_identity`, an email, and `setup_enabled`). Returns the stored rows. `422` on an invalid row. |
+| `DELETE` | `/api/v1/console/principals/:id/google_chat_dm_permissions/:target_identity` | Google Chat DM only. Delete the direct DM permission for that email. `204`; `404` if absent. |
 
 The console principal payload is the bearer payload plus `kind`,
 `slack_user_id`, `roles` (`[{ id, foreign_id, name }]`), and
-`inherited_slack_channel_permissions` (merged from assigned roles).
+`inherited_slack_channel_permissions`, `inherited_google_chat_space_permissions`,
+and `inherited_google_chat_dm_permissions` (merged from assigned roles).
 
 `GET /api/v1/console/principals/:id/effective_grants` returns:
 
@@ -2104,6 +2109,7 @@ The console principal payload is the bearer payload plus `kind`,
 | `GET` | `/api/v1/console/roles/:role_id/grants` | [Grants](#list-by-grantee) attached to the role, with `grantable`. |
 | `PUT` | `/api/v1/console/roles/:id/slack_channel_permissions` | Replace the role's Slack channel permissions with `data.slack_channel_permissions`. Rows are keyed by `channel_id`. An unchanged submission writes nothing; a change bumps the sync config of every principal holding the role. Returns the stored rows. `422` if a row has no permission enabled. |
 | `DELETE` | `/api/v1/console/roles/:id/slack_channel_permissions/:channel_id` | Delete one role Slack channel permission. `204`; `404` if absent. |
+| `PUT`/`DELETE` | `/api/v1/console/roles/:id/google_chat_space_permissions[/spaces/:space_id]`, `/api/v1/console/roles/:id/google_chat_dm_permissions[/:target_identity]` | Google Chat DM only. As the principal endpoints; a change bumps the sync config of every principal holding the role. |
 
 ### Secrets (all kinds)
 
@@ -2328,8 +2334,8 @@ returned. Responses set `Cache-Control: no-store`.
 | Method | Path | Notes |
 | ------ | ---- | ----- |
 | `GET` | `/api/v1/console/scheduled_tasks` | The caller's tasks, ordered by name. |
-| `GET` | `/api/v1/console/scheduled_tasks/new` | Defaults for a new task: daily at 9:00 PT, enabled, delivered to the caller's Slack DM when one is linked. |
-| `GET` | `/api/v1/console/scheduled_tasks/:id/edit` | One of the caller's tasks in the console shape below. |
+| `GET` | `/api/v1/console/scheduled_tasks/new` | Defaults for a new task: daily at 9:00 PT, enabled, delivered to the caller's Slack DM when one is linked, else to their Google Chat DM when Slack delivery is unavailable. Adds the form options below. |
+| `GET` | `/api/v1/console/scheduled_tasks/:id/edit` | One of the caller's tasks in the console shape below, plus the form options. |
 | `POST` | `/api/v1/console/scheduled_tasks` | Create a task authored by the caller. Returns `201`. |
 | `PUT`/`PATCH` | `/api/v1/console/scheduled_tasks/:id` | Update the fields sent; keep the rest. |
 | `DELETE` | `/api/v1/console/scheduled_tasks/:id` | Returns `204`. |
@@ -2343,7 +2349,7 @@ Write bodies take `data` with:
 | `name`, `prompt`, `enabled` | Same validation as the sandbox endpoints. |
 | `schedule_preset` | `manual`, `daily`, `weekdays`, `mondays`, `fridays` (all at 9:00 PT), `custom`, or `cron` (uses `cron_expression` verbatim). Omitted keeps the stored schedule. |
 | `custom_days`, `custom_time` | For `custom`: weekday values `"1"`..`"6"` and `"0"` (Sunday), plus `"HH:MM"`. Missing days or time returns `422` on `cron_expression`. |
-| `delivery_mode` | `dm` delivers to the author's linked Slack DM and ignores `delivery_channel`; `channel` uses `delivery_channel`. A destination the author's Slack permissions do not allow returns `422` on `delivery_channel`. |
+| `delivery_mode` | `dm` delivers to the author's linked Slack DM and ignores `delivery_channel`; `channel` uses `delivery_channel`. A destination the author's Slack permissions do not allow returns `422` on `delivery_channel`. Google Chat DM only: `gchat_dm` delivers to the author's Google Chat DM and ignores `delivery_channel`; `gchat_space` uses `delivery_channel` as `spaces/<id>`, which needs an effective `send` space permission, else `422` on `delivery_channel`. |
 
 ```json
 {
@@ -2364,6 +2370,16 @@ Write bodies take `data` with:
 
 `delivery_name` is the channel's catalog name, or "Direct message to you" for a
 DM. `direct_message_user_id` is the caller's linked Slack user ID, or `null`.
+Google Chat DM only: `delivery_mode` can also be `gchat_dm` or `gchat_space`,
+and `delivery_name` is "Google Chat DM to you" or the space's display name.
+
+`new` and `edit` add form options:
+`slack_delivery_available` (the Slack token is configured and the bot catalog
+or the caller's Slack DM exists) and `google_chat`:
+`{ "direct_message_identity": "you@example.com", "spaces": [{ "name": "spaces/AAAA", "display_name": "AI" }] }`.
+`spaces` lists the caller's send-permitted spaces; when space names resolve,
+unnamed spaces are omitted, otherwise every space is listed with a `null`
+`display_name`.
 
 ### Workflows
 

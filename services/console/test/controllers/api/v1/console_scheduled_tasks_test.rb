@@ -54,7 +54,7 @@ module Api
       test "new defaults to channel delivery without a linked Slack identity" do
         sign_in_console(users(:member_user))
 
-        get new_api_v1_console_scheduled_task_path
+        with_catalog { get new_api_v1_console_scheduled_task_path }
 
         assert_equal "channel", json_body.dig("data", "delivery_mode")
         assert_nil json_body.dig("data", "direct_message_user_id")

@@ -7,7 +7,7 @@ import { createQueryKeys } from "@/lib/query-keys";
 export const scheduledTaskKeys = createQueryKeys("scheduled_tasks");
 export const workflowKeys = createQueryKeys("workflows");
 
-export type DeliveryMode = "dm" | "channel";
+export type DeliveryMode = "dm" | "channel" | "gchat_dm" | "gchat_space";
 export type SchedulePreset = "manual" | "daily" | "weekdays" | "mondays" | "fridays" | "custom";
 
 export interface ScheduledTask {
@@ -31,6 +31,15 @@ export interface ScheduledTask {
   last_error: string | null;
   created_at: string | null;
   updated_at: string | null;
+  /** new/edit only. */
+  slack_delivery_available?: boolean;
+  /** new/edit only: the caller's Google Chat DM address and send-permitted spaces. */
+  google_chat?: GoogleChatDeliveryOptions;
+}
+
+export interface GoogleChatDeliveryOptions {
+  direct_message_identity: string;
+  spaces: { name: string; display_name: string | null }[];
 }
 
 export interface ScheduledTaskInput {

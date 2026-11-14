@@ -2,6 +2,11 @@
 // inherited Slack permissions, and effective grants.
 import { keepPreviousData, useQuery, useSuspenseQuery, type QueryClient } from "@tanstack/react-query";
 
+import type {
+  GoogleChatDmPermissionRow,
+  GoogleChatPermissionKey,
+  GoogleChatSpacePermissionRow,
+} from "@/components/google-chat-permissions-editor";
 import type { SlackChannelPermissionRow } from "@/components/slack-channel-permissions-editor";
 import { api, type DataEnvelope, type ListEnvelope } from "@/lib/api";
 import { createQueryKeys, sharedKeys } from "@/lib/query-keys";
@@ -21,6 +26,8 @@ export interface Role {
   name: string | null;
   labels: Record<string, string>;
   slack_channel_permissions: SlackChannelPermissionRow[];
+  google_chat_space_permissions: GoogleChatSpacePermissionRow[];
+  google_chat_dm_permissions: GoogleChatDmPermissionRow[];
   created_at: string;
   updated_at: string;
 }
@@ -110,6 +117,27 @@ export async function replaceRoleSlackPermissions(queryClient: QueryClient, id: 
 
 export async function deleteRoleSlackPermission(queryClient: QueryClient, id: string, channelId: string) {
   await api.delete(`${base}/${id}/slack_channel_permissions/${encodeURIComponent(channelId)}`);
+  await refreshRole(queryClient, id);
+}
+
+export async function replaceRoleGoogleChatPermissions(
+  queryClient: QueryClient,
+  id: string,
+  key: GoogleChatPermissionKey,
+  rows: (GoogleChatSpacePermissionRow | GoogleChatDmPermissionRow)[],
+) {
+  await api.put(`${base}/${id}/${key}`, { data: { [key]: rows } });
+  await refreshRole(queryClient, id);
+}
+
+/** Space targets are `spaces/<id>` and keep their slash as a path segment. */
+export async function deleteRoleGoogleChatPermission(
+  queryClient: QueryClient,
+  id: string,
+  key: GoogleChatPermissionKey,
+  target: string,
+) {
+  await api.delete(`${base}/${id}/${key}/${target.split("/").map(encodeURIComponent).join("/")}`);
   await refreshRole(queryClient, id);
 }
 

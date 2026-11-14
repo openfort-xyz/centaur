@@ -8,14 +8,21 @@ module Api
       # inherited_slack_channel_permissions); the list takes q (name or
       # foreign_id, case-insensitive) and sort=name (unnamed last). The console
       # also deletes principals, reads effective grants, and replaces or
-      # removes Slack channel permissions.
+      # removes Slack channel and Google Chat space/DM permissions.
       class PrincipalsController < ::Api::V1::PrincipalsController
         include ConsoleApiAuthentication
         include PrincipalEffectiveGrants
         include SlackChannelPermissionReplacement
+        include GoogleChatPermissionReplacement
 
         def index
-          scope = Principal.includes(:console_user, :slack_channel_permissions, roles: :slack_channel_permissions)
+          scope = Principal.includes(
+            :console_user,
+            :slack_channel_permissions,
+            :google_chat_space_permissions,
+            :google_chat_dm_permissions,
+            roles: %i[slack_channel_permissions google_chat_space_permissions google_chat_dm_permissions]
+          )
           query = params[:q].to_s.strip
           if query.present?
             pattern = "%#{Principal.sanitize_sql_like(query)}%"
@@ -58,7 +65,9 @@ module Api
             kind: principal.kind,
             slack_user_id: principal.slack_user_id,
             roles: principal.roles.sort_by(&:id).map { |role| { id: role.oid, foreign_id: role.foreign_id, name: role.name } },
-            inherited_slack_channel_permissions: principal.inherited_slack_channel_permissions_payload
+            inherited_slack_channel_permissions: principal.inherited_slack_channel_permissions_payload,
+            inherited_google_chat_space_permissions: principal.inherited_google_chat_space_permissions_payload,
+            inherited_google_chat_dm_permissions: principal.inherited_google_chat_dm_permissions_payload
           )
         end
       end

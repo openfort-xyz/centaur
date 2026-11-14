@@ -15,21 +15,22 @@ module Api
 
         def index
           tasks = current_user.scheduled_tasks.includes(:author, :principal).order(:name, :id).to_a
-          names = slack_channel_names(tasks)
+          names = delivery_names(tasks)
           render json: { data: tasks.map { |task| console_payload(task, names) } }
         end
 
         # Defaults for the new-task form: daily at 9:00 PT, enabled, and the
-        # caller's Slack DM as the destination when one is linked.
+        # caller's Slack DM as the destination when one is linked (their Google
+        # Chat DM when Slack delivery is unavailable).
         def new
           task = current_user.scheduled_tasks.new(cron_expression: ScheduledTask::SCHEDULE_PRESETS.fetch("daily"),
                                                    enabled: true)
-          render json: { data: console_payload(task, {}) }
+          render json: { data: console_payload(task, {}).merge(form_options) }
         end
 
         # The caller's own task, as the edit form shows it.
         def edit
-          render json: { data: console_payload(@task) }
+          render json: { data: console_payload(@task).merge(form_options) }
         end
 
         def create
@@ -98,7 +99,7 @@ module Api
                                        :schedule_preset, :cron_expression, :custom_time, custom_days: [])
         end
 
-        def console_payload(task, names = slack_channel_names([ task ]))
+        def console_payload(task, names = delivery_names([ task ]))
           dm_user_id = task.author && direct_message_user_id_for(task.author)
           delivers_to_dm = task.delivery_channel.present? && task.delivery_channel == dm_user_id
           {
@@ -109,7 +110,7 @@ module Api
             principal_id: task.principal&.oid,
             delivery_channel: task.delivery_channel.presence,
             delivery_mode: delivery_mode(task, dm_user_id),
-            delivery_name: delivers_to_dm ? "Direct message to you" : names[task.delivery_channel],
+            delivery_name: delivery_name(task, delivers_to_dm, names),
             direct_message_user_id: dm_user_id,
             cron_expression: task.cron_expression,
             timezone: task.timezone.presence || ScheduledTask::DEFAULT_TIMEZONE,
@@ -140,10 +141,52 @@ module Api
         # A user id destination is a DM, any other destination
         # a channel; a new task defaults to the DM when one is linked.
         def delivery_mode(task, dm_user_id)
+          return task.delivery_platform.to_s if task.google_chat_delivery?
           return "dm" if task.delivery_channel.to_s.start_with?("U", "W")
           return "channel" if task.delivery_channel.present?
+          return "dm" if dm_user_id.present?
 
-          dm_user_id.present? ? "dm" : "channel"
+          slack_delivery_available? ? "channel" : "gchat_dm"
+        end
+
+        def delivery_name(task, delivers_to_dm, names)
+          return "Direct message to you" if delivers_to_dm
+          return "Google Chat DM to you" if task.delivery_platform == :gchat_dm
+
+          names[task.delivery_channel]
+        end
+
+        # A configured token alone is not enough: a deployment can carry the
+        # console Slack token while running no Slack bot, so Slack is offered
+        # only when something is actually deliverable.
+        def slack_delivery_available?
+          SlackChannelCatalogSync.configured? &&
+            (SlackBotChannel.exists? || direct_message_user_id_for(current_user).present?)
+        end
+
+        # The new/edit form's Google Chat destinations: the caller's own DM and
+        # the spaces they may send to. With directory names available, unnamed
+        # spaces (mostly other people's DMs) are left out; on a directory
+        # outage every space is listed by resource name.
+        def form_options
+          policy = GoogleChatDeliveryPolicy.new(current_user)
+          names = policy.send_spaces.any? ? GoogleChatSpaceDirectory.display_names(current_user) : {}
+          spaces = policy.send_spaces.filter_map do |space|
+            next { name: space, display_name: nil } if names.empty?
+
+            { name: space, display_name: names[space] } if names[space].present?
+          end
+          {
+            slack_delivery_available: slack_delivery_available?,
+            google_chat: { direct_message_identity: policy.direct_message_identity, spaces: spaces }
+          }
+        end
+
+        def delivery_names(tasks)
+          names = slack_channel_names(tasks)
+          return names unless tasks.any? { |task| task.delivery_platform == :gchat_space }
+
+          names.merge(GoogleChatSpaceDirectory.display_names(current_user))
         end
 
         def slack_channel_names(tasks)

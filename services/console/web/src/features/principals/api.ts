@@ -1,5 +1,10 @@
 import { keepPreviousData, useQuery, useSuspenseQuery, type QueryClient } from "@tanstack/react-query";
 
+import type {
+  GoogleChatDmPermissionRow,
+  GoogleChatPermissionKey,
+  GoogleChatSpacePermissionRow,
+} from "@/components/google-chat-permissions-editor";
 import type { SlackChannelPermissionRow } from "@/components/slack-channel-permissions-editor";
 import { api, type DataEnvelope, type ListEnvelope } from "@/lib/api";
 import { createQueryKeys, sharedKeys } from "@/lib/query-keys";
@@ -29,6 +34,10 @@ export interface Principal {
   slack_channel_permissions: SlackChannelPermissionRow[];
   inherited_slack_channel_permissions: SlackChannelPermissionRow[];
   effective_slack_channel_permissions: SlackChannelPermissionRow[];
+  google_chat_space_permissions: GoogleChatSpacePermissionRow[];
+  inherited_google_chat_space_permissions: GoogleChatSpacePermissionRow[];
+  google_chat_dm_permissions: GoogleChatDmPermissionRow[];
+  inherited_google_chat_dm_permissions: GoogleChatDmPermissionRow[];
   sandbox_repo_cache: SandboxRepoCache;
   sandbox_observability_enabled: boolean;
   sandbox_sessions_read_enabled: boolean;
@@ -196,6 +205,27 @@ export async function replacePrincipalSlackPermissions(queryClient: QueryClient,
 
 export async function deletePrincipalSlackPermission(queryClient: QueryClient, id: string, channelId: string) {
   await api.delete(`${base}/${id}/slack_channel_permissions/${encodeURIComponent(channelId)}`);
+  await refreshPrincipal(queryClient, id);
+}
+
+export async function replacePrincipalGoogleChatPermissions(
+  queryClient: QueryClient,
+  id: string,
+  key: GoogleChatPermissionKey,
+  rows: (GoogleChatSpacePermissionRow | GoogleChatDmPermissionRow)[],
+) {
+  await api.put(`${base}/${id}/${key}`, { data: { [key]: rows } });
+  await refreshPrincipal(queryClient, id);
+}
+
+/** Space targets are `spaces/<id>` and keep their slash as a path segment. */
+export async function deletePrincipalGoogleChatPermission(
+  queryClient: QueryClient,
+  id: string,
+  key: GoogleChatPermissionKey,
+  target: string,
+) {
+  await api.delete(`${base}/${id}/${key}/${target.split("/").map(encodeURIComponent).join("/")}`);
   await refreshPrincipal(queryClient, id);
 }
 

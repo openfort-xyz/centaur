@@ -5,14 +5,16 @@ module Api
       # top of labels and pagination: q (name or foreign_id, case-insensitive)
       # and exclude_principal (a principal oid; omits the roles already
       # assigned to it, for the assign-role picker; 404 when unknown). Slack
-      # channel permissions can be replaced as a set or removed one channel at
-      # a time.
+      # channel and Google Chat space/DM permissions can be replaced as a set or
+      # removed one row at a time.
       class RolesController < ::Api::V1::RolesController
         include ConsoleApiAuthentication
         include SlackChannelPermissionReplacement
+        include GoogleChatPermissionReplacement
 
         def index
-          records, meta = paginated_label_search(filtered_roles(Role.includes(:slack_channel_permissions)))
+          scope = Role.includes(:slack_channel_permissions, :google_chat_space_permissions, :google_chat_dm_permissions)
+          records, meta = paginated_label_search(filtered_roles(scope))
           render json: { data: records.map { |r| record_payload(r) }, meta: meta }
         end
 

@@ -40,14 +40,16 @@ export const CUSTOM_DAYS: [string, string][] = [
 
 // A delivery destination typed by hand must be a channel (the DM is its own mode).
 const CHANNEL_ID_PATTERN = /^[CDG][A-Z0-9]{8,}$/;
+const CHAT_SPACE_PATTERN = /^spaces\/[A-Za-z0-9_-]+$/i;
 const FIELDS = ["name", "prompt", "delivery_channel"] as const;
 
 const schema = z
   .object({
     name: z.string().trim().min(1, "can't be blank").max(100, "is too long (maximum is 100 characters)"),
     prompt: z.string().trim().min(1, "can't be blank"),
-    delivery_mode: z.enum(["dm", "channel"]),
+    delivery_mode: z.enum(["dm", "channel", "gchat_dm", "gchat_space"]),
     delivery_channel: z.string(),
+    chat_space: z.string(),
     schedule_preset: z.enum(["manual", "daily", "weekdays", "mondays", "fridays", "custom"]),
     custom_days: z.array(z.string()),
     custom_time: z.string(),
@@ -57,6 +59,9 @@ const schema = z
   .superRefine((values, ctx) => {
     if (values.delivery_mode === "channel" && values.delivery_channel.trim() === "") {
       ctx.addIssue({ code: "custom", path: ["delivery_channel"], message: "Choose a Slack channel." });
+    }
+    if (values.delivery_mode === "gchat_space" && !CHAT_SPACE_PATTERN.test(values.chat_space.trim())) {
+      ctx.addIssue({ code: "custom", path: ["chat_space"], message: "Enter a Google Chat space as spaces/<id>." });
     }
     if (values.schedule_preset === "custom") {
       if (values.custom_days.length === 0) {
@@ -78,6 +83,8 @@ interface ScheduledTaskFormProps {
 
 export function ScheduledTaskForm({ task, submitLabel, onSubmit }: ScheduledTaskFormProps) {
   const dmUserId = task.direct_message_user_id;
+  const chatDm = task.google_chat?.direct_message_identity ?? "";
+  const showSlack = task.slack_delivery_available !== false || task.delivery_mode === "dm" || task.delivery_mode === "channel";
   const form = useForm<Values>({
     resolver: zodResolver(schema),
     defaultValues: {
@@ -85,6 +92,7 @@ export function ScheduledTaskForm({ task, submitLabel, onSubmit }: ScheduledTask
       prompt: task.prompt ?? "",
       delivery_mode: task.delivery_mode === "dm" && !dmUserId ? "channel" : task.delivery_mode,
       delivery_channel: task.delivery_mode === "channel" ? (task.delivery_channel ?? "") : "",
+      chat_space: task.delivery_mode === "gchat_space" ? (task.delivery_channel ?? "") : "",
       schedule_preset: task.schedule_preset,
       custom_days: task.custom_days,
       custom_time: task.custom_time,
@@ -100,9 +108,10 @@ export function ScheduledTaskForm({ task, submitLabel, onSubmit }: ScheduledTask
   const submit = form.handleSubmit(async (values) => {
     setSaveError(null);
     try {
+      const { chat_space: chatSpace, ...input } = values;
       await onSubmit({
-        ...values,
-        delivery_channel: values.delivery_mode === "channel" ? values.delivery_channel : "",
+        ...input,
+        delivery_channel: deliveryChannel(values.delivery_mode, values.delivery_channel, chatSpace),
         custom_days: values.schedule_preset === "custom" ? values.custom_days : [],
       });
     } catch (error) {
@@ -157,13 +166,25 @@ export function ScheduledTaskForm({ task, submitLabel, onSubmit }: ScheduledTask
               onValueChange={(next) => field.onChange(next)}
               className="flex flex-wrap gap-x-6 gap-y-3"
             >
-              <label className={cn("flex items-center gap-2 text-sm", dmUserId ? "cursor-pointer" : "cursor-not-allowed opacity-60")}>
-                <RadioGroupItem value="dm" disabled={!dmUserId} />
-                <span>Deliver to my DM</span>
+              {showSlack && (
+                <>
+                  <label className={cn("flex items-center gap-2 text-sm", dmUserId ? "cursor-pointer" : "cursor-not-allowed opacity-60")}>
+                    <RadioGroupItem value="dm" disabled={!dmUserId} />
+                    <span>Deliver to my DM</span>
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-sm">
+                    <RadioGroupItem value="channel" />
+                    <span>Deliver to a channel</span>
+                  </label>
+                </>
+              )}
+              <label className={cn("flex items-center gap-2 text-sm", chatDm ? "cursor-pointer" : "cursor-not-allowed opacity-60")}>
+                <RadioGroupItem value="gchat_dm" disabled={!chatDm} />
+                <span>Google Chat: my DM</span>
               </label>
               <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <RadioGroupItem value="channel" />
-                <span>Deliver to a channel</span>
+                <RadioGroupItem value="gchat_space" />
+                <span>Google Chat: a space</span>
               </label>
             </RadioGroup>
           )}
@@ -197,7 +218,44 @@ export function ScheduledTaskForm({ task, submitLabel, onSubmit }: ScheduledTask
             </p>
           </div>
         )}
-        {!dmUserId && (
+        {deliveryMode === "gchat_space" && (
+          <div className="mt-3">
+            <label htmlFor="scheduled-task-chat-space" className="mb-2 block text-sm font-medium">
+              Google Chat space
+            </label>
+            <Controller
+              control={form.control}
+              name="chat_space"
+              render={({ field, fieldState }) => (
+                <>
+                  <Input
+                    id="scheduled-task-chat-space"
+                    list="google-chat-spaces"
+                    placeholder="spaces/AAQA42QLdws"
+                    autoComplete="off"
+                    aria-invalid={fieldState.invalid || undefined}
+                    {...field}
+                  />
+                  {fieldState.error && <p className="mt-1.5 text-xs text-destructive">{fieldState.error.message}</p>}
+                </>
+              )}
+            />
+            <p className="mt-2 text-xs text-muted-foreground">
+              Spaces you can send to are suggested by name. Any space with a send permission is accepted.
+            </p>
+            <datalist id="google-chat-spaces">
+              {task.google_chat?.spaces.map((space) => (
+                <option key={space.name} value={space.name}>
+                  {space.display_name ?? space.name}
+                </option>
+              ))}
+            </datalist>
+          </div>
+        )}
+        {deliveryMode === "gchat_dm" && (
+          <p className="mt-2 text-xs text-muted-foreground">Your Google Chat DM goes to {chatDm}.</p>
+        )}
+        {showSlack && !dmUserId && (
           <p className="mt-2 text-xs text-muted-foreground">
             Connect your Slack account to deliver to your DM.
           </p>
@@ -296,6 +354,12 @@ export function ScheduledTaskForm({ task, submitLabel, onSubmit }: ScheduledTask
       </div>
     </form>
   );
+}
+
+function deliveryChannel(mode: Values["delivery_mode"], slackChannel: string, chatSpace: string) {
+  if (mode === "channel") return slackChannel;
+  if (mode === "gchat_space") return chatSpace.trim();
+  return "";
 }
 
 function saveErrorMessages(error: unknown): string[] {

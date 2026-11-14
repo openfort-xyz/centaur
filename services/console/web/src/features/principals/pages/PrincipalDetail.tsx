@@ -16,6 +16,7 @@ import { DirectGrantsSection } from "../sections/DirectGrantsSection";
 import { EffectiveGrantsSection } from "../sections/EffectiveGrantsSection";
 import { RolesSection } from "../sections/RolesSection";
 import { SandboxAccessSection } from "../sections/SandboxAccessSection";
+import { GoogleChatPermissionsSection } from "../sections/GoogleChatPermissionsSection";
 import { SlackPermissionsSection } from "../sections/SlackPermissionsSection";
 
 export default function PrincipalDetailPage() {
@@ -80,6 +81,7 @@ function PrincipalDetail() {
       </div>
 
       <SlackPermissionsSection principal={principal} />
+      <GoogleChatPermissionsSection principal={principal} />
       <SandboxAccessSection principal={principal} />
       <RolesSection principal={principal} />
       <DirectGrantsSection principal={principal} />
