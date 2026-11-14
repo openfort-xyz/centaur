@@ -27,5 +27,7 @@ build-backend = "hatchling.build"
 [tool.centaur]
 module = "client.py"
 secrets = [
-    {type = "http", name = "YOUTUBE_API_KEY", mode = "inject", inject_query_param = "key", hosts = ["www.googleapis.com"]},
+    # Host must match client.py's base_url. www.googleapis.com is shared with
+    # gsuite's oauth_token, whose Bearer shadows this key — see client.py.
+    {type = "http", name = "YOUTUBE_API_KEY", mode = "inject", inject_query_param = "key", hosts = ["youtube.googleapis.com"]},
 ]
