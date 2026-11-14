@@ -294,14 +294,14 @@ importers:
         specifier: workspace:*
         version: link:../../packages/rendering
       '@chat-adapter/state-pg':
-        specifier: 4.40.0
-        version: 4.40.0(zod@4.6.7)
+        specifier: 4.44.0
+        version: 4.44.0(zod@4.6.7)
       chat:
-        specifier: 4.40.0
-        version: 4.40.0(zod@4.6.7)
+        specifier: 4.44.0
+        version: 4.44.0(zod@4.6.7)
       hono:
         specifier: ^4.13.14
-        version: 4.13.14
+        version: 4.13.16
       pg:
         specifier: ^8.23.1
         version: 8.23.1
@@ -310,14 +310,14 @@ importers:
         version: 4.6.7
     devDependencies:
       '@chat-adapter/state-memory':
-        specifier: 4.40.0
-        version: 4.40.0(zod@4.6.7)
+        specifier: 4.44.0
+        version: 4.44.0(zod@4.6.7)
       '@types/bun':
         specifier: ^1.4.4
         version: 1.4.4
       '@types/node':
         specifier: ^26.6.5
-        version: 26.6.5
+        version: 26.6.6
       '@types/pg':
         specifier: ^8.23.1
         version: 8.23.1
