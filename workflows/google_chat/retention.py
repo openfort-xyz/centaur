@@ -8,7 +8,7 @@ from typing import Any
 
 from api.workflow_engine import WorkflowContext
 from workflows.google_chat.metrics import record_retention
-from workflows.slack.shared import env_flag_enabled, positive_int
+from workflows.google_chat.sync import DOCUMENT_SOURCE, env_flag_enabled, positive_int
 
 WORKFLOW_NAME = "google_chat_retention"
 DEFAULT_INTERVAL_MINUTES = 60
@@ -33,14 +33,12 @@ def _configured_batch_limit() -> int:
     )
 
 
+# Discovery imports this module without deployment env, so the schedule is
+# fixed; the handler reads the retention settings at run time.
 SCHEDULE = {
     "schedule_id": WORKFLOW_NAME,
-    "interval_seconds": positive_int(
-        os.getenv("GOOGLE_CHAT_RETENTION_INTERVAL_MINUTES"), DEFAULT_INTERVAL_MINUTES
-    )
-    * 60,
-    "enabled": env_flag_enabled("GOOGLE_CHAT_RETENTION_ENABLED", default=True)
-    and _configured_days() > 0,
+    "interval_seconds": DEFAULT_INTERVAL_MINUTES * 60,
+    "enabled": True,
     "no_delivery": True,
 }
 
@@ -56,8 +54,8 @@ class Input:
 _TARGETS = (
     (
         "documents",
-        "company_context_documents",
-        "source = 'google_chat' AND occurred_at < NOW() - make_interval(days => $1)",
+        "company_context_system.custom_documents",
+        f"source = '{DOCUMENT_SOURCE}' AND occurred_at < NOW() - make_interval(days => $1)",
     ),
     (
         "attachments",
@@ -126,6 +124,14 @@ async def prune_google_chat(
 
 
 async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
+    if inp.retention_days is None and not env_flag_enabled(
+        "GOOGLE_CHAT_RETENTION_ENABLED", default=True
+    ):
+        return {
+            "ok": True,
+            "status": "skipped",
+            "reason": "google_chat_retention_disabled",
+        }
     days = (
         _nonnegative_int(inp.retention_days)
         if inp.retention_days is not None

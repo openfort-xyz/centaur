@@ -1,7 +1,10 @@
-"""Workflow: sync Google Chat space history into Postgres.
+"""Workflow: sync Google Chat space history into Postgres and company context.
 
-Mirrors the Slack ETL: enumerate spaces the Chat app is a member of, then page
-each space's message history into raw ``google_chat_sync_*`` tables. Scheduled
+Enumerate spaces the Chat app is a member of, then page each space's message
+history into raw ``google_chat_sync_*`` tables. Every thread a run touches is
+rendered into one ``google-chat`` row of
+``company_context_system.custom_documents``, readable only from the thread's
+space (DM-sync threads: only from the owner's DM with the bot). Scheduled
 runs rescan history because Chat's list filter is based on ``createTime`` and
 cannot select old messages edited later. Explicit manual ``since`` runs remain
 bounded by a per-space watermark. A page budget persists continuation tokens so
@@ -17,16 +20,12 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from api.runtime_control import canonical_json
-from workflows.etl_metrics import (
-    record_etl_items_failed,
-    record_etl_items_seen,
-    record_etl_items_upserted,
-)
 from workflows.google_chat.metrics import (
     observe_run_duration,
     record_api_outcome,
@@ -39,7 +38,6 @@ from workflows.google_chat.metrics import (
     set_watermark_lag,
 )
 from api.workflow_engine import WorkflowContext
-from workflows.slack.shared import env_flag_enabled, positive_int
 
 WORKFLOW_NAME = "google_chat_sync"
 DEFAULT_SYNC_INTERVAL_SECONDS = 4 * 60 * 60
@@ -50,13 +48,32 @@ DEFAULT_WATERMARK_OVERLAP_SECONDS = 60
 # converges across runs instead of in one long run.
 DEFAULT_MAX_PAGES_PER_RUN = 0
 # Google Chat space types: SPACE (named rooms), GROUP_CHAT, DIRECT_MESSAGE.
-# Default to named rooms only — DMs/group chats are private and would land in a
-# company-wide corpus, mirroring how Slack DMs are kept out of the shared ETL.
+# Default to named rooms only; the app never syncs DMs, which come only from
+# the opt-in DWD DM sync.
 DEFAULT_INCLUDE_SPACE_TYPES = "SPACE"
 # Reclaim runs orphaned in `running` by a dead workflow host after this long.
 # Must exceed the longest plausible run (~1h, bounded by the queue claim lease)
 # and stay under DEFAULT_SYNC_INTERVAL_SECONDS so the next run does the cleanup.
 RUN_STALE_RUNNING_HOURS = 3
+DOCUMENT_SOURCE = "google-chat"
+# company_context_system.custom_documents rejects bodies above 1,000,000 bytes.
+MAX_DOCUMENT_BODY_BYTES = 1_000_000
+FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+
+
+def positive_int(value: int | str | None, default: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def env_flag_enabled(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in FALSE_ENV_VALUES
 
 
 def _include_space_types() -> set[str]:
@@ -64,13 +81,12 @@ def _include_space_types() -> set[str]:
     return {part.strip().upper() for part in raw.split(",") if part.strip()}
 
 
+# Discovery imports this module without deployment env, so the schedule is
+# fixed; the handler reads GOOGLE_CHAT_ETL_ENABLED at run time and skips.
 SCHEDULE = {
     "schedule_id": "google_chat_sync",
-    "interval_seconds": positive_int(
-        os.getenv("GOOGLE_CHAT_SYNC_INTERVAL_SECONDS"),
-        DEFAULT_SYNC_INTERVAL_SECONDS,
-    ),
-    "enabled": env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED", default=False),
+    "interval_seconds": DEFAULT_SYNC_INTERVAL_SECONDS,
+    "enabled": True,
     "no_delivery": True,
 }
 
@@ -679,14 +695,15 @@ async def _upsert_message(
     member_names: dict[str, str],
     run_id: str,
     owner_email: str = "",
-) -> bool:
+) -> str:
+    """Upsert one message; return its thread id, or "" when it was skipped."""
     message_name = str(message.get("name") or "")
     message_id = _resource_id(message_name)
     if not message_id:
-        return False
+        return ""
     text = _message_text(message)
     if not text and not message.get("attachment"):
-        return False
+        return ""
 
     thread = message.get("thread") if isinstance(message.get("thread"), dict) else {}
     thread_id = _resource_id(str(thread.get("name") or "")) or message_id
@@ -737,7 +754,7 @@ async def _upsert_message(
         canonical_json(message),
         run_id,
     )
-    return True
+    return thread_id
 
 
 async def _replace_attachments(
@@ -869,8 +886,11 @@ async def _replace_reactions(
 
 async def _delete_message(
     pool, *, owner_email: str, space_id: str, message_id: str
-) -> None:
-    """Remove retained content when a showDeleted tombstone arrives."""
+) -> str | None:
+    """Remove retained content when a showDeleted tombstone arrives.
+
+    Returns the deleted message's thread id, or None if it was not stored.
+    """
     for table in ("google_chat_sync_attachments", "google_chat_sync_reactions"):
         await pool.execute(
             f"DELETE FROM {table} WHERE owner_email=$1 AND space_id=$2 AND message_id=$3",
@@ -878,12 +898,163 @@ async def _delete_message(
             space_id,
             message_id,
         )
-    await pool.execute(
+    return await pool.fetchval(
         "DELETE FROM google_chat_sync_messages "
-        "WHERE owner_email=$1 AND space_id=$2 AND message_id=$3",
+        "WHERE owner_email=$1 AND space_id=$2 AND message_id=$3 RETURNING thread_id",
         owner_email,
         space_id,
         message_id,
+    )
+
+
+def _slugify(value: str) -> str:
+    """The principal slug rule of crates/centaur-iron-control/src/util.rs."""
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "x"
+
+
+def _space_reader(space_id: str) -> str:
+    """The reader matching a Chat space session's principal foreign id."""
+    return f"principal:gchat-space-{_slugify(space_id)}"
+
+
+async def _document_readers(pool, space_id: str, owner_email: str) -> list[str]:
+    """Who may read this space's thread documents.
+
+    Shared-space threads: sessions in that space. DM-sync threads: the owner's
+    DM sessions with the bot, i.e. the spaces whose verified requester email
+    api-rs labels on the owner's ``gchat_dm`` principal. An owner who never
+    messaged the bot gets no readers, so the document is hidden.
+    """
+    if not owner_email:
+        return [_space_reader(space_id)]
+    rows = await pool.fetch(
+        "SELECT DISTINCT split_part(thread_key, ':', 3) AS space_id FROM sessions "
+        "WHERE thread_key LIKE 'chat:spaces:%' "
+        "AND upper(metadata->>'googlechat_space_type') = 'DIRECT_MESSAGE' "
+        "AND metadata->>'googlechat_request_verified' = 'true' "
+        "AND lower(btrim(metadata->>'user_email')) = $1 "
+        "ORDER BY 1",
+        owner_email.lower(),
+    )
+    return [_space_reader(str(row["space_id"])) for row in rows if row["space_id"]]
+
+
+def _thread_external_id(owner_email: str, space_id: str, thread_id: str) -> str:
+    name = f"spaces/{space_id}/threads/{thread_id}"
+    return f"{owner_email}/{name}" if owner_email else name
+
+
+def _format_time(value: dt.datetime | None) -> str:
+    if not value:
+        return "unknown time"
+    return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _chat_speaker(row: Any) -> str:
+    return str(row["sender_name"] or "").strip() or str(row["sender_id"] or "").strip() or "Unknown"
+
+
+def _thread_document(space_id: str, thread_id: str, messages: list[Any]) -> dict[str, Any]:
+    """Render one Chat thread as a custom document's title, body, and metadata."""
+    first = messages[0]
+    space_name = str(first["space_display_name"] or space_id)
+    first_text = re.sub(r"\s+", " ", str(first["text_content"] or "")).strip()
+    title = first_text[:80] or f"Chat thread in {space_name}"
+    participants = sorted({_chat_speaker(row) for row in messages if row["sender_id"]})
+    lines = [
+        f"# {title}",
+        "",
+        "- Source: Google Chat",
+        f"- Space: {space_name}",
+        f"- Started: {_format_time(first['source_create_time'])}",
+        f"- Participants: {', '.join(participants)}",
+        f"- Messages: {len(messages)}",
+        "",
+        "---",
+        "",
+    ]
+    for row in messages:
+        lines.extend(
+            [
+                f"### {_chat_speaker(row)} - {_format_time(row['source_create_time'])}",
+                "",
+                str(row["text_content"] or "").strip(),
+                *([f"Attachments: {row['attachments']}"] if row["attachments"] else []),
+                *([f"Reactions: {row['reactions']}"] if row["reactions"] else []),
+                "",
+            ]
+        )
+    # ponytail: truncates a thread past the table's byte limit instead of
+    # splitting it; split into several documents if such threads show up.
+    body = "\n".join(lines).strip().encode()[:MAX_DOCUMENT_BODY_BYTES].decode(errors="ignore")
+    return {
+        "title": title,
+        "body": body,
+        "occurred_at": first["source_create_time"],
+        "metadata": {
+            "space_id": space_id,
+            "space_name": space_name,
+            "space_type": str(first["space_type"] or ""),
+            "thread_id": thread_id,
+            "message_count": len(messages),
+            "participants": participants,
+        },
+    }
+
+
+async def _project_thread(
+    pool, *, owner_email: str, space_id: str, thread_id: str, readers: list[str]
+) -> None:
+    """Upsert the thread's company-context document, or delete it once empty."""
+    external_id = _thread_external_id(owner_email, space_id, thread_id)
+    messages = await pool.fetch(
+        "SELECT s.display_name AS space_display_name, s.space_type, m.sender_id, "
+        "m.sender_name, m.text_content, m.source_create_time, "
+        "COALESCE((SELECT string_agg(a.content_name, ', ' ORDER BY a.attachment_id) "
+        "FROM google_chat_sync_attachments a WHERE a.owner_email=m.owner_email "
+        "AND a.space_id=m.space_id AND a.message_id=m.message_id AND a.content_name <> ''), "
+        "'') AS attachments, "
+        "COALESCE((SELECT string_agg(COALESCE(NULLIF(r.emoji_unicode, ''), r.custom_emoji_uid), "
+        "', ' ORDER BY r.reaction_id) FROM google_chat_sync_reactions r "
+        "WHERE r.owner_email=m.owner_email AND r.space_id=m.space_id "
+        "AND r.message_id=m.message_id), '') AS reactions "
+        "FROM google_chat_sync_messages m LEFT JOIN google_chat_sync_spaces s "
+        "ON s.owner_email=m.owner_email AND s.space_id=m.space_id "
+        "WHERE m.owner_email=$1 AND m.space_id=$2 AND m.thread_id=$3 AND m.last_error='' "
+        "ORDER BY m.source_create_time NULLS LAST, m.message_id",
+        owner_email,
+        space_id,
+        thread_id,
+    )
+    if not messages:
+        await pool.execute(
+            "DELETE FROM company_context_system.custom_documents "
+            "WHERE source=$1 AND external_id=$2",
+            DOCUMENT_SOURCE,
+            external_id,
+        )
+        return
+    document = _thread_document(space_id, thread_id, list(messages))
+    if owner_email:
+        document["metadata"]["owner_email"] = owner_email
+    await pool.execute(
+        "INSERT INTO company_context_system.custom_documents "
+        "(source, external_id, title, body, occurred_at, readers, metadata) "
+        "VALUES ($1, $2, $3, $4, $5, $6::text[], $7::jsonb) "
+        "ON CONFLICT (source, external_id) DO UPDATE SET "
+        "title=EXCLUDED.title, body=EXCLUDED.body, occurred_at=EXCLUDED.occurred_at, "
+        "readers=EXCLUDED.readers, metadata=EXCLUDED.metadata "
+        "WHERE (custom_documents.title, custom_documents.body, custom_documents.occurred_at, "
+        "custom_documents.readers, custom_documents.metadata) IS DISTINCT FROM "
+        "(EXCLUDED.title, EXCLUDED.body, EXCLUDED.occurred_at, EXCLUDED.readers, "
+        "EXCLUDED.metadata)",
+        DOCUMENT_SOURCE,
+        external_id,
+        document["title"],
+        document["body"],
+        document["occurred_at"],
+        readers,
+        canonical_json(document["metadata"]),
     )
 
 
@@ -933,6 +1104,7 @@ async def _sync_space(
     successful_watermark: dt.datetime | None = None
     page_token: str | None = stored_token or None
     pages = 0
+    touched_threads: set[str] = set()
     while True:
         try:
             page = await _call_client(
@@ -950,20 +1122,20 @@ async def _sync_space(
             raise
         messages = [m for m in page.get("messages", []) if isinstance(m, dict)]
         counts["messages_seen"] += len(messages)
-        if messages:
-            record_etl_items_seen("google_chat", "message", "message", len(messages))
         record_items("message", len(messages))
         for message in messages:
             message_id = _resource_id(str(message.get("name") or ""))
             if message_id and (message.get("deleteTime") or message.get("deletionMetadata")):
-                await _delete_message(
+                deleted_thread = await _delete_message(
                     pool,
                     owner_email=owner_email,
                     space_id=space_id,
                     message_id=message_id,
                 )
+                if deleted_thread:
+                    touched_threads.add(deleted_thread)
                 continue
-            upserted = await _upsert_message(
+            thread_id = await _upsert_message(
                 pool,
                 space_id=space_id,
                 message=message,
@@ -971,9 +1143,9 @@ async def _sync_space(
                 run_id=run_id,
                 owner_email=owner_email,
             )
-            if upserted:
+            if thread_id:
+                touched_threads.add(thread_id)
                 counts["messages_upserted"] += 1
-                record_etl_items_upserted("google_chat", "message", "message", 1)
                 attachment_count = await _replace_attachments(
                     pool,
                     owner_email=owner_email,
@@ -1008,6 +1180,18 @@ async def _sync_space(
             break
         if max_pages and pages >= max_pages:
             break
+
+    if touched_threads:
+        readers = await _document_readers(pool, space_id, owner_email)
+        for thread_id in sorted(touched_threads):
+            await _project_thread(
+                pool,
+                owner_email=owner_email,
+                space_id=space_id,
+                thread_id=thread_id,
+                readers=readers,
+            )
+        counts["threads_projected"] = counts.get("threads_projected", 0) + len(touched_threads)
 
     # Never let the stored watermark regress past the pre-run checkpoint: an
     # explicit `since` re-backfill truncated by max_pages would otherwise pull
@@ -1048,7 +1232,7 @@ async def _sync_space(
 
 
 async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
-    """Sync Google Chat space history into raw Chat sync tables."""
+    """Sync Google Chat space history and project its threads into company context."""
     started_at = time.monotonic()
     record_run("started")
     if not env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED", default=False):
@@ -1126,7 +1310,6 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         kind = _error_kind(exc)
         error = _safe_error(exc)
         record_api_outcome("list_spaces", "rate_limited" if kind == "rate_limited" else "error")
-        record_etl_items_failed("google_chat", "message", "spaces", kind)
         await _record_run_finish(
             ctx._pool,
             run_id=run_id,
@@ -1186,6 +1369,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         "messages_upserted": 0,
         "files_processed": 0,
         "reactions_processed": 0,
+        "threads_projected": 0,
     }
     synced: list[dict[str, str]] = []
     failed: list[dict[str, str]] = enumeration_failures
@@ -1218,7 +1402,6 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             kind = _error_kind(exc)
             error = _safe_error(exc)
             failed.append(_scope_ref(space_id, error))
-            record_etl_items_failed("google_chat", "message", "space", kind)
             record_space_failure(kind)
             set_last_failure_time(dt.datetime.now(dt.timezone.utc).timestamp())
             await _update_checkpoint_failure(

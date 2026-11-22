@@ -2,17 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
 import time
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlencode
-
-# Google Chat is a Google Workspace API, so it reuses the same proxy-routed
-# httplib2 transport the Drive/Calendar ETLs use. Only the transport helper is
-# shared; this package stays the messaging analog of workflows/slack.
-from workflows.gsuite.http import build_http
+from urllib.parse import urlencode, urlsplit
 
 CHAT_API_BASE = "https://chat.googleapis.com/v1"
 # Bound every Chat call so a blocked egress rule fails fast instead of hanging
@@ -27,8 +23,7 @@ _TRANSIENT_BROKER_ERROR = re.compile(
     r"|response failed)"
 )
 
-# App-authentication is minted by iron-proxy's gcp_auth transform, exactly like
-# the Drive/Calendar ETLs. Opt-in private-DM sync uses WorkflowContext's
+# App-authentication is minted by iron-proxy's gcp_auth transform. Opt-in private-DM sync uses WorkflowContext's
 # subject-bound api-rs broker; the service-account key stays in googlechatbot.
 #
 # The grant must request these scopes (configured on the proxy, not here):
@@ -37,6 +32,28 @@ _TRANSIENT_BROKER_ERROR = re.compile(
 # chat.app.messages.readonly is what permits history reads, and REQUIRES a
 # one-time Workspace-admin install of the app's Marketplace listing — the
 # self-granted chat.bot scope alone is rejected with 403 for history.
+
+
+def build_http() -> Any:
+    """Build an httplib2 transport routed through iron-proxy.
+
+    httplib2 ignores HTTPS_PROXY, so the proxy and CA bundle are wired
+    explicitly; PySocks must be installed for httplib2 to honor the proxy.
+    """
+    import httplib2
+    import socks
+
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    proxy_info = None
+    if proxy_url:
+        parts = urlsplit(proxy_url)
+        proxy_info = httplib2.ProxyInfo(
+            proxy_type=socks.PROXY_TYPE_HTTP,
+            proxy_host=parts.hostname,
+            proxy_port=parts.port or 8080,
+        )
+    ca_certs = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+    return httplib2.Http(proxy_info=proxy_info, ca_certs=ca_certs)
 
 
 class GoogleChatApiError(RuntimeError):
@@ -88,8 +105,7 @@ class GoogleChatReadonlyClient:
 
     def _transport(self) -> Any:
         if self._http is None:
-            # The shared upstream helper takes no timeout argument, so the
-            # bound is set here; httplib2 applies `timeout` to every connection.
+            # httplib2 applies `timeout` to every connection.
             http = build_http()
             http.timeout = CHAT_HTTP_TIMEOUT_SECONDS
             self._http = http
