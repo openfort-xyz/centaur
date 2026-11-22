@@ -1,0 +1,5 @@
+description = "Google Chat: spaces, messages, threads, members, reactions, files and DMs; send, edit, delete and upload"
+
+# No declared secrets. Every call goes through Centaur's principal-scoped
+# /api/google-chat/* routes (CENTAUR_API_URL, with the principal API JWT
+# iron-proxy injects); the API checks the caller's per-space grants.

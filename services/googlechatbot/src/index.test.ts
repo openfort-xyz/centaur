@@ -474,15 +474,25 @@ describe('api-rs-only /api/chat routes', () => {
 describe('outbound /api/chat/attachments', () => {
   const appWith = (env: Record<string, string>) =>
     createGooglechatbot(loadConfig({ ...env }), { state: createMemoryState() }).app
-  const post = (app: ReturnType<typeof appWith>, headers: Record<string, string>, body: unknown) =>
-    app.request('/api/chat/spaces/A/attachments', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...headers },
-      body: JSON.stringify(body)
+  const form = (fields: Record<string, string | File>) => {
+    const body = new FormData()
+    for (const [name, value] of Object.entries(fields)) body.append(name, value)
+    return body
+  }
+  const post = (app: ReturnType<typeof appWith>, headers: Record<string, string>, body: BodyInit) =>
+    app.request('/api/chat/spaces/A/attachments', { method: 'POST', headers, body })
+  const configured = () =>
+    appWith({
+      GOOGLECHATBOT_INTERNAL_API_KEY: 'secret',
+      GOOGLECHATBOT_UPLOAD_USER: 'files@openfort.xyz',
+      GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
+        client_email: 'sa@example.iam.gserviceaccount.com',
+        private_key: 'key'
+      })
     })
 
   test('fails closed (503) when GOOGLECHATBOT_INTERNAL_API_KEY is not configured', async () => {
-    const res = await post(appWith({}), {}, {})
+    const res = await post(appWith({}), {}, form({}))
     expect(res.status).toBe(503)
   })
 
@@ -491,43 +501,38 @@ describe('outbound /api/chat/attachments', () => {
     const res = await post(
       app,
       { Authorization: 'Bearer secret' },
-      { filename: 'a.png', content_base64: 'aGk=' }
+      form({ file: new File(['hi'], 'a.png') })
     )
     expect(res.status).toBe(503)
     const body = (await res.json()) as { error?: string }
     expect(body.error).toContain('GOOGLECHATBOT_UPLOAD_USER')
   })
 
-  test('requires space_name, filename and content_base64 (400) when configured', async () => {
-    const app = appWith({
-      GOOGLECHATBOT_INTERNAL_API_KEY: 'secret',
-      GOOGLECHATBOT_UPLOAD_USER: 'files@openfort.xyz',
-      GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        client_email: 'sa@example.iam.gserviceaccount.com',
-        private_key: 'key'
-      })
-    })
-    const res = await post(app, { Authorization: 'Bearer secret' }, { space_name: 'spaces/A' })
+  test('requires a named file part (400) when configured', async () => {
+    const res = await post(configured(), { Authorization: 'Bearer secret' }, form({ text: 'hi' }))
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error?: string }
+    expect(body.error).toContain('`file` part')
+  })
+
+  test('rejects an empty file (400)', async () => {
+    const res = await post(
+      configured(),
+      { Authorization: 'Bearer secret' },
+      form({ file: new File([], 'a.txt') })
+    )
     expect(res.status).toBe(400)
   })
 
-  test('rejects malformed base64 (400) instead of silently truncating', async () => {
-    const app = appWith({
-      GOOGLECHATBOT_INTERNAL_API_KEY: 'secret',
-      GOOGLECHATBOT_UPLOAD_USER: 'files@openfort.xyz',
-      GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        client_email: 'sa@example.iam.gserviceaccount.com',
-        private_key: 'key'
-      })
-    })
+  test('rejects a non-multipart body (400)', async () => {
     const res = await post(
-      app,
-      { Authorization: 'Bearer secret' },
-      { filename: 'a.txt', content_base64: 'SGVsbG8h%%%%V29ybGQh' }
+      configured(),
+      { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      JSON.stringify({ filename: 'a.txt', content_base64: 'aGk=' })
     )
     expect(res.status).toBe(400)
     const body = (await res.json()) as { error?: string }
-    expect(body.error).toContain('not valid base64')
+    expect(body.error).toContain('multipart/form-data')
   })
 
   test('binds a threaded attachment create to the route space', async () => {
@@ -538,7 +543,9 @@ describe('outbound /api/chat/attachments', () => {
     let uploadSubject: string | undefined
     bot.client.canUploadAttachments = () => true
     bot.client.getSpace = async () => ({ name: 'spaces/A', spaceType: 'SPACE' })
-    bot.client.uploadAttachment = (async (_space, _name, _type, _data, subject) => {
+    let uploaded: unknown
+    bot.client.uploadAttachment = (async (_space, name, type, data, subject) => {
+      uploaded = { name, type, text: Buffer.from(data).toString() }
       uploadSubject = subject
       return { attachmentDataRef: { resourceName: 'media/F1' } }
     }) as typeof bot.client.uploadAttachment
@@ -551,17 +558,16 @@ describe('outbound /api/chat/attachments', () => {
       method: 'POST',
       headers: {
         Authorization: 'Bearer secret',
-        'content-type': 'application/json',
         'x-centaur-google-chat-dwd-subject': 'arnau@example.com'
       },
-      body: JSON.stringify({
-        filename: 'a.txt',
-        content_base64: 'aGk=',
+      body: form({
+        file: new File(['hi'], 'a.pdf', { type: 'application/pdf' }),
         thread_name: 'spaces/A/threads/T1'
       })
     })
 
     expect(response.status).toBe(200)
+    expect(uploaded).toEqual({ name: 'a.pdf', type: 'application/pdf', text: 'hi' })
     expect(uploadSubject).toBe('arnau@example.com')
     expect(options).toEqual({
       threadName: 'spaces/A/threads/T1',
