@@ -4,7 +4,7 @@ import { query, type Params } from "../_lib/http";
 // Centaur Console's sandbox API, reached through the sandbox's iron-proxy, which injects the
 // short-lived sandbox entitlement for the caller's principal. Results are Console's own
 // payloads with the `{ data: ... }` envelope removed. Admin endpoints answer only in an active
-// Console admin's Slack DM.
+// Console admin's Slack or Google Chat DM.
 
 const DEFAULT_BASE = "http://centaur-console:3000";
 const PERMISSIONS_PATH = "/api/v1/sandbox/permissions";
@@ -21,6 +21,7 @@ const ADMIN_PAGE_LIMIT = 200;
 const ADMIN_WRITABLE_SECRET_PATHS: Record<string, string> = {
   static: "/api/v1/sandbox/admin/static_secrets",
   pg_dsn: "/api/v1/sandbox/admin/pg_dsn_secrets",
+  gcp_auth: "/api/v1/sandbox/admin/gcp_auth_secrets",
   gcp_id_token: "/api/v1/sandbox/admin/gcp_id_token_secrets",
 };
 
@@ -155,7 +156,7 @@ export interface EffectiveGrant {
   [field: string]: unknown;
 }
 
-/** A static, pg_dsn, or gcp_id_token secret document; its source reference, never its value. */
+/** A static, pg_dsn, gcp_auth, or gcp_id_token secret document; its source reference, never its value. */
 export interface SecretDocument {
   id: string;
   foreign_id: string;
@@ -376,8 +377,13 @@ export async function scheduled_task(
 /**
  * Create a scheduled task owned by the caller. Omit `cron_expression` for a manual (run-on-demand)
  * task; otherwise pass five cron fields, interpreted in Pacific Time. Omit `delivery_channel` to
- * deliver to the caller's DM, or to the current channel in a Slack channel thread. `enabled`
- * defaults to true.
+ * deliver to the caller's DM, or to the current channel in a Slack channel thread. A Google Chat
+ * space (`spaces/<id>`) the caller may send to, or the caller's own email for their Chat DM, is
+ * also a valid `delivery_channel`. `enabled`
+ * defaults to true. Pass `owner: "me"` in a Slack channel thread to create the task for the person
+ * who sent the current message instead of the channel: it runs with their permissions and always
+ * delivers to their DM (any other `delivery_channel` is refused). It cannot target anyone else, and
+ * such tasks are listed and managed from that person's DM, not the channel.
  */
 export async function create_scheduled_task(
   args: {
@@ -386,6 +392,7 @@ export async function create_scheduled_task(
     cron_expression?: string;
     delivery_channel?: string;
     enabled?: boolean;
+    owner?: "me";
   },
   ctx: Ctx,
 ): Promise<{ task: ScheduledTask }> {
@@ -396,6 +403,7 @@ export async function create_scheduled_task(
     enabled: args.enabled === undefined ? true : args.enabled,
   };
   if (args.delivery_channel !== undefined) data.delivery_channel = args.delivery_channel;
+  if (args.owner !== undefined) data.owner = args.owner;
   return {
     task: dataObject(
       await request(ctx, SCHEDULED_TASKS_PATH, {
@@ -603,7 +611,7 @@ export async function admin_secrets(
 }
 
 /**
- * Read a static, pg_dsn, or gcp_id_token secret's document by OID, foreign ID or unambiguous name:
+ * Read a static, pg_dsn, gcp_auth, or gcp_id_token secret's document by OID, foreign ID or unambiguous name:
  * its source reference and rules, never the secret value. Other secret kinds can only be inspected
  * in the Console UI.
  */
@@ -616,21 +624,22 @@ export async function admin_secret(
 }
 
 /**
- * Create a static, pg_dsn, or gcp_id_token secret from a Console API document. `data` is that
- * kind's document, for example `{ name, foreign_id, description, labels, source: { source_type,
- * config } }` for static, `{ name, foreign_id, database, role, dsn: {...} }` for pg_dsn, or
- * `{ name, foreign_id, audience, keyfile: {...} }` for gcp_id_token. Sources must reference an
- * external secret store. Console admins only.
+ * Create a static, pg_dsn, gcp_auth, or gcp_id_token secret from a Console API document. `data` is
+ * that kind's document, for example `{ name, foreign_id, description, labels, source: {
+ * source_type, config } }` for static, `{ name, foreign_id, database, role, dsn: {...} }` for
+ * pg_dsn, `{ name, foreign_id, scopes, rules, keyfile: {...} }` or `{ ..., credentials_provider: {
+ * type: "workload_identity" } }` for gcp_auth, or `{ name, foreign_id, audience, keyfile: {...} }`
+ * for gcp_id_token. Sources must reference an external secret store. Console admins only.
  */
 export async function admin_create_secret(
   args: {
-    kind: "static" | "pg_dsn" | "gcp_id_token";
+    kind: "static" | "pg_dsn" | "gcp_auth" | "gcp_id_token";
     data: Record<string, unknown>;
   },
   ctx: Ctx,
 ): Promise<{ secret: SecretDocument }> {
   const path = ADMIN_WRITABLE_SECRET_PATHS[args.kind];
-  if (!path) throw new Error("kind must be static, pg_dsn, or gcp_id_token");
+  if (!path) throw new Error("kind must be static, pg_dsn, gcp_auth, or gcp_id_token");
   return {
     secret: dataObject(
       await request(ctx, path, { method: "POST", data: { data: args.data }, label: admin }),
@@ -640,8 +649,9 @@ export async function admin_create_secret(
 }
 
 /**
- * Replace the given fields of a static, pg_dsn, or gcp_id_token secret, addressed by OID, foreign
- * ID or unambiguous name; omitted fields, including its source, are kept. Console admins only.
+ * Replace the given fields of a static, pg_dsn, gcp_auth, or gcp_id_token secret, addressed by OID,
+ * foreign ID or unambiguous name; omitted fields, including its source, are kept. Console admins
+ * only.
  */
 export async function admin_update_secret(
   args: { secret: string; data: Record<string, unknown> },
@@ -752,6 +762,91 @@ export async function admin_remove_slack_permission(
     encodeURIComponent(args.channel_id);
   await request(ctx, path, { method: "DELETE", label: admin });
   return { principal: args.principal, channel_id: args.channel_id, removed: true };
+}
+
+const GOOGLE_SPACE_PERMISSION_FLAGS = [
+  "send",
+  "update",
+  "delete",
+  "upload",
+  "download",
+  "history",
+  "members",
+  "reactions",
+] as const;
+
+type GoogleSpacePermissionFlag = (typeof GOOGLE_SPACE_PERMISSION_FLAGS)[number];
+
+function googleSpaceName(space: string): string {
+  const trimmed = space.trim();
+  return trimmed.startsWith("spaces/") ? trimmed : `spaces/${trimmed}`;
+}
+
+/**
+ * Create or update a principal's Google Chat space permission. `space` is `spaces/<id>` or the bare
+ * id. Each flag defaults to enabled when omitted on a new permission and stays unchanged when
+ * omitted on an existing one. Console admins only, from a Google Chat DM.
+ */
+export async function admin_set_google_space_permission(
+  args: { principal: string; space: string } & Partial<Record<GoogleSpacePermissionFlag, boolean>>,
+  ctx: Ctx,
+): Promise<{ permission: Record<string, unknown> }> {
+  const data: Record<string, unknown> = { space_name: googleSpaceName(args.space) };
+  for (const flag of GOOGLE_SPACE_PERMISSION_FLAGS) {
+    const value = args[flag];
+    if (value !== undefined) data[`${flag}_enabled`] = value;
+  }
+  const principalId = await adminPrincipalId(ctx, args.principal);
+  const path = `${ADMIN_PRINCIPALS_PATH}/${encodeURIComponent(principalId)}/google_chat_space_permissions`;
+  return {
+    permission: dataObject(
+      await request(ctx, path, { method: "POST", data: { data }, label: admin }),
+      admin,
+    ),
+  };
+}
+
+/** Remove a principal's own permission for a Google Chat space. Console admins only. */
+export async function admin_remove_google_space_permission(
+  args: { principal: string; space: string },
+  ctx: Ctx,
+): Promise<{ principal: string; space: string; removed: boolean }> {
+  const principalId = await adminPrincipalId(ctx, args.principal);
+  const spaceId = googleSpaceName(args.space).slice("spaces/".length);
+  const path =
+    `${ADMIN_PRINCIPALS_PATH}/${encodeURIComponent(principalId)}/google_chat_space_permissions/` +
+    encodeURIComponent(spaceId);
+  await request(ctx, path, { method: "DELETE", label: admin });
+  return { principal: args.principal, space: args.space, removed: true };
+}
+
+/** Allow a principal to set up a Google Chat DM with the person at `email`. Console admins only. */
+export async function admin_set_google_dm_permission(
+  args: { principal: string; email: string },
+  ctx: Ctx,
+): Promise<{ permission: Record<string, unknown> }> {
+  const principalId = await adminPrincipalId(ctx, args.principal);
+  const path = `${ADMIN_PRINCIPALS_PATH}/${encodeURIComponent(principalId)}/google_chat_dm_permissions`;
+  const data = { target_identity: args.email, setup_enabled: true };
+  return {
+    permission: dataObject(
+      await request(ctx, path, { method: "POST", data: { data }, label: admin }),
+      admin,
+    ),
+  };
+}
+
+/** Remove a principal's own Google Chat DM permission for `email`. Console admins only. */
+export async function admin_remove_google_dm_permission(
+  args: { principal: string; email: string },
+  ctx: Ctx,
+): Promise<{ principal: string; email: string; removed: boolean }> {
+  const principalId = await adminPrincipalId(ctx, args.principal);
+  const path =
+    `${ADMIN_PRINCIPALS_PATH}/${encodeURIComponent(principalId)}/google_chat_dm_permissions/` +
+    encodeURIComponent(args.email);
+  await request(ctx, path, { method: "DELETE", label: admin });
+  return { principal: args.principal, email: args.email, removed: true };
 }
 
 /**

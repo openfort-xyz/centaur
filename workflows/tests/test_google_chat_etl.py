@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import importlib
 import json
@@ -16,14 +17,6 @@ def _install_api_stubs() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-
-    # Sibling test modules (test_attio_sync, test_company_context_documents_
-    # attachments, the slack ETL tests) stub these into sys.modules at import
-    # time, and some stubs lack the record_etl_items_* names. Evict them so
-    # this module imports the real implementations regardless of collection
-    # order.
-    for stubbed in ("workflows.etl_metrics", "workflows.slack.shared"):
-        sys.modules.pop(stubbed, None)
 
     runtime_control = sys.modules.get("api.runtime_control") or types.ModuleType(
         "api.runtime_control"
@@ -56,7 +49,6 @@ def _install_api_stubs() -> None:
 
 
 _install_api_stubs()
-projection = importlib.import_module("workflows.company_context_documents")
 chat_sync = importlib.import_module("workflows.google_chat.sync")
 chat_metrics = importlib.import_module("workflows.google_chat.metrics")
 chat_retention = importlib.import_module("workflows.google_chat.retention")
@@ -64,115 +56,87 @@ chat_client = importlib.import_module("workflows.google_chat.client")
 
 
 # --------------------------------------------------------------------------- #
-# Projection: thread document builder
+# Company-context documents: rendering and readers
 # --------------------------------------------------------------------------- #
-def _msg_row(message_id, sender_id, sender_name, text, created, updated):
+def _msg_row(sender_id, sender_name, text, created, attachments="", reactions=""):
     return {
-        "space_id": "S1",
         "space_display_name": "Engineering",
         "space_type": "SPACE",
-        "message_id": message_id,
-        "message_name": f"spaces/S1/messages/{message_id}",
-        "thread_id": "T1",
         "sender_id": sender_id,
         "sender_name": sender_name,
-        "sender_type": "HUMAN",
         "text_content": text,
         "source_create_time": created,
-        "updated_at": updated,
+        "attachments": attachments,
+        "reactions": reactions,
     }
 
 
-def test_google_chat_thread_document_renders_thread():
+def test_thread_document_renders_thread():
+    started = dt.datetime(2026, 6, 1, 9, 0, tzinfo=dt.UTC)
     messages = [
+        _msg_row("users/1", "Alice", "Should we ship the paymaster change?", started),
         _msg_row(
-            "m1",
-            "users/1",
-            "Alice",
-            "Should we ship the paymaster change?",
-            dt.datetime(2026, 6, 1, 9, 0, tzinfo=dt.UTC),
-            dt.datetime(2026, 6, 1, 9, 5, tzinfo=dt.UTC),
-        ),
-        _msg_row(
-            "m2",
             "users/2",
             "Bob",
             "Yes, after the canary passes.",
             dt.datetime(2026, 6, 1, 9, 2, tzinfo=dt.UTC),
-            dt.datetime(2026, 6, 1, 9, 3, tzinfo=dt.UTC),
+            attachments="runbook.txt",
+            reactions="✅",
         ),
     ]
 
-    document = projection._google_chat_thread_document(
-        space_id="S1", thread_id="T1", messages=messages
-    )
+    document = chat_sync._thread_document("S1", "T1", messages)
 
-    assert document is not None
-    assert document["document_id"] == "google_chat:thread:S1:T1"
-    assert document["source"] == "google_chat"
-    assert document["source_type"] == "google_chat_thread"
-    assert document["source_document_id"] == "S1:T1"
     assert document["title"] == "Should we ship the paymaster change?"
-    assert document["author_name"] == "Alice"
-    assert document["occurred_at"] == dt.datetime(2026, 6, 1, 9, 0, tzinfo=dt.UTC)
-    # source_updated_at is the newest message updated_at across the thread.
-    assert document["source_updated_at"] == dt.datetime(2026, 6, 1, 9, 5, tzinfo=dt.UTC)
-    assert document["metadata"]["message_count"] == 2
-    assert document["metadata"]["participants"] == ["Alice", "Bob"]
-    assert document["url"] == ""  # Chat has no stable public message URL
+    assert document["occurred_at"] == started
+    assert document["metadata"] == {
+        "space_id": "S1",
+        "space_name": "Engineering",
+        "space_type": "SPACE",
+        "thread_id": "T1",
+        "message_count": 2,
+        "participants": ["Alice", "Bob"],
+    }
     assert "- Space: Engineering" in document["body"]
     assert "Yes, after the canary passes." in document["body"]
+    assert "Attachments: runbook.txt" in document["body"]
+    assert "Reactions: ✅" in document["body"]
 
 
-def test_google_chat_thread_document_falls_back_to_sender_id_and_space_title():
-    messages = [
-        _msg_row(
-            "m1",
-            "users/9",
-            "",  # no display name resolved
-            "",  # no text -> title falls back to the space
-            dt.datetime(2026, 6, 2, 8, 0, tzinfo=dt.UTC),
-            dt.datetime(2026, 6, 2, 8, 0, tzinfo=dt.UTC),
-        )
-    ]
+def test_thread_document_falls_back_to_sender_id_and_space_title():
+    created = dt.datetime(2026, 6, 2, 8, 0, tzinfo=dt.UTC)
+    document = chat_sync._thread_document("S1", "T9", [_msg_row("users/9", "", "", created)])
 
-    document = projection._google_chat_thread_document(
-        space_id="S1", thread_id="T9", messages=messages
-    )
-
-    assert document is not None
     assert document["title"] == "Chat thread in Engineering"
-    assert document["author_name"] == "users/9"
+    assert "### users/9 - 2026-06-02 08:00:00 UTC" in document["body"]
 
 
-def test_google_chat_attachment_document_is_company_context():
-    row = {
-        "space_id": "S1",
-        "message_id": "M1",
-        "attachment_id": "A1",
-        "content_name": "runbook.txt",
-        "content_text": "restart api-rs",
-        "content_type": "text/plain",
-        "source_uri": "https://example.invalid/source",
-        "download_uri": "",
-        "sender_id": "users/1",
-        "sender_name": "Alice",
-        "source_create_time": dt.datetime(2026, 6, 1, tzinfo=dt.UTC),
-        "updated_at": dt.datetime(2026, 6, 2, tzinfo=dt.UTC),
-    }
-    document = projection._google_chat_attachment_document(row)
-    assert document["document_id"] == "google_chat:attachment:S1:M1:A1"
-    assert document["source_type"] == "google_chat_attachment"
-    assert document["access_scope"] == "company"
-    assert document["body"] == "restart api-rs"
+def test_thread_document_body_fits_the_custom_documents_limit():
+    created = dt.datetime(2026, 6, 2, 8, 0, tzinfo=dt.UTC)
+    huge = "é" * chat_sync.MAX_DOCUMENT_BODY_BYTES
+    document = chat_sync._thread_document("S1", "T1", [_msg_row("users/1", "A", huge, created)])
+    assert len(document["body"].encode()) <= chat_sync.MAX_DOCUMENT_BODY_BYTES
 
 
-def test_google_chat_registered_as_projection_source():
-    assert "google_chat_thread" in projection.COMPANY_CONTEXT_SOURCE_TYPES["google_chat"]
+def test_space_reader_matches_iron_control_principal_slug():
+    # Expected values follow crates/centaur-iron-control/src/util.rs slugify.
+    assert chat_sync._space_reader("AAAAb3_x-Y") == "principal:gchat-space-aaaab3-x-y"
+    assert chat_sync._space_reader("--Edge  Proxy--") == "principal:gchat-space-edge-proxy"
+    assert chat_sync._space_reader("__") == "principal:gchat-space-x"
+
+
+def test_thread_external_ids_are_scoped_by_dm_owner():
+    assert chat_sync._thread_external_id("", "S1", "T1") == "spaces/S1/threads/T1"
     assert (
-        projection.ETL_CHECKPOINT_TABLES["google_chat"]
-        == "google_chat_sync_checkpoints"
+        chat_sync._thread_external_id("alice@example.com", "DM1", "T1")
+        == "alice@example.com/spaces/DM1/threads/T1"
     )
+
+
+def test_schedules_do_not_depend_on_deployment_env():
+    assert chat_sync.SCHEDULE["interval_seconds"] == chat_sync.DEFAULT_SYNC_INTERVAL_SECONDS
+    assert chat_sync.SCHEDULE["enabled"] is True
+    assert chat_retention.SCHEDULE["enabled"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -562,6 +526,13 @@ class FakeSyncPool:
         # _load_checkpoint -> no existing checkpoint (cold start)
         return None
 
+    async def fetch(self, query, *args):
+        return []
+
+    async def fetchval(self, query, *args):
+        self.executed.append((query, args))
+        return None
+
     async def execute(self, query, *args):
         self.executed.append((query, args))
         if "google_chat_sync_checkpoints" in query and "watermark_time" in query:
@@ -628,9 +599,6 @@ def test_sync_space_emits_only_positive_counter_increments(monkeypatch):
         increments.append((name, count))
 
     monkeypatch.setattr(chat_metrics, "increment_metric", record)
-    # Sibling test modules may replace workflows.etl_metrics in sys.modules,
-    # so patch the module the sync imported from.
-    monkeypatch.setitem(chat_sync.record_etl_items_seen.__globals__, "increment_metric", record)
     message = {
         "name": "spaces/S1/messages/m1",
         "text": "no files, no reactions",
@@ -1019,24 +987,6 @@ def test_message_without_reaction_summaries_clears_stale_reactions_without_rpc()
     assert reaction_deletes == {"unreacted": []}
 
 
-def test_changed_chat_threads_exclude_owner_scoped_dms():
-    class Pool:
-        def __init__(self):
-            self.queries = []
-
-        async def fetch(self, query, *args):
-            self.queries.append(query)
-            return []
-
-        async def fetchrow(self, query, *args):
-            self.queries.append(query)
-            return {"changed_messages": 0, "max_updated_at": None}
-
-    pool = Pool()
-    asyncio.run(projection._load_changed_chat_threads(pool, None))
-    assert all("owner_email = ''" in query for query in pool.queries)
-
-
 def test_dm_sync_allowlist_defaults_off_and_intersects_requested(monkeypatch):
     monkeypatch.delenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", raising=False)
     monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SUBJECTS", "alice@example.com")
@@ -1138,12 +1088,145 @@ def test_error_classification_uses_status_not_string_sniffing():
     assert "nope" not in chat_sync._safe_error(leaky)
 
 
-def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
-    monkeypatch,
-):
+# The custom documents table as crates/centaur-company-context migrations
+# 0014-0018 leave it, minus the projection triggers. Those migrations need the
+# vector extension, which the session test database does not have.
+CUSTOM_DOCUMENTS_SQL = """
+CREATE SCHEMA company_context_system;
+CREATE TABLE company_context_system.custom_documents (
+    source text NOT NULL,
+    external_id text NOT NULL,
+    title text NOT NULL DEFAULT '',
+    body text NOT NULL,
+    occurred_at timestamptz,
+    readers text[] NOT NULL,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    written_by text,
+    PRIMARY KEY (source, external_id),
+    CHECK (source ~ '^[a-z0-9][a-z0-9-]{0,63}$'),
+    CHECK (external_id <> '' AND octet_length(external_id) <= 512),
+    CHECK (char_length(title) <= 1000),
+    CHECK (btrim(body) <> '' AND octet_length(body) <= 1000000),
+    CHECK (array_to_string(readers, ' ') ~ '^((public|(principal|role):[A-Za-z0-9._~-]+)( |$))*$')
+);
+"""
+
+
+@contextlib.asynccontextmanager
+async def _test_database(name):
+    """A fresh database with the session migrations and custom documents table."""
     database_url = os.getenv("SESSION_SQLX_TEST_DATABASE_URL")
     if not database_url:
         raise SkipTest("SESSION_SQLX_TEST_DATABASE_URL is required for database coverage")
+    import asyncpg
+
+    admin = await asyncpg.connect(database_url)
+    database = f"centaur_google_chat_{name}_{os.getpid()}_{time.time_ns()}"
+    await admin.execute(f'CREATE DATABASE "{database}"')
+    conn = None
+    try:
+        conn = await asyncpg.connect(database_url, database=database)
+        migration_dir = Path(__file__).resolve().parents[2] / "crates/centaur-session-sqlx/migrations"
+        for migration in sorted(migration_dir.glob("*.sql")):
+            await conn.execute(migration.read_text())
+        await conn.execute(CUSTOM_DOCUMENTS_SQL)
+        yield conn
+    finally:
+        if conn is not None:
+            await conn.close()
+        await admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+        await admin.close()
+
+
+class _Ctx:
+    def __init__(self, run_id, pool):
+        self.run_id = run_id
+        self._pool = pool
+
+    def log(self, _event, **_fields):
+        pass
+
+
+def _space_message(message_id, thread_id, text, **fields):
+    return {
+        "name": f"spaces/S1/messages/{message_id}",
+        "text": text,
+        "thread": {"name": f"spaces/S1/threads/{thread_id}"},
+        "sender": {"name": "users/1", "displayName": "Alice", "type": "HUMAN"},
+        "createTime": "2026-08-14T10:00:00Z",
+        **fields,
+    }
+
+
+def test_space_threads_become_space_scoped_documents_and_tombstones_remove_them(
+    monkeypatch,
+):
+    class AppClient:
+        def __init__(self, messages):
+            self.messages = messages
+
+        def list_members(self, space_name, *, page_size, page_token=None):
+            return {"memberships": []}
+
+        def list_messages(
+            self, space_name, *, page_size, page_token=None, filter=None, show_deleted=False
+        ):
+            return {"messages": self.messages}
+
+        def list_reactions(self, message_name, *, page_size, page_token=None):
+            return {"emojiReactions": []}
+
+    async def run():
+        async with _test_database("space") as conn:
+            monkeypatch.setenv("GOOGLE_CHAT_ETL_ENABLED", "true")
+            monkeypatch.delenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", raising=False)
+            client = AppClient(
+                [
+                    _space_message("M1", "T1", "ship it?"),
+                    _space_message("M2", "T1", "after canary"),
+                    _space_message("M3", "T2", "unrelated"),
+                ]
+            )
+            monkeypatch.setattr(chat_sync, "_client", lambda _ctx: client)
+            for run_id in ("workflow-1", "workflow-2"):
+                result = await chat_sync.handler(
+                    chat_sync.Input(space_ids=["spaces/S1"]), _Ctx(run_id, conn)
+                )
+                assert result["status"] == "completed"
+
+            rows = await conn.fetch(
+                "SELECT source, external_id, title, body, readers, metadata "
+                "FROM company_context_system.custom_documents ORDER BY external_id"
+            )
+            assert [row["external_id"] for row in rows] == [
+                "spaces/S1/threads/T1",
+                "spaces/S1/threads/T2",
+            ]
+            thread = rows[0]
+            assert thread["source"] == "google-chat"
+            assert thread["readers"] == ["principal:gchat-space-s1"]
+            assert thread["title"] == "ship it?"
+            assert "after canary" in thread["body"]
+            assert json.loads(thread["metadata"])["message_count"] == 2
+
+            client.messages = [
+                _space_message("M1", "T1", "", deleteTime="2026-08-15T10:00:00Z"),
+                _space_message("M2", "T1", "", deleteTime="2026-08-15T10:00:00Z"),
+            ]
+            result = await chat_sync.handler(
+                chat_sync.Input(space_ids=["S1"]), _Ctx("workflow-3", conn)
+            )
+            assert result["status"] == "completed"
+            assert await conn.fetchval(
+                "SELECT array_agg(external_id) FROM company_context_system.custom_documents"
+            ) == ["spaces/S1/threads/T2"]
+
+    asyncio.run(run())
+
+
+def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
+    monkeypatch,
+):
 
     class AppClient:
         def list_spaces(self, *, page_size, page_token=None):
@@ -1203,30 +1286,19 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
                 ]
             }
 
-    class Ctx:
-        def __init__(self, run_id, pool):
-            self.run_id = run_id
-            self._pool = pool
-
-        def log(self, _event, **_fields):
-            pass
-
     async def run():
-        import asyncpg
-
-        admin = await asyncpg.connect(database_url)
-        database = f"centaur_google_chat_dwd_{os.getpid()}_{time.time_ns()}"
-        await admin.execute(f'CREATE DATABASE "{database}"')
-        conn = None
-        try:
-            conn = await asyncpg.connect(database_url, database=database)
-            migration_dir = (
-                Path(__file__).resolve().parents[2]
-                / "crates/centaur-session-sqlx/migrations"
+        async with _test_database("dwd") as conn:
+            # Alice's verified DM with the bot, and an unverified one that
+            # api-rs would not label with her email.
+            await conn.execute(
+                "INSERT INTO sessions (thread_key, harness_type, status, metadata) VALUES "
+                "('chat:spaces:BotDM_1:t1', 'codex', 'idle', "
+                "'{\"googlechat_space_type\": \"DIRECT_MESSAGE\", "
+                "\"googlechat_request_verified\": true, \"user_email\": \"Alice@Example.com\"}'), "
+                "('chat:spaces:Spoof:t1', 'codex', 'idle', "
+                "'{\"googlechat_space_type\": \"DIRECT_MESSAGE\", "
+                "\"googlechat_request_verified\": false, \"user_email\": \"alice@example.com\"}')"
             )
-            for migration in sorted(migration_dir.glob("*.sql")):
-                await conn.execute(migration.read_text())
-
             monkeypatch.setenv("GOOGLE_CHAT_ETL_ENABLED", "true")
             monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SYNC_ENABLED", "true")
             monkeypatch.setenv("GOOGLE_CHAT_DWD_DM_SUBJECTS", "alice@example.com")
@@ -1238,7 +1310,7 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
             for run_id in ("workflow-1", "workflow-2"):
                 result = await chat_sync.handler(
                     chat_sync.Input(dm_subjects=["alice@example.com"]),
-                    Ctx(run_id, conn),
+                    _Ctx(run_id, conn),
                 )
                 assert result["status"] == "completed"
                 assert result["files_processed"] == 1
@@ -1260,11 +1332,14 @@ def test_dwd_dm_sync_persists_participants_attachments_reactions_idempotently(
             assert await conn.fetchval(
                 "SELECT emoji_unicode FROM google_chat_sync_reactions"
             ) == "✅"
-        finally:
-            if conn is not None:
-                await conn.close()
-            await admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
-            await admin.close()
+            document = await conn.fetchrow(
+                "SELECT external_id, readers, body, metadata "
+                "FROM company_context_system.custom_documents"
+            )
+            assert document["external_id"] == "alice@example.com/spaces/DM1/threads/M1"
+            assert document["readers"] == ["principal:gchat-space-botdm-1"]
+            assert "Attachments: runbook.txt" in document["body"]
+            assert json.loads(document["metadata"])["owner_email"] == "alice@example.com"
 
     asyncio.run(run())
 
@@ -1293,25 +1368,8 @@ def test_retention_modes_never_call_google_api():
 
 
 def test_retention_db_age_batch_cleanup_and_idempotency():
-    database_url = os.getenv("SESSION_SQLX_TEST_DATABASE_URL")
-    if not database_url:
-        raise SkipTest("SESSION_SQLX_TEST_DATABASE_URL is required for database coverage")
-
     async def run():
-        import asyncpg
-
-        admin = await asyncpg.connect(database_url)
-        database = f"centaur_google_chat_retention_{os.getpid()}_{time.time_ns()}"
-        await admin.execute(f'CREATE DATABASE "{database}"')
-        conn = None
-        try:
-            conn = await asyncpg.connect(database_url, database=database)
-            migration_dir = (
-                Path(__file__).resolve().parents[2]
-                / "crates/centaur-session-sqlx/migrations"
-            )
-            for migration in sorted(migration_dir.glob("*.sql")):
-                await conn.execute(migration.read_text())
+        async with _test_database("retention") as conn:
             await conn.execute(
                 "INSERT INTO google_chat_sync_runs "
                 "(run_id,status,started_at,finished_at) VALUES "
@@ -1348,10 +1406,11 @@ def test_retention_db_age_batch_cleanup_and_idempotency():
                 "('','OLD',NOW()-INTERVAL '40 days'),('','NEW',NOW())"
             )
             await conn.execute(
-                "INSERT INTO company_context_documents "
-                "(document_id,source,source_type,source_document_id,occurred_at) VALUES "
-                "('google_chat:old','google_chat','google_chat_thread','OLD',NOW()-INTERVAL '40 days'),"
-                "('google_chat:new','google_chat','google_chat_thread','NEW',NOW())"
+                "INSERT INTO company_context_system.custom_documents "
+                "(source,external_id,body,occurred_at,readers) VALUES "
+                "('google-chat','spaces/OLD/threads/OLD','old',NOW()-INTERVAL '40 days','{}'),"
+                "('google-chat','spaces/NEW/threads/NEW','new',NOW(),'{}'),"
+                "('memory','old','not chat',NOW()-INTERVAL '40 days','{}')"
             )
             dry = await chat_retention.prune_google_chat(
                 conn, retention_days=30, mode="dry_run", batch_limit=1
@@ -1386,11 +1445,10 @@ def test_retention_db_age_batch_cleanup_and_idempotency():
             assert await conn.fetchval(
                 "SELECT COUNT(*) FROM google_chat_sync_reactions"
             ) == 1
-        finally:
-            if conn is not None:
-                await conn.close()
-            await admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
-            await admin.close()
+            assert await conn.fetchval(
+                "SELECT array_agg(source || ':' || external_id ORDER BY source) "
+                "FROM company_context_system.custom_documents"
+            ) == ["google-chat:spaces/NEW/threads/NEW", "memory:old"]
 
     asyncio.run(run())
 

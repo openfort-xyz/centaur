@@ -190,7 +190,7 @@ with `chat.spaces.create`, so the target must be an active, impersonable user in
 the service account's Workspace domain.
 
 Scheduled DM ETL uses the exact lowercase subjects in
-`apiRs.etl.googleChat.dmSync.subjects` and additionally needs
+`GOOGLE_CHAT_DWD_DM_SUBJECTS` and additionally needs
 `chat.spaces.readonly`, `chat.memberships.readonly`, and
 `chat.messages.reactions.readonly`. The workflow sandbox sends bounded read
 requests to api-rs; googlechatbot alone receives `GOOGLE_SERVICE_ACCOUNT_JSON`
@@ -383,8 +383,8 @@ requires every ledger gate to pass on the same immutable release.
 1. Disable the public Google Chat endpoint or set `googlechatbot.enabled=false`,
    then deploy. Do not disable signature verification while leaving ingress
    public.
-2. Set `apiRs.etl.googleChat.enabled=false` and
-   `apiRs.etl.googleChat.dmSync.enabled=false` to stop new ingestion.
+2. Set `GOOGLE_CHAT_ETL_ENABLED=false` and
+   `GOOGLE_CHAT_DWD_DM_SYNC_ENABLED=false` to stop new ingestion.
 3. Revoke the service account's DWD scopes and remove the Chat app installation
    if the integration is being retired.
 4. Remove Google Chat space and DM grants from affected principals and roles.

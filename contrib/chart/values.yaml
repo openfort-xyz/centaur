@@ -157,7 +157,7 @@ console:
   # must exist or the console pods CreateContainerConfigError. This is the
   # Sign-in-with-Slack OIDC app (scopes openid/email/profile, redirect URL
   # <publicUrl>/auth/slack/callback) — not the DB-managed Slack OAuth app the
-  # bot and DM sync use.
+  # bot and company-context service use.
   slackOauth:
     enabled: false
   # Okta as an OIDC identity provider for console sign-in. Set issuer to the
@@ -171,19 +171,11 @@ console:
     issuer: ""
     # Must match token_endpoint_auth_method on the Okta client application.
     tokenEndpointAuthMethod: client_secret_basic
-  # OAuth app slug whose user-level Slack credentials are used by the DM sync
-  # worker. Keep this aligned with the Console OAuth app users authorize.
+  # OAuth app slug whose user-level Slack credentials the company-context
+  # service indexes. Keep this aligned with the Console OAuth app users
+  # authorize.
   slackDmSync:
     oauthAppSlug: slack
-  # Google Docs metadata and document-content ETL. Enable this to run the
-  # recurring poller and queued Google Docs sync jobs. Disabled jobs exit
-  # without work.
-  # This does not disable Google OAuth or remove previously indexed content.
-  googleDocsSync:
-    enabled: false
-    # Index credentials from this OAuth app. A dedicated app can limit ingestion
-    # to one shared account without syncing other connected users.
-    oauthAppSlug: google
   service:
     httpPort: 3000
   # Optional Ingress for the console. Bring your own controller — Tailscale
@@ -250,10 +242,11 @@ overlay:
 # toolServer.extraSources are mapped into this shape for compatibility.
 #
 # Subdirs default to the conventional layout — toolsSubdir: tools,
-# workflowsSubdir: workflows, skillsSubdir: .agents/skills — so most sources
-# only need `repo`; set `ref` to a branch, tag, or commit when you do not want
-# the repo's default branch. Directories missing from a repo are skipped at
-# runtime. Set a subdir to "" to explicitly disable that surface for a source.
+# workflowsSubdir: workflows, skillsSubdir: .agents/skills,
+# connectorsSubdir: connectors — so most sources only need `repo`; set `ref` to
+# a branch, tag, or commit when you do not want the repo's default branch.
+# Directories missing from a repo are skipped at runtime. Set a subdir to ""
+# to explicitly disable that surface for a source.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
 overlays:
@@ -269,6 +262,7 @@ overlays:
   #   visibility: private
   #   toolsSubdir: ""
   #   skillsSubdir: ""
+  #   connectorsSubdir: ""
 
 codex:
   # Operator-defined OpenAI-compatible Responses providers. Each provider is
@@ -298,6 +292,15 @@ codex:
   #           defaultReasoning: high
   #           reasoningAliases: {max: high}
   customProviders: {}
+
+# Code Mode runtime image. api-rs builds one sandbox per principal from this
+# slim image when `apiRs.mcpEnabled` is true. Pull policy and pull secrets
+# reuse `sandbox.image.pullPolicy` and `global.imagePullSecrets`. Rendered as
+# CENTAUR_CODEMODE_IMAGE.
+codemode:
+  image:
+    repository: centaur-codemode
+    tag: latest
 
 sandbox:
   image:
@@ -515,14 +518,6 @@ tokenBroker:
     annotations: {}
   resources: {}
 
-# v1 company-context ingestion: the api-rs Slack workflows (slack_sync,
-# slack_backfill, slack_retention) and the Console Slack DM, Google Docs, and
-# Granola sync jobs. Set false to stop all of them, for example to roll out
-# experimentalCompanyContext in isolation. Already-synced data is kept, and
-# Slack retention does not run while this is false.
-companyContextV1:
-  enabled: true
-
 # API clients: machine callers, such as eval runners, that exchange a client
 # secret for a session API token at api-rs /oauth/token. Off hides them in the
 # Console, removes the token endpoint, and rejects their existing tokens.
@@ -531,9 +526,16 @@ apiClients:
 
 # Standalone company-context ingestion service. It indexes Google Docs and PDFs
 # from Google Drive, Google Calendar events, and Granola meeting notes into its
-# private system and data schemas. Disabled while the corpus is validated
-# alongside the legacy Python workflows.
-experimentalCompanyContext:
+# private system and data schemas. Off by default. Enabling it requires
+# OPENAI_API_KEY, SLACK_BOT_TOKEN, and CENTAUR_JWT_SIGNING_SECRET in the shared
+# Secret; the pod does not start without them. Review the indexers and
+# syncLimits below before enabling. See docs/pages/operate/company-context.mdx.
+#
+# Backwards compatibility: this block used to be named
+# `experimentalCompanyContext`. That key is still honored as a deprecated alias:
+# anything set under it is merged on top of these `companyContext` values (see
+# the `centaur.companyContextValues` helper), and wins for keys set under both.
+companyContext:
   enabled: false
   replicaCount: 1
   nodeSelector: {}
@@ -655,8 +657,15 @@ apiRs:
   # incompatible with preapproved mode. Internal workflow/MCP sessions use
   # separate principal-provisioning paths.
   sessionPrincipalAdmission: automatic
-  # Expose the experimental centaur MCP dispatcher (currently action=list).
-  mcpV2Enabled: false
+  # Serve /mcp through Code Mode: a centaur-codemode sandbox per principal,
+  # with api-rs forwarding catalog search/load and centaur_execute over HTTP.
+  # A principal normally has one sandbox; with several api-rs replicas (or
+  # during a rolling deploy) it may briefly have more, which is harmless.
+  # Readiness is the sandbox pod's own readiness probe; api-rs neither polls the
+  # sandbox nor waits for one shared instance. false turns off /mcp and its
+  # OAuth protected-resource metadata, and api-rs starts no Code Mode sandboxes.
+  # Rendered as CENTAUR_MCP_ENABLED.
+  mcpEnabled: true
   sandboxReadyTimeoutSecs: 90
   # Warm pool of default-harness sandboxes with full repo-cache access.
   # Ignored when sandboxWarmPools is set.
@@ -693,89 +702,10 @@ apiRs:
   # Workflow enablement policy. Production defaults to all workflows enabled.
   # Set workflowEnableMode: allowlist in staging and list allowed workflow names
   # in workflowAllowedNames as a comma/whitespace-separated string.
-  workflowHostSandbox: true
   workflowEnableMode: all
   workflowAllowedNames: ""
   # Requests/limits for the workflow-host sandbox pod (k8s resources map).
   workflowHostResources: {}
-  # Scheduled ETL workflow configuration. The chart renders these into api-rs
-  # env so workflow discovery sees the right schedules, then derives the
-  # workflow-host passthrough list from the same non-secret config.
-  etl:
-    slack:
-      enabled: false
-      syncIntervalSeconds: 3600
-      syncBackfillLookbackDays: 30
-      syncThreadLookbackDays: 3
-      indexPrivateChannels: false
-      excludedChannelPatterns: ""
-      attachments:
-        enabled: true
-        maxBytes: 10485760
-      backfill:
-        enabled: true
-        intervalSeconds: 600
-        channelBatchLimit: 50
-        channelPagesPerJob: 5
-      retention:
-        enabled: true
-        intervalMinutes: 60
-        etlDays: 0
-        dmDays: 0
-    linear:
-      enabled: false
-      syncIntervalSeconds: 14400
-    googleDrive:
-      enabled: false
-      syncIntervalSeconds: 14400
-    googleCalendar:
-      enabled: false
-      syncIntervalSeconds: 14400
-    googleChat:
-      enabled: false
-      syncIntervalSeconds: 14400
-      # Comma-separated Chat space types to sync (SPACE, GROUP_CHAT,
-      # DIRECT_MESSAGE). Defaults to named rooms only so DMs/group chats stay
-      # out of the company-wide corpus, mirroring the Slack ETL.
-      includeSpaceTypes: SPACE
-      # 0 = unlimited (page each space to completion every run). Set > 0 to
-      # bound a large first backfill so it converges across runs.
-      maxPagesPerRun: 0
-      # Comma-separated space IDs the Chat app reads but is not a listed
-      # member of (spaces.list only returns member spaces).
-      spaceIds: ""
-      retention:
-        enabled: true
-        intervalMinutes: 60
-        days: 0
-        batchLimit: 1000
-      # DWD DM history is opt-in and limited to these delegated user emails.
-      # api-rs receives only this allowlist and the internal bot key;
-      # GOOGLE_SERVICE_ACCOUNT_JSON remains in googlechatbot.
-      dmSync:
-        enabled: false
-        subjects: ""
-    companyContextDocuments:
-      enabled: true
-      intervalSeconds: 14400
-      maxWindowSeconds: 21600
-      batchSize: 50
-    companyContextEmbeddings:
-      # Enables the embedding workflow and hybrid search in agent sandboxes.
-      enabled: false
-      # Delay between scheduled scans for missing or stale embeddings.
-      intervalSeconds: 300
-      # Maximum documents claimed by each workflow run.
-      batchSize: 250
-      # Maximum characters sent per document. Inputs are capped at 8192.
-      maxInputChars: 8192
-      # Shared by the embedding workflow and company-context searches in agent sandboxes.
-      model: text-embedding-3-small
-      # Vector width requested from the model by both the write and query sides.
-      # This must match the database column width. Changing it requires a schema
-      # migration, index rebuild, and re-embedding existing rows. pgvector will
-      # not build an HNSW or IVFFlat index above 2000.
-      dimensions: 1536
   # Reaper: stop sandboxes older than the max lifetime, whether running or
   # suspended. Warm-pool sandboxes age from when a session claims them, and a
   # sandbox with a queued or running turn waits for a later sweep unless that
@@ -846,6 +776,14 @@ apiRs:
     periodSeconds: 10
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
+  # Extra environment variables: strings or Kubernetes valueFrom objects.
+  # extraEnv:
+  #   LOG_LEVEL: "info"
+  #   EXAMPLE_TOKEN:
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: example-secret
+  #         key: example-key
   extraEnv: {}
   resources: {}
   # PriorityClass for the api-rs control plane pod itself. Pair with
@@ -856,6 +794,10 @@ apiRs:
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.
 slackbotv2:
+  # Optional public PEM CA bundle trusted in addition to the runtime's default
+  # roots (for example, a database CA). Stored in a ConfigMap, never private keys.
+  # A change updates the pod checksum so the runtime reloads its trust at startup.
+  extraCaCertificates: ""
   enabled: true
   replicaCount: 1
   image:
@@ -1000,6 +942,10 @@ slackbotv2:
 # Disabled by default: requires the LINEAR_ACCESS_TOKEN / LINEARBOT_WEBHOOK_SECRET
 # secrets from the Linear OAuth app install (see contrib/scripts/bootstrap-k8s-secrets.sh).
 linearbot:
+  # Optional public PEM CA bundle trusted in addition to the runtime's default
+  # roots (for example, a database CA). Stored in a ConfigMap, never private keys.
+  # A change updates the pod checksum so the runtime reloads its trust at startup.
+  extraCaCertificates: ""
   enabled: false
   replicaCount: 1
   image:
@@ -1026,6 +972,10 @@ linearbot:
 # (see contrib/scripts/bootstrap-k8s-secrets.sh). userName must be the bot
 # account's GitHub login so @-mention and review-request matching work.
 githubbot:
+  # Optional public PEM CA bundle trusted in addition to the runtime's default
+  # roots (for example, a database CA). Stored in a ConfigMap, never private keys.
+  # A change updates the pod checksum so the runtime reloads its trust at startup.
+  extraCaCertificates: ""
   enabled: false
   replicaCount: 1
   image:
@@ -1074,6 +1024,9 @@ discordbot:
   userName: centaur
   # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
   guildAllowlist: ""
+  # Comma/space-separated Discord channel IDs the bot answers in; threads count as their
+  # parent channel. Empty means every channel in an allowlisted guild.
+  channelAllowlist: ""
   # Comma/space-separated role IDs whose mentions also trigger the bot.
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
@@ -1311,7 +1264,8 @@ externalDatabase:
   # namespace.
   namespace: ""
   port: 5432
-  # Keyword search backend for company context. "postgres" (used when empty)
+  # Keyword search backend for company context, in api-rs and the
+  # company-context service. "postgres" (used when empty)
   # uses built-in full-text search and works on RDS and Cloud SQL; "paradedb"
   # uses BM25 and requires the pg_search extension. Must be empty while
   # postgres.enabled=true: the bundled Postgres always uses "paradedb". A
@@ -1331,6 +1285,20 @@ ingress:
   tls: []
 
 httpRoutes: []
+
+# Workflow discovery service (`workflow-host serve` from the agent image). api-rs
+# calls it to discover workflows, so workflow module code never runs in api-rs.
+# Rendered with api-rs. It uses sandbox.image, the same workflow sources, and the
+# same placement and isolation (sandbox.nodeSelector, tolerations,
+# runtimeClassName, priorityClassName, hostUsers, podAnnotations, and
+# containerSecurityContext) as sandbox pods.
+workflowDiscovery:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
 
 networkPolicy:
   enabled: true

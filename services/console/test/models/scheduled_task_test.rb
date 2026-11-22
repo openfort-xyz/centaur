@@ -74,7 +74,7 @@ class ScheduledTaskTest < ActiveSupport::TestCase
     )
 
     assert_not task.valid?
-    assert_includes task.errors[:cron_expression], "is not a valid cron schedule"
+    assert_includes task.errors[:cron_expression], "is not a valid five-field cron schedule"
     assert_includes task.errors[:delivery_channel], "must be a Slack channel or user ID"
   end
 
@@ -95,23 +95,62 @@ class ScheduledTaskTest < ActiveSupport::TestCase
     assert_nil task.next_run_at
   end
 
-  test "builds api input with the author's Console principal" do
-    task = ScheduledTask.create!(valid_attributes)
-    principal = task.execution_principal
+  test "accepts standard five-field cron" do
+    [
+      "0 18 * * 0", "30 16 * * 1-5", "*/15 * * * *", "0 * * * *", "0 9 * * 7", "0 9 * * MON-FRI",
+      "0 9 1 jan *", "0 9-17/4 * * *", "5,35 * * * *", "0 9 1-15/2 * 1,3", "0 9 * * 1-5/2"
+    ].each do |cron|
+      assert ScheduledTask.new(valid_attributes(cron_expression: cron)).valid?, cron
+    end
+  end
 
+  # api-rs computes next runs for standard cron only
+  # (crates/centaur-console-db/src/cron.rs), so fugit's extensions are refused.
+  test "rejects cron fugit accepts but api-rs does not run" do
+    [
+      "@daily", "0 0 9 * * *", "0 9 L * *", "0 9 -1 * *", "0 9 * * 1#2", "0 9 * * mon%2",
+      "0 9 * * 1&", "0 9~11 * * *", "0 24 * * *", "0 9 * * 5-1", "5/15 9 * * *", "*/0 9 * * *",
+      "0 9 *,1 * *", "0 9 1, * *", "0 9 30 2 *"
+    ].each do |cron|
+      task = ScheduledTask.new(valid_attributes(cron_expression: cron))
+
+      assert_not task.valid?, cron
+      assert_includes task.errors[:cron_expression], "is not a valid five-field cron schedule", cron
+    end
+  end
+
+  test "requires an IANA timezone" do
+    assert ScheduledTask.new(valid_attributes(timezone: "Europe/Berlin")).valid?
+
+    [ "+05:00", "PST", "Pacific Time (US & Canada)" ].each do |timezone|
+      task = ScheduledTask.new(valid_attributes(timezone: timezone))
+
+      assert_not task.valid?, timezone
+      assert_includes task.errors[:timezone], "must be an IANA timezone name"
+    end
+  end
+
+  test "saving a user's task provisions the Console principal it runs as" do
+    author = users(:acme_admin)
+    foreign_id = ConsoleUserPrincipalProvisioner.new(author).send(:foreign_id)
+    Principal.where(foreign_id: foreign_id).destroy_all
+
+    task = ScheduledTask.create!(valid_attributes)
+
+    principal = Principal.find_by!(foreign_id: foreign_id)
     assert_equal "console_user", principal.kind
-    assert_equal task.author, principal.console_user
-    assert_equal(
-      {
-        prompt: "Summarize open incidents.",
-        principal: principal.foreign_id,
-        channel: "C0123456789",
-        slack_user_id: "U0123456789",
-        scheduled_task_id: task.oid,
-        scheduled_task_name: "Incident summary"
-      },
-      task.api_input
-    )
+    assert_equal author, principal.console_user
+    assert_equal principal, task.execution_principal
+  end
+
+  test "a channel task runs as its channel without provisioning a user principal" do
+    channel = principals(:acme_channel)
+
+    assert_no_difference -> { Principal.where(kind: "console_user").count } do
+      task = ScheduledTask.create!(name: "Channel digest", prompt: "Summarize this channel.", principal: channel)
+
+      assert_equal channel, task.execution_principal
+    end
   end
 
   test "allows a granted Google Chat space and rejects an ungranted one" do
@@ -135,36 +174,13 @@ class ScheduledTaskTest < ActiveSupport::TestCase
     assert_includes foreign_dm.errors[:delivery_channel], "is not available to the author"
   end
 
-  test "builds api input for Google Chat destinations with the author's email" do
-    grant_google_chat_space("spaces/AAQA42QLdws")
-    space_task = ScheduledTask.create!(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
-    dm_task = ScheduledTask.create!(
-      valid_attributes(name: "Incident DM", delivery_channel: users(:acme_admin).email.upcase)
-    )
-
-    assert_equal(
-      {
-        prompt: "Summarize open incidents.",
-        principal: space_task.execution_principal.foreign_id,
-        channel: "spaces/AAQA42QLdws",
-        author_email: users(:acme_admin).email.downcase,
-        scheduled_task_id: space_task.oid,
-        scheduled_task_name: "Incident summary"
-      },
-      space_task.api_input
-    )
-    assert_equal users(:acme_admin).email.downcase, dm_task.api_input.fetch(:channel).downcase
-    assert_not_includes dm_task.api_input.keys, :slack_user_id
-  end
-
   test "a Google Chat DM task keeps running and follows the author to a new address" do
     task = ScheduledTask.create!(valid_attributes(delivery_channel: "admin@acme.example"))
     user_identities(:acme_admin_google).update!(email: "admin@renamed.example")
     task.reload
 
     assert task.valid?, task.errors.full_messages.to_sentence
-    assert_equal "admin@renamed.example", task.api_input.fetch(:channel)
-    assert_equal "admin@renamed.example", task.api_input.fetch(:author_email)
+    assert_equal "admin@renamed.example", GoogleChatDeliveryPolicy.new(users(:acme_admin)).direct_message_identity
     assert_equal "admin@acme.example", task.delivery_channel
     moved = ScheduledTask.new(valid_attributes(name: "Moved", delivery_channel: "admin@renamed.example"))
     assert moved.valid?, moved.errors.full_messages.to_sentence
@@ -175,15 +191,6 @@ class ScheduledTaskTest < ActiveSupport::TestCase
 
     assert_not ScheduledTask.new(valid_attributes(delivery_channel: "admin@renamed.example")).valid?
     assert_equal "admin@acme.example", GoogleChatDeliveryPolicy.new(users(:acme_admin)).direct_message_identity
-  end
-
-  test "raises when a Google Chat space grant is revoked after the task was saved" do
-    principal = grant_google_chat_space("spaces/AAQA42QLdws")
-    task = ScheduledTask.create!(valid_attributes(delivery_channel: "spaces/AAQA42QLdws"))
-
-    GoogleChatSpacePermission.replace_for!(principal, [])
-
-    assert_raises(ScheduledTask::DeliveryDestinationUnavailable) { task.api_input }
   end
 
   private
