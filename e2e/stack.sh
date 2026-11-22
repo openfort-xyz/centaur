@@ -32,6 +32,11 @@ cd "$(dirname "$0")/.."
 
 CLUSTER="${CENTAUR_E2E_CLUSTER:-centaur-e2e}"
 RELEASE=centaur # contrib/scripts/bootstrap-k8s-secrets.sh assumes this name
+NODE="${CLUSTER}-control-plane"
+# The node directory sandboxes mount (sandbox.reposPath in e2e/infra/values.yaml)
+# and the workflow directory under it that tests install workflow files into.
+REPOS_DIR=/var/lib/centaur-e2e/repos
+WORKFLOW_DIR="$REPOS_DIR/centaur-e2e/workflows"
 NAMESPACE=centaur
 SLACK_NAMESPACE=centaur-e2e-slack
 MODEL_NAMESPACE=centaur-e2e-model
@@ -58,7 +63,7 @@ case "$AUTH_MODE" in
   api_key | access_token) ;;
   *) echo "CENTAUR_E2E_AUTH_MODE must be api_key or access_token, not $AUTH_MODE" >&2; exit 2 ;;
 esac
-IMAGES=(api-rs:apiRs proxy-sync:proxySync token-broker:tokenBroker iron-proxy:ironProxy slackbotv2:slackbotv2 agent:sandbox console:console)
+IMAGES=(api-rs:apiRs proxy-sync:proxySync codemode:codemode token-broker:tokenBroker iron-proxy:ironProxy slackbotv2:slackbotv2 agent:sandbox console:console)
 
 export KUBECONFIG
 KUBECONFIG="$(mktemp)"
@@ -76,7 +81,8 @@ apply_stdin() {
 up() {
   if kind get clusters | grep -qx "$CLUSTER"; then
     use_cluster
-    if ! docker port "${CLUSTER}-control-plane" | grep -q '^30082/tcp'; then
+    if ! docker port "${CLUSTER}-control-plane" | grep -q '^30082/tcp' \
+      || [[ "$(kubectl get node "${CLUSTER}-control-plane" -o jsonpath='{.status.capacity.pods}')" -lt 250 ]]; then
       echo "cluster $CLUSTER predates e2e/infra/kind.yaml; run e2e/stack.sh down first" >&2
       exit 1
     fi
@@ -89,6 +95,8 @@ up() {
   # which is slow under load. resolv.conf is bind-mounted, so write in place.
   docker exec "${CLUSTER}-control-plane" sh -c \
     "grep -v '^search ' /etc/resolv.conf > /tmp/resolv.conf && cat /tmp/resolv.conf > /etc/resolv.conf"
+
+  docker exec "$NODE" mkdir -p "$WORKFLOW_DIR"
 
   kubectl -n kube-system create configmap coredns --from-file=Corefile=e2e/infra/Corefile \
     --dry-run=client -o yaml | apply_stdin
@@ -242,7 +250,8 @@ deploy_model_server() {
 # cluster: the gateway authorizes the public half, and tests grant the private
 # half to the principals that may use it.
 deploy_ssh_gateway() {
-  docker build -q -t centaur-e2e-ssh-gateway:latest e2e/infra/ssh-gateway > /dev/null
+  docker build -q ${CENTAUR_BUILD_HTTP_PROXY:+--build-arg "http_proxy=$CENTAUR_BUILD_HTTP_PROXY"} \
+    -t centaur-e2e-ssh-gateway:latest e2e/infra/ssh-gateway > /dev/null
   kind load docker-image --name "$CLUSTER" centaur-e2e-ssh-gateway:latest
   issue_cert ssh-gateway workspace.ssh-gateway.test
 
@@ -277,6 +286,9 @@ deploy_fake_slack() {
 run_tests() {
   use_cluster
   remove_sandboxes
+  # Workflows installed by earlier runs would otherwise be discovered forever.
+  docker exec "$NODE" sh -c "mkdir -p '$WORKFLOW_DIR' && rm -f '$WORKFLOW_DIR'/*.py"
+  export E2E_KIND_NODE="$NODE" E2E_WORKFLOW_DIR="$WORKFLOW_DIR"
   local password
   password="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)"
   export E2E_SLACK_URL=http://127.0.0.1:30443

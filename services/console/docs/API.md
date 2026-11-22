@@ -1083,13 +1083,14 @@ The `provider` field is validated against the [supported providers](#supported-p
 | `description`          | optional    | |
 | `labels`               | optional    | |
 | `provider`             | required    | The provider strategy. See [supported providers](#supported-providers). |
-| `provider_config`      | conditional | Required for `"custom"` and must be empty (`{}`) otherwise. An object with `authorization_endpoint`, `token_endpoint`, `resource`, and optionally `userinfo_endpoint`, each an `https` URL. |
+| `provider_config`      | conditional | Required for `"custom"` and must be empty (`{}`) otherwise. An object with `authorization_endpoint`, `token_endpoint`, `resource`, and optionally `userinfo_endpoint` and `revocation_endpoint` (RFC 7009, used by Disconnect), each an `https` URL. |
 | `client_id`            | required    | OAuth client id. Not secret; returned in responses. |
 | `client_secret`        | required on create | OAuth client secret. Write-only and encrypted at rest; on update it is only changed when supplied. Never returned. |
 | `allowed_scopes`       | required    | Non-empty array of scope strings the start endpoint requests. A flow's optional `scopes` param must be a subset; omitting it requests all of these. |
 | `enabled`              | optional    | Defaults to `true`. A disabled app rejects new consent flows; existing credentials keep refreshing. |
 | `shared`               | optional    | Defaults to `false`. One admin-connected account with role-granted access. Create-only; changes return `422`. Incompatible with `always_available`. |
 | `always_available`     | optional    | Defaults to `false`. Use the connecting user's credential automatically whenever they ask the bot, not only in their DMs. |
+| `owner_only`           | optional    | Defaults to `false`. Each Console user's connection is keyed by that user (no provider identity is resolved) and its token is delivered only to that user's own principals through a direct grant -- never roles, other principals, or email matching -- and only while live, the app enabled, and the user active. Create-only; changes return `422`. Incompatible with `shared`. |
 
 The `client_secret` is required and write-only: it is accepted on writes but never returned in any response.
 
@@ -1143,7 +1144,7 @@ Returns `201`. The `client_secret` is never echoed back:
 
 `GET /api/v1/sandbox/oauth_apps`
 
-Returns enabled non-shared OAuth apps and the console URLs a sandbox user can open to start consent. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
+Returns enabled non-shared OAuth apps and the console URLs a sandbox user can open to start consent. `resource` is the app's protected resource URL (for example an MCP URL) when it has one. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
 
 ```json
 {
@@ -1155,6 +1156,8 @@ Returns enabled non-shared OAuth apps and the console URLs a sandbox user can op
       "labels": {},
       "provider": "google",
       "allowed_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+      "owner_only": false,
+      "resource": null,
       "start_url": "https://<iron-control>/oauth/google/start"
     }
   ]
@@ -1204,8 +1207,8 @@ Other sandboxes, including channel, shared Google Chat space, Slack Connect, bar
 | `GET` | `/api/v1/sandbox/admin/principals/:id` | Fetch one by OID. |
 | `POST` | `/api/v1/sandbox/admin/principals` | Create a Slack channel (`data: { kind: "slack_channel", slack_channel_id }`), Slack user (`data: { kind: "slack_dm", slack_user_id }`), or workflow (`data: { kind: "workflow", workflow_name }`) principal. The foreign ID, kind, and Slack fields match what api-rs derives: `slack-channel-<channel>`, `slack-user-<team>-<user>` in the admin's workspace, or `workflow-<slugged workflow_name>` for `WORKFLOW_PRINCIPAL = True`. A new channel principal gets full Slack access to its own channel. Other kinds and DM channel IDs return `400`; invalid IDs and existing principals return `422`. |
 | `GET` | `/api/v1/sandbox/admin/principals/lookup/:foreign_id` | Fetch one by foreign ID. |
-| `GET`/`POST` | `/api/v1/sandbox/admin/static_secrets[/:id]`, `/api/v1/sandbox/admin/pg_dsn_secrets[/:id]`, `/api/v1/sandbox/admin/gcp_id_token_secrets[/:id]` | Fetch a secret by OID or create one, as in the static, Postgres DSN, and GCP ID token secret APIs. Inline `control_plane` and OAuth `token_broker` sources return `403`. |
-| `PATCH`/`PUT` | `/api/v1/sandbox/admin/static_secrets/:id`, `/api/v1/sandbox/admin/pg_dsn_secrets/:id`, `/api/v1/sandbox/admin/gcp_id_token_secrets/:id` | Update an existing secret by OID. Omitted fields, including the source, keep their current values. Same source restrictions; secrets with a `token_broker` source return `403`. |
+| `GET`/`POST` | `/api/v1/sandbox/admin/static_secrets[/:id]`, `/api/v1/sandbox/admin/pg_dsn_secrets[/:id]`, `/api/v1/sandbox/admin/gcp_auth_secrets[/:id]`, `/api/v1/sandbox/admin/gcp_id_token_secrets[/:id]` | Fetch a secret by OID or create one, as in the static, Postgres DSN, GCP auth, and GCP ID token secret APIs. Inline `control_plane` and OAuth `token_broker` sources return `403`. |
+| `PATCH`/`PUT` | `/api/v1/sandbox/admin/static_secrets/:id`, `/api/v1/sandbox/admin/pg_dsn_secrets/:id`, `/api/v1/sandbox/admin/gcp_auth_secrets/:id`, `/api/v1/sandbox/admin/gcp_id_token_secrets/:id` | Update an existing secret by OID. Omitted fields, including the source, keep their current values. To switch a GCP auth secret between a `keyfile` and `credentials_provider`, send the other as `null` (and `subject: null` when leaving keyfile mode). Same source restrictions; secrets with a `token_broker` source return `403`. |
 | `GET`/`POST` | `/api/v1/sandbox/admin/principals/:principal_id/roles` | List or assign roles (`data: { role_id }`). |
 | `DELETE` | `/api/v1/sandbox/admin/principals/:principal_id/roles/:id` | Unassign a role. |
 | `GET` | `/api/v1/sandbox/admin/roles`, `/roles/:id`, `/roles/lookup/:foreign_id` | List or fetch roles. |
@@ -1571,24 +1574,26 @@ Returns `201`. The plaintext `token` is included **only** in this create respons
 
 ## Scheduled Tasks
 
-Tasks run one agent prompt and deliver the result to Slack. A task may have a five-field cron schedule in Pacific Time; omitting `cron_expression` or sending `null` or an empty string makes it manual-only. Task IDs use the `tsk_` prefix. The `delivery_channel` can be a Slack channel ID available to the task author, or the special value `dm`, which resolves to the linked user's Slack direct message when the task is created or updated.
+Tasks run one agent prompt and deliver the result to Slack. api-rs runs them, on schedule and on demand. A task may have a five-field cron schedule in Pacific Time: each field takes numbers, `*`, ranges (`1-5`), steps on `*` or a range (`*/15`, `9-17/2`), and comma-separated lists, and the month and weekday fields also take three-letter names (`jan`, `mon-fri`). Sunday is `0` or `7`. When both day fields are restricted, a day matching either runs. Seconds, `@daily`-style shortcuts, `L`, `#`, `?`, and wrapping ranges such as `fri-mon` are rejected with `422` on `cron_expression`. Omitting `cron_expression` or sending `null` or an empty string makes it manual-only. Task IDs use the `tsk_` prefix. The `delivery_channel` can be a Slack channel ID available to the task author, or the special value `dm`, which resolves to the linked user's Slack direct message when the task is created or updated.
 
 These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. For most sandboxes, every operation requires an active Console user linked to the sandbox principal and is scoped to tasks owned by that user. A task owned by another user returns `404`.
 
 When the sandbox principal is a Slack channel, the endpoints manage that channel's tasks instead. Any Slack user from a workspace the bot is installed in who requests the current turn may list, create, update, delete, or run them; no Console account is required. A turn without such a requester, such as a scheduled run, receives `403`. Channel tasks run with the channel principal's permissions and always deliver to the channel; omit `data.delivery_channel` or pass the channel's ID, since any other value returns `422`.
 
+To create a task for the requester instead, a Slack channel session sends `data.owner: "me"` on `POST`. The task is authored by the Console user linked to the Slack user who requested the current turn, runs with that user's permissions, and always delivers to their Slack DM: omit `data.delivery_channel` or pass `dm` or their Slack user ID, since any other value returns `422`. The owner comes only from the turn's requester, so no request can create a task for someone else. The requester must be from a workspace the bot is installed in and linked to an active Console user whose Slack DM is that requester, else `403`. Personal tasks are not visible from the channel; list and manage them from the user's DM. In other sessions `owner: "me"` keeps the linked user as owner and likewise restricts delivery to their DM. Any other `owner` value, or `owner` on any request other than `POST`, returns `422`.
+
 | Method | Path | Notes |
 | ------ | ---- | ----- |
 | `GET` | `/api/v1/sandbox/scheduled_tasks` | List the linked user's tasks. |
 | `GET` | `/api/v1/sandbox/scheduled_tasks/:id` | Read one owned task by `tsk_...` OID. |
-| `POST` | `/api/v1/sandbox/scheduled_tasks` | Create a task from `data.name`, `data.prompt`, and optional `data.delivery_channel` (default `dm`), `data.cron_expression`, and `data.enabled`. |
+| `POST` | `/api/v1/sandbox/scheduled_tasks` | Create a task from `data.name`, `data.prompt`, and optional `data.delivery_channel` (default `dm`), `data.cron_expression`, `data.enabled`, and `data.owner` (`me`). |
 | `PUT`/`PATCH` | `/api/v1/sandbox/scheduled_tasks/:id` | Update any supplied task fields. Set `data.cron_expression` to `null` or an empty string to make the task manual-only. |
 | `DELETE` | `/api/v1/sandbox/scheduled_tasks/:id` | Delete an owned task. Returns `204`. |
-| `POST` | `/api/v1/sandbox/scheduled_tasks/:id/run` | Queue an immediate run. Returns `202`; disabled tasks return `422`. |
+| `POST` | `/api/v1/sandbox/scheduled_tasks/:id/run` | Start an immediate run. Returns `202` with the task, `queued: true`, and the workflow `run_id`. Disabled tasks, and tasks whose owner can no longer deliver to the destination, return `422`; `503` means the run could not be started. |
 
 The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for scheduled workflows to read the task's current ID, enabled state, and delivery channel. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`.
 
-Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur-console` CLI exposes the same operations through `tasks`, `task`, `create-task`, `update-task`, `delete-task`, and `run-task`. Omit `--cron` when creating a manual-only task, or pass `update-task --cron ""` to remove an existing recurring schedule.
+Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur_console` Code Mode connector exposes the same operations through `scheduled_tasks`, `scheduled_task`, `create_scheduled_task`, `update_scheduled_task`, `delete_scheduled_task`, and `run_scheduled_task`. Omit `cron_expression` when creating a manual-only task, or pass `cron_expression: ""` to `update_scheduled_task` to remove an existing recurring schedule.
 
 ## Skills
 
@@ -2008,7 +2013,7 @@ Console-only actions:
 | ------ | ---- | ----- |
 | `GET`  | `/api/v1/console/oauth_apps/:id/credentials` | The broker credentials the app minted, oldest first. `labels[k]=v` and pagination optional. Each row has `id`, `foreign_id`, `name`, `status`, `provider_email`, `external_user_key`, and `created_at`; token material is never included. `404` if the app is missing. |
 | `GET`  | `/api/v1/console/oauth_apps/:id/provider_details` | Provider-specific details for a shared app's connected account (its oldest credential). Returns `data: { provider, credential, details }`, where `credential` is `null` for personal apps or when nothing is connected, else `{ id, provider_subject, static_secret_id }` (`static_secret_id` is the wrapping static secret, or `null`). `details` is fetched live from the provider (2-second timeouts) only while the credential is live with an unexpired access token, which is never refreshed for this. Only `mercator` returns details (`{ claimed, ... }`); any provider failure yields `{}`. |
-| `POST` | `/api/v1/console/oauth_apps/presets/:provider` | Set up a provider preset. If no app has the preset's slug, registers an OAuth client with the provider (RFC 7591) and creates the app. Returns `200` with `data: { id, slug, start_url }`; send the admin to `start_url` to connect the account. `404` for providers without a preset, `409` when an existing app with the preset's slug has a different provider, shared mode, or is disabled, and `502` when registration fails (no app is created). |
+| `POST` | `/api/v1/console/oauth_apps/presets/:provider` | Set up a preset (a provider preset such as `mercator`, or the standalone `runlayer` preset). If no app has the preset's slug, registers an OAuth client with the provider (RFC 7591) and creates the app. A preset with `inputs` (see [Integrations](#integrations)) reads them from `data`; `runlayer` takes `data: { resource_url }`, the tenant's exact `https://…/mcp` URL, and creates an owner-only, always-available `custom` app with the tenant's `/api/v1/oauth/{authorize,token,revoke}` endpoints. Returns `200` with `data: { id, slug, start_url }`; send the admin to `start_url` to connect the account. `404` for an unknown preset, `422` when a required input is missing or invalid, `409` when an existing app with the preset's slug has a different provider, shared or owner-only mode, or is disabled, and `502` when registration fails (no app is created). |
 
 #### OAuth providers
 
@@ -2019,8 +2024,8 @@ Console-only actions:
   "data": [
     { "key": "google", "display_name": "Google", "presettable": false, "config_keys": [], "optional_config_keys": [] },
     { "key": "custom", "display_name": "Custom", "presettable": false,
-      "config_keys": ["authorization_endpoint", "token_endpoint", "userinfo_endpoint", "resource"],
-      "optional_config_keys": ["userinfo_endpoint"] }
+      "config_keys": ["authorization_endpoint", "token_endpoint", "userinfo_endpoint", "revocation_endpoint", "resource"],
+      "optional_config_keys": ["userinfo_endpoint", "revocation_endpoint"] }
   ]
 }
 ```
@@ -2037,12 +2042,16 @@ Console-only actions:
     "apps": [
       {
         "id": "oap_...", "slug": "google", "provider": "google", "description": "Gmail",
-        "shared": false, "always_available": false, "usage": "direct_messages",
+        "shared": false, "always_available": false, "owner_only": false, "usage": "direct_messages",
         "start_url": "https://<iron-control>/oauth/google/start",
-        "connection": { "status": "connected" }
+        "connection": { "id": "bcr_...", "status": "connected", "can_disconnect": true }
       }
     ],
-    "presets": [{ "provider": "mercator", "display_name": "Mercator", "description": "Shared with your agents." }],
+    "presets": [
+      { "provider": "mercator", "display_name": "Mercator", "description": "Shared with your agents.", "inputs": [] },
+      { "provider": "runlayer", "display_name": "Runlayer", "description": "Your Runlayer tools and permissions.",
+        "inputs": [{ "name": "resource_url", "label": "MCP URL", "type": "url", "placeholder": "https://<tenant>/mcp" }] }
+    ],
     "ssh_key": { "configured": false }
   }
 }
@@ -2050,8 +2059,11 @@ Console-only actions:
 
 - `apps` lists enabled apps ordered by slug. Shared apps appear only for admins. The client id, client secret, scopes, and labels are never included.
 - `usage` is `shared`, `always_available`, or `direct_messages` (the app is used only in the user's DMs with the bot).
-- `connection` is `null` when the caller has no credential for the app, otherwise `status` is `connected` or `needs_reconnect` (dead, or missing a scope the app requires). The caller's credentials are those they minted while signed in plus any whose provider email matches their console email; for a shared app, any credential counts. The most recently updated match wins.
-- `presets` lists providers with a preset but no app yet; empty for non-admins.
+- `connection` is `null` when the caller has no credential for the app, otherwise `status` is `connected` or `needs_reconnect` (dead, or missing a scope the app requires). The caller's credentials are those they minted while signed in plus any whose provider email matches their console email; for a shared app, any credential counts. A credential the caller disconnected does not count. The most recently updated match wins. `can_disconnect` is `true` only for a live connection to a personal app that the caller made while signed in.
+- `owner_only` apps give each user their own connection, which serves only that user (see the `owner_only` field of [OAuth apps](#oauth-apps)).
+- `presets` lists presets whose app does not exist yet (a provider preset is also hidden once any app uses its provider); empty for non-admins. `inputs` lists the values the admin enters to set one up.
+
+`DELETE /api/v1/console/integrations/connections/:id` (any active user; CSRF) disconnects one of the caller's own connections to a personal app, by credential OID. The tokens are cleared and the credential marked dead first, so proxy sync and token-broker stop using it; then, when the provider has a revocation endpoint (a `custom` app's `revocation_endpoint`), both tokens are revoked there (RFC 7009). Returns `200` with `data: { id, outcome }`, where `outcome` is `revoked`, `local_only` (no revocation endpoint), or `failed` (revocation failed; access in Centaur is still removed). `404` for a credential the caller did not make or of a shared app. Connecting again revives it.
 - `ssh_key.configured` reports whether the caller saved a personal SSH key.
 
 #### Console principals
@@ -2339,7 +2351,7 @@ returned. Responses set `Cache-Control: no-store`.
 | `POST` | `/api/v1/console/scheduled_tasks` | Create a task authored by the caller. Returns `201`. |
 | `PUT`/`PATCH` | `/api/v1/console/scheduled_tasks/:id` | Update the fields sent; keep the rest. |
 | `DELETE` | `/api/v1/console/scheduled_tasks/:id` | Returns `204`. |
-| `POST` | `/api/v1/console/scheduled_tasks/:id/run` | Queue an immediate run. Returns `202` with the task and `queued: true`. A disabled task returns `422` with `details.reason=task_disabled` and `Enable the task before running it.` |
+| `POST` | `/api/v1/console/scheduled_tasks/:id/run` | Start an immediate run. Returns `202` with the task, `queued: true`, and the workflow `run_id`. A disabled task returns `422` with `details.reason=task_disabled` and `Enable the task before running it.`; a destination the author can no longer deliver to returns `422` with the reason, and `503` means the run could not be started. |
 | `GET` | `/api/v1/console/scheduled_tasks/slack_channel_options` | Delivery channel search (`q`, at most 20): public channels plus private channels both the caller and the bot are in. `?task_id=` (when editing) must be one of the caller's tasks, else `404`. Same shape as `GET /api/v1/console/slack_channels`; `meta.catalog_error` can also be `Slack channel memberships are loading.` |
 
 Write bodies take `data` with:
@@ -2347,7 +2359,7 @@ Write bodies take `data` with:
 | Field | Notes |
 |---|---|
 | `name`, `prompt`, `enabled` | Same validation as the sandbox endpoints. |
-| `schedule_preset` | `manual`, `daily`, `weekdays`, `mondays`, `fridays` (all at 9:00 PT), `custom`, or `cron` (uses `cron_expression` verbatim). Omitted keeps the stored schedule. |
+| `schedule_preset` | `manual`, `daily`, `weekdays`, `mondays`, `fridays` (all at 9:00 PT), `custom`, or `cron` (uses `cron_expression` verbatim, in the grammar above). Omitted keeps the stored schedule. |
 | `custom_days`, `custom_time` | For `custom`: weekday values `"1"`..`"6"` and `"0"` (Sunday), plus `"HH:MM"`. Missing days or time returns `422` on `cron_expression`. |
 | `delivery_mode` | `dm` delivers to the author's linked Slack DM and ignores `delivery_channel`; `channel` uses `delivery_channel`. A destination the author's Slack permissions do not allow returns `422` on `delivery_channel`. Google Chat DM only: `gchat_dm` delivers to the author's Google Chat DM and ignores `delivery_channel`; `gchat_space` uses `delivery_channel` as `spaces/<id>`, which needs an effective `send` space permission, else `422` on `delivery_channel`. |
 

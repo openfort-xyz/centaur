@@ -6,6 +6,7 @@ mod error;
 mod google_chat_proxy;
 mod mcp;
 mod routes;
+mod scheduled_tasks;
 mod slack_external_teams;
 mod slack_proxy;
 mod tool_discovery;
@@ -14,10 +15,12 @@ pub mod types;
 pub use auth::{ApiAuthConfig, ApiAuthConfigError};
 pub use centaur_session_runtime::{SandboxRuntime, SessionRuntime};
 pub use error::ApiError;
+pub use mcp::mcp_enabled;
 pub use routes::{
     AppState, build_router_with_app_state, build_router_with_runtime,
     build_router_with_session_and_workflow_runtime, build_router_with_session_runtime,
 };
+pub use scheduled_tasks::spawn_scheduled_task_scheduler;
 pub use slack_external_teams::partition_slack_external_team_ids;
 pub use tool_discovery::{
     DiscoveredToolProxyFragment, ToolDiscoveryConfig, ToolDiscoveryError,
@@ -250,6 +253,12 @@ mod tests {
                 .uri("/api/workflows/runs")
                 .body(Body::empty())
                 .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/scheduled-tasks/tsk_example/runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
         ] {
             let response = build_router_with_app_state(AppState::unready(test_auth()))
                 .oneshot(request)
@@ -261,6 +270,26 @@ mod tests {
                 Some(&"Bearer".parse().unwrap())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn principals_cannot_run_scheduled_tasks() {
+        let response = build_router_with_app_state(AppState::unready(test_auth()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/scheduled-tasks/tsk_example/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", principal_token("slack-channel-example")),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -306,28 +335,6 @@ mod tests {
                 .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"event_name":"test.event","payload":{}}"#))
-                .unwrap(),
-            Request::builder()
-                .uri("/api/admin/slack/dm-sync/checkpoints")
-                .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .uri("/api/admin/google/docs-sync/checkpoint")
-                .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/admin/google/docs-sync/content-status")
-                .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"files":[]}"#))
-                .unwrap(),
-            Request::builder()
-                .uri("/api/admin/granola/sync/checkpoint")
-                .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
-                .body(Body::empty())
                 .unwrap(),
         ] {
             let response = build_router_with_app_state(AppState::unready(test_auth()))
@@ -854,6 +861,12 @@ mod tests {
                 .uri("/api/workflows/events")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"event_name":"test.event","payload":{}}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/scheduled-tasks/tsk_example/runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
                 .unwrap(),
             Request::builder()
                 .method(Method::POST)

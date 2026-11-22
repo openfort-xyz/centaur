@@ -74,13 +74,6 @@
             "oauthAppSlug": { "type": "string" }
           }
         },
-        "googleDocsSync": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "oauthAppSlug": { "type": "string" }
-          }
-        },
         "service": {
           "type": "object",
           "properties": {
@@ -179,12 +172,6 @@
         }
       }
     },
-    "companyContextV1": {
-      "type": "object",
-      "properties": {
-        "enabled": { "type": "boolean" }
-      }
-    },
     "console": { "$ref": "#/definitions/consoleConfig" },
     "ironControl": { "$ref": "#/definitions/consoleConfig" },
     "secrets": {
@@ -214,6 +201,7 @@
               "toolsSubdir": { "type": "string" },
               "workflowsSubdir": { "type": "string" },
               "skillsSubdir": { "type": "string" },
+              "connectorsSubdir": { "type": "string" },
               "promptPath": { "type": "string" },
               "personasSubdir": { "type": "string" }
             },
@@ -296,6 +284,18 @@
           "properties": {
             "captureTranscripts": { "type": "boolean" },
             "captureToolTraces": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "codemode": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" }
           }
         }
       }
@@ -455,7 +455,7 @@
       "type": "object",
       "properties": {
         "syncInfraSecrets": { "type": "boolean" },
-        "mcpV2Enabled": { "type": "boolean" },
+        "mcpEnabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "sessionPrincipalAdmission": {
           "type": "string",
@@ -482,120 +482,7 @@
         "sessionEventsRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
         "sessionEventsRetentionSweepIntervalSecs": { "type": "integer", "minimum": 1 },
         "sandboxOrphanSweepGraceSecs": { "type": "integer", "minimum": 1 },
-        "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
-        "etl": {
-          "type": "object",
-          "properties": {
-            "slack": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "syncIntervalSeconds": { "type": "integer" },
-                "syncBackfillLookbackDays": { "type": "integer" },
-                "syncThreadLookbackDays": { "type": "integer" },
-                "indexPrivateChannels": { "type": "boolean" },
-                "excludedChannelPatterns": { "type": "string" },
-                "attachments": {
-                  "type": "object",
-                  "properties": {
-                    "enabled": { "type": "boolean" },
-                    "maxBytes": { "type": "integer" }
-                  }
-                },
-                "backfill": {
-                  "type": "object",
-                  "properties": {
-                    "enabled": { "type": "boolean" },
-                    "intervalSeconds": { "type": "integer" },
-                    "channelBatchLimit": { "type": "integer" },
-                    "channelPagesPerJob": { "type": "integer" }
-                  }
-                },
-                "retention": {
-                  "type": "object",
-                  "properties": {
-                    "enabled": { "type": "boolean" },
-                    "intervalMinutes": { "type": "integer" },
-                    "etlDays": { "type": "integer" },
-                    "dmDays": { "type": "integer" }
-                  }
-                }
-              }
-            },
-            "linear": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "syncIntervalSeconds": { "type": "integer" }
-              }
-            },
-            "googleDrive": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "syncIntervalSeconds": { "type": "integer" }
-              }
-            },
-            "googleCalendar": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "syncIntervalSeconds": { "type": "integer" }
-              }
-            },
-            "googleChat": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "syncIntervalSeconds": { "type": "integer" },
-                "includeSpaceTypes": { "type": "string" },
-                "maxPagesPerRun": { "type": "integer" },
-                "spaceIds": { "type": "string" },
-                "retention": {
-                  "type": "object",
-                  "properties": {
-                    "enabled": { "type": "boolean" },
-                    "intervalMinutes": { "type": "integer", "minimum": 1 },
-                    "days": { "type": "integer", "minimum": 0 },
-                    "batchLimit": { "type": "integer", "minimum": 1 }
-                  }
-                },
-                "dmSync": {
-                  "type": "object",
-                  "properties": {
-                    "enabled": { "type": "boolean" },
-                    "subjects": { "type": "string" }
-                  }
-                }
-              }
-            },
-            "companyContextDocuments": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "intervalSeconds": { "type": "integer" },
-                "maxWindowSeconds": { "type": "integer" },
-                "batchSize": { "type": "integer", "minimum": 1 }
-              }
-            },
-            "companyContextEmbeddings": {
-              "type": "object",
-              "properties": {
-                "enabled": { "type": "boolean" },
-                "intervalSeconds": { "type": "integer", "minimum": 1 },
-                "batchSize": { "type": "integer", "minimum": 1 },
-                "maxInputChars": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 8192
-                },
-                "model": { "type": "string", "minLength": 1 },
-                "dimensions": { "type": "integer", "minimum": 1, "maximum": 2000 }
-              }
-            }
-          }
-        },
         "metrics": {
           "type": "object",
           "properties": {
@@ -609,13 +496,24 @@
         },
         "extraEnv": {
           "type": "object",
-          "additionalProperties": { "type": "string" }
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["valueFrom"],
+                "additionalProperties": false,
+                "properties": { "valueFrom": { "type": "object", "minProperties": 1 } }
+              }
+            ]
+          }
         }
       }
     },
     "slackbotv2": {
       "type": "object",
       "properties": {
+        "extraCaCertificates": { "type": "string" },
         "agentViewEnabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "responseMetadataMode": {
@@ -840,6 +738,12 @@
             "sizeLimit": { "type": "string" }
           }
         }
+      }
+    },
+    "workflowDiscovery": {
+      "type": "object",
+      "properties": {
+        "resources": { "type": "object" }
       }
     },
     "networkPolicy": {
