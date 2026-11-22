@@ -54,6 +54,8 @@ const GOOGLE_CHAT_DWD_DM_SUBJECTS_ENV: &str = "GOOGLE_CHAT_DWD_DM_SUBJECTS";
 const GOOGLE_CHAT_DWD_SUBJECT_HEADER: &str = "x-centaur-google-chat-dwd-subject";
 const DEFAULT_GOOGLECHATBOT_INTERNAL_URL: &str = "http://centaur-centaur-googlechatbot:3002";
 const MAX_GOOGLE_CHAT_DWD_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Matches googlechatbot's `MAX_UPLOAD_BYTES` for the attachments route.
+const MAX_GOOGLE_CHAT_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
 /// Upper bound on one discovery request.
 const WORKFLOW_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(150);
 const WORKFLOW_STARTUP_DISCOVERY_INITIAL_DELAY: Duration = Duration::from_secs(2);
@@ -4231,13 +4233,19 @@ async fn post_to_googlechatbot(
     })?;
     let base_url = env::var(GOOGLECHATBOT_INTERNAL_URL_ENV)
         .unwrap_or_else(|_| DEFAULT_GOOGLECHATBOT_INTERNAL_URL.to_owned());
-    let response = reqwest::Client::new()
+    let request = reqwest::Client::new()
         .post(format!("{}{path}", base_url.trim_end_matches('/')))
         .bearer_auth(&token)
         .json(body)
-        .timeout(timeout)
-        .send()
-        .await?;
+        .timeout(timeout);
+    send_to_googlechatbot(request, failure).await
+}
+
+async fn send_to_googlechatbot(
+    request: reqwest::RequestBuilder,
+    failure: &str,
+) -> Result<Value, WorkflowRuntimeError> {
+    let response = request.send().await?;
     let status = response.status();
     let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
@@ -4639,47 +4647,90 @@ async fn google_chat_dm_setup(message: &Value) -> Result<Value, WorkflowRuntimeE
 }
 
 async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowRuntimeError> {
-    let required = |key: &str| -> Result<String, WorkflowRuntimeError> {
+    let token = env::var(GOOGLECHATBOT_INTERNAL_API_KEY_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{GOOGLECHATBOT_INTERNAL_API_KEY_ENV} must be set"
+        ))
+    })?;
+    let base_url = env::var(GOOGLECHATBOT_INTERNAL_URL_ENV)
+        .unwrap_or_else(|_| DEFAULT_GOOGLECHATBOT_INTERNAL_URL.to_owned());
+    post_google_chat_attachment_to(&base_url, &token, message).await
+}
+
+/// Uploads a workflow attachment to googlechatbot as `multipart/form-data`
+/// (`file`, `text`, `thread_name`), the same contract the `google_chat`
+/// connector uses. The workflow ctx message carries the file as base64.
+async fn post_google_chat_attachment_to(
+    base_url: &str,
+    token: &str,
+    message: &Value,
+) -> Result<Value, WorkflowRuntimeError> {
+    let (path, form) = google_chat_attachment_form(message)?;
+    let request = reqwest::Client::new()
+        .post(format!("{}{path}", base_url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(120));
+    send_to_googlechatbot(request, "google chat attachment upload failed").await
+}
+
+fn google_chat_attachment_form(
+    message: &Value,
+) -> Result<(String, reqwest::multipart::Form), WorkflowRuntimeError> {
+    use base64::Engine as _;
+
+    let bad_request = |detail: String| {
+        WorkflowRuntimeError::BadRequest(format!("ctx.post_to_google_chat_attachment {detail}"))
+    };
+    let required = |key: &str| {
         message
             .get(key)
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                WorkflowRuntimeError::BadRequest(format!(
-                    "ctx.post_to_google_chat_attachment requires {key}"
-                ))
-            })
+            .ok_or_else(|| bad_request(format!("requires {key}")))
     };
     let space_name = required("space_name")?;
     let filename = required("filename")?;
-    let content_base64 = required("content_base64")?;
+    let content_base64: String = required("content_base64")?
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
     let arg = |key: &str| {
         message
             .get("args")
             .and_then(|args| args.get(key))
             .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
     };
 
-    let path = google_chat_relay_path(&space_name, "attachments")?;
-
-    let mut body = json!({
-        "filename": filename,
-        "content_base64": content_base64,
-    });
-    for key in ["mime_type", "text", "thread_name"] {
-        if let Some(value) = arg(key) {
-            body[key] = json!(value);
-        }
+    let path = google_chat_relay_path(space_name, "attachments")?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(content_base64)
+        .map_err(|_| bad_request("content_base64 is not valid base64".to_owned()))?;
+    if data.is_empty() {
+        return Err(bad_request(
+            "content_base64 decoded to zero bytes".to_owned(),
+        ));
+    }
+    if data.len() > MAX_GOOGLE_CHAT_ATTACHMENT_BYTES {
+        return Err(bad_request(format!(
+            "attachment exceeds the {MAX_GOOGLE_CHAT_ATTACHMENT_BYTES} byte limit"
+        )));
     }
 
-    post_to_googlechatbot(
-        &path,
-        &body,
-        std::time::Duration::from_secs(120),
-        "google chat attachment upload failed",
-    )
-    .await
+    let mut file = reqwest::multipart::Part::bytes(data).file_name(filename.to_owned());
+    if let Some(mime_type) = arg("mime_type") {
+        file = file
+            .mime_str(mime_type)
+            .map_err(|_| bad_request(format!("mime_type {mime_type:?} is invalid")))?;
+    }
+    let mut form = reqwest::multipart::Form::new().part("file", file);
+    for key in ["text", "thread_name"] {
+        if let Some(value) = arg(key) {
+            form = form.text(key, value.to_owned());
+        }
+    }
+    Ok((path, form))
 }
 
 fn slack_post_result_from_response(channel: &str, response: Value) -> SlackPostResult {
@@ -6253,6 +6304,71 @@ mod tests {
         for space_name in ["", "AAQA42QLdws", "spaces/A/messages/M", "spaces/bad id"] {
             let error = google_chat_relay_path(space_name, "messages").unwrap_err();
             assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn google_chat_attachment_posts_multipart_to_the_space_route() {
+        let (url, server) = serve_one_response("200 OK", json!({"name": "spaces/A/messages/M"}));
+        let message = json!({
+            "space_name": "spaces/A",
+            "filename": "report.pdf",
+            "content_base64": "aGVs\nbG8=",
+            "args": {"mime_type": "application/pdf", "text": "Weekly", "thread_name": "spaces/A/threads/T"},
+        });
+        let value = post_google_chat_attachment_to(&url, "internal-test-key", &message)
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+        assert_eq!(value, json!({"name": "spaces/A/messages/M"}));
+        assert!(
+            request.starts_with("POST /api/chat/spaces/A/attachments HTTP/1.1"),
+            "{request}"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer internal-test-key"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("content-type: multipart/form-data; boundary="),
+            "{request}"
+        );
+        assert!(!request.contains("content_base64"), "{request}");
+        assert!(
+            request.contains(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"report.pdf\"\r\n\
+                 Content-Type: application/pdf\r\n\r\nhello\r\n"
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains("Content-Disposition: form-data; name=\"text\"\r\n\r\nWeekly\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains(
+                "Content-Disposition: form-data; name=\"thread_name\"\r\n\r\nspaces/A/threads/T\r\n"
+            ),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn google_chat_attachment_rejects_bad_content_before_sending() {
+        for (content_base64, expected) in [
+            ("not base64!", "not valid base64"),
+            ("   ", "decoded to zero bytes"),
+            ("", "requires content_base64"),
+        ] {
+            let message = json!({
+                "space_name": "spaces/A",
+                "filename": "a.txt",
+                "content_base64": content_base64,
+            });
+            let error = google_chat_attachment_form(&message).unwrap_err();
+            assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 
