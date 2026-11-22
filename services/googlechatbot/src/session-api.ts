@@ -753,7 +753,7 @@ function stagedAttachmentInputLines(part: NormalizedPart, attachmentId: string):
 /**
  * Upload-destination block prepended to every executed turn, mirroring
  * slackbotv2's "Slack Session Context". Gives the agent the exact space/thread
- * resource names so `google-chat upload` can deliver files into this thread
+ * resource names so `tools.google_chat.upload_file` can deliver files into this thread
  * (the bot relays the upload; the DWD credential never leaves it).
  */
 function chatSessionContext(message: GoogleChatTurnMessage, threadKey: string): string | undefined {
@@ -769,7 +769,7 @@ function chatSessionContext(message: GoogleChatTurnMessage, threadKey: string): 
     `- thread_key: ${threadKey}`,
     '',
     'Use these exact resource names for Google Chat file uploads in this thread.',
-    `Example: google-chat upload ${message.spaceName} /path/to/file${thread ? ` --thread ${thread}` : ''}`,
+    `Example (Code Mode): tools.google_chat.upload_file({ space: "${message.spaceName}", ${thread ? `thread: "${thread}", ` : ''}path: "<file under the home directory>" })`,
     'Do not recover this destination with Google Chat search.',
     '---'
   ]

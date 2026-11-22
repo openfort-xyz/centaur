@@ -709,6 +709,9 @@ class RetiredToolShimTest(unittest.TestCase):
     def test_centaur_console_is_retired_to_its_connector(self) -> None:
         self.assertEqual(install_tool_shims.RETIRED_TOOLS["centaur-console"], "centaur_console")
 
+    def test_google_chat_is_retired_to_its_connector(self) -> None:
+        self.assertEqual(install_tool_shims.RETIRED_TOOLS["google-chat"], "google_chat")
+
     def test_tools_replaced_by_same_named_connectors_are_retired(self) -> None:
         for name in (
             "coindesk", "edgar", "fedreg", "googlenews", "kalshi", "laminar", "mercator",

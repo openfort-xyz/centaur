@@ -158,8 +158,8 @@ ownership check for the selected app or delegated credential.
 
 DM creation has a separate grant. Add an exact email address under **Google
 Chat DM permissions**. Resource names such as `users/<id>` and the legacy
-`users/<email>` form are rejected before Google is called. The `google-chat dm`
-command asks api-rs to create or reuse that target's DM and send the first text
+`users/<email>` form are rejected before Google is called. The `google_chat.send_dm`
+connector function asks api-rs to create or reuse that target's DM and send the first text
 in one operation. The caller cannot replace the returned space or reuse the DM
 as an ungranted send target.
 
@@ -256,8 +256,9 @@ the scopes above to one convenience account.
   `googlechatbot.attachmentAggregateMaxBytes` ceiling (100 MiB by default).
 - Files up to 25 MiB are inlined. Larger accepted files use bounded
   `attachment.chunk` staging before execution.
-- Agent uploads and proxy downloads have a 100 MiB server ceiling. The CLI
-  download default is 10 MiB and refuses to overwrite an existing file.
+- Agent uploads (multipart/form-data through api-rs) and proxy downloads have
+  a 100 MiB server ceiling. Connector downloads stream to the sandbox file,
+  replacing any file already at that path.
 - A complete serialized Google `Message` is capped at 32,000 UTF-8 bytes.
   Longer answers are split losslessly into ordered, retry-safe messages.
 - Ordinary answers use Chat text formatting. Standalone images use Cards v2
@@ -278,10 +279,11 @@ the scopes above to one convenience account.
   `files.export` MIME/extension pairs and its separate 10 MB ceiling. Vids stay
   metadata-only until the long-running `files.download` flow is implemented.
 
-The agent CLI includes space discovery, metadata, members, paginated history,
-threads, bounded search, reactions, DM setup/send, questions, dump, feedback,
-message send/update/delete, upload, file list/search/info, and raw download.
-Every command routes through api-rs authorization.
+The `google_chat` Code Mode connector covers space discovery, metadata,
+members, paginated history, threads, bounded search, reactions, DM setup/send,
+questions, dump, feedback, message send/update/delete, upload, file
+list/search/info, and download. Run `centaur-codemode load google_chat` for its
+functions. Every function routes through api-rs authorization.
 
 ## Deliver scheduled tasks
 

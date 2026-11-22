@@ -270,8 +270,8 @@ impl ChatDestination {
                 thread_name,
             } => format!(
                 "[chat surface: Google Chat · space {space_name} · thread {thread_name}. \
-                 Centaur delivers your reply to this thread automatically — do not repost it with the google-chat tool. \
-                 Send files here with `google-chat upload`.]"
+                 Centaur delivers your reply to this thread automatically — do not repost it with the google_chat connector. \
+                 Send files here with the `google_chat.upload_file` connector.]"
             ),
         }
     }
@@ -914,11 +914,7 @@ mod tests {
             .context_line();
         assert!(google_chat.contains("Google Chat"));
         assert!(google_chat.contains("spaces/AAAA/threads/BBBB"));
-        // The shim is generated from `[project.scripts]` in
-        // tools/comms/google_chat/pyproject.toml, which names it `google-chat`.
-        // `google_chat upload` is not a command that exists in the sandbox.
-        assert!(google_chat.contains("google-chat upload"));
-        assert!(!google_chat.contains("google_chat upload"));
+        assert!(google_chat.contains("google_chat.upload_file"));
     }
 
     #[test]

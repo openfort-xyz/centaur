@@ -32,6 +32,7 @@ RETIRED_TOOLS: dict[str, str] = {
     "company_context": "company_context",
     "edgar": "edgar",
     "fedreg": "fedreg",
+    "google-chat": "google_chat",
     "googlenews": "googlenews",
     "kalshi": "kalshi",
     "laminar": "laminar",

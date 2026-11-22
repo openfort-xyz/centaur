@@ -399,10 +399,12 @@ async function runInternalRouteSmoke(runtime: ReturnType<typeof createGooglechat
   assert.equal((await runtime.app.request('/api/chat/spaces/S/messages/M1/reactions', {
     headers: auth
   })).status, 200)
+  const uploadForm = new FormData()
+  uploadForm.append('file', new File(['uploaded'], 'upload.txt'))
   assert.equal((await runtime.app.request('/api/chat/spaces/S/attachments', {
     method: 'POST',
-    headers: auth,
-    body: JSON.stringify({ filename: 'upload.txt', content_base64: 'dXBsb2FkZWQ=' })
+    headers: { authorization: auth.authorization },
+    body: uploadForm
   })).status, 200)
   const download = await runtime.app.request(
     '/api/chat/spaces/S/messages/M1/attachments/A1/download',

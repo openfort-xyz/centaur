@@ -186,10 +186,8 @@ const SPACE_LOOKUP_TIMEOUT_MS = 3_000
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 const MAX_CHAT_EVENT_BODY_BYTES = 1024 * 1024
 const MAX_INTERNAL_JSON_BYTES = 1024 * 1024
-// Interim JSON/base64 transport inflates a 100MiB file by ~4/3. TASK-023
-// replaces this with raw streaming; the decoded MAX_UPLOAD_BYTES remains the
-// authoritative file limit.
-const MAX_INTERNAL_UPLOAD_BYTES = 135 * 1024 * 1024
+// The multipart body: the file plus its part headers and caption fields.
+const MAX_INTERNAL_UPLOAD_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
 const DWD_SUBJECT_HEADER = 'x-centaur-google-chat-dwd-subject'
 const CHAT_INGRESS_DEADLINE_MS = 29_000
 
@@ -659,9 +657,9 @@ export function createGooglechatbot(
   })
 
   // Upload a file into a space (optionally threaded, with a caption). This is
-  // how agent tooling delivers files to the thread — the Slack analogue is the
-  // `slack upload` CLI hitting Slack directly; here the credential (a DWD
-  // user impersonation, see GOOGLECHATBOT_UPLOAD_USER) stays in the bot.
+  // how agent tooling (`tools.google_chat.upload_file`, via api-rs) delivers
+  // files to the thread as multipart/form-data; the credential (a DWD user
+  // impersonation, see GOOGLECHATBOT_UPLOAD_USER) stays in the bot.
   app.post('/api/chat/spaces/:spaceId/attachments', async c => {
     const denied = requireInternalAuth(c)
     if (denied) return denied
@@ -680,37 +678,28 @@ export function createGooglechatbot(
         503
       )
     }
-    const body = await readJsonBody<{
-      filename?: string
-      content_base64?: string
-      mime_type?: string
-      text?: string
-      thread_name?: string
-    }>(c, MAX_INTERNAL_UPLOAD_BYTES)
-    if (body instanceof InputError) return c.json({ error: body.message }, body.status)
-    if (!body?.filename || !body.content_base64) {
-      return c.json({ error: 'filename and content_base64 are required' }, 400)
+    const form = await readMultipartBody(c, MAX_INTERNAL_UPLOAD_BYTES)
+    if (form instanceof InputError) return c.json({ error: form.message }, form.status)
+    const file = form.get('file')
+    if (!(file instanceof File) || !file.name) {
+      return c.json({ error: 'a multipart `file` part with a filename is required' }, 400)
     }
-    // Buffer.from(x, 'base64') never throws — it silently drops invalid chars,
-    // so a malformed payload would upload a truncated file with a 200. Validate
-    // explicitly (whitespace tolerated) so bad input fails as a clean 400.
-    const b64 = body.content_base64.replace(/\s+/g, '')
-    if (b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
-      return c.json({ error: 'content_base64 is not valid base64' }, 400)
-    }
-    const data = Uint8Array.from(Buffer.from(b64, 'base64'))
-    if (data.byteLength === 0) return c.json({ error: 'content_base64 decoded to zero bytes' }, 400)
-    // Same 100MB ceiling slackbotv2 applies to inline file content; the Chat
-    // API itself allows up to 200MB per attachment.
-    if (data.byteLength > MAX_UPLOAD_BYTES) {
+    if (file.size === 0) return c.json({ error: 'the uploaded file is empty' }, 400)
+    if (file.size > MAX_UPLOAD_BYTES) {
       return c.json({ error: `attachment exceeds the ${MAX_UPLOAD_BYTES} byte limit` }, 413)
     }
+    const field = (name: string) => {
+      const value = form.get(name)
+      return typeof value === 'string' && value ? value : undefined
+    }
+    const body = { text: field('text'), thread_name: field('thread_name') }
+    const data = new Uint8Array(await file.arrayBuffer())
     try {
       const thread = internalThreadOptions(spaceName, body.thread_name)
       const uploaded = await client.uploadAttachment(
         spaceName,
-        body.filename,
-        body.mime_type ?? 'application/octet-stream',
+        file.name,
+        file.type || 'application/octet-stream',
         data,
         subject
       )
@@ -921,13 +910,32 @@ async function readJsonBody<T>(c: Context, limit: number): Promise<T | null | In
   }
 }
 
+async function readMultipartBody(c: Context, limit: number): Promise<FormData | InputError> {
+  const contentType = c.req.header('content-type') ?? ''
+  if (!contentType.toLowerCase().startsWith('multipart/form-data')) {
+    return new InputError(400, 'upload body must be multipart/form-data')
+  }
+  const bytes = await readBodyBytes(c, limit)
+  if (bytes instanceof InputError) return bytes
+  try {
+    return await new Response(new Uint8Array(bytes), { headers: { 'content-type': contentType } }).formData()
+  } catch {
+    return new InputError(400, 'upload body is not valid multipart/form-data')
+  }
+}
+
 async function readBodyText(c: Context, limit: number): Promise<string | InputError> {
+  const bytes = await readBodyBytes(c, limit)
+  return bytes instanceof InputError ? bytes : bytes.toString()
+}
+
+async function readBodyBytes(c: Context, limit: number): Promise<Buffer | InputError> {
   const declared = Number(c.req.header('content-length'))
   if (Number.isFinite(declared) && declared > limit) {
     return new InputError(413, 'request body exceeds the configured limit')
   }
   const reader = c.req.raw.body?.getReader()
-  if (!reader) return ''
+  if (!reader) return Buffer.alloc(0)
   const chunks: Uint8Array[] = []
   let size = 0
   while (true) {
@@ -940,7 +948,7 @@ async function readBodyText(c: Context, limit: number): Promise<string | InputEr
     }
     chunks.push(value)
   }
-  return Buffer.concat(chunks).toString()
+  return Buffer.concat(chunks)
 }
 
 function pageOptions(c: Context): { pageSize?: number; pageToken?: string } | InputError {

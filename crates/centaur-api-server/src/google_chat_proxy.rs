@@ -24,9 +24,9 @@ use crate::{ApiError, api_jwt::bearer_token, routes::AppState};
 
 const DEFAULT_GOOGLECHATBOT_INTERNAL_URL: &str = "http://centaur-centaur-googlechatbot:3002";
 const DEFAULT_JSON_BODY_MAX_BYTES: usize = 1024 * 1024;
-// Interim JSON upload envelope: 100 MiB decoded content expands by 4/3 in base64.
-// The bot enforces the authoritative 100 MiB decoded limit.
-const DEFAULT_UPLOAD_BODY_MAX_BYTES: usize = 135 * 1024 * 1024;
+// Multipart upload: a 100 MiB file plus part headers and caption fields.
+// The bot enforces the authoritative 100 MiB file limit.
+const DEFAULT_UPLOAD_BODY_MAX_BYTES: usize = 101 * 1024 * 1024;
 const DEFAULT_DOWNLOAD_RESPONSE_MAX_BYTES: usize = 100 * 1024 * 1024;
 const DEFAULT_JSON_RESPONSE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -389,13 +389,25 @@ async fn upload_attachment(
     body: Body,
 ) -> Result<Response, ApiError> {
     let (space, subject) = authorized_space_with_reader(&headers, &space_id, Operation::Upload)?;
-    forward_as(
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        })
+        .ok_or_else(|| {
+            ApiError::BadRequest("Google Chat uploads must be multipart/form-data".to_owned())
+        })?;
+    forward_with_content_type(
         Method::POST,
         &format!("/api/chat/{space}/attachments"),
         None,
         body,
         config()?.max_upload_body_bytes,
         subject.as_deref(),
+        content_type,
     )
     .await
 }
@@ -748,6 +760,27 @@ async fn forward_as(
     max_body_bytes: usize,
     subject: Option<&str>,
 ) -> Result<Response, ApiError> {
+    forward_with_content_type(
+        method,
+        path,
+        query,
+        body,
+        max_body_bytes,
+        subject,
+        "application/json",
+    )
+    .await
+}
+
+async fn forward_with_content_type(
+    method: Method,
+    path: &str,
+    query: Option<&str>,
+    body: Body,
+    max_body_bytes: usize,
+    subject: Option<&str>,
+    content_type: &str,
+) -> Result<Response, ApiError> {
     let config = config()?;
     let is_download = method == Method::GET && path.ends_with("/download");
     let max_response_bytes = if is_download {
@@ -764,7 +797,7 @@ async fn forward_as(
         .client
         .request(method, url)
         .bearer_auth(&config.internal_key)
-        .header(header::CONTENT_TYPE.as_str(), "application/json");
+        .header(header::CONTENT_TYPE.as_str(), content_type);
     if let Some(subject) = subject {
         request = request.header(GOOGLE_CHAT_DWD_SUBJECT_HEADER, subject);
     }
@@ -1118,6 +1151,8 @@ mod tests {
         )
     }
 
+    const MULTIPART_TEST_TYPE: &str = "multipart/form-data; boundary=test";
+
     async fn call(
         app: &Router,
         method: Method,
@@ -1126,6 +1161,9 @@ mod tests {
         body: Body,
     ) -> Response {
         let mut request = Request::builder().method(method).uri(uri);
+        if uri.ends_with("/attachments") {
+            request = request.header(header::CONTENT_TYPE, MULTIPART_TEST_TYPE);
+        }
         if let Some(token) = token {
             request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
@@ -1597,6 +1635,16 @@ mod tests {
         );
         drop(forwarded_paths);
 
+        let json_upload = Request::builder()
+            .method(Method::POST)
+            .uri("/api/google-chat/spaces/S/attachments")
+            .header(header::AUTHORIZATION, format!("Bearer {allowed}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let rejected = app.clone().oneshot(json_upload).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
         let upstream_error = call(
             &app,
             Method::GET,
@@ -1647,6 +1695,15 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned),
                 });
+                if target.ends_with("/attachments")
+                    && parts
+                        .headers
+                        .get(header::CONTENT_TYPE)
+                        .map(HeaderValue::as_bytes)
+                        != Some(MULTIPART_TEST_TYPE.as_bytes())
+                {
+                    return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+                }
                 if target.starts_with("/api/chat/spaces?") {
                     return Json(json!({"spaces": [{"name": "spaces/S"}]})).into_response();
                 }
