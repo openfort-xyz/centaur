@@ -1,13 +1,11 @@
 //! Scheduled-task runs against a Postgres database holding Console's schema.
 //!
-//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database prepared with Console's
-//! `bin/rails db:prepare`. A scheduler pass claims every due task in the
+//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database migrated with
+//! `cargo run -p centaur-console-db --example migrate -- <url>`. A scheduler pass claims every due task in the
 //! database, so these tests run one at a time and start from an empty
 //! `scheduled_tasks` table.
 
 use std::{
-    env,
-    str::FromStr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -21,10 +19,9 @@ use centaur_console_db::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use sqlx::{
-    PgPool, Row,
-    postgres::{PgConnectOptions, PgPoolOptions},
-};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+
+mod common;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -47,28 +44,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let Ok(url) = env::var("CONSOLE_DB_TEST_DATABASE_URL") else {
-            assert!(
-                env::var_os("CI").is_none(),
-                "CONSOLE_DB_TEST_DATABASE_URL must be set in CI"
-            );
-            eprintln!(
-                "skipping: set CONSOLE_DB_TEST_DATABASE_URL to a database with Console's schema"
-            );
-            return None;
-        };
+        let admin_pool = common::database().await?;
         let serial = SERIAL.lock().await;
-        let options = PgConnectOptions::from_str(&url)
-            .unwrap()
+        let options = (*admin_pool.connect_options())
+            .clone()
             .options([("default_transaction_read_only", "on")]);
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect_with(options)
-            .await
-            .unwrap();
-        let admin_pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
             .await
             .unwrap();
         sqlx::query("DELETE FROM scheduled_tasks")
@@ -424,7 +407,7 @@ async fn a_task_that_cannot_deliver_advances_without_blocking_others() {
     let request = starter
         .requests()
         .into_iter()
-        .find(|request| request.task_id == channel_task)
+        .find(|request| request.input["scheduled_task_id"] == json!(oid("tsk", channel_task)))
         .unwrap();
     assert_eq!(request.input["principal"], json!(foreign_id));
     assert_eq!(request.input["channel"], json!(channel));
@@ -727,7 +710,6 @@ async fn google_chat_tasks_run_as_their_author_with_a_current_grant() {
     let requests = starter.requests();
     assert_eq!(requests.len(), 1);
     let dm = &requests[0];
-    assert_eq!(dm.task_id, dm_task);
     let name = dm.input["scheduled_task_name"].clone();
     assert_eq!(
         dm.input,
@@ -776,7 +758,7 @@ async fn google_chat_tasks_run_as_their_author_with_a_current_grant() {
     let space_run = starter
         .requests()
         .into_iter()
-        .find(|request| request.task_id == space_task)
+        .find(|request| request.input["scheduled_task_id"] == oid("tsk", space_task))
         .unwrap();
     assert_eq!(space_run.input["channel"], json!(space));
     assert_eq!(space_run.input["author_email"], json!(renamed));

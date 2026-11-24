@@ -1,14 +1,29 @@
 # iron-control API
 
-`iron-control` exposes a JSON API under `/api/v1` in three namespaces, each with exactly one credential type. No endpoint accepts more than one.
+`iron-control` exposes a JSON API under `/api/v1` in three namespaces. The console namespace accepts a session cookie or a sandbox-delegated user credential, never an API key; the other two accept exactly one credential type.
 
 | Namespace | Credential | Callers |
 |---|---|---|
 | `/api/v1/*` (this document's resource sections) | Bearer API key | Machine callers: CLIs, api-rs, provisioning scripts |
-| [`/api/v1/console/*`](#console-api) | Console session cookie (with CSRF on writes) | The operator console SPA |
+| [`/api/v1/console/*`](#console-api) | Console session cookie (writes need an exact same-origin `Origin`), or a sandbox token from an active admin's Slack or verified Google Chat DM | The operator Console and delegated admin DM sandboxes |
 | `/api/v1/sandbox/*` | Sandbox entitlement JWT injected by `iron-proxy` | Agents inside sandboxes |
 
 The [Console API](#console-api) is documented separately at the end. It reuses several bearer resources with console-only additions; the bearer contract never changes for it.
+
+### Contract notes
+
+api-rs serves this API (`crates/centaur-api-server/src/console/README.md`):
+
+- Unsafe cookie-authenticated requests need an exact Console `Origin`; there is
+  no CSRF token.
+- A server-rendered redirect error is `GET /login?error=<code>`.
+- Console updates use `PATCH`; `me/ssh_key` uses `PUT`; bearer resources use
+  `PUT`; proxies and sandbox resources use `PATCH`; Slack permission
+  replacements use `PUT`.
+- Skill detail returns raw `instructions`; the SPA renders and sanitizes the
+  markdown.
+- Health is api-rs `/healthz`. Foreign-id lookup is `/lookup/:foreign_id`.
+  Admin DM sandboxes use the sandbox-delegated Console credential.
 
 - [Authentication](#authentication)
 - [Conventions](#conventions)
@@ -34,7 +49,7 @@ The [Console API](#console-api) is documented separately at the end. It reuses s
 - [Skills](#skills)
 - [Proxies](#proxies)
 - [Proxy sync](#proxy-sync)
-- [Console API](#console-api) (session only)
+- [Console API](#console-api)
   - [Credentials and authorization](#credentials-and-authorization)
   - [Session endpoints](#session-endpoints)
   - [Console sign-in and OAuth pages](#console-sign-in-and-oauth-pages)
@@ -1190,44 +1205,11 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 }
 ```
 
-### Sandbox Admin Permission Management
+### Sandbox-delegated console access
 
-An active admin Console user's DM sandbox may create workflow principals, create and edit static, Postgres DSN, and GCP ID token secrets whose sources reference an external store, grant secrets to roles, inspect a principal's effective grants, and manage its roles, direct secret grants, and sandbox capabilities with its sandbox entitlement JWT. From a Slack DM it may additionally create Slack channel and Slack user principals, manage Slack channel permissions, and edit the Slack Connect allowlist; those Slack-scoped operations return `403` from a Google Chat DM. From a Google Chat DM it may additionally manage Google Chat space permissions and email-targeted DM permissions; those return `403` from a Slack DM.
+An active admin Console user's Slack DM sandbox may call the [Console API](#console-api) with its sandbox entitlement JWT instead of a session cookie. The sandbox principal must be a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog. It acts as that Console user with the same admin/active/pending rules as a session: a request without a cookie has no `Origin` requirement, and every other `Authorization` value (including an API key) is still `403 session_required`.
 
-The sandbox principal must be one of:
-
-- a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog;
-- a `gchat_dm` principal whose verified `google_email` label (stamped by api-rs only on signature-verified 1:1 DMs) is the email of its proxy's current requester, a `gchat_user` principal whose Google account is the linked admin's: matched by its `google_subject` label against the admin's Google sign-in, else by that email being the admin's stored email or the verified email of their Google sign-in.
-
-Other sandboxes, including channel, shared Google Chat space, Slack Connect, bare `gchat_user`, unverified or requester-less Google Chat DM, and Console-user sessions, receive `403`. Request and response shapes match the corresponding admin endpoints.
-
-| Method | Path | Notes |
-| ------ | ---- | ----- |
-| `GET` | `/api/v1/sandbox/admin/principals` | List principals. `slack_channel_id=<id>` returns only principals bound to that channel. |
-| `GET` | `/api/v1/sandbox/admin/principals/:id` | Fetch one by OID. |
-| `POST` | `/api/v1/sandbox/admin/principals` | Create a Slack channel (`data: { kind: "slack_channel", slack_channel_id }`), Slack user (`data: { kind: "slack_dm", slack_user_id }`), or workflow (`data: { kind: "workflow", workflow_name }`) principal. The foreign ID, kind, and Slack fields match what api-rs derives: `slack-channel-<channel>`, `slack-user-<team>-<user>` in the admin's workspace, or `workflow-<slugged workflow_name>` for `WORKFLOW_PRINCIPAL = True`. A new channel principal gets full Slack access to its own channel. Other kinds and DM channel IDs return `400`; invalid IDs and existing principals return `422`. |
-| `GET` | `/api/v1/sandbox/admin/principals/lookup/:foreign_id` | Fetch one by foreign ID. |
-| `GET`/`POST` | `/api/v1/sandbox/admin/static_secrets[/:id]`, `/api/v1/sandbox/admin/pg_dsn_secrets[/:id]`, `/api/v1/sandbox/admin/gcp_auth_secrets[/:id]`, `/api/v1/sandbox/admin/gcp_id_token_secrets[/:id]` | Fetch a secret by OID or create one, as in the static, Postgres DSN, GCP auth, and GCP ID token secret APIs. Inline `control_plane` and OAuth `token_broker` sources return `403`. |
-| `PATCH`/`PUT` | `/api/v1/sandbox/admin/static_secrets/:id`, `/api/v1/sandbox/admin/pg_dsn_secrets/:id`, `/api/v1/sandbox/admin/gcp_auth_secrets/:id`, `/api/v1/sandbox/admin/gcp_id_token_secrets/:id` | Update an existing secret by OID. Omitted fields, including the source, keep their current values. To switch a GCP auth secret between a `keyfile` and `credentials_provider`, send the other as `null` (and `subject: null` when leaving keyfile mode). Same source restrictions; secrets with a `token_broker` source return `403`. |
-| `GET`/`POST` | `/api/v1/sandbox/admin/principals/:principal_id/roles` | List or assign roles (`data: { role_id }`). |
-| `DELETE` | `/api/v1/sandbox/admin/principals/:principal_id/roles/:id` | Unassign a role. |
-| `GET` | `/api/v1/sandbox/admin/roles`, `/roles/:id`, `/roles/lookup/:foreign_id` | List or fetch roles. |
-| `GET` | `/api/v1/sandbox/admin/roles/:role_id/grants` | List a role's grants. |
-| `GET` | `/api/v1/sandbox/admin/principals/:principal_id/grants` | List a principal's direct grants. |
-| `GET` | `/api/v1/sandbox/admin/principals/:id/effective_grants` | List secrets the principal holds directly or through roles, paginated with `page` and `limit`. Each row has `id`, `grant_key`, `foreign_id`, `name`, `direct`, and `roles` (`id`, `foreign_id`, `name`) that grant it. |
-| `POST` | `/api/v1/sandbox/admin/grants` | Grant a secret to a principal (`data: { principal_id, <grant_key>: <secret oid> }`) or a role (`data: { role_id, <grant_key>: <secret oid> }`). A role grant reaches every holder of the role. |
-| `DELETE` | `/api/v1/sandbox/admin/grants/:id` | Revoke a principal or role grant. |
-| `GET` | `/api/v1/sandbox/admin/secrets` | List grantable secrets of every kind with `id`, `grant_key`, `foreign_id`, `name`, `description`, and `labels`. `q` filters by name or foreign ID. |
-| `POST` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions` | Upsert one Slack channel permission (`data: { channel_id, upload_enabled, download_enabled, history_enabled }`). New permissions default omitted flags to `true`. |
-| `DELETE` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions/:channel_id` | Remove the principal's own permission for a channel. |
-| `POST` | `/api/v1/sandbox/admin/principals/:id/google_chat_space_permissions` | Google Chat DM only. Upsert one Google Chat space permission (`data: { space_name, send_enabled, update_enabled, delete_enabled, upload_enabled, download_enabled, history_enabled, members_enabled, reactions_enabled }`), as in the principal API. New permissions default omitted flags to `true`. |
-| `DELETE` | `/api/v1/sandbox/admin/principals/:id/google_chat_space_permissions/:space_id` | Google Chat DM only. Remove the principal's own permission for `spaces/:space_id`. |
-| `POST` | `/api/v1/sandbox/admin/principals/:id/google_chat_dm_permissions` | Google Chat DM only. Upsert one Google Chat DM permission (`data: { target_identity, setup_enabled }`); `target_identity` must be an email address. |
-| `DELETE` | `/api/v1/sandbox/admin/principals/:id/google_chat_dm_permissions/:target_identity` | Google Chat DM only. Remove the principal's own DM permission for that email. |
-| `PATCH` | `/api/v1/sandbox/admin/principals/:id/sandbox_access` | Update only the supplied `sandbox_repo_cache` and `sandbox_*_enabled` fields. Flags must be JSON booleans; other values return `400`. |
-| `GET` | `/api/v1/sandbox/admin/slack_external_teams` | List allowed Slack Connect workspace (`T…`) and Enterprise Grid org (`E…`) ids as `data: [id, …]`. The list is stored by api-rs; if it is unreachable the request returns `503`. |
-| `POST` | `/api/v1/sandbox/admin/slack_external_teams` | Allow one id (`data: { team_id }`) and return the updated list. Adding an allowed id changes nothing. Invalid ids return `422`. |
-| `DELETE` | `/api/v1/sandbox/admin/slack_external_teams/:id` | Remove one id and return the updated list. Returns `404` if the id is not allowed. |
+The plain sandbox resources above (`permissions`, `oauth_apps`, `scheduled_tasks`, and `skills`) keep their entitlement-only behavior. There is no `/api/v1/sandbox/admin/*` namespace.
 
 ## OAuth consent flow
 
@@ -1803,22 +1785,24 @@ Notes on the proxy-sync payload, which differs from the REST representation:
 
 ## Console API
 
-Everything the operator console SPA calls lives under `/api/v1/console`
-(`Api::V1::Console` controllers). These endpoints take the console session
-only and are not for machine callers: use the bearer resources above, which
-the console API never changes. Responses use the same [conventions](#conventions)
-and [error envelope](#errors).
+Everything the operator console SPA calls lives under `/api/v1/console`. These endpoints take the console session
+cookie, or a sandbox-delegated user credential, and never an API key: use the
+bearer resources above for machine callers, which the console API never
+changes. Responses use the same [conventions](#conventions) and
+[error envelope](#errors).
 
 ### Credentials and authorization
 
-- **Session only.** A request with an `Authorization` header (any scheme, even
-  alongside a valid cookie) gets `403` with `details.reason = "session_required"`;
-  it never falls back to the cookie. No session gets `401` with
-  `details.reason = "session_required"`.
-- **CSRF.** Requests other than `GET`/`HEAD` must send the session's CSRF token
-  (from [`GET /api/v1/console/me`](#session-endpoints)) as `X-CSRF-Token`, from a
-  same-origin page. A missing or invalid token, or a cross-site `Origin`,
-  returns `403` with `details.reason = "csrf"`.
+- **No API keys.** A request with an `Authorization` header gets
+  `403` with `details.reason = "session_required"`, unless it is the
+  sandbox-delegated credential described below; it never falls back to the
+  cookie. No session gets `401` with `details.reason = "session_required"`.
+- **Sandbox delegation.** A sandbox entitlement JWT from an active admin's
+  Slack DM or verified Google Chat DM with the bot (see [Sandbox-delegated console access](#sandbox-delegated-console-access)) acts as that admin.
+  It has no cookie, so it needs no `Origin`.
+- **Origin.** Cookie-authenticated requests other than `GET`/`HEAD` must send
+  an `Origin` exactly equal to the Console public origin. A missing, `null`, or
+  cross-site `Origin` returns `403` with `details.reason = "csrf"`.
 - **Account status.** A disabled account's session is cleared: `401` with
   `details.reason = "account_disabled"`, and the next `/login` page shows
   "Your account is disabled." A pending account gets `403` with
@@ -1845,9 +1829,7 @@ and [error envelope](#errors).
     "user": { "id": "usr_…", "email": "ops@example.com", "name": null, "status": "active", "admin": true },
     "auth_method": "session",
     "acting_admin": true,
-    "csrf_token": "…",
     "features": { "api_clients": false, "password_login": true },
-    "flash": { "notice": "Signed in as ops@example.com." },
     "nav": {
       "control": true, "principals": true, "roles": true, "secrets": true,
       "credentials": true, "oauth_apps": true, "users": true, "api_clients": false,
@@ -1858,54 +1840,52 @@ and [error envelope](#errors).
 }
 ```
 
-`auth_method` is always `"session"`. `flash` returns, once, any
-`notice`/`alert` left by a redirect-based flow such as SSO or an OAuth
-callback, and is `{}` otherwise.
+`auth_method` is `"session"` for a session cookie and `"sandbox"` for a sandbox-delegated caller; both name the same Console account.
 
 ### Console sign-in and OAuth pages
 
 The login and pending pages, the [MCP OAuth consent](#mcp-oauth-consent) page,
 and the broker OAuth result page ([consent flow](#oauth-consent-flow)) are
-server-rendered by Rails with plain CSS and no JavaScript, because sign-in is a
-step of the MCP OAuth flow. They are not API endpoints or SPA routes.
-Keep their form contract stable so pods on either side of a rolling deploy or
-rollback accept each other's forms.
+server-rendered with plain CSS and no JavaScript, because sign-in is a step of
+the MCP OAuth flow. They are not API endpoints or SPA routes. Keep their URLs
+and form contract stable for installed MCP clients and bookmarked links.
+
+Every form post must send an `Origin` exactly equal to the Console public
+origin; a missing, `null`, or cross-site `Origin` gets a `422` error page.
+There is no CSRF token.
 
 | Method | Path | Access | Description |
 |---|---|---|---|
-| `GET` | `/login` | public | Login page: SSO buttons, the password form, the one-shot flash |
-| `POST` | `/login` | public, authenticity token required | Password sign-in (form post) |
-| `DELETE` | `/logout` | session, authenticity token required | Sign out (form post with `_method=delete`) |
+| `GET` | `/login` | public | Login page: SSO buttons, the password form, and the message for `?error=<code>` |
+| `POST` | `/login` | public | Password sign-in (form post) |
+| `POST` | `/logout` | session | Sign out (form post) |
 | `GET` | `/pending` | pending session | Holding page for an account awaiting approval |
 
 - `GET /login` shows a "Continue with <Provider>" link to
   `/auth/<provider>/start` per configured SSO provider and, unless
-  `CENTAUR_CONSOLE_PASSWORD_LOGIN_ENABLED=false`, a form posting
-  `authenticity_token`, `email`, and `password` to `/login`. An active session
-  is redirected to `?return_to=` (when allowlisted) or its landing page.
+  `CENTAUR_CONSOLE_PASSWORD_LOGIN_ENABLED=false`, a form posting `email` and
+  `password` to `/login`. An active session is redirected to `?return_to=`
+  (when valid) or its landing page.
 - `?return_to=` (the SPA sends the current page on a `401`) is remembered for
-  the post-login redirect only when it is an allowlisted same-origin path: `/`,
-  `/console…`, `/mcp/oauth/authorize` (or `/mcp/oauth/authorize.html`),
-  `/oauth/<slug>/start`, or `/launch`, query kept, with no scheme, host, `//`,
-  backslashes, control characters, or dot segments. Other values are ignored.
-  Session-gated GET endpoints that bounce a signed-out browser to `/login`
-  remember their path the same way.
+  the post-login redirect only when it is a same-origin path, query kept, with
+  no scheme, host, `//`, backslashes, whitespace, or control characters; dot
+  segments are resolved. Other values are ignored. Session-gated GET endpoints
+  that bounce a signed-out browser to `/login` remember their path the same
+  way.
 - `POST /login` trims the email and matches it case-insensitively. Success
-  resets the session (fixation) and redirects (`302`) to the remembered path or
-  the landing page (`/console/principals` for admins, `/console/integrations`
-  otherwise) with the notice `"Signed in as <email>."`. A pending account is
-  signed in and redirected to `/pending` ("Your account is awaiting
-  approval."). Failures re-render the page: `404` "Email and password sign in
-  is disabled.", `422` "Invalid email or password.", `422` "Your account is
-  disabled.". A missing or invalid authenticity token, or a cross-site
-  `Origin`, is a `422`.
-- `DELETE /logout` (and `DELETE /api/v1/console/session`) clears the session; the
-  former redirects to `/login` and both leave the notice `"Signed out."`.
+  issues a new session and redirects (`302`) to the remembered path or the
+  landing page (`/console/principals` for admins, `/console/integrations`
+  otherwise). A pending account is signed in and redirected to `/pending`.
+  Failures re-render the page: `404` "Email and password sign in is
+  disabled.", `422` "Invalid email or password.", `422` "Your account is
+  disabled.".
+- `POST /logout` (and `DELETE /api/v1/console/session`) clears the session; the
+  former redirects to `/login`.
 - `GET /pending` shows the signed-in email and a sign-out button. Active
   sessions are redirected to their landing page, signed-out browsers to
   `/login`.
-- SSO failures (`/auth/<provider>/*`) and disabled accounts bounced by a
-  Rails-owned route redirect to `/login` with an alert.
+- SSO failures (`/auth/<provider>/*`) and disabled accounts redirect to
+  `/login?error=<code>`, which renders the matching message.
 
 #### MCP OAuth consent
 
@@ -1927,11 +1907,11 @@ resource. Invalid requests redirect to the registered `redirect_uri` with
 client or `redirect_uri` is not trusted. A valid request renders the consent
 page.
 
-The consent page posts a standard Rails form to `POST /mcp/oauth/authorize`
-with `authenticity_token`, the original `response_type`, `client_id`,
+The consent page posts a form to `POST /mcp/oauth/authorize` with the original
+`response_type`, `client_id`,
 `redirect_uri`, `scope`, `state`, `resource`, `code_challenge`,
 `code_challenge_method`, and `decision`. It needs an active console session and
-a valid authenticity token, and is validated again. `decision=approve` issues a
+the Console `Origin`, and is validated again. `decision=approve` issues a
 single-use code and redirects (`302`) to the `redirect_uri` with `code` and
 `state`; any other decision redirects with `error=access_denied`.
 
@@ -1946,8 +1926,8 @@ the additions listed here. The additions exist only under `/api/v1/console`.
 | `GET`/`POST`/`PUT`/`PATCH`/`DELETE` `/api/v1/console/{static,pg_dsn,gcp_auth,gcp_id_token}_secrets[/:id]` (show, create, update, destroy) | [Static](#static-secrets), [PG DSN](#pg-dsn-secrets), [GCP auth](#gcp-auth-secrets), [GCP ID token](#gcp-id-token-secrets) secrets | [Secret write semantics](#console-secret-writes) |
 | `/api/v1/console/broker_credentials[/:id]` (index, show, create, update, destroy) | [Broker credentials](#broker-credentials) | [Broker credential fields](#console-broker-credentials) |
 | `/api/v1/console/oauth_apps[/:id]` (index, show, create, update, destroy), plus `credentials`, `provider_details`, `presets/:provider` | [OAuth apps](#oauth-apps) | [OAuth app fields and actions](#console-oauth-apps) |
-| `/api/v1/console/principals[/:id]` (index, show, create, update, destroy), `…/roles`, `…/grants`, `…/effective_grants`, `…/slack_channel_permissions`, `…/google_chat_space_permissions`, `…/google_chat_dm_permissions` | [Principals](#principals), [role assignments](#role-assignments) | [Principal views and actions](#console-principals) |
-| `/api/v1/console/roles[/:id]` (index, show, create, update, destroy), `…/grants`, `…/slack_channel_permissions`, `…/google_chat_space_permissions`, `…/google_chat_dm_permissions` | [Roles](#roles) | [Role filters and actions](#console-roles) |
+| `/api/v1/console/principals[/:id]` (index, show, create, update, destroy), `…/roles`, `…/grants`, `…/effective_grants`, `…/slack_channel_permissions` | [Principals](#principals), [role assignments](#role-assignments) | [Principal views and actions](#console-principals) |
+| `/api/v1/console/roles[/:id]` (index, show, create, update, destroy), `…/grants`, `…/slack_channel_permissions` | [Roles](#roles) | [Role filters and actions](#console-roles) |
 | `GET`/`POST`/`DELETE` `/api/v1/console/grants[/:id]`, `GET /api/v1/console/{principals,roles}/:id/grants` | [Grants](#grants) | Every grant payload adds `grantable` (below) |
 
 Grant payloads in the console API add a summary of the secret, never its
@@ -2063,7 +2043,7 @@ Console-only actions:
 - `owner_only` apps give each user their own connection, which serves only that user (see the `owner_only` field of [OAuth apps](#oauth-apps)).
 - `presets` lists presets whose app does not exist yet (a provider preset is also hidden once any app uses its provider); empty for non-admins. `inputs` lists the values the admin enters to set one up.
 
-`DELETE /api/v1/console/integrations/connections/:id` (any active user; CSRF) disconnects one of the caller's own connections to a personal app, by credential OID. The tokens are cleared and the credential marked dead first, so proxy sync and token-broker stop using it; then, when the provider has a revocation endpoint (a `custom` app's `revocation_endpoint`), both tokens are revoked there (RFC 7009). Returns `200` with `data: { id, outcome }`, where `outcome` is `revoked`, `local_only` (no revocation endpoint), or `failed` (revocation failed; access in Centaur is still removed). `404` for a credential the caller did not make or of a shared app. Connecting again revives it.
+`DELETE /api/v1/console/integrations/connections/:id` (any active user) disconnects one of the caller's own connections to a personal app, by credential OID. The tokens are cleared and the credential marked dead first, so proxy sync and token-broker stop using it; then, when the provider has a revocation endpoint (a `custom` app's `revocation_endpoint`), both tokens are revoked there (RFC 7009). Returns `200` with `data: { id, outcome }`, where `outcome` is `revoked`, `local_only` (no revocation endpoint), or `failed` (revocation failed; access in Centaur is still removed). `404` for a credential the caller did not make or of a shared app. Connecting again revives it.
 - `ssh_key.configured` reports whether the caller saved a personal SSH key.
 
 #### Console principals
@@ -2080,15 +2060,10 @@ Console-only actions:
 | `GET` | `/api/v1/console/principals/:principal_id/grants` | [Direct grants](#list-by-grantee), with `grantable`. |
 | `PUT` | `/api/v1/console/principals/:id/slack_channel_permissions` | Replace the direct Slack channel permissions with `data.slack_channel_permissions`. DM rows (`D…`) are API-managed: stored DM rows are kept and submitted DM rows ignored. An unchanged submission writes nothing. Returns the stored rows. |
 | `DELETE` | `/api/v1/console/principals/:id/slack_channel_permissions/:channel_id` | Delete one direct Slack channel permission. `204`; `404` if absent. |
-| `PUT` | `/api/v1/console/principals/:id/google_chat_space_permissions` | Google Chat DM only. Replace the direct Google Chat space permissions with `data.google_chat_space_permissions` (rows of `space_name` plus the eight `*_enabled` flags). Rows are keyed by `space_name`. An unchanged submission writes nothing. Returns the stored rows. `422` if a row has no permission enabled or an invalid space name. |
-| `DELETE` | `/api/v1/console/principals/:id/google_chat_space_permissions/spaces/:space_id` | Google Chat DM only. Delete the direct permission for `spaces/:space_id`. `204`; `404` if absent. |
-| `PUT` | `/api/v1/console/principals/:id/google_chat_dm_permissions` | Google Chat DM only. Replace the direct Google Chat DM permissions with `data.google_chat_dm_permissions` (rows of `target_identity`, an email, and `setup_enabled`). Returns the stored rows. `422` on an invalid row. |
-| `DELETE` | `/api/v1/console/principals/:id/google_chat_dm_permissions/:target_identity` | Google Chat DM only. Delete the direct DM permission for that email. `204`; `404` if absent. |
 
 The console principal payload is the bearer payload plus `kind`,
 `slack_user_id`, `roles` (`[{ id, foreign_id, name }]`), and
-`inherited_slack_channel_permissions`, `inherited_google_chat_space_permissions`,
-and `inherited_google_chat_dm_permissions` (merged from assigned roles).
+`inherited_slack_channel_permissions` (merged from assigned roles).
 
 `GET /api/v1/console/principals/:id/effective_grants` returns:
 
@@ -2121,7 +2096,6 @@ and `inherited_google_chat_dm_permissions` (merged from assigned roles).
 | `GET` | `/api/v1/console/roles/:role_id/grants` | [Grants](#list-by-grantee) attached to the role, with `grantable`. |
 | `PUT` | `/api/v1/console/roles/:id/slack_channel_permissions` | Replace the role's Slack channel permissions with `data.slack_channel_permissions`. Rows are keyed by `channel_id`. An unchanged submission writes nothing; a change bumps the sync config of every principal holding the role. Returns the stored rows. `422` if a row has no permission enabled. |
 | `DELETE` | `/api/v1/console/roles/:id/slack_channel_permissions/:channel_id` | Delete one role Slack channel permission. `204`; `404` if absent. |
-| `PUT`/`DELETE` | `/api/v1/console/roles/:id/google_chat_space_permissions[/spaces/:space_id]`, `/api/v1/console/roles/:id/google_chat_dm_permissions[/:target_identity]` | Google Chat DM only. As the principal endpoints; a change bumps the sync config of every principal holding the role. |
 
 ### Secrets (all kinds)
 
@@ -2336,6 +2310,26 @@ accepts. api-rs stores it, Slackbot reads it, and the console proxies it.
 | `GET` | `/api/v1/console/system_settings/slack_external_teams` | `{"data": {"slack_external_team_ids": ["T0…"]}}`. Returns `503` if the Centaur API is unreachable. |
 | `PUT` | `/api/v1/console/system_settings/slack_external_teams` | `{"data": {"slack_external_team_ids": [...]}}` replaces the whole list; the value may also be one string split on whitespace and commas. Returns the stored list. A Centaur API validation error (HTTP 400) returns `422` with its message; any other failure returns `503`. |
 
+### Google Chat permissions
+
+Principal and role responses include `google_chat_space_permissions` and
+`google_chat_dm_permissions`. Principal detail also includes the effective
+permissions and the permissions inherited from roles.
+
+Console administrators can use the following paths for either `principals` or
+`roles` under `/api/v1/console`.
+
+| Method | Suffix after `/{owner}/{id}` | Operation |
+| --- | --- | --- |
+| `PUT` | `/google_chat_space_permissions` | Replace direct grants with `data.google_chat_space_permissions`. |
+| `PUT` | `/google_chat_dm_permissions` | Replace direct grants with `data.google_chat_dm_permissions`. |
+| `POST` | `/google_chat_space_permissions` or `/google_chat_dm_permissions` | Upsert one direct grant. |
+| `DELETE` | `/google_chat_space_permissions/spaces/{space_id}` or `/google_chat_dm_permissions/{target_identity}` | Delete one direct grant by its target. |
+
+An active Console admin can use these writes from a verified Google Chat DM.
+The bearer routes under `/api/v1` accept individual `POST` writes and
+`DELETE` by permission OID.
+
 ### Console scheduled tasks
 
 Any active user. The bearer `GET /api/v1/scheduled_tasks/:id` execution-state lookup is separate (see [Scheduled Tasks](#scheduled-tasks)). Each endpoint is scoped to tasks the
@@ -2346,8 +2340,8 @@ returned. Responses set `Cache-Control: no-store`.
 | Method | Path | Notes |
 | ------ | ---- | ----- |
 | `GET` | `/api/v1/console/scheduled_tasks` | The caller's tasks, ordered by name. |
-| `GET` | `/api/v1/console/scheduled_tasks/new` | Defaults for a new task: daily at 9:00 PT, enabled, delivered to the caller's Slack DM when one is linked, else to their Google Chat DM when Slack delivery is unavailable. Adds the form options below. |
-| `GET` | `/api/v1/console/scheduled_tasks/:id/edit` | One of the caller's tasks in the console shape below, plus the form options. |
+| `GET` | `/api/v1/console/scheduled_tasks/new` | Defaults for a new task: Daily at 9:00 PT and enabled. Uses the caller's Slack DM when linked and Google Chat DM when Slack delivery is unavailable. |
+| `GET` | `/api/v1/console/scheduled_tasks/:id/edit` | One of the caller's tasks in the console shape below. |
 | `POST` | `/api/v1/console/scheduled_tasks` | Create a task authored by the caller. Returns `201`. |
 | `PUT`/`PATCH` | `/api/v1/console/scheduled_tasks/:id` | Update the fields sent; keep the rest. |
 | `DELETE` | `/api/v1/console/scheduled_tasks/:id` | Returns `204`. |
@@ -2361,7 +2355,7 @@ Write bodies take `data` with:
 | `name`, `prompt`, `enabled` | Same validation as the sandbox endpoints. |
 | `schedule_preset` | `manual`, `daily`, `weekdays`, `mondays`, `fridays` (all at 9:00 PT), `custom`, or `cron` (uses `cron_expression` verbatim, in the grammar above). Omitted keeps the stored schedule. |
 | `custom_days`, `custom_time` | For `custom`: weekday values `"1"`..`"6"` and `"0"` (Sunday), plus `"HH:MM"`. Missing days or time returns `422` on `cron_expression`. |
-| `delivery_mode` | `dm` delivers to the author's linked Slack DM and ignores `delivery_channel`; `channel` uses `delivery_channel`. A destination the author's Slack permissions do not allow returns `422` on `delivery_channel`. Google Chat DM only: `gchat_dm` delivers to the author's Google Chat DM and ignores `delivery_channel`; `gchat_space` uses `delivery_channel` as `spaces/<id>`, which needs an effective `send` space permission, else `422` on `delivery_channel`. |
+| `delivery_mode` | `dm` uses the author's Slack DM. `gchat_dm` uses their current Google address. `channel` and `gchat_space` use `delivery_channel`. An unavailable destination returns `422` on `delivery_channel`. |
 
 ```json
 {
@@ -2382,16 +2376,6 @@ Write bodies take `data` with:
 
 `delivery_name` is the channel's catalog name, or "Direct message to you" for a
 DM. `direct_message_user_id` is the caller's linked Slack user ID, or `null`.
-Google Chat DM only: `delivery_mode` can also be `gchat_dm` or `gchat_space`,
-and `delivery_name` is "Google Chat DM to you" or the space's display name.
-
-`new` and `edit` add form options:
-`slack_delivery_available` (the Slack token is configured and the bot catalog
-or the caller's Slack DM exists) and `google_chat`:
-`{ "direct_message_identity": "you@example.com", "spaces": [{ "name": "spaces/AAAA", "display_name": "AI" }] }`.
-`spaces` lists the caller's send-permitted spaces; when space names resolve,
-unnamed spaces are omitted, otherwise every space is listed with a `null`
-`display_name`.
 
 ### Workflows
 

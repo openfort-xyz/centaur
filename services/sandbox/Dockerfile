@@ -97,8 +97,8 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
 ARG CLAUDE_CODE_VERSION=2.1.325
 # Bumping CODEX_VERSION: refresh services/sandbox/codex-base-instructions.md
 # from openai/codex rust-v<version>/codex-rs/models-manager/prompt.md.
-ARG CODEX_VERSION=0.167.1
-ARG PI_CODING_AGENT_VERSION=1.5.2
+ARG CODEX_VERSION=0.171.0
+ARG PI_CODING_AGENT_VERSION=1.6.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG NUSHELL_VERSION=0.117.0
@@ -214,7 +214,7 @@ ARG FOUNDRY_VERSION=v1.9.0
 ARG AMP_CLI_VERSION=0.0.1794326444-g2deeb3
 ARG MANIM_VERSION=0.22.1
 ARG BUN_VERSION=bun-v1.4.4
-ARG OMP_VERSION=18.21.0
+ARG OMP_VERSION=19.1.1
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -276,11 +276,11 @@ RUN set -eux; \
     amp --version >/dev/null
 
 # ── agent-browser: download Chrome binary (runs as agent, deps already installed) ─
-# Pinned to Chrome for Testing Stable 158.0.8127.36, which fixes CVE-2026-130963
-# and the 38 other CVEs in the same Chrome release (earlier pins covered
-# CVE-2026-126846, CVE-2026-125350, and CVE-2026-121030, -121035, -121071, -121189).
+# Pinned to Chrome for Testing Stable 158.0.8127.88, which fixes CVE-2026-134401
+# (earlier pins covered CVE-2026-130963, CVE-2026-126846, CVE-2026-125350, and
+# CVE-2026-121030, -121035, -121071, -121189).
 # agent-browser discovers the browser at ~/.agent-browser/browsers/chrome-<version>.
-ARG CHROME_FOR_TESTING_VERSION=158.0.8127.36
+ARG CHROME_FOR_TESTING_VERSION=158.0.8127.88
 RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       set -eux; \
       dest="$HOME/.agent-browser/browsers/chrome-${CHROME_FOR_TESTING_VERSION}"; \

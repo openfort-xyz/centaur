@@ -1,7 +1,7 @@
 // The shell loads GET /api/v1/console/me once; read it through useSession().
 import { useSuspenseQuery, type QueryClient } from "@tanstack/react-query";
 
-import { api, setCsrfToken, type DataEnvelope } from "@/lib/api";
+import { api, type DataEnvelope } from "@/lib/api";
 import { sharedKeys } from "@/lib/query-keys";
 
 export type NavSection =
@@ -13,6 +13,7 @@ export type NavSection =
   | "oauth_apps"
   | "users"
   | "api_clients"
+  | "api_keys"
   | "settings"
   | "workflows"
   | "integrations"
@@ -21,17 +22,14 @@ export type NavSection =
 
 export interface Me {
   user: { id: string; email: string; name: string | null; status: "active" | "pending" | "disabled"; admin: boolean };
-  auth_method: "session" | "api_key";
+  auth_method: "session" | "sandbox";
   acting_admin: boolean;
-  csrf_token: string | null;
   features: { api_clients: boolean; password_login: boolean };
   nav: Record<NavSection, boolean>;
-  flash: { notice?: string; alert?: string };
 }
 
 export async function fetchMe(): Promise<Me> {
   const body = await api.get<DataEnvelope<Me>>("/api/v1/console/me");
-  setCsrfToken(body.data.csrf_token);
   return body.data;
 }
 

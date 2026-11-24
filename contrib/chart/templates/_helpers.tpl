@@ -245,7 +245,7 @@ chart-managed workloads.
 {{- end -}}
 
 {{- /*
-console — Rails control plane (formerly "iron-control") for authenticated API
+console — control plane (formerly "iron-control"), served by api-rs, for authenticated API
 access and encrypted secret storage. Required in-cluster ClusterIP Service.
 
 Backwards compatibility: the canonical values key is `console`; `ironControl` is
@@ -258,9 +258,15 @@ templates should consume this helper rather than `.Values.console` /
 `.Values.ironControl` directly.
 
 In-cluster Service/DNS names use the "console" component (e.g.
-`<release>-centaur-console`). The api-rs-facing env vars stay IRON_CONTROL_URL /
-IRON_CONTROL_API_KEY (their names are hardcoded in the Rust binaries); the URL
-*value* is derived from `centaur.consoleUrl`, so it tracks the Service name.
+`<release>-centaur-console`). The api-rs-facing env var stays IRON_CONTROL_URL
+(its name is hardcoded in the Rust binaries); the URL *value* is derived from
+`centaur.consoleUrl`.
+
+The Console is served by api-rs. The `console` Service survives only as a
+compatibility alias (same name and port, forwarding to api-rs) for in-cluster
+clients that default to `centaur-console:3000`, and `centaur.consoleUrl` returns
+the api-rs Service URL. api-rs also owns the Console schema and the Slack
+channel catalog.
 */ -}}
 {{- define "centaur.consoleValues" -}}
 {{- $console := deepCopy (.Values.console | default dict) -}}
@@ -285,13 +291,54 @@ consume this helper rather than the raw values.
 {{- include "centaur.componentName" (dict "root" . "component" "console") -}}
 {{- end -}}
 
-{{- define "centaur.consoleHost" -}}
-{{- include "centaur.consoleName" . -}}
+{{- /*
+The in-cluster Console URL. The Console is served by api-rs, so this is always
+the api-rs Service: sandboxes, iron-proxy, proxy-sync, and api-rs itself
+(`IRON_CONTROL_URL`) dial it. The Console is part of api-rs, so a deployment with
+apiRs.enabled=false has none; fail rather than render a URL nothing answers.
+*/ -}}
+{{- define "centaur.consoleUrl" -}}
+{{- if not .Values.apiRs.enabled -}}
+{{- fail "the Console is served by api-rs: this chart requires apiRs.enabled=true" -}}
+{{- end -}}
+{{- printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "api-rs")) .Values.apiRs.port -}}
 {{- end -}}
 
-{{- define "centaur.consoleUrl" -}}
-{{- $console := include "centaur.consoleValues" . | fromYaml -}}
-{{- printf "http://%s:%v" (include "centaur.consoleHost" .) $console.service.httpPort -}}
+{{- /*
+Init container that blocks on a psql predicate against a Console database.
+Console-database clients use it so they start only after api-rs has applied
+the schema.
+
+Params: root, name (container name), database (PGDATABASE), query (SQL returning
+t for ready), message (log line while waiting). It connects through
+IRON_CONTROL_DATABASE_URL, which carries no database path, so PGDATABASE selects
+the logical database.
+*/ -}}
+{{- define "centaur.consoleDbWait" -}}
+{{- $root := .root -}}
+- name: {{ .name }}
+  image: {{ printf "%s:%s" $root.Values.postgres.image.repository $root.Values.postgres.image.tag | quote }}
+  imagePullPolicy: {{ $root.Values.postgres.image.pullPolicy }}
+  command:
+    - /bin/sh
+    - -ec
+    - |
+      until [ "$(psql "$CONSOLE_DATABASE_URL" -tAc "{{ .query }}")" = "t" ]; do
+        echo "{{ .message }}"
+        sleep 2
+      done
+  env:
+    - name: CONSOLE_DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "centaur.secretEnvName" $root }}
+          key: {{ printf "%sIRON_CONTROL_DATABASE_URL" $root.Values.secretManager.envPrefix }}
+    - name: PGDATABASE
+      value: {{ .database | quote }}
+  securityContext:
+{{ toYaml $root.Values.containerSecurityContext | nindent 4 }}
+    seccompProfile:
+      type: RuntimeDefault
 {{- end -}}
 
 {{- define "centaur.proxySyncName" -}}

@@ -20,9 +20,9 @@ excluded from the HTTP request metrics.
 - `IRON_CONTROL_DATABASE_NAME` — optional database name override; the Helm chart sets this to Console's configured primary database.
 - `IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY` — Active Record encryption primary key.
 - `IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT` — Active Record key derivation salt.
-- `CENTAUR_JWT_SIGNING_SECRET` — optional shared key for generated API and sandbox-entitlement credentials.
-- `CENTAUR_CONSOLE_URL` — Console URL used for sandbox-entitlement rules.
-- `CENTAUR_API_URL` / `CENTAUR_API_SERVER_PROXY_HOSTS` — API hosts used for generated API credentials.
+- `CENTAUR_JWT_SIGNING_SECRET` — optional shared key for the single sandbox token.
+- `CENTAUR_CONSOLE_URL` — Console URL. The Console host is an api-rs host, so the sandbox token is injected there too.
+- `CENTAUR_API_URL` / `CENTAUR_API_SERVER_PROXY_HOSTS` — api-rs hosts the sandbox token is injected for.
 - `BIND_ADDR` — listen address; defaults to `0.0.0.0:8080`.
 - `DATABASE_MAX_CONNECTIONS` — SQLx pool limit; defaults to `5`.
 
@@ -32,9 +32,7 @@ Integration tests run the HTTP handlers against Postgres with Console's schema.
 Load the schema into an empty database, then point the tests at it:
 
 ```bash
-cd services/console
-RAILS_ENV=test CENTAUR_CONSOLE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/proxy_sync_test bin/rails db:prepare
-cd ../..
+cargo run -p centaur-console-db --example migrate -- postgresql://postgres:postgres@127.0.0.1:55432/proxy_sync_test
 PROXY_SYNC_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/proxy_sync_test cargo test -p centaur-proxy-sync
 ```
 

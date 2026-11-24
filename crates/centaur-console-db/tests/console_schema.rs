@@ -1,10 +1,8 @@
 //! Tests against a Postgres database holding Console's schema.
 //!
-//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database prepared with Console's
-//! `bin/rails db:prepare`. Each test inserts uniquely named rows, so tests can
+//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database migrated with
+//! `cargo run -p centaur-console-db --example migrate -- <url>`. Each test inserts uniquely named rows, so tests can
 //! share one database and run in parallel.
-
-use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
@@ -17,7 +15,11 @@ use centaur_console_db::{
 use centaur_iron_control::{IronControlClient, SessionRegistrar, slugify};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
+
+mod common;
+
+use common::database;
 
 const PRIMARY_KEY: &str = "dev_ar_encryption_primary_key_0000000000000000";
 const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
@@ -25,24 +27,6 @@ const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
 const ENCRYPTED: &str =
     r#"{"p":"xOiyro9XYBkfABUF","h":{"iv":"pCjJC5SxH78ZN0Nm","at":"s9DIUyHAkF8ZAthKO6ROtw=="}}"#;
 const PLAINTEXT: &str = "known secret";
-
-async fn database() -> Option<PgPool> {
-    let Ok(url) = env::var("CONSOLE_DB_TEST_DATABASE_URL") else {
-        assert!(
-            env::var_os("CI").is_none(),
-            "CONSOLE_DB_TEST_DATABASE_URL must be set in CI"
-        );
-        eprintln!("skipping: set CONSOLE_DB_TEST_DATABASE_URL to a database with Console's schema");
-        return None;
-    };
-    Some(
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("connect to the test database"),
-    )
-}
 
 struct Fixture {
     pool: PgPool,
@@ -581,8 +565,7 @@ async fn chat_sender(
     email: &str,
     subject: Option<&str>,
 ) -> Option<(String, usize)> {
-    let client = IronControlClient::new("http://127.0.0.1:9", "unused")
-        .with_console_db(fixture.pool.clone());
+    let client = IronControlClient::new(fixture.pool.clone());
     let metadata = json!({
         "googlechat_request_verified": true,
         "googlechat_requester_email": email,
