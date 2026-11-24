@@ -30,6 +30,7 @@ const API_RS_PREFIXES: &[&str] = &[
     "/api/session",
     "/api/sandboxes",
     "/api/slack",
+    "/api/google-chat",
     "/api/workflows",
     "/api/scheduled-tasks",
     "/api/admin",
