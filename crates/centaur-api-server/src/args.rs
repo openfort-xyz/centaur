@@ -13,8 +13,8 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use centaur_api_server::{
-    DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig, discover_persona_registry,
-    discover_tool_proxy_fragment,
+    ConsoleSessionConfig, DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig,
+    discover_persona_registry, discover_tool_proxy_fragment,
 };
 use centaur_iron_control::{
     IdentityInput, IronControlClient, IronControlError, PrincipalInput, RegisterError, RoleSpec,
@@ -89,6 +89,10 @@ pub(crate) struct Args {
     session_principal_admission: SessionPrincipalAdmissionArg,
     #[command(flatten)]
     activity_summary: ActivitySummaryArgs,
+    #[command(flatten)]
+    console_session: ConsoleSessionArgs,
+    #[command(flatten)]
+    console_bootstrap: ConsoleBootstrapArgs,
 }
 
 impl Args {
@@ -181,6 +185,39 @@ impl Args {
         self.activity_summary.config()
     }
 
+    pub(crate) fn console_session_config(
+        &self,
+    ) -> Result<Option<ConsoleSessionConfig>, ServerError> {
+        // Console booleans are strict: a typo is a startup error instead of a
+        // guess.
+        centaur_api_server::validate_boolean_settings().map_err(ServerError::UnsupportedConfig)?;
+        ConsoleSessionConfig::from_settings(
+            self.console_session.session_secret.as_deref(),
+            self.console_session.public_url.as_deref(),
+        )
+        .map_err(|error| ServerError::UnsupportedConfig(error.to_string()))
+    }
+
+    /// A writable Console pool for the ported Console handlers. The pool used
+    /// by the turn path stays read-only. Both come from the same URL.
+    pub(crate) fn console_write_db(&self) -> Option<PgPool> {
+        self.sandbox.iron_control.console_write_db().ok()
+    }
+
+    /// The operator to create on a Console database with no users, when
+    /// `CENTAUR_CONSOLE_INITIAL_USER_EMAIL` is set.
+    pub(crate) fn console_initial_admin(&self) -> Option<centaur_console_db::InitialAdmin> {
+        let email = non_empty(self.console_bootstrap.initial_user_email.as_deref())?;
+        Some(centaur_console_db::InitialAdmin {
+            email: email.to_owned(),
+            password: self
+                .console_bootstrap
+                .initial_user_password
+                .clone()
+                .unwrap_or_default(),
+        })
+    }
+
     pub(crate) fn shutdown_execution_drain_timeout(&self) -> Duration {
         Duration::from_secs(self.server.shutdown_execution_drain_timeout_secs)
     }
@@ -202,6 +239,38 @@ pub(crate) struct IronControlRuntime {
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
     pub(crate) workflow_principal_registrar: WorkflowPrincipalRegistrar,
+}
+
+/// The initial Console operator, created as an active admin when the Console
+/// database has no users.
+#[derive(Debug, ClapArgs)]
+struct ConsoleBootstrapArgs {
+    #[arg(
+        long = "console-initial-user-email",
+        env = "CENTAUR_CONSOLE_INITIAL_USER_EMAIL"
+    )]
+    initial_user_email: Option<String>,
+    #[arg(
+        long = "console-initial-user-password",
+        env = "CENTAUR_CONSOLE_INITIAL_USER_PASSWORD",
+        hide_env_values = true
+    )]
+    initial_user_password: Option<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+struct ConsoleSessionArgs {
+    /// Secret used to authenticate the Rust Console session cookie. Setting it
+    /// enables the Console API; it requires `CENTAUR_CONSOLE_PUBLIC_URL`.
+    #[arg(
+        long = "console-session-secret",
+        env = "CONSOLE_SESSION_SECRET",
+        hide_env_values = true
+    )]
+    session_secret: Option<String>,
+    /// Console's public origin, used to validate `Origin` on writes.
+    #[arg(long = "console-public-url", env = "CENTAUR_CONSOLE_PUBLIC_URL")]
+    public_url: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -572,6 +641,8 @@ fn slug_path_component(value: &str) -> String {
 
 #[derive(Debug, ClapArgs)]
 struct IronControlArgs {
+    /// The Console's in-cluster URL, handed to sandboxes (`CENTAUR_CONSOLE_URL`)
+    /// and their network policy.
     #[arg(long = "iron-control-url", env = "IRON_CONTROL_URL")]
     url: Option<String>,
     #[arg(
@@ -579,11 +650,8 @@ struct IronControlArgs {
         env = "IRON_CONTROL_PROXY_SYNC_URL"
     )]
     proxy_sync_url: Option<String>,
-    #[arg(long = "iron-control-api-key", env = "IRON_CONTROL_API_KEY")]
-    api_key: Option<String>,
-    /// Console's database. Principals and their effective config are read from
-    /// it directly instead of through the Console API, and Console's scheduled
-    /// tasks are run from it.
+    /// Console's database. api-rs migrates it, serves the Console from it, and
+    /// registers principals, roles, secrets, and proxies in it directly.
     #[arg(
         long = "iron-control-database-url",
         env = "IRON_CONTROL_DATABASE_URL",
@@ -596,33 +664,29 @@ struct IronControlArgs {
         env = "IRON_CONTROL_DATABASE_NAME"
     )]
     console_database_name: Option<String>,
+    /// At least 2: the Slack channel catalog refresh holds one connection for
+    /// its advisory lock while its queries use another.
     #[arg(
         long = "iron-control-database-max-connections",
         env = "IRON_CONTROL_DATABASE_MAX_CONNECTIONS",
-        default_value_t = 5
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(2..)
     )]
     console_database_max_connections: u32,
-    /// The Console database pool shared by every client built from these args.
+    /// The read-only Console database pool shared by every client built from
+    /// these args.
     #[arg(skip)]
     console_db: OnceLock<PgPool>,
+    /// The writable Console pool. `None` until first use.
+    #[arg(skip)]
+    console_write_db: OnceLock<PgPool>,
 }
 
 impl IronControlArgs {
-    /// An [`IronControlClient`] when both URL and API key are configured.
-    fn client(&self) -> Option<IronControlClient> {
-        let url = non_empty(self.url.as_deref())?;
-        let api_key = non_empty(self.api_key.as_deref())?;
-        Some(IronControlClient::new(url, api_key))
-    }
-
+    /// The client api-rs registers its Console model with, on the writable
+    /// Console pool.
     fn required_client(&self) -> Result<IronControlClient, ServerError> {
-        let client = self.client().ok_or_else(|| {
-            ServerError::UnsupportedConfig(
-                "iron-control is required: set IRON_CONTROL_URL and IRON_CONTROL_API_KEY"
-                    .to_owned(),
-            )
-        })?;
-        Ok(client.with_console_db(self.console_db()?))
+        Ok(IronControlClient::new(self.console_write_db()?))
     }
 
     /// The shared Console database pool. Call it within a Tokio runtime: the
@@ -644,10 +708,34 @@ impl IronControlArgs {
         Ok(self.console_db.get_or_init(|| pool).clone())
     }
 
+    /// The writable Console pool, from the same settings as the read-only one.
+    /// Call within a Tokio runtime.
+    fn console_write_db(&self) -> Result<PgPool, ServerError> {
+        if let Some(pool) = self.console_write_db.get() {
+            return Ok(pool.clone());
+        }
+        let url = non_empty(self.console_database_url.as_deref()).ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "the Console database is required: set IRON_CONTROL_DATABASE_URL".to_owned(),
+            )
+        })?;
+        let options =
+            console_write_db_options(url, non_empty(self.console_database_name.as_deref()))?;
+        let pool = PgPoolOptions::new()
+            .max_connections(self.console_database_max_connections)
+            .acquire_timeout(CONSOLE_DB_ACQUIRE_TIMEOUT)
+            .connect_lazy_with(options);
+        Ok(self.console_write_db.get_or_init(|| pool).clone())
+    }
+
     /// Required backend sync settings (admin client + proxy-sync URL).
     fn settings(&self) -> Result<IronControlSettings, ServerError> {
         let client = self.required_client()?;
-        let admin_url = non_empty(self.url.as_deref()).expect("required client validates URL");
+        let console_url = non_empty(self.url.as_deref()).ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "the Console URL is required: set IRON_CONTROL_URL".to_owned(),
+            )
+        })?;
         let control_url = non_empty(self.proxy_sync_url.as_deref()).ok_or_else(|| {
             ServerError::UnsupportedConfig(
                 "proxy-sync is required: set IRON_CONTROL_PROXY_SYNC_URL".to_owned(),
@@ -655,7 +743,7 @@ impl IronControlArgs {
         })?;
         Ok(IronControlSettings {
             client,
-            console_url: admin_url.to_owned(),
+            console_url: console_url.to_owned(),
             control_url: control_url.to_owned(),
         })
     }
@@ -685,6 +773,23 @@ fn console_db_options(
         None => options,
     };
     Ok(options.options([("default_transaction_read_only", "on")]))
+}
+
+/// The writable counterpart of [`console_db_options`], for the Rust Console
+/// handlers. Same URL, no read-only transaction default.
+fn console_write_db_options(
+    url: &str,
+    database_name: Option<&str>,
+) -> Result<PgConnectOptions, ServerError> {
+    let options = PgConnectOptions::from_str(url).map_err(|_| {
+        ServerError::UnsupportedConfig(
+            "IRON_CONTROL_DATABASE_URL is not a valid PostgreSQL URL".to_owned(),
+        )
+    })?;
+    Ok(match database_name {
+        Some(name) => options.database(name),
+        None => options,
+    })
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -1803,14 +1908,10 @@ fn should_retry_iron_control_register(error: &RegisterError) -> bool {
         RegisterError::Translate(_) => false,
         RegisterError::Control(IronControlError::PrincipalDerivation(_))
         | RegisterError::Control(IronControlError::SessionPrincipalNotPreapproved { .. }) => false,
-        RegisterError::Control(IronControlError::Transport { .. }) => true,
-        RegisterError::Control(IronControlError::Decode { .. })
-        | RegisterError::Control(IronControlError::NotFound { .. }) => false,
+        RegisterError::Control(IronControlError::NotFound { .. })
+        | RegisterError::Control(IronControlError::InProcess { .. }) => false,
         RegisterError::Control(IronControlError::ConsoleDb(error)) => {
             matches!(error, centaur_console_db::Error::Database(_))
-        }
-        RegisterError::Control(IronControlError::Status { status, .. }) => {
-            *status == 429 || (500..600).contains(status)
         }
     }
 }
@@ -2770,24 +2871,52 @@ mod tests {
 
     #[test]
     fn iron_control_registration_retry_policy_is_transient_only() {
-        let status_error = |status| {
-            RegisterError::Control(IronControlError::Status {
-                method: "PUT".to_owned(),
-                path: "/api/v1/static_secrets/example".to_owned(),
-                status,
-                body: String::new(),
+        assert!(should_retry_iron_control_register(&RegisterError::Control(
+            IronControlError::ConsoleDb(centaur_console_db::Error::Database(
+                sqlx::Error::PoolTimedOut
+            ))
+        )));
+        assert!(!should_retry_iron_control_register(
+            &RegisterError::Control(IronControlError::InProcess {
+                operation: "upsert static secret",
+                message: "validation failed".to_owned(),
             })
-        };
-
-        assert!(should_retry_iron_control_register(&status_error(500)));
-        assert!(should_retry_iron_control_register(&status_error(503)));
-        assert!(should_retry_iron_control_register(&status_error(429)));
-        assert!(!should_retry_iron_control_register(&status_error(400)));
+        ));
+        assert!(!should_retry_iron_control_register(
+            &RegisterError::Control(IronControlError::NotFound {
+                resource: "role",
+                ident: "missing".to_owned(),
+            })
+        ));
         assert!(!should_retry_iron_control_register(
             &RegisterError::Translate(centaur_iron_control::TranslateError::Unsupported {
                 what: "unsupported transform".to_owned(),
             })
         ));
+    }
+
+    #[test]
+    fn console_initial_admin_requires_an_email() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap().console_initial_admin()
+        };
+        assert!(parse(&[]).is_none());
+        assert!(parse(&["--console-initial-user-email", " "]).is_none());
+        let admin = parse(&[
+            "--console-initial-user-email",
+            "admin@example.com",
+            "--console-initial-user-password",
+            "correct horse battery",
+        ])
+        .expect("an email configures the initial admin");
+        assert_eq!(admin.email, "admin@example.com");
+        assert_eq!(admin.password, "correct horse battery");
     }
 
     #[test]
@@ -3047,8 +3176,6 @@ mod tests {
                     "http://console.local",
                     "--iron-control-proxy-sync-url",
                     "http://proxy-sync.local:8080",
-                    "--iron-control-api-key",
-                    "iak_test",
                     "--iron-control-database-url",
                     "postgres://console@localhost/console",
                 ]
@@ -3073,8 +3200,6 @@ mod tests {
                 "http://console.local",
                 "--iron-control-proxy-sync-url",
                 "http://proxy-sync.local:8080",
-                "--iron-control-api-key",
-                "iak_test",
                 "--iron-control-database-url",
                 "postgres://console@localhost/console",
                 "--session-sandbox-state-volume-enabled",
@@ -3144,8 +3269,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -3172,8 +3295,6 @@ mod tests {
             "http://console.local:3000",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -3189,6 +3310,45 @@ mod tests {
                 .get("app.kubernetes.io/component"),
             Some(&"console".to_owned())
         );
+    }
+
+    #[test]
+    fn console_pool_needs_at_least_two_connections() {
+        let parse = |max: &str| {
+            Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--iron-control-database-max-connections",
+                max,
+            ])
+        };
+        assert!(parse("1").is_err());
+        assert!(parse("2").is_ok());
+    }
+
+    #[tokio::test]
+    async fn iron_control_requires_the_console_database() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        assert!(
+            parse(&[
+                "--iron-control-database-url",
+                "postgres://console@localhost/console"
+            ])
+            .sandbox
+            .iron_control
+            .required_client()
+            .is_ok()
+        );
+        assert!(parse(&[]).sandbox.iron_control.required_client().is_err());
     }
 
     #[test]
@@ -3220,8 +3380,6 @@ mod tests {
             "http://console.local:3000",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
         ])
         .unwrap();
 
@@ -3239,8 +3397,6 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--iron-control-url",
             "http://console.local:3000",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -3262,8 +3418,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
             "--kubernetes-tools-repo",
@@ -3678,8 +3832,6 @@ mod tests {
                     "http://console.local",
                     "--iron-control-proxy-sync-url",
                     "http://proxy-sync.local:8080",
-                    "--iron-control-api-key",
-                    "iak_test",
                     "--iron-control-database-url",
                     "postgres://console@localhost/console",
                 ]
@@ -4259,8 +4411,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])
@@ -4320,8 +4470,6 @@ mod tests {
             "http://console.local",
             "--iron-control-proxy-sync-url",
             "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
             "--iron-control-database-url",
             "postgres://console@localhost/console",
         ])

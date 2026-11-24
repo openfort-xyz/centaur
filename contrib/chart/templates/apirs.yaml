@@ -236,12 +236,101 @@ spec:
             - name: CENTAUR_MCP_PUBLIC_URL
               value: {{ $mcpPublicUrl | quote }}
 {{- end }}
-{{- if $console.publicUrl }}
+            # The Console is served by api-rs: the Console host (SPA, sign-in and
+            # other server-rendered pages, MCP OAuth endpoints), `/api/v1/console/*`,
+            # the bearer API `/api/v1/*`, and the sandbox API `/api/v1/sandbox/*`
+            # all answer from this listener. console.publicUrl is required: it is
+            # the origin the session cookie and unsafe-request Origin checks use,
+            # and the host that selects the Console router.
             - name: CENTAUR_CONSOLE_PUBLIC_URL
-              value: {{ $console.publicUrl | quote }}
+              value: {{ required "console.publicUrl is required: set it to the origin users and MCP clients reach the Console at (for example https://console.example.com)" $console.publicUrl | quote }}
+            # The shared Console secrets keep their original IRON_CONTROL_* keys
+            # in the Secret (existing deployments already hold them) and are
+            # mounted under the CENTAUR_CONSOLE_* names api-rs reads.
+            # CONSOLE_SESSION_SECRET is the input api-rs derives its
+            # session-cookie and SSO keys from with its own PBKDF2 labels.
+            # Rotating it signs every browser out. The AR encryption keys decrypt
+            # existing records; never rotate them in place.
+            - name: CONSOLE_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_SECRET_KEY_BASE" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_AR_ENCRYPTION_PRIMARY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_AR_ENCRYPTION_KEY_DERIVATION_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_PASSWORD_LOGIN_ENABLED
+              value: {{ $console.passwordLoginEnabled | quote }}
+            - name: CENTAUR_CONSOLE_API_CLIENTS_ENABLED
+              value: {{ .Values.apiClients.enabled | quote }}
+{{- with $console.ssoEmailDomains }}
+            - name: CENTAUR_CONSOLE_SSO_EMAIL_DOMAINS
+              value: {{ join "," . | quote }}
+{{- end }}
+{{- if $console.googleOauth.enabled }}
+            # Google console sign-in secrets still use their legacy
+            # IRON_CONTROL_* keys in the shared Secret.
+            - name: CENTAUR_CONSOLE_GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_GOOGLE_CLIENT_ID" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_GOOGLE_CLIENT_SECRET" .Values.secretManager.envPrefix }}
+{{- end }}
+{{- if $console.slackOauth.enabled }}
+            - name: CENTAUR_CONSOLE_SLACK_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCENTAUR_CONSOLE_SLACK_CLIENT_ID" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_SLACK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCENTAUR_CONSOLE_SLACK_CLIENT_SECRET" .Values.secretManager.envPrefix }}
+{{- end }}
+{{- if $console.oktaOauth.enabled }}
+            - name: CENTAUR_CONSOLE_OKTA_ISSUER
+              value: {{ required "console.oktaOauth.issuer is required when Okta OAuth is enabled" $console.oktaOauth.issuer | quote }}
+            - name: CENTAUR_CONSOLE_OKTA_TOKEN_ENDPOINT_AUTH_METHOD
+              value: {{ $console.oktaOauth.tokenEndpointAuthMethod | quote }}
+            - name: CENTAUR_CONSOLE_OKTA_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCENTAUR_CONSOLE_OKTA_CLIENT_ID" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_OKTA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCENTAUR_CONSOLE_OKTA_CLIENT_SECRET" .Values.secretManager.envPrefix }}
 {{- end }}
             - name: RUN_MIGRATIONS
               value: {{ .Values.apiRs.runMigrations | quote }}
+            # The initial Console admin, created when the Console database has no
+            # operators. Operators create their API keys on the Console's API Keys
+            # page; api-rs itself writes as the Console system user.
+            - name: CENTAUR_CONSOLE_INITIAL_USER_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_INITIAL_USER_EMAIL" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_CONSOLE_INITIAL_USER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_INITIAL_USER_PASSWORD" .Values.secretManager.envPrefix }}
 {{- if not (hasKey .Values.apiRs.extraEnv "DATABASE_TEXT_SEARCH") }}
             - name: DATABASE_TEXT_SEARCH
               value: {{ ternary "paradedb" (default "postgres" .Values.externalDatabase.textSearch) .Values.postgres.enabled | quote }}
@@ -589,11 +678,6 @@ copies in source order (later roots shadow earlier ones). */}}
               value: {{ include "centaur.consoleUrl" . | quote }}
             - name: IRON_CONTROL_PROXY_SYNC_URL
               value: {{ include "centaur.proxySyncUrl" . | quote }}
-            - name: IRON_CONTROL_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
             # Principals and their effective config are read from the console
             # database directly, in read-only sessions. The scheduled-task
             # scheduler also claims and updates scheduled_tasks rows there.

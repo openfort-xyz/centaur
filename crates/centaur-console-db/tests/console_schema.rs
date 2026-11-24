@@ -1,10 +1,8 @@
 //! Tests against a Postgres database holding Console's schema.
 //!
-//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database prepared with Console's
-//! `bin/rails db:prepare`. Each test inserts uniquely named rows, so tests can
+//! Set `CONSOLE_DB_TEST_DATABASE_URL` to a database migrated with
+//! `cargo run -p centaur-console-db --example migrate -- <url>`. Each test inserts uniquely named rows, so tests can
 //! share one database and run in parallel.
-
-use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
@@ -17,7 +15,11 @@ use centaur_console_db::{
 use centaur_iron_control::{IronControlClient, SessionRegistrar, slugify};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
+
+mod common;
+
+use common::database;
 
 const PRIMARY_KEY: &str = "dev_ar_encryption_primary_key_0000000000000000";
 const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
@@ -25,24 +27,6 @@ const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
 const ENCRYPTED: &str =
     r#"{"p":"xOiyro9XYBkfABUF","h":{"iv":"pCjJC5SxH78ZN0Nm","at":"s9DIUyHAkF8ZAthKO6ROtw=="}}"#;
 const PLAINTEXT: &str = "known secret";
-
-async fn database() -> Option<PgPool> {
-    let Ok(url) = env::var("CONSOLE_DB_TEST_DATABASE_URL") else {
-        assert!(
-            env::var_os("CI").is_none(),
-            "CONSOLE_DB_TEST_DATABASE_URL must be set in CI"
-        );
-        eprintln!("skipping: set CONSOLE_DB_TEST_DATABASE_URL to a database with Console's schema");
-        return None;
-    };
-    Some(
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("connect to the test database"),
-    )
-}
 
 struct Fixture {
     pool: PgPool,
@@ -573,16 +557,14 @@ async fn grant_secrets(fixture: &Fixture, foreign_id: &str) -> String {
 }
 
 /// The OID of the principal api-rs resolves a verified Chat sender to, with
-/// the number of secrets that principal is granted. The registrar reads
-/// Console's database as it does in production; its admin API is unreachable,
-/// so resolving must not write.
+/// the number of secrets that principal is granted. Resolve without creating
+/// a principal.
 async fn chat_sender(
     fixture: &Fixture,
     email: &str,
     subject: Option<&str>,
 ) -> Option<(String, usize)> {
-    let client = IronControlClient::new("http://127.0.0.1:9", "unused")
-        .with_console_db(fixture.pool.clone());
+    let client = IronControlClient::new(fixture.pool.clone());
     let metadata = json!({
         "googlechat_request_verified": true,
         "googlechat_requester_email": email,
@@ -598,6 +580,47 @@ async fn chat_sender(
         .unwrap()?;
     let config = client.effective_config(&principal.id).await.unwrap();
     Some((principal.id, config.secrets.len()))
+}
+
+#[tokio::test]
+async fn registering_a_chat_sender_updates_the_existing_principal_after_a_rename() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let old_email = format!("{}@old.example", fixture.unique);
+    let new_email = format!("{}@new.example", fixture.unique);
+    let subject = google_account();
+    let foreign_id = gchat_user_as(
+        &fixture,
+        chat_sender_foreign_id(&old_email),
+        json!({"google_email": old_email, "google_subject": subject, "team": "infra"}),
+        None,
+    )
+    .await;
+    let original = find_principal_by_foreign_id(&fixture.pool, &foreign_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let registrar = SessionRegistrar::new(IronControlClient::new(fixture.pool.clone()));
+    let metadata = json!({
+        "googlechat_request_verified": true,
+        "googlechat_requester_email": new_email,
+        "googlechat_requester_subject": subject
+    });
+    let principal = registrar
+        .register_requester("chat:spaces:DM:spaces:DM:threads:T2", Some(&metadata))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(principal.id, oid("prn", original.id));
+    let stored = find_principal(&fixture.pool, original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.foreign_id, Some(foreign_id));
+    assert_eq!(stored.labels["google_email"], new_email);
+    assert_eq!(stored.labels["google_subject"], subject);
+    assert_eq!(stored.labels["team"], "infra");
 }
 
 #[tokio::test]

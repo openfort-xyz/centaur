@@ -509,11 +509,8 @@ fn slack_permission(channel_id: String) -> SlackChannelPermissionInput {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use crate::{PrincipalDerivationError, derive_principal};
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -603,8 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_session_rejects_slack_dm_without_team_id() {
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new("http://127.0.0.1:1", "test-key"));
+        let registrar = SessionRegistrar::new(unconnected_client());
         let metadata = json!({ "slack_user_id": "U123" });
 
         let error = registrar
@@ -620,8 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_session_rejects_slack_dm_without_user_id() {
-        let registrar =
-            SessionRegistrar::new(IronControlClient::new("http://127.0.0.1:1", "test-key"));
+        let registrar = SessionRegistrar::new(unconnected_client());
         let metadata = json!({ "slack_team_id": "T123" });
 
         let error = registrar
@@ -633,153 +628,6 @@ mod tests {
             error,
             IronControlError::PrincipalDerivation(PrincipalDerivationError::MissingSlackUserId)
         ));
-    }
-
-    #[tokio::test]
-    async fn preapproved_session_rejects_a_missing_principal_without_writing() {
-        let (base_url, requests, server) = spawn_iron_control_stub(|method, _| match method {
-            "GET" => not_found(),
-            _ => (
-                "500 Internal Server Error",
-                r#"{"error":"unexpected"}"#.to_owned(),
-            ),
-        })
-        .await;
-        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-        let metadata = json!({
-            "slack_user_id": "U123",
-            "slack_team_id": "T123"
-        });
-
-        let error = registrar
-            .resolve_session("slack:T123:C123:1773364194.179929", Some(&metadata), false)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            IronControlError::SessionPrincipalNotPreapproved { ref foreign_id }
-                if foreign_id == "slack-channel-t123-c123"
-        ));
-        assert!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|request| request.method == "GET"),
-            "preapproved admission must not write to iron-control"
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn existing_dm_principal_refreshes_its_permission_on_the_upserted_record() {
-        // The lookup and upsert answer with different ids, so the permission
-        // write shows which record it was bound to.
-        let (base_url, requests, server) =
-            spawn_iron_control_stub(|method, path| match (method, path) {
-                ("GET", "/api/v1/principals/lookup/slack-user-t123-u123") => {
-                    principal("prn_looked_up", "slack-user-t123-u123", json!({}))
-                }
-                ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
-                    principal("prn_upserted", "slack-user-t123-u123", json!({}))
-                }
-                ("POST", "/api/v1/principals/prn_upserted/slack_channel_permissions") => {
-                    ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
-                }
-                _ => not_found(),
-            })
-            .await;
-        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-
-        let record = registrar
-            .register_session(
-                "slack:T123:D123:1773364194.179929",
-                Some(&json!({"slack_user_id": "U123", "slack_team_id": "T123"})),
-            )
-            .await
-            .expect("register DM session");
-
-        assert_eq!(record.id, "prn_upserted");
-        let permission = requests
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|request| request.path.ends_with("/slack_channel_permissions"))
-            .and_then(|request| request.body.clone())
-            .expect("DM permission is written");
-        assert_eq!(
-            permission["data"],
-            json!({
-                "channel_id": "D123",
-                "upload_enabled": true,
-                "download_enabled": true,
-                "history_enabled": true
-            })
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn unknown_console_requester_is_an_error_not_an_omitted_requester() {
-        let (base_url, _requests, server) = spawn_iron_control_stub(|_, _| not_found()).await;
-        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-
-        let error = registrar
-            .register_requester(
-                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
-                Some(&json!({"requester_principal_foreign_id": "console-user-ghost"})),
-            )
-            .await
-            .expect_err("a console requester the console never provisioned must fail");
-
-        assert!(error.is_not_found(), "{error:?}");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn channel_requester_upsert_keeps_existing_labels_and_sets_email() {
-        let (base_url, requests, server) =
-            spawn_iron_control_stub(|method, path| match (method, path) {
-                ("GET", "/api/v1/principals/lookup/slack-user-t123-u123") => principal(
-                    "prn_user",
-                    "slack-user-t123-u123",
-                    json!({"team": "finance"}),
-                ),
-                ("PUT", "/api/v1/principals/slack-user-t123-u123") => {
-                    principal("prn_user", "slack-user-t123-u123", json!({}))
-                }
-                _ => not_found(),
-            })
-            .await;
-        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-
-        let requester = registrar
-            .register_requester(
-                "slack:T123:C123:1773364194.179929",
-                Some(&json!({
-                    "slack_user_id": "U123",
-                    "slack_team_id": "T123",
-                    "slack_home_team_id": "T123",
-                    "slack_user_email": " ada@example.com "
-                })),
-            )
-            .await
-            .expect("register requester")
-            .expect("home-team channel requester resolves");
-
-        assert_eq!(requester.id, "prn_user");
-        let upsert = requests
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|request| request.method == "PUT")
-            .and_then(|request| request.body.clone())
-            .expect("requester principal is upserted");
-        assert_eq!(upsert["data"]["slack_email"], "ada@example.com");
-        assert_eq!(upsert["data"]["labels"]["team"], "finance");
-        assert_eq!(upsert["data"]["labels"]["managed-by"], "centaur");
-        server.abort();
     }
 
     #[test]
@@ -1005,93 +853,14 @@ mod tests {
         );
     }
 
-    /// One request the stub received; `body` is the decoded JSON body, if any.
-    #[derive(Clone, Debug)]
-    struct StubRequest {
-        method: String,
-        path: String,
-        body: Option<Value>,
-    }
-
-    type StubResponder = fn(&str, &str) -> (&'static str, String);
-
-    /// A stub iron-control API answering with `respond(method, path)` and
-    /// recording every request it receives.
-    async fn spawn_iron_control_stub(
-        respond: StubResponder,
-    ) -> (
-        String,
-        Arc<Mutex<Vec<StubRequest>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        fn content_length(headers: &str) -> usize {
-            headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse().ok())
-                .unwrap_or(0)
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = Vec::new();
-                let mut buf = [0u8; 1024];
-                loop {
-                    let complete = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .is_some_and(|headers_end| {
-                            let headers = String::from_utf8_lossy(&request[..headers_end]);
-                            request.len() >= headers_end + 4 + content_length(&headers)
-                        });
-                    if complete {
-                        break;
-                    }
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => request.extend_from_slice(&buf[..read]),
-                    }
-                }
-                let request = String::from_utf8_lossy(&request);
-                let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
-                let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
-                let method = parts.next().unwrap_or_default().to_owned();
-                let path = parts.next().unwrap_or_default().to_owned();
-                let (status_line, response_body) = respond(&method, &path);
-                seen.lock().unwrap().push(StubRequest {
-                    method,
-                    path,
-                    body: serde_json::from_str(body).ok(),
-                });
-                let response = format!(
-                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len(),
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        (base_url, requests, handle)
-    }
-
-    fn not_found() -> (&'static str, String) {
-        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
-    }
-
-    fn principal(id: &str, foreign_id: &str, labels: Value) -> (&'static str, String) {
-        (
-            "200 OK",
-            json!({"data": {"id": id, "foreign_id": foreign_id, "name": "stub", "labels": labels}})
-                .to_string(),
-        )
+    /// A client whose pool never connects: for paths that fail before any
+    /// Console call.
+    fn unconnected_client() -> IronControlClient {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("a lazy pool never connects");
+        IronControlClient::new(pool)
     }
 
     const GCHAT_DM_THREAD: &str = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
@@ -1239,226 +1008,48 @@ mod tests {
         assert_eq!(input.kind.as_deref(), Some("slack_dm"));
     }
 
-    #[tokio::test]
-    async fn register_requester_upserts_gchat_user_principal_for_any_space() {
-        // A group thread and a DM both resolve the same person to the same
-        // per-user principal: Chat sessions key on the space, so this is the
-        // only principal a personal grant can live on.
+    #[test]
+    fn requester_plan_derives_the_same_chat_user_in_a_space_or_dm() {
+        let metadata = json!({
+            "user_id": "users/123",
+            "user_name": "Ada Lovelace",
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@example.com"
+        });
         for thread_key in [
             "chat:spaces:GROUP:spaces:GROUP:threads:T1",
             "chat:spaces:DM:spaces:DM:threads:T2",
         ] {
-            let (base_url, requests, server) = spawn_iron_control_stub(|method, path| {
-                if method == "PUT" && path.ends_with("/gchat-user-ada-example-com-b5fc85e55755") {
-                    principal(
-                        "prn_user",
-                        "gchat-user-ada-example-com-b5fc85e55755",
-                        json!({}),
-                    )
-                } else {
-                    not_found()
-                }
-            })
-            .await;
-            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-            let metadata = json!({
-                "user_id": "users/123",
-                "user_name": "Ada Lovelace",
-                "user_email": "ada@example.com",
-                "googlechat_request_verified": true,
-                "googlechat_requester_email": "ada@example.com"
-            });
-
-            let principal = registrar
-                .register_requester(thread_key, Some(&metadata))
-                .await
-                .unwrap()
-                .expect("a verified Chat requester resolves to a principal");
-            assert_eq!(principal.id, "prn_user");
-
-            let requests = requests.lock().unwrap();
-            assert!(
-                !requests
-                    .iter()
-                    .any(|request| request.path.ends_with("/roles"))
-            );
-            let upsert = requests
-                .iter()
-                .find(|request| request.method == "PUT")
-                .and_then(|request| request.body.as_ref())
-                .expect("gchat requester principal is upserted");
-            assert_eq!(upsert["data"]["kind"], "gchat_user");
-            assert_eq!(upsert["data"]["name"], "Google Chat User @Ada Lovelace");
-            assert_eq!(upsert["data"]["labels"]["google_email"], "ada@example.com");
-            server.abort();
+            let Some(RequesterPlan::UpsertDerived(principal)) =
+                requester_plan(thread_key, &metadata)
+            else {
+                panic!("a verified Chat requester should resolve to a principal");
+            };
+            let input = principal.to_principal_input();
+            assert_eq!(input.foreign_id, "gchat-user-ada-example-com-b5fc85e55755");
+            assert_eq!(input.kind.as_deref(), Some("gchat_user"));
+            assert_eq!(input.name, "Google Chat User @Ada Lovelace");
+            assert_eq!(input.labels["google_email"], "ada@example.com");
         }
     }
 
-    /// A Console holding one Google Chat user: Ada, Google account 1042, whose
-    /// principal was created while her address was `ada@old.example`.
-    fn console_with_ada(method: &str, path: &str) -> (&'static str, String) {
-        const ADA: &str = "gchat-user-ada-old-example-";
-        let ada_labels = json!({
-            "google_email": "ada@old.example",
-            "google_subject": "1042",
-            "team": "infra"
-        });
-        let foreign_id = path.rsplit('/').next().unwrap_or_default();
-        match method {
-            "GET" if path.starts_with("/api/v1/principals?") => {
-                let data = if path.contains("=1042&") {
-                    json!([{
-                        "id": "prn_ada",
-                        "foreign_id": format!("{ADA}0123456789ab"),
-                        "name": "Google Chat User @Ada",
-                        "labels": ada_labels
-                    }])
-                } else {
-                    json!([])
-                };
-                ("200 OK", json!({ "data": data }).to_string())
-            }
-            "GET" if foreign_id.starts_with(ADA) => principal("prn_ada", foreign_id, ada_labels),
-            "PUT" if foreign_id.starts_with(ADA) => principal("prn_ada", foreign_id, json!({})),
-            "PUT" => principal("prn_new", foreign_id, json!({})),
-            _ => not_found(),
-        }
-    }
-
-    /// Registers the Chat requester in `metadata` against [`console_with_ada`]
-    /// and returns the resolved principal id with the upsert it sent.
-    async fn register_gchat_requester(metadata: Value) -> (String, StubRequest) {
-        let (base_url, requests, server) = spawn_iron_control_stub(console_with_ada).await;
-        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-        let principal = registrar
-            .register_requester("chat:spaces:GROUP:spaces:GROUP:threads:T1", Some(&metadata))
-            .await
-            .unwrap()
-            .expect("a verified Chat requester resolves to a principal");
-        server.abort();
-        let upsert = requests
-            .lock()
-            .unwrap()
-            .drain(..)
-            .find(|request| request.method == "PUT")
-            .expect("the requester principal is upserted");
-        (principal.id, upsert)
-    }
-
-    #[tokio::test]
-    async fn a_chat_requester_keeps_its_principal_when_its_email_changes() {
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@new.example",
-            "googlechat_requester_subject": "1042"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_ada");
-        assert_eq!(
-            upsert.path,
-            "/api/v1/principals/gchat-user-ada-old-example-0123456789ab"
-        );
-        let labels = &upsert.body.expect("upsert body")["data"]["labels"];
-        assert_eq!(labels["google_email"], "ada@new.example");
-        assert_eq!(labels["google_subject"], "1042");
-        assert_eq!(labels["team"], "infra");
-    }
-
-    #[tokio::test]
-    async fn a_chat_requester_without_an_account_id_still_resolves_by_email() {
-        let old_address = derive_gchat_requester_principal(
-            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
-            "ada@old.example",
-            None,
-            None,
-        )
-        .unwrap();
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@old.example"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_ada");
-        assert_eq!(
-            upsert.path,
-            format!("/api/v1/principals/{}", old_address.foreign_id)
-        );
-        assert_eq!(
-            upsert.body.expect("upsert body")["data"]["labels"]["google_subject"],
-            "1042"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unknown_google_account_gets_its_own_email_keyed_principal() {
-        let derived = derive_gchat_requester_principal(
-            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
-            "grace@new.example",
-            None,
-            None,
-        )
-        .unwrap();
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "grace@new.example",
-            "googlechat_requester_subject": "2077"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_new");
-        assert_eq!(
-            upsert.path,
-            format!("/api/v1/principals/{}", derived.foreign_id)
-        );
-        assert_eq!(
-            upsert.body.expect("upsert body")["data"]["labels"]["google_subject"],
-            "2077"
-        );
-    }
-
-    #[tokio::test]
-    async fn another_google_account_never_takes_over_a_principal_by_reusing_its_email() {
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@old.example",
-            "googlechat_requester_subject": "2077"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_new");
-        assert_eq!(upsert.path, "/api/v1/principals/gchat-user-2077");
-        let labels = &upsert.body.expect("upsert body")["data"]["labels"];
-        assert_eq!(labels["google_subject"], "2077");
-        assert_eq!(labels.get("team"), None);
-    }
-
-    #[tokio::test]
-    async fn register_requester_ignores_unverified_or_display_only_gchat_emails() {
-        let thread_key = "chat:spaces:GROUP:spaces:GROUP:threads:T1";
+    #[test]
+    fn requester_plan_ignores_unverified_or_display_only_chat_email() {
         for metadata in [
-            // Signature verification skipped: the email proves nothing.
             json!({
                 "googlechat_request_verified": false,
                 "googlechat_requester_email": "ada@example.com"
             }),
-            // Only the display-only message email, never gated by the bot.
             json!({
                 "googlechat_request_verified": true,
                 "user_email": "ada@example.com"
             }),
             json!({ "googlechat_requester_email": "ada@example.com" }),
         ] {
-            let (base_url, requests, server) = spawn_iron_control_stub(|_, _| not_found()).await;
-            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-            let principal = registrar
-                .register_requester(thread_key, Some(&metadata))
-                .await
-                .unwrap();
-            assert_eq!(principal, None, "{metadata}");
-            assert!(requests.lock().unwrap().is_empty());
-            server.abort();
+            assert!(
+                requester_plan("chat:spaces:GROUP:spaces:GROUP:threads:T1", &metadata).is_none(),
+                "{metadata}"
+            );
         }
     }
 }

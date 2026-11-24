@@ -88,7 +88,7 @@ const FIELDS = [
 
 const SECRET_FIELDS = ["client_secret", "refresh_token", "username", "password", "preqin_username", "api_key"] as const;
 
-function defaultValues(credential?: BrokerCredential): CredentialFormValues {
+export function defaultValues(credential?: BrokerCredential): CredentialFormValues {
   return {
     foreign_id: credential?.foreign_id ?? "",
     name: credential?.name ?? "",
@@ -98,7 +98,7 @@ function defaultValues(credential?: BrokerCredential): CredentialFormValues {
     client_secret: "",
     scopes: (credential?.scopes ?? []).join("\n"),
     headers: (credential?.token_endpoint_header_names ?? []).map((name) => ({ key: name, value: "", stored: name })),
-    // BrokerCredential column defaults for a new record.
+    // Broker credential column defaults for a new record.
     early_refresh_fraction: String(credential?.early_refresh_fraction ?? 0.2),
     early_refresh_slack_seconds: String(credential?.early_refresh_slack_seconds ?? 300),
     max_refresh_interval_seconds: String(credential?.max_refresh_interval_seconds ?? 86400),
@@ -140,14 +140,27 @@ export function toPayload(values: CredentialFormValues, credential?: BrokerCrede
     client_secret: values.client_secret,
     scopes: values.scopes.split(/\s+/).filter(Boolean),
     token_endpoint_headers: Object.keys(headers).length > 0 ? headers : null,
-    early_refresh_fraction: values.early_refresh_fraction,
-    early_refresh_slack_seconds: values.early_refresh_slack_seconds,
-    max_refresh_interval_seconds: values.max_refresh_interval_seconds,
-    refresh_timeout_seconds: values.refresh_timeout_seconds,
+    early_refresh_fraction: numberField(values.early_refresh_fraction),
+    early_refresh_slack_seconds: numberField(values.early_refresh_slack_seconds),
+    max_refresh_interval_seconds: numberField(values.max_refresh_interval_seconds),
+    refresh_timeout_seconds: numberField(values.refresh_timeout_seconds),
     ...grantFields,
     labels: rowsToRecord(values.labels),
   };
   return omitBlankSecrets(payload, ["client_secret", "refresh_token", "username", "password", "api_key"]) as CredentialPayload;
+}
+
+/**
+ * The refresh-policy inputs are text fields; the API takes JSON numbers. A blank
+ * field is omitted so the server default (on create) or current value (on edit)
+ * applies; text that isn't a number is sent as-is so the API's validation error
+ * shows under the field.
+ */
+function numberField(value: string): number | string | undefined {
+  const trimmed = value.trim();
+  if (trimmed === "") return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : trimmed;
 }
 
 interface CredentialFormProps {

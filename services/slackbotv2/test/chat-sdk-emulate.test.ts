@@ -1011,7 +1011,7 @@ describe('slackbotv2', () => {
           apiKey: 'test-key', model: 'classifier',
           fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => Response.json({ answers: [
             { name: 'selection_request', probability: 0.99, type: 'predicate' },
-            { name: 'model', choice: String(init?.body).includes('use Sol') ? 'gpt-6.1-sol' : 'private/atlas-full', type: 'choice' }
+            { name: 'model', choice: String(init?.body).includes('use Sol') ? 'gpt-6.2-sol' : 'private/atlas-full', type: 'choice' }
           ] })) as unknown as typeof fetch
         })
       })
@@ -1034,7 +1034,7 @@ describe('slackbotv2', () => {
       const reset = await sendMessage(`<@${BOT_USER_ID}> use Sol again`, { threadTs: parent.ts })
       await reset.finished()
       const resetLine = JSON.parse(codexApi.executes[3]!.body.input_lines.at(-1)!)
-      expect(resetLine.model).toBe('gpt-6.1-sol')
+      expect(resetLine.model).toBe('gpt-6.2-sol')
       // Slack clears the provider; the harness resolves the default route.
       expect(resetLine.provider).toBeUndefined()
       const invalid = await sendMessage(`<@${BOT_USER_ID}> --provider openrouter --model atlas use this`, { threadTs: parent.ts })
@@ -7601,6 +7601,9 @@ async function handlePatchedSlackRequest(
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${input.port}`)
   const request = await nodeRequestToWebRequest(req, url)
+  const upstreamRequestUrl = new URL(input.upstreamUrl)
+  upstreamRequestUrl.pathname = url.pathname
+  upstreamRequestUrl.search = url.search
 
   if (url.pathname.endsWith('/files/captured.png') || url.pathname.endsWith('/captured.png')) {
     await sendWebResponse(
@@ -7822,7 +7825,7 @@ async function handlePatchedSlackRequest(
     }
     if (input.threadMessageFiles.size > 0) {
       const rawBody = await request.arrayBuffer()
-      const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
+      const proxied = await fetch(upstreamRequestUrl, {
         method: request.method,
         headers: request.headers,
         body: rawBody.byteLength > 0 ? rawBody : undefined
@@ -7844,7 +7847,7 @@ async function handlePatchedSlackRequest(
   }
 
   const body = await request.arrayBuffer()
-  const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
+  const proxied = await fetch(upstreamRequestUrl, {
     method: request.method,
     headers: request.headers,
     body: body.byteLength > 0 ? body : undefined

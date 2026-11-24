@@ -17,10 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[cfg(not(test))]
-use crate::api_jwt::verify_console_jwt;
-#[cfg(test)]
-use crate::api_jwt::verify_hs256_jwt;
-use crate::{ApiError, api_jwt::bearer_token, routes::AppState};
+use crate::api_jwt::jwt_signing_secret;
+use crate::{
+    ApiError,
+    api_jwt::{bearer_token, verify_hs256_jwt},
+    auth::{SANDBOX_TOKEN_AUDIENCE, SANDBOX_TOKEN_ISSUER},
+    routes::AppState,
+};
 
 const DEFAULT_GOOGLECHATBOT_INTERNAL_URL: &str = "http://centaur-centaur-googlechatbot:3002";
 const DEFAULT_JSON_BODY_MAX_BYTES: usize = 1024 * 1024;
@@ -107,7 +110,7 @@ struct GoogleChatClaims {
     dm_setup_targets: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct PageQuery {
     #[serde(default)]
     page_size: Option<u16>,
@@ -160,7 +163,14 @@ async fn list_spaces(
             next_page_token: None,
         }));
     }
-    let query = page_query(&query)?;
+    chat_spaces_page(&allowed, &query).await.map(Json)
+}
+
+async fn chat_spaces_page(
+    allowed: &BTreeSet<String>,
+    query: &PageQuery,
+) -> Result<SpacesResponse, ApiError> {
+    let query = page_query(query)?;
     let value = forward_json(Method::GET, "/api/chat/spaces", query.as_deref(), None).await?;
     let spaces = value
         .get("spaces")
@@ -180,10 +190,34 @@ async fn list_spaces(
         .or_else(|| value.get("next_page_token"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    Ok(Json(SpacesResponse {
+    Ok(SpacesResponse {
         spaces,
         next_page_token,
-    }))
+    })
+}
+
+pub(crate) async fn schedule_space_names(
+    spaces: &[String],
+) -> Result<BTreeMap<String, String>, ApiError> {
+    if spaces.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let allowed: BTreeSet<_> = spaces.iter().cloned().collect();
+    let page = chat_spaces_page(&allowed, &PageQuery::default()).await?;
+    Ok(page
+        .spaces
+        .iter()
+        .filter_map(|space| {
+            Some((
+                space.get("name")?.as_str()?.to_owned(),
+                space
+                    .get("displayName")?
+                    .as_str()
+                    .filter(|name| !name.is_empty())?
+                    .to_owned(),
+            ))
+        })
+        .collect())
 }
 
 async fn get_space(headers: HeaderMap, Path(space_id): Path<String>) -> Result<Response, ApiError> {
@@ -484,9 +518,17 @@ enum Operation {
 fn authorize(headers: &HeaderMap) -> Result<GoogleChatProxyJwt, ApiError> {
     let token = bearer_token(headers)?;
     #[cfg(test)]
-    return verify_hs256_jwt(token, b"test-secret", "centaur-api", "centaur-console");
+    let secret = "test-secret";
     #[cfg(not(test))]
-    verify_console_jwt(token)
+    let secret = jwt_signing_secret().ok_or_else(|| {
+        ApiError::Internal("CENTAUR_JWT_SIGNING_SECRET is not configured".to_owned())
+    })?;
+    verify_hs256_jwt(
+        token,
+        secret.as_bytes(),
+        SANDBOX_TOKEN_AUDIENCE,
+        SANDBOX_TOKEN_ISSUER,
+    )
 }
 
 fn authorized_space(
@@ -1121,7 +1163,7 @@ mod tests {
             &json!({
                 "iss": "centaur-console",
                 "sub": "principal_test",
-                "aud": "centaur-api",
+                "aud": SANDBOX_TOKEN_AUDIENCE,
                 "iat": now,
                 "exp": expires_at,
                 "google_chat": google_chat,
@@ -1366,7 +1408,7 @@ mod tests {
                     Some("Bearer internal-test-key")
                 );
                 if uri.path().contains("TIMEOUT") {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(750)).await;
                 }
                 if uri.path().contains("ERROR") {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "upstream secret detail")
@@ -1391,7 +1433,7 @@ mod tests {
             ("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-test-key"),
             ("GOOGLE_CHAT_PROXY_MAX_JSON_BODY_BYTES", "64"),
             ("GOOGLE_CHAT_PROXY_MAX_UPLOAD_BYTES", "64"),
-            ("GOOGLE_CHAT_PROXY_READ_TIMEOUT_MS", "20"),
+            ("GOOGLE_CHAT_PROXY_READ_TIMEOUT_MS", "250"),
         ]);
         let app = google_chat_proxy_router().with_state(AppState::unready(
             crate::ApiAuthConfig::testing("test-secret"),

@@ -16,7 +16,6 @@ pub(crate) struct AppState {
     pub(crate) encryption: Arc<ActiveRecordEncryption>,
     pub(crate) jwt_secret: Option<String>,
     pub(crate) api_hosts: Vec<String>,
-    pub(crate) console_host: Option<String>,
     pub(crate) sync_cache: Arc<SyncCache>,
     pub(crate) metrics: PrometheusHandle,
 }
@@ -34,8 +33,12 @@ pub(crate) struct ProxyRecord {
     pub(crate) principal: Option<Value>,
     pub(crate) console_user_email: Option<String>,
     pub(crate) console_user_id: Option<i64>,
+    pub(crate) console_user_admin: bool,
+    pub(crate) console_user_status: Option<String>,
+    pub(crate) slack_bot_home_team: bool,
     pub(crate) slack_history_channel_ids: Value,
     pub(crate) google_chat: GoogleChatClaims,
+    pub(crate) google_chat_delegate: bool,
     /// An owner-only token's liveness (expiry, owner status, app state) is
     /// not covered by the principal cache version, so such configs are always
     /// assembled live.
@@ -48,6 +51,14 @@ impl ProxyRecord {
             .as_ref()
             .and_then(|principal| principal.get(field))
             .unwrap_or(&Value::Null)
+    }
+
+    pub(crate) fn console_delegate(&self) -> bool {
+        self.console_user_admin
+            && self.console_user_status.as_deref() == Some("active")
+            && (self.google_chat_delegate
+                || (self.principal_field("kind").as_str() == Some("slack_dm")
+                    && self.slack_bot_home_team))
     }
 }
 

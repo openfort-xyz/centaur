@@ -1,7 +1,6 @@
 import { Menu } from "lucide-react";
 import { Suspense, useEffect, useMemo, useRef } from "react";
 import { Link, Outlet, useLocation } from "react-router";
-import { toast } from "sonner";
 
 import { features } from "@/app/registry";
 import { useSession } from "@/app/session";
@@ -53,8 +52,6 @@ function ShellFrame() {
   const controlTabs = useMemo(() => visibleControlTabs(features, me), [me]);
   const shell = useMemo(() => ({ controlTabs, isSpaPath }), [controlTabs]);
 
-  useFlashToasts(me.flash);
-
   // A pending account may only see the server-rendered /pending page.
   if (me.user.status === "pending") return <FullPageRedirect to="/pending" />;
 
@@ -76,7 +73,7 @@ function ShellFrame() {
   );
 }
 
-/** Leaves the SPA for a Rails-rendered page (login, pending). */
+/** Leaves the SPA for a server-rendered page (login, pending). */
 function FullPageRedirect({ to }: { to: string }) {
   useEffect(() => navigation.assign(to), [to]);
   return <ShellLoading />;
@@ -117,15 +114,4 @@ function MobileTopBar() {
       </Link>
     </div>
   );
-}
-
-/** Shows a redirect flash handed off through GET /api/v1/console/me exactly once. */
-function useFlashToasts(flash: { notice?: string; alert?: string }) {
-  const shown = useRef<object | null>(null);
-  useEffect(() => {
-    if (shown.current === flash) return;
-    shown.current = flash;
-    if (flash.notice) toast.success(flash.notice);
-    if (flash.alert) toast.error(flash.alert);
-  }, [flash]);
 }

@@ -22,17 +22,17 @@ Sidebar, Tooltip, Skeleton, Sonner) and keep the stock focus ring.
 
 | Component | File | Use |
 |---|---|---|
-| `AppLink` | `app-link.tsx` | Link to any console path. Client-side for SPA routes, full page load for Rails protocol routes (`/oauth/:slug/start`, `/auth/:provider/start`). Use it for cross-slice links. |
-| `PageHeader`, `SectionHeading`, `useDocumentTitle` | `page-header.tsx` | Page title/subtitle/actions (legacy `_page_header`); sets `<title>` to "X · Centaur Console". `SectionHeading` is the in-page section title. |
+| `AppLink` | `app-link.tsx` | Link to any console path. Client-side for SPA routes, full page load for server protocol routes (`/oauth/:slug/start`, `/auth/:provider/start`). Use it for cross-slice links. |
+| `PageHeader`, `SectionHeading`, `useDocumentTitle` | `page-header.tsx` | Page title/subtitle/actions; sets `<title>` to "X · Centaur Console". `SectionHeading` is the in-page section title. |
 | `BackLink` | `back-link.tsx` | "← back to …" link. |
 | `ControlTabs` | `control-tabs.tsx` | The Control tab strip. Render at the top of Control index pages; tabs come from feature `controlTabs`. |
-| `RequireAccess` | `require-access.tsx` | Page guard: `allowed={(me) => me.nav.x}`. Silently sends others to their landing page (legacy `require_admin`). The API still enforces access. |
+| `RequireAccess` | `require-access.tsx` | Page guard: `allowed={(me) => me.nav.x}`. Silently sends others to their landing page. The API still enforces access. |
 | `DataTable`, `Column` | `data-table.tsx` | Table panel (shadcn `Table`) with header, hover rows, skeleton loading rows, an empty row, and an optional `Pagination` footer from API `meta`. Tables with `fixed` layout or four or more columns keep a minimum width and scroll horizontally on narrow screens; override with `minWidth`. |
 | `Pagination`, `usePageParam` | `pagination.tsx` | "N units · page X of Y" with Previous/Next. `usePageParam("roles_page")` keeps several paginators on one page independent in the URL. A response past the last page (`page > total_pages > 0`) replaces the URL's page with the last page, keeping other params; `DataTable` shows loading rows meanwhile. Pass `hideSinglePage` instead of omitting `pagination` so stale pages still clamp. |
 | `SearchBox` | `search-box.tsx` | `?q=` search form with Search/Clear; resets `page`. |
 | `EmptyState` | `empty-state.tsx` | Dashed empty box. |
 | `ErrorAlert`, `WarningAlert` | `alerts.tsx` | Red error box, amber warning box. |
-| `ConfirmDialog` | `confirm-dialog.tsx` | Confirmation for destructive actions (replaces `data-turbo-confirm`). `onConfirm` may be async. |
+| `ConfirmDialog` | `confirm-dialog.tsx` | Confirmation for destructive actions. `onConfirm` may be async. |
 | `CopyButton` | `copy-button.tsx` | Copy a value to the clipboard with feedback. |
 | `LocalTime` | `local-time.tsx` | Timestamp in the viewer's zone: `absolute` (MM/DD/YYYY HH:MM:SS), `relative`, or `compact` ("4d"); re-renders every 30s; `—` for null. |
 | `ResourceBadge`, `LabelChip(s)`, `RolePill`, `StatusBadge` (+ `credentialStatusTone`, `workflowStatusTone`, `userStatusTone`) | `badges.tsx` | Badges and status pills. |
@@ -50,9 +50,9 @@ Related modules outside this folder:
 - `@/lib/api` — `api.get/post/put/patch/delete`, `ApiError` (`status`,
   `reason`, `fieldErrors`), `errorMessage`. Only accepts paths under
   `/api/v1/console/` (`CONSOLE_API_PREFIX`, the session-only console API;
-  the rest of `/api/v1` is the bearer API). Sends `X-CSRF-Token` on writes,
-  redirects to `/login` on 401 and `/pending` for pending accounts, retries
-  once on a stale CSRF token.
+  the rest of `/api/v1` is the bearer API). Sends no CSRF token; the browser's
+  same-origin `Origin` is what the server checks on writes. Redirects to
+  `/login` on 401 and `/pending` for pending accounts.
 - `@/lib/query-keys` — `createQueryKeys("<slice>")` and `sharedKeys`.
 - `@/lib/format` — `truncateMiddle`, `pluralize`, `displayLabel`, time formats.
 - `@/lib/secret-kinds` — secret kind registry, `grantKey`, `secretOptionLabel`,
@@ -63,8 +63,9 @@ Related modules outside this folder:
   write, held in component state.
 - `@/test/utils` — `mockApi`, `apiResponse`, `renderRoute`, `adminMe`,
   `operatorMe` for the SPA tests.
-- Toasts: `import { toast } from "sonner"` (`toast.success` for the legacy
-  flash notice, `toast.error` for alerts).
+- Toasts: `import { toast } from "sonner"` for action results (`toast.success`,
+  `toast.error`). Redirect flash messages are not used; server-rendered pages
+  carry `?error=<code>` instead.
 
 ## Reads and writes
 
@@ -92,5 +93,6 @@ The SPA keeps tests for logic and for secret handling only: `lib/api`,
 `lib/format`, `LocalTime`, stale-page clamping in `Pagination`, the Slack channel picker's saved label, the secret form model, `SecretField`, the shell,
 navigation, and `features/secret-handling.test.tsx` (plaintext gone from the
 inputs, the page, and both TanStack caches after each secret-bearing submit,
-and the show-once API client secret). Page behaviour is covered by the Rails
-request tests and a browser pass.
+and the show-once API client secret). Endpoint behaviour is covered by the api-rs
+Console tests (`crates/centaur-api-server/src/console`); check page behaviour in a
+browser.
