@@ -557,9 +557,8 @@ async fn grant_secrets(fixture: &Fixture, foreign_id: &str) -> String {
 }
 
 /// The OID of the principal api-rs resolves a verified Chat sender to, with
-/// the number of secrets that principal is granted. The registrar reads
-/// Console's database as it does in production; its admin API is unreachable,
-/// so resolving must not write.
+/// the number of secrets that principal is granted. Resolve without creating
+/// a principal.
 async fn chat_sender(
     fixture: &Fixture,
     email: &str,
@@ -581,6 +580,47 @@ async fn chat_sender(
         .unwrap()?;
     let config = client.effective_config(&principal.id).await.unwrap();
     Some((principal.id, config.secrets.len()))
+}
+
+#[tokio::test]
+async fn registering_a_chat_sender_updates_the_existing_principal_after_a_rename() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let old_email = format!("{}@old.example", fixture.unique);
+    let new_email = format!("{}@new.example", fixture.unique);
+    let subject = google_account();
+    let foreign_id = gchat_user_as(
+        &fixture,
+        chat_sender_foreign_id(&old_email),
+        json!({"google_email": old_email, "google_subject": subject, "team": "infra"}),
+        None,
+    )
+    .await;
+    let original = find_principal_by_foreign_id(&fixture.pool, &foreign_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let registrar = SessionRegistrar::new(IronControlClient::new(fixture.pool.clone()));
+    let metadata = json!({
+        "googlechat_request_verified": true,
+        "googlechat_requester_email": new_email,
+        "googlechat_requester_subject": subject
+    });
+    let principal = registrar
+        .register_requester("chat:spaces:DM:spaces:DM:threads:T2", Some(&metadata))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(principal.id, oid("prn", original.id));
+    let stored = find_principal(&fixture.pool, original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.foreign_id, Some(foreign_id));
+    assert_eq!(stored.labels["google_email"], new_email);
+    assert_eq!(stored.labels["google_subject"], subject);
+    assert_eq!(stored.labels["team"], "infra");
 }
 
 #[tokio::test]

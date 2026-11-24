@@ -7601,6 +7601,9 @@ async function handlePatchedSlackRequest(
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${input.port}`)
   const request = await nodeRequestToWebRequest(req, url)
+  const upstreamRequestUrl = new URL(input.upstreamUrl)
+  upstreamRequestUrl.pathname = url.pathname
+  upstreamRequestUrl.search = url.search
 
   if (url.pathname.endsWith('/files/captured.png') || url.pathname.endsWith('/captured.png')) {
     await sendWebResponse(
@@ -7822,7 +7825,7 @@ async function handlePatchedSlackRequest(
     }
     if (input.threadMessageFiles.size > 0) {
       const rawBody = await request.arrayBuffer()
-      const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
+      const proxied = await fetch(upstreamRequestUrl, {
         method: request.method,
         headers: request.headers,
         body: rawBody.byteLength > 0 ? rawBody : undefined
@@ -7844,7 +7847,7 @@ async function handlePatchedSlackRequest(
   }
 
   const body = await request.arrayBuffer()
-  const proxied = await fetch(new URL(`${path}${url.search}`, input.upstreamUrl), {
+  const proxied = await fetch(upstreamRequestUrl, {
     method: request.method,
     headers: request.headers,
     body: body.byteLength > 0 ? body : undefined

@@ -1008,226 +1008,48 @@ mod tests {
         assert_eq!(input.kind.as_deref(), Some("slack_dm"));
     }
 
-    #[tokio::test]
-    async fn register_requester_upserts_gchat_user_principal_for_any_space() {
-        // A group thread and a DM both resolve the same person to the same
-        // per-user principal: Chat sessions key on the space, so this is the
-        // only principal a personal grant can live on.
+    #[test]
+    fn requester_plan_derives_the_same_chat_user_in_a_space_or_dm() {
+        let metadata = json!({
+            "user_id": "users/123",
+            "user_name": "Ada Lovelace",
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@example.com"
+        });
         for thread_key in [
             "chat:spaces:GROUP:spaces:GROUP:threads:T1",
             "chat:spaces:DM:spaces:DM:threads:T2",
         ] {
-            let (base_url, requests, server) = spawn_iron_control_stub(|method, path| {
-                if method == "PUT" && path.ends_with("/gchat-user-ada-example-com-b5fc85e55755") {
-                    principal(
-                        "prn_user",
-                        "gchat-user-ada-example-com-b5fc85e55755",
-                        json!({}),
-                    )
-                } else {
-                    not_found()
-                }
-            })
-            .await;
-            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-            let metadata = json!({
-                "user_id": "users/123",
-                "user_name": "Ada Lovelace",
-                "user_email": "ada@example.com",
-                "googlechat_request_verified": true,
-                "googlechat_requester_email": "ada@example.com"
-            });
-
-            let principal = registrar
-                .register_requester(thread_key, Some(&metadata))
-                .await
-                .unwrap()
-                .expect("a verified Chat requester resolves to a principal");
-            assert_eq!(principal.id, "prn_user");
-
-            let requests = requests.lock().unwrap();
-            assert!(
-                !requests
-                    .iter()
-                    .any(|request| request.path.ends_with("/roles"))
-            );
-            let upsert = requests
-                .iter()
-                .find(|request| request.method == "PUT")
-                .and_then(|request| request.body.as_ref())
-                .expect("gchat requester principal is upserted");
-            assert_eq!(upsert["data"]["kind"], "gchat_user");
-            assert_eq!(upsert["data"]["name"], "Google Chat User @Ada Lovelace");
-            assert_eq!(upsert["data"]["labels"]["google_email"], "ada@example.com");
-            server.abort();
+            let Some(RequesterPlan::UpsertDerived(principal)) =
+                requester_plan(thread_key, &metadata)
+            else {
+                panic!("a verified Chat requester should resolve to a principal");
+            };
+            let input = principal.to_principal_input();
+            assert_eq!(input.foreign_id, "gchat-user-ada-example-com-b5fc85e55755");
+            assert_eq!(input.kind.as_deref(), Some("gchat_user"));
+            assert_eq!(input.name, "Google Chat User @Ada Lovelace");
+            assert_eq!(input.labels["google_email"], "ada@example.com");
         }
     }
 
-    /// A Console holding one Google Chat user: Ada, Google account 1042, whose
-    /// principal was created while her address was `ada@old.example`.
-    fn console_with_ada(method: &str, path: &str) -> (&'static str, String) {
-        const ADA: &str = "gchat-user-ada-old-example-";
-        let ada_labels = json!({
-            "google_email": "ada@old.example",
-            "google_subject": "1042",
-            "team": "infra"
-        });
-        let foreign_id = path.rsplit('/').next().unwrap_or_default();
-        match method {
-            "GET" if path.starts_with("/api/v1/principals?") => {
-                let data = if path.contains("=1042&") {
-                    json!([{
-                        "id": "prn_ada",
-                        "foreign_id": format!("{ADA}0123456789ab"),
-                        "name": "Google Chat User @Ada",
-                        "labels": ada_labels
-                    }])
-                } else {
-                    json!([])
-                };
-                ("200 OK", json!({ "data": data }).to_string())
-            }
-            "GET" if foreign_id.starts_with(ADA) => principal("prn_ada", foreign_id, ada_labels),
-            "PUT" if foreign_id.starts_with(ADA) => principal("prn_ada", foreign_id, json!({})),
-            "PUT" => principal("prn_new", foreign_id, json!({})),
-            _ => not_found(),
-        }
-    }
-
-    /// Registers the Chat requester in `metadata` against [`console_with_ada`]
-    /// and returns the resolved principal id with the upsert it sent.
-    async fn register_gchat_requester(metadata: Value) -> (String, StubRequest) {
-        let (base_url, requests, server) = spawn_iron_control_stub(console_with_ada).await;
-        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-        let principal = registrar
-            .register_requester("chat:spaces:GROUP:spaces:GROUP:threads:T1", Some(&metadata))
-            .await
-            .unwrap()
-            .expect("a verified Chat requester resolves to a principal");
-        server.abort();
-        let upsert = requests
-            .lock()
-            .unwrap()
-            .drain(..)
-            .find(|request| request.method == "PUT")
-            .expect("the requester principal is upserted");
-        (principal.id, upsert)
-    }
-
-    #[tokio::test]
-    async fn a_chat_requester_keeps_its_principal_when_its_email_changes() {
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@new.example",
-            "googlechat_requester_subject": "1042"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_ada");
-        assert_eq!(
-            upsert.path,
-            "/api/v1/principals/gchat-user-ada-old-example-0123456789ab"
-        );
-        let labels = &upsert.body.expect("upsert body")["data"]["labels"];
-        assert_eq!(labels["google_email"], "ada@new.example");
-        assert_eq!(labels["google_subject"], "1042");
-        assert_eq!(labels["team"], "infra");
-    }
-
-    #[tokio::test]
-    async fn a_chat_requester_without_an_account_id_still_resolves_by_email() {
-        let old_address = derive_gchat_requester_principal(
-            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
-            "ada@old.example",
-            None,
-            None,
-        )
-        .unwrap();
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@old.example"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_ada");
-        assert_eq!(
-            upsert.path,
-            format!("/api/v1/principals/{}", old_address.foreign_id)
-        );
-        assert_eq!(
-            upsert.body.expect("upsert body")["data"]["labels"]["google_subject"],
-            "1042"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unknown_google_account_gets_its_own_email_keyed_principal() {
-        let derived = derive_gchat_requester_principal(
-            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
-            "grace@new.example",
-            None,
-            None,
-        )
-        .unwrap();
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "grace@new.example",
-            "googlechat_requester_subject": "2077"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_new");
-        assert_eq!(
-            upsert.path,
-            format!("/api/v1/principals/{}", derived.foreign_id)
-        );
-        assert_eq!(
-            upsert.body.expect("upsert body")["data"]["labels"]["google_subject"],
-            "2077"
-        );
-    }
-
-    #[tokio::test]
-    async fn another_google_account_never_takes_over_a_principal_by_reusing_its_email() {
-        let (id, upsert) = register_gchat_requester(json!({
-            "googlechat_request_verified": true,
-            "googlechat_requester_email": "ada@old.example",
-            "googlechat_requester_subject": "2077"
-        }))
-        .await;
-
-        assert_eq!(id, "prn_new");
-        assert_eq!(upsert.path, "/api/v1/principals/gchat-user-2077");
-        let labels = &upsert.body.expect("upsert body")["data"]["labels"];
-        assert_eq!(labels["google_subject"], "2077");
-        assert_eq!(labels.get("team"), None);
-    }
-
-    #[tokio::test]
-    async fn register_requester_ignores_unverified_or_display_only_gchat_emails() {
-        let thread_key = "chat:spaces:GROUP:spaces:GROUP:threads:T1";
+    #[test]
+    fn requester_plan_ignores_unverified_or_display_only_chat_email() {
         for metadata in [
-            // Signature verification skipped: the email proves nothing.
             json!({
                 "googlechat_request_verified": false,
                 "googlechat_requester_email": "ada@example.com"
             }),
-            // Only the display-only message email, never gated by the bot.
             json!({
                 "googlechat_request_verified": true,
                 "user_email": "ada@example.com"
             }),
             json!({ "googlechat_requester_email": "ada@example.com" }),
         ] {
-            let (base_url, requests, server) = spawn_iron_control_stub(|_, _| not_found()).await;
-            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
-            let principal = registrar
-                .register_requester(thread_key, Some(&metadata))
-                .await
-                .unwrap();
-            assert_eq!(principal, None, "{metadata}");
-            assert!(requests.lock().unwrap().is_empty());
-            server.abort();
+            assert!(
+                requester_plan("chat:spaces:GROUP:spaces:GROUP:threads:T1", &metadata).is_none(),
+                "{metadata}"
+            );
         }
     }
 }
