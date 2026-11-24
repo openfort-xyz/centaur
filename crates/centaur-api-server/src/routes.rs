@@ -1051,27 +1051,40 @@ mod session_authorization_tests {
         };
         use tower::ServiceExt;
 
-        let app = super::build_router_with_app_state(super::AppState::unready(
-            crate::ApiAuthConfig::testing("test-secret"),
-        ));
+        let state = super::AppState::unready(crate::ApiAuthConfig::testing("test-secret"))
+            .with_console_session(
+                crate::ConsoleSessionConfig::from_settings(
+                    Some("console-session-fixture"),
+                    Some("https://console.example.test"),
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        let app = super::build_router_with_app_state(state);
         for (method, path) in [
             (Method::GET, "/api/slack/channels"),
             (Method::GET, "/api/google-chat/spaces"),
             (Method::POST, "/api/google-chat/spaces/space-test/messages"),
             (Method::POST, "/api/google-chat/dms/setup"),
         ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            for (host, status) in [
+                ("api.internal.test", StatusCode::UNAUTHORIZED),
+                ("console.example.test", StatusCode::NOT_FOUND),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(path)
+                            .header("host", host)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{host}{path}");
+            }
         }
     }
 
