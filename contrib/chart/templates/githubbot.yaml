@@ -103,6 +103,18 @@ spec:
             # v2 PR self-management knobs.
             - name: GITHUBBOT_AUTO_MERGE
               value: {{ .Values.githubbot.autoMerge | quote }}
+            - name: GITHUBBOT_MERGE_POLICY_URL
+              value: {{ .Values.githubbot.mergePolicyUrl | quote }}
+            - name: GITHUBBOT_HUMAN_REVIEWERS
+              value: {{ join "," .Values.githubbot.humanReviewers | quote }}
+{{- with .Values.githubbot.mergePolicyCredentialsSecret }}
+            - name: GITHUBBOT_MERGE_POLICY_CLIENT_ID
+              valueFrom:
+                secretKeyRef: { name: {{ . | quote }}, key: client-id }
+            - name: GITHUBBOT_MERGE_POLICY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: {{ . | quote }}, key: client-secret }
+{{- end }}
             - name: GITHUBBOT_MERGE_METHOD
               value: {{ .Values.githubbot.mergeMethod | quote }}
             - name: GITHUBBOT_WORKFLOW_EVENTS

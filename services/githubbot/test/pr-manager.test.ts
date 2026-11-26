@@ -46,6 +46,7 @@ function prPayload(input: {
   return {
     assignees: input.assignees ?? [{ login: "centaur-bot" }],
     draft: false,
+    base: { sha: "base123" },
     head: {
       ref: "feature",
       repo: { full_name: input.headRepoFullName },
@@ -577,6 +578,12 @@ describe("decideMerge", () => {
   });
 });
 
+const passingPolicy = {
+  mergePolicyUrl: "https://policy.example/merge",
+  fetch: async (url: URL) => Response.json({ url: url.searchParams.get("url"),
+    base: url.searchParams.get("base"), head: url.searchParams.get("head"), action: "merge" }),
+};
+
 describe("PR management webhooks", () => {
   test("merges when CI settles green again on an already-evaluated head", async () => {
     let mergeCalls = 0;
@@ -605,6 +612,7 @@ describe("PR management webhooks", () => {
         },
       },
       options: {
+        ...passingPolicy,
         apiUrl: "http://localhost",
         deleteBranchOnMerge: false,
         logger: { debug() {}, warn() {}, error() {}, info() {} },
@@ -664,6 +672,7 @@ describe("PR management webhooks", () => {
         },
       },
       options: {
+        ...passingPolicy,
         apiUrl: "http://localhost",
         logger: { debug() {}, warn() {}, error() {}, info() {} },
       },
@@ -729,6 +738,7 @@ describe("PR management webhooks", () => {
         },
       },
       options: {
+        ...passingPolicy,
         apiUrl: "http://localhost",
         deleteBranchOnMerge: false,
         logger: { debug() {}, warn() {}, error() {}, info() {} },
@@ -782,6 +792,7 @@ describe("merge claim lifecycle", () => {
         },
       },
       options: {
+        ...passingPolicy,
         apiUrl: "http://localhost",
         deleteBranchOnMerge: false,
         logger: quietLogger,
@@ -1471,5 +1482,83 @@ describe("management turn reaction ack", () => {
       content: "EYES",
     });
     await drainBackgroundWork(5_000);
+  });
+});
+
+describe("merge policy on owned PRs", () => {
+  const target = { head: "abc123", base: "base123", url: "https://github.com/base/repo/pull/7" };
+  const approved = { state: "APPROVED", user: { type: "User", login: "reviewer" },
+    commit_id: target.head };
+  async function event(input: {
+    response?: Record<string, unknown>; disabled?: boolean; outage?: boolean; nextHead?: string;
+    reviews?: (typeof approved)[]; changedHold?: boolean;
+  }) {
+    const merges: string[] = [];
+    const comments: string[] = [];
+    let reads = 0;
+    const ctx = {
+      state: makeState(), userName: "centaur-bot",
+      options: {
+        logger: quietLogger, apiUrl: "http://localhost", humanReviewers: ["reviewer", "centaur-bot"],
+        mergePolicyUrl: input.disabled ? undefined : "https://policy.example/check",
+        deleteBranchOnMerge: false,
+        fetch: async (endpoint: URL) => {
+          for (const [key, value] of Object.entries(target))
+            expect(endpoint.searchParams.get(key)).toBe(value);
+          if (input.outage) throw new Error("policy offline");
+          return Response.json({ ...target, ...input.response });
+        },
+      },
+      octokit: {
+        paginate: async () => input.reviews ?? [],
+        rest: {
+          issues: { createComment: async ({ body }: { body: string }) => comments.push(body) },
+          pulls: {
+            get: async () => {
+              reads++;
+              const data = prPayload({ headRepoFullName: "base/repo",
+                headSha: reads >= 3 ? input.nextHead : target.head });
+              return { data: { ...data, labels: reads >= 3 && input.changedHold ? [{ name: "do-not-merge" }] : [] } };
+            },
+            merge: async ({ sha }: { sha: string }) => merges.push(sha),
+            listReviews: async () => [],
+          },
+        },
+      },
+    } as unknown as PrManagerContext;
+    await handlePullRequestEvent(ctx, JSON.stringify({ action: "reopened",
+      repository: { full_name: "base/repo" }, pull_request: { number: 7 } }));
+    return { merges, comments };
+  }
+
+  test("merges a clean policy result at its head, never a later push or a new hold", async () => {
+    const response = { action: "merge" };
+    expect((await event({ response })).merges).toEqual([target.head]);
+    expect((await event({ response, nextHead: "def456" })).merges).toEqual([]);
+    expect((await event({ response, changedHold: true })).merges).toEqual([]);
+  });
+  test("waits on missing configuration, service failure, delegation, or mismatched decisions", async () => {
+    for (const response of [{}, { action: "managed" }, { action: "wait" }, { action: "other" },
+      { action: "merge", url: "https://github.com/base/repo/pull/8" },
+      { action: "merge", head: "old" }, { action: "merge", base: "old" }]) {
+      expect((await event({ response })).merges).toEqual([]);
+    }
+    expect((await event({ disabled: true, reviews: [approved] })).merges).toEqual([]);
+    expect((await event({ outage: true, reviews: [approved] })).merges).toEqual([]);
+  });
+  test("requires an eligible person's live approval of this commit", async () => {
+    const response = { action: "needs_human", reason: "Changed critical path src/auth.ts." };
+    for (const reviews of [[], [{ ...approved, commit_id: "old" }],
+      [{ ...approved, user: { type: "Bot", login: "reviewer" } }],
+      [{ ...approved, user: { type: "User", login: "centaur-bot" } }],
+      [{ ...approved, user: { type: "User", login: "outsider" } }],
+      [approved, { ...approved, state: "DISMISSED" }],
+      [approved, { ...approved, state: "CHANGES_REQUESTED" }]]) {
+      const result = await event({ response, reviews });
+      expect(result.merges).toEqual([]);
+      expect(result.comments[0]).toContain(response.reason);
+    }
+    expect((await event({ response, reviews: [approved, { ...approved, state: "COMMENTED" }] })).merges)
+      .toEqual([target.head]);
   });
 });
