@@ -98,11 +98,12 @@ management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHu
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
   turn that reads all the feedback, makes a single coherent commit, replies on each thread, resolves
   what it addressed, and re-requests review.
-- **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
-  the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
-  conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
-  owned PRs; disable globally with `GITHUBBOT_AUTO_MERGE=false`, or per-PR with the hold label
-  (`GITHUBBOT_HOLD_LABEL`, default `do-not-merge`) or by keeping the PR a draft.
+- **Merge when ready.** Every assigned PR needs GitHub to report it clean and a trusted policy
+  decision for the same repository, PR, base and head. The policy provider checks criticality,
+  CI and the AI review. A human-only verdict posts the reason on the PR and requires a current
+  GitHub approval from a configured human reviewer. The merge API receives the reviewed head SHA.
+  A draft, the hold label, or disabling automatic merges still pauses merging. Conflicts and
+  out-of-date branches follow their usual repair paths.
 - **Owned-PR conversation.** An @-mention in an owned PR's conversation (or a review-comment thread)
   runs in that PR's management session too — so the bot answers with the context of the CI fixes and
   review work it's been doing on the PR — while the rendered reply still posts to the comment thread.
@@ -170,6 +171,9 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_USER_ID` | — | Bot's numeric user id for self-message detection (auto-detected otherwise). |
 | `GITHUBBOT_STATE_KEY_PREFIX` | — | Chat-SDK state key prefix, default `centaur-githubbot`. |
 | `GITHUBBOT_LOG_LEVEL` | — | `debug`/`info`/`warn`/`error`, default `info`. |
+| `GITHUBBOT_MERGE_POLICY_URL` | — | Trusted HTTPS GET endpoint. Receives `url`, `base`, `head` and echoes them in JSON with an `action`. Use `merge` only after green checks and a clean AI review, `needs_human` with a reason after green checks, `managed` when the task owner handles the merge, `reviewing` while AI runs, or `wait` otherwise. Missing or unreadable policy leaves the PR open. |
+| `GITHUBBOT_MERGE_POLICY_CLIENT_ID`, `GITHUBBOT_MERGE_POLICY_CLIENT_SECRET` | — | Optional Access credentials for the policy endpoint. |
+| `GITHUBBOT_HUMAN_REVIEWERS` | — | Comma-separated GitHub logins of people authorized to release a human-only verdict. Without a list, merge manually on GitHub. |
 | `GITHUBBOT_AUTO_MERGE` | — | Auto-merge owned PRs when mergeable. Default `true`. |
 | `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
 | `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |

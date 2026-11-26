@@ -969,6 +969,12 @@ githubbot:
   # Auto-merge respects branch protection and is paused per-PR by the hold label
   # / draft status.
   autoMerge: true
+  # HTTPS decision endpoint. Without one automatic merges wait.
+  mergePolicyUrl: ""
+  # Optional Secret with client-id and client-secret for the policy endpoint.
+  mergePolicyCredentialsSecret: ""
+  # Human GitHub logins whose current-head approval can release a critical PR.
+  humanReviewers: []
   mergeMethod: squash
   # Emit CI and review workflow events to api-rs.
   workflowEvents: false

@@ -1,5 +1,6 @@
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
+import { humanApproved, readMergePolicy, type PolicyTarget } from "./merge-policy";
 import { backgroundWaitUntil } from "./context";
 import { resolveAllowedAuthorAssociations } from "./authorization";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
@@ -19,15 +20,12 @@ import type {
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
 /**
- * v2: PR self-management for PRs the bot owns (it authored them, or they carry
- * the managed label). Reacts to PR/review/CI lifecycle webhooks to drive an
+ * PR self-management for PRs assigned to the bot. Reacts to PR/review/CI lifecycle webhooks to drive an
  * owned PR toward merge:
  *  - Fix CI    — once *all* checks for a head SHA are settled and red, run a
  *                bounded fix turn (the agent diagnoses + pushes via gh).
  *  - Address review — one holistic turn per submitted review.
- *  - Merge     — deterministic: when GitHub reports the PR mergeable (clean),
- *                the bot merges it directly (no agent — branch protection is the
- *                source of truth). dirty -> conflict turn; behind -> update.
+ *  - Merge     — a clean PR also needs a policy verdict for its current commit.
  * Escalation tags a human and stops; the bot backs off human-authored commits.
  */
 /** The Octokit instance the GitHub adapter exposes (its `.octokit` getter). */
@@ -179,6 +177,7 @@ function logger(ctx: PrManagerContext) {
 // ---------------------------------------------------------------------------
 
 type PullRequestSummary = {
+  baseSha: string;
   assignees: string[];
   draft: boolean;
   headRef: string;
@@ -200,6 +199,7 @@ function assigneeLogins(
 }
 
 function summarizePr(pr: {
+  base: { sha: string };
   draft?: boolean | null;
   head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
   labels: { name?: string }[];
@@ -211,6 +211,7 @@ function summarizePr(pr: {
   assignees?: ({ login?: string } | null)[] | null;
 }): PullRequestSummary {
   return {
+    baseSha: pr.base.sha,
     assignees: assigneeLogins(pr.assignees),
     draft: pr.draft === true,
     headRef: pr.head.ref,
@@ -491,16 +492,48 @@ async function processCi(
   fireCiFixTurn(ctx, owner, repo, pr, evaluation.failingNames, attempts + 1, maxAttempts);
 }
 
-/** Deterministic merge gate — no agent; GitHub's mergeable_state decides. */
-async function tryMerge(
-  ctx: PrManagerContext,
-  owner: string,
-  repo: string,
-  number: number,
-): Promise<void> {
-  const pr = await fetchPr(ctx, owner, repo, number);
-  if (!pr || !owns(ctx, pr)) return;
-  const decision = decideMerge({
+async function requestHumanReview(ctx: PrManagerContext, target: PolicyTarget, reason: string) {
+  const { owner, repo, number, head } = target;
+  const key = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:human-review:${owner}/${repo}#${number}:${head}`;
+  if (!(await claim(ctx, key))) return;
+  try {
+    await ctx.octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: number,
+      body: `Human review required for ${head}. ${reason}`,
+    });
+  } catch (error) {
+    await release(ctx, key);
+    throw error;
+  }
+}
+
+async function policyAllowsMerge(ctx: PrManagerContext, target: PolicyTarget): Promise<boolean> {
+  try {
+    const policy = await readMergePolicy(ctx.options, target);
+    traceLog(ctx.options, "githubbot_review_policy", makeTrace(
+      managementThreadKey(target.owner, target.repo, target.number), `policy-${target.head}`,
+    ), { decision: policy.action, head: target.head });
+    if (policy.action === "needs_human") {
+      if (!(await humanApproved(ctx, target))) {
+        await requestHumanReview(ctx, target, policy.reason);
+        return false;
+      }
+    } else if (policy.action !== "merge") return false;
+    // Ownership, base, draft and holds can change during a review.
+    const current = await fetchPr(ctx, target.owner, target.repo, target.number);
+    return !!current && owns(ctx, current) && current.headSha === target.head &&
+      current.baseSha === target.base && readiness(ctx, current) === "merge";
+  } catch (error) {
+    logger(ctx).warn("githubbot_merge_policy_failed", { error: errorMessage(error) });
+    return false;
+  }
+}
+
+/** GitHub prerequisites checked both before and after the policy review. */
+function readiness(ctx: PrManagerContext, pr: PullRequestSummary): MergeDecision {
+  return decideMerge({
     autoMerge: ctx.options.autoMerge !== false,
     draft: pr.draft,
     holdLabel: ctx.options.holdLabel ?? "do-not-merge",
@@ -509,6 +542,17 @@ async function tryMerge(
     mergeableState: pr.mergeableState,
     state: pr.state,
   });
+}
+
+async function tryMerge(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<void> {
+  const pr = await fetchPr(ctx, owner, repo, number);
+  if (!pr || !owns(ctx, pr)) return;
+  const decision = readiness(ctx, pr);
   const trace = makeTrace(managementThreadKey(owner, repo, number), `merge-${pr.headSha}`);
   traceLog(ctx.options, "githubbot_merge_decision", trace, {
     decision,
@@ -517,6 +561,8 @@ async function tryMerge(
   });
 
   if (decision === "merge") {
+    const target = { owner, repo, number, head: pr.headSha, base: pr.baseSha };
+    if (!(await policyAllowsMerge(ctx, target))) return;
     // The claim guards against two concurrent lifecycle events both calling
     // merge. It's released on failure (below) so a transient merge error — "Base
     // branch was modified", a secondary rate limit, a 5xx — is retried on the
@@ -531,6 +577,7 @@ async function tryMerge(
         owner,
         repo,
         pull_number: number,
+        sha: pr.headSha,
         merge_method: ctx.options.mergeMethod ?? "squash",
       });
       traceLog(ctx.options, "githubbot_merged", trace, { pr: `${owner}/${repo}#${number}` });

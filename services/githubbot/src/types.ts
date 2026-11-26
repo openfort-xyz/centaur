@@ -138,10 +138,15 @@ export type GithubbotOptions = {
    */
   managementPrompt?: string;
   /**
-   * v2 PR self-management: auto-merge owned PRs when GitHub reports them
-   * mergeable (branch protection is the source of truth). Defaults to true.
+   * Consider owned PRs for merge when GitHub and the policy provider permit it. Defaults to true.
    */
   autoMerge?: boolean;
+  /** Trusted HTTPS policy service, queried before every automatic merge. */
+  mergePolicyUrl?: string;
+  mergePolicyClientId?: string;
+  mergePolicyClientSecret?: string;
+  /** GitHub logins of people authorized to approve a human-only commit. */
+  humanReviewers?: string[];
   /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
   ciFixMaxAttempts?: number;
   /** Delay before confirming a settled-green rollup. Default 15000ms. */
